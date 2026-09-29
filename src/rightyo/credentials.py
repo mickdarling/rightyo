@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -33,6 +34,7 @@ def load_jev_api_key() -> str:
         return _validate_key(configured)
     if sys.platform != "darwin":
         raise CredentialError("Configure TYPESAFE_API_KEY through your secret manager.")
+    result = None
     try:
         result = subprocess.run(
             [
@@ -43,16 +45,24 @@ def load_jev_api_key() -> str:
                 "-a",
                 KEYCHAIN_ACCOUNT,
                 "-w",
+                str(Path.home() / "Library" / "Keychains" / "login.keychain-db"),
             ],
             capture_output=True,
-            timeout=30,
+            timeout=120,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        raise CredentialError("The Jev login Keychain item could not be accessed.") from None
+        # Raise outside the handler: timeout exceptions can carry partial stdout.
+        pass
+    if result is None:
+        raise CredentialError("The Jev login Keychain item could not be accessed.")
     if result.returncode != 0:
         raise CredentialError("Save a Jev API key with the native RightyO credential dialog.")
+    decoded = None
     try:
-        return _validate_key(result.stdout.decode("utf-8"))
+        decoded = result.stdout.decode("utf-8")
     except UnicodeDecodeError:
-        raise CredentialError("The configured Jev credential is invalid.") from None
+        pass
+    if decoded is None:
+        raise CredentialError("The configured Jev credential is invalid.")
+    return _validate_key(decoded)

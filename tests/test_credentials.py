@@ -1,6 +1,7 @@
 """Credential regressions use invented tokens and never access a real Keychain."""
 
 import os
+from pathlib import Path
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -25,6 +26,7 @@ class CredentialTests(unittest.TestCase):
                 arguments, options = runner.call_args
                 self.assertNotIn(TOKEN, str(arguments))
                 self.assertTrue(options["capture_output"])
+                self.assertEqual(arguments[0][-1], str(Path.home() / "Library/Keychains/login.keychain-db"))
 
     def test_failure_does_not_expose_subprocess_output(self):
         response = subprocess.CompletedProcess([], 1, TOKEN.encode(), TOKEN.encode())
@@ -33,6 +35,7 @@ class CredentialTests(unittest.TestCase):
                 with self.assertRaises(CredentialError) as error:
                     load_jev_api_key()
                 self.assertNotIn(TOKEN, str(error.exception))
+                self.assertIsNone(error.exception.__context__)
 
     def test_invalid_environment_is_redacted(self):
         with patch.dict(os.environ, {"TYPESAFE_API_KEY": TOKEN + "\nINJECTED"}, clear=True):
