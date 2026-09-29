@@ -202,11 +202,22 @@ def issue_references(event, repository):
 
 
 def workflow_errors(path, document):
-    """A deliberately narrow secretless baseline policy; actionlint validates syntax."""
+    """Narrow baseline policy; reject the secrets token even in harmless text labels."""
     errors = []
     if not isinstance(document, dict):
         return [f"{path}: workflow must be a mapping"]
-    if "secrets." in str(document):
+
+    def mentions_secrets(value):
+        if isinstance(value, str):
+            return re.search(r"\bsecrets\b", value, re.I) is not None
+        if isinstance(value, dict):
+            return any(mentions_secrets(k) or mentions_secrets(v) for k, v in value.items())
+        if isinstance(value, list):
+            return any(mentions_secrets(item) for item in value)
+        return False
+
+    # Walk actual strings: repr/JSON escaping can hide word boundaries around newlines.
+    if mentions_secrets(document):
         errors.append(f"{path}: baseline workflow must not reference secrets")
     event = document.get("on", document.get(True, {}))  # YAML 1.1 parsers treat on as True.
     if isinstance(event, str):

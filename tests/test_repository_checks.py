@@ -153,6 +153,35 @@ class WorkflowPolicyTests(unittest.TestCase):
                     ["ci.yml: baseline workflow must not reference secrets"],
                 )
 
+    def test_secret_context_forms_fail_at_every_scope(self):
+        expressions = (
+            "${{ secrets['INVENTED_ONLY'] }}",
+            '${{ secrets["INVENTED_ONLY"] }}',
+            "${{ secrets . INVENTED_ONLY }}",
+            "${{ SECRETS.INVENTED_ONLY }}",
+            "${{ toJSON(secrets) }}",
+            "${{\nsecrets\n[ 'INVENTED_ONLY' ] }}",
+        )
+        for expression in expressions:
+            for location in ("root", "job", "step", "container", "service"):
+                with self.subTest(expression=expression, location=location):
+                    doc = self.document()
+                    job = doc["jobs"]["checks"]
+                    if location == "root":
+                        doc["env"] = {"EXAMPLE": expression}
+                    elif location == "job":
+                        job["env"] = {"EXAMPLE": expression}
+                    elif location == "step":
+                        job["steps"][0]["env"] = {"EXAMPLE": expression}
+                    elif location == "container":
+                        job["container"] = {"credentials": {"password": expression}}
+                    else:
+                        job["services"] = {"db": {"env": {"EXAMPLE": expression}}}
+                    self.assertEqual(
+                        workflow_errors("ci.yml", doc),
+                        ["ci.yml: baseline workflow must not reference secrets"],
+                    )
+
     def test_mutable_action_permissions_timeout_and_interpolation_fail(self):
         doc = self.document()
         job = doc["jobs"]["checks"]
