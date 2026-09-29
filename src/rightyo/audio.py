@@ -40,11 +40,7 @@ def _id(value: Any) -> str:
 
 def _interval(value: dict[str, Any]) -> tuple[int, int]:
     start, end = value.get("start_ms"), value.get("end_ms")
-    if (
-        type(start) is not int
-        or type(end) is not int
-        or not 0 <= start < end <= MAX_MS
-    ):
+    if type(start) is not int or type(end) is not int or not 0 <= start < end <= MAX_MS:
         raise AudioError("Invalid timestamp interval")
     return start, end
 
@@ -151,12 +147,14 @@ def _speaker_segments(timeline: Any) -> list[dict[str, Any]]:
     for record in _records(timeline):
         start, end = _interval(record)
         speaker = record.get("speaker_id")
-        result.append({
-            "start_ms": start,
-            "end_ms": end,
-            "speaker_id": None if speaker is None else _id(speaker),
-            "finalized": _boolean(record.get("finalized")),
-        })
+        result.append(
+            {
+                "start_ms": start,
+                "end_ms": end,
+                "speaker_id": None if speaker is None else _id(speaker),
+                "finalized": _boolean(record.get("finalized")),
+            }
+        )
     return sorted(result, key=lambda item: (item["start_ms"], item["end_ms"]))
 
 
@@ -195,15 +193,15 @@ def join_transcript_timeline(
             raise AudioError("Invalid revision")
         finalized = _boolean(record.get("finalized"))
         relevant = [s for s in segments if s["start_ms"] < end and s["end_ms"] > start]
-        boundaries = sorted({start, end} | {
-            max(start, min(end, s[edge])) for s in relevant for edge in ("start_ms", "end_ms")
-        })
+        boundaries = sorted(
+            {start, end}
+            | {max(start, min(end, s[edge])) for s in relevant for edge in ("start_ms", "end_ms")}
+        )
         candidate = None
         ambiguous, overlap = False, False
         for left, right in zip(boundaries, boundaries[1:]):
             active = {
-                s["speaker_id"] for s in relevant
-                if s["start_ms"] < right and s["end_ms"] > left
+                s["speaker_id"] for s in relevant if s["start_ms"] < right and s["end_ms"] > left
             }
             overlap |= len(active) > 1
             if len(active) != 1 or None in active:
@@ -214,20 +212,22 @@ def join_transcript_timeline(
                 ambiguous = True
             candidate = speaker
         assigned = aliases[candidate] if candidate is not None and not ambiguous else None
-        result.append({
-            "session_id": session_id,
-            "utterance_id": _id(record.get("utterance_id", f"u{index + 1}")),
-            "revision": revision,
-            "start_ms": start,
-            "end_ms": end,
-            "text": text,
-            "speaker_id": assigned,
-            "finalized": finalized and all(s["finalized"] for s in relevant),
-            "overlap": overlap,
-            "recognizer_id": recognizer_id,
-            "provenance": provenance,
-            "speaker_provenance": "diarization-timeline" if relevant else "unknown",
-        })
+        result.append(
+            {
+                "session_id": session_id,
+                "utterance_id": _id(record.get("utterance_id", f"u{index + 1}")),
+                "revision": revision,
+                "start_ms": start,
+                "end_ms": end,
+                "text": text,
+                "speaker_id": assigned,
+                "finalized": finalized and all(s["finalized"] for s in relevant),
+                "overlap": overlap,
+                "recognizer_id": recognizer_id,
+                "provenance": provenance,
+                "speaker_provenance": "diarization-timeline" if relevant else "unknown",
+            }
+        )
     return result
 
 
@@ -241,7 +241,8 @@ def load_timeline(path: str | Path, *, session_id: str | None = None) -> list[di
     if type(document.get("schema_version")) is not int or document["schema_version"] != 1:
         raise AudioError("Unsupported timeline schema")
     return join_transcript_timeline(
-        document.get("transcript"), document.get("speakers"),
+        document.get("transcript"),
+        document.get("speakers"),
         session_id=session_id if session_id is not None else document.get("session_id"),
         recognizer_id=document.get("recognizer_id"),
         provenance=document.get("provenance"),
@@ -257,13 +258,21 @@ def parse_whisper_cpp(document: dict[str, Any], *, session_id: str) -> list[dict
         offsets = segment.get("offsets")
         if not isinstance(offsets, dict):
             raise AudioError("Missing Whisper timestamp offsets")
-        transcript.append({
-            "utterance_id": f"u{index + 1}", "revision": 0,
-            "start_ms": offsets.get("from"), "end_ms": offsets.get("to"),
-            "text": segment.get("text"), "finalized": True,
-        })
+        transcript.append(
+            {
+                "utterance_id": f"u{index + 1}",
+                "revision": 0,
+                "start_ms": offsets.get("from"),
+                "end_ms": offsets.get("to"),
+                "text": segment.get("text"),
+                "finalized": True,
+            }
+        )
     return join_transcript_timeline(
-        transcript, [], session_id=session_id, recognizer_id="whisper.cpp:external-cli",
+        transcript,
+        [],
+        session_id=session_id,
+        recognizer_id="whisper.cpp:external-cli",
     )
 
 
@@ -311,11 +320,22 @@ def transcribe_whisper_cpp(
         output = Path(directory) / "transcript"
         try:
             subprocess.run(
-                [str(executable.resolve()), "--model", str(model_path.resolve()),
-                 "--file", str(audio_path.resolve()), "--output-json",
-                 "--output-file", str(output), "--no-prints"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, timeout=timeout_seconds, check=True,
+                [
+                    str(executable.resolve()),
+                    "--model",
+                    str(model_path.resolve()),
+                    "--file",
+                    str(audio_path.resolve()),
+                    "--output-json",
+                    "--output-file",
+                    str(output),
+                    "--no-prints",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout_seconds,
+                check=True,
             )
         except subprocess.TimeoutExpired:
             raise AudioError("Local recognizer timed out") from None
@@ -324,6 +344,9 @@ def transcribe_whisper_cpp(
         turns = parse_whisper_cpp(_json(_read(output.with_suffix(".json"))), session_id=session_id)
     if diarization_path is not None:
         return join_transcript_timeline(
-            turns, timeline, session_id=session_id, recognizer_id="whisper.cpp:external-cli",
+            turns,
+            timeline,
+            session_id=session_id,
+            recognizer_id="whisper.cpp:external-cli",
         )
     return turns

@@ -27,14 +27,22 @@ def speaker(start=0, end=1000, label="voice-1", finalized=True):
 
 def join(turns, timeline):
     return join_transcript_timeline(
-        turns, timeline, session_id="test", recognizer_id="synthetic-fixture", provenance="synthetic",
+        turns,
+        timeline,
+        session_id="test",
+        recognizer_id="synthetic-fixture",
+        provenance="synthetic",
     )
 
 
 class SpeakerTimelineTests(unittest.TestCase):
     def test_a_b_a_reuses_session_identity_and_hides_source_labels(self):
         turns = [transcript(0, 100), transcript(100, 200), transcript(200, 300)]
-        timeline = [speaker(0, 100, "voice-7"), speaker(100, 200, "voice-2"), speaker(200, 300, "voice-7")]
+        timeline = [
+            speaker(0, 100, "voice-7"),
+            speaker(100, 200, "voice-2"),
+            speaker(200, 300, "voice-7"),
+        ]
         result = join(turns, timeline)
         self.assertEqual([r["speaker_id"] for r in result], ["Speaker A", "Speaker B", "Speaker A"])
         self.assertNotIn("voice-7", json.dumps(result))
@@ -61,13 +69,21 @@ class SpeakerTimelineTests(unittest.TestCase):
         self.assertFalse(result["overlap"])
 
     def test_tentative_diarization_prevents_final_and_preserves_revision(self):
-        result = join([transcript(utterance_id="stable-u", revision=4)], [speaker(finalized=False)])[0]
+        result = join(
+            [transcript(utterance_id="stable-u", revision=4)], [speaker(finalized=False)]
+        )[0]
         self.assertFalse(result["finalized"])
         self.assertEqual((result["utterance_id"], result["revision"]), ("stable-u", 4))
 
     def test_invalid_times_finality_and_revisions_fail_closed(self):
-        for key, value in (("start_ms", True), ("end_ms", float("nan")), ("end_ms", -1),
-                           ("finalized", "true"), ("revision", True), ("revision", -1)):
+        for key, value in (
+            ("start_ms", True),
+            ("end_ms", float("nan")),
+            ("end_ms", -1),
+            ("finalized", "true"),
+            ("revision", True),
+            ("revision", -1),
+        ):
             turn = transcript()
             turn[key] = value
             with self.subTest(key=key, value=value), self.assertRaises(AudioError):
@@ -76,7 +92,9 @@ class SpeakerTimelineTests(unittest.TestCase):
     def test_synthetic_fixture_contains_overlap_unknown_and_tentative(self):
         fixture = Path(__file__).parents[1] / "examples" / "synthetic-speakers.json"
         result = load_timeline(fixture)
-        self.assertEqual([r["speaker_id"] for r in result[:3]], ["Speaker A", "Speaker B", "Speaker A"])
+        self.assertEqual(
+            [r["speaker_id"] for r in result[:3]], ["Speaker A", "Speaker B", "Speaker A"]
+        )
         self.assertTrue(result[3]["overlap"])
         self.assertIsNone(result[4]["speaker_id"])
         self.assertFalse(result[5]["finalized"])
@@ -102,7 +120,9 @@ class SpeakerTimelineTests(unittest.TestCase):
 
     def test_rttm_recording_mismatch_rejected(self):
         with self.assertRaises(AudioError):
-            parse_rttm("SPEAKER other 1 0.000 1.000 <NA> <NA> A <NA> <NA>", expected_file_id="fixture")
+            parse_rttm(
+                "SPEAKER other 1 0.000 1.000 <NA> <NA> A <NA> <NA>", expected_file_id="fixture"
+            )
 
 
 class WhisperAdapterTests(unittest.TestCase):
@@ -115,11 +135,17 @@ class WhisperAdapterTests(unittest.TestCase):
         self.audio = self.root / "supplied.wav"
         for path in (self.executable, self.model, self.audio):
             path.touch()
-        self.vendor_json = {"transcription": [{"offsets": {"from": 0, "to": 1000}, "text": "Synthetic speech"}]}
+        self.vendor_json = {
+            "transcription": [{"offsets": {"from": 0, "to": 1000}, "text": "Synthetic speech"}]
+        }
 
     def invoke(self, **extra):
         return transcribe_whisper_cpp(
-            self.audio, executable=self.executable, model_path=self.model, session_id="test", **extra,
+            self.audio,
+            executable=self.executable,
+            model_path=self.model,
+            session_id="test",
+            **extra,
         )
 
     def test_upstream_offsets_are_ms_and_turn_marker_is_not_identity(self):
@@ -131,6 +157,7 @@ class WhisperAdapterTests(unittest.TestCase):
 
     def test_explicit_local_process_argv_and_private_output_cleanup(self):
         outputs = []
+
         def vendor_process(argv, **kwargs):
             self.assertEqual(argv[0], str(self.executable.resolve()))
             self.assertEqual(argv[argv.index("--model") + 1], str(self.model.resolve()))
@@ -141,6 +168,7 @@ class WhisperAdapterTests(unittest.TestCase):
             self.assertEqual(output.parent.stat().st_mode & 0o777, 0o700)
             outputs.append(output)
             output.write_text(json.dumps(self.vendor_json))
+
         with patch("rightyo.audio.subprocess.run", side_effect=vendor_process):
             result = self.invoke()
         self.assertEqual(result[0]["provenance"], "recorded-file")
@@ -149,9 +177,11 @@ class WhisperAdapterTests(unittest.TestCase):
     def test_actual_rttm_schema_can_join_whisper_output(self):
         diarization = self.root / "speaker.rttm"
         diarization.write_text("SPEAKER supplied 1 0.000 1.000 <NA> <NA> A <NA> <NA>")
+
         def vendor_process(argv, **kwargs):
             output = Path(argv[argv.index("--output-file") + 1]).with_suffix(".json")
             output.write_text(json.dumps(self.vendor_json))
+
         with patch("rightyo.audio.subprocess.run", side_effect=vendor_process):
             result = self.invoke(diarization_path=diarization)
         self.assertEqual(result[0]["speaker_id"], "Speaker A")
@@ -165,14 +195,21 @@ class WhisperAdapterTests(unittest.TestCase):
 
     def test_other_session_timeline_never_starts_process(self):
         diarization = self.root / "speaker.json"
-        diarization.write_text(json.dumps({"schema_version": 1, "session_id": "other", "speakers": []}))
+        diarization.write_text(
+            json.dumps({"schema_version": 1, "session_id": "other", "speakers": []})
+        )
         with patch("rightyo.audio.subprocess.run") as process, self.assertRaises(AudioError):
             self.invoke(diarization_path=diarization)
         process.assert_not_called()
 
     def test_process_failure_never_exposes_vendor_content(self):
-        error = subprocess.CalledProcessError(2, ["private-path"], output="private speech", stderr="secret")
-        with patch("rightyo.audio.subprocess.run", side_effect=error), self.assertRaises(AudioError) as caught:
+        error = subprocess.CalledProcessError(
+            2, ["private-path"], output="private speech", stderr="secret"
+        )
+        with (
+            patch("rightyo.audio.subprocess.run", side_effect=error),
+            self.assertRaises(AudioError) as caught,
+        ):
             self.invoke()
         self.assertEqual(str(caught.exception), "Local recognizer failed")
         self.assertIsNone(caught.exception.__cause__)
@@ -180,10 +217,15 @@ class WhisperAdapterTests(unittest.TestCase):
     def test_missing_or_duplicate_json_output_fails(self):
         with patch("rightyo.audio.subprocess.run"), self.assertRaises(AudioError):
             self.invoke()
+
         def malformed(argv, **kwargs):
             output = Path(argv[argv.index("--output-file") + 1]).with_suffix(".json")
             output.write_text('{"transcription": [], "transcription": []}')
-        with patch("rightyo.audio.subprocess.run", side_effect=malformed), self.assertRaises(AudioError):
+
+        with (
+            patch("rightyo.audio.subprocess.run", side_effect=malformed),
+            self.assertRaises(AudioError),
+        ):
             self.invoke()
 
 
