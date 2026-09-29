@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>RightyO · Speech lab</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="masthead">
+      <div class="brand" aria-label="RightyO speech lab"><span class="brand-mark" aria-hidden="true">R<span>o</span></span><span>RightyO<span class="brand-subtitle">SPEECH LAB</span></span></div>
+      <div class="local-label"><span class="dot"></span> On this Mac</div>
+    </header>
+    <main>
+      <section class="intro" aria-labelledby="page-title">
+        <div><p class="eyebrow">OFF-THE-SHELF PROTOTYPE</p><h1 id="page-title">A conversation worth remembering.</h1><p class="intro-text">Hear the conversation. Keep the context. Notice when you ask your agent to pay attention.</p></div>
+        <div id="phase-pill" class="phase-pill" data-phase="idle"><span class="dot"></span><span id="phase-label">Idle · microphone off</span></div>
+      </section>
+      <section class="model-strip" aria-label="The model pipeline">
+        <div class="model-step"><span class="step-number">01</span><div><strong>Nemotron 3</strong><span>Who is speaking</span></div><span class="step-tag">LOCAL</span></div>
+        <div class="model-step"><span class="step-number">02</span><div><strong>Whisper base.en</strong><span>What was said</span></div><span class="step-tag">LOCAL</span></div>
+        <div class="model-step"><span class="step-number">03</span><div><strong>Jev</strong><span>Is this for the agent?</span></div><span id="jev-model-tag" class="step-tag">OFF</span></div>
+      </section>
+      <div class="workspace">
+        <aside class="settings card" aria-labelledby="controls-title">
+          <div class="section-heading"><h2 id="controls-title">Your experiment</h2><span class="small-tag">OPT-IN</span></div>
+          <p class="muted">Start only when everyone present agrees. Nothing records on page load.</p>
+          <button id="start-button" class="button primary" type="button" disabled><span aria-hidden="true">●</span> Start microphone</button>
+          <button id="demo-button" class="button secondary" type="button" disabled><span aria-hidden="true">▷</span> Replay audio demo</button>
+          <button id="stop-button" class="button stop" type="button" disabled>Stop &amp; clear context</button>
+          <p id="source-help" class="help">The demo uses configured audio and leaves your microphone off.</p>
+          <fieldset id="settings-fields">
+            <legend class="sr-only">Session settings</legend>
+            <div class="setting-group">
+              <label class="setting-title" for="retention-seconds">Conversation memory <output id="retention-label" for="retention-seconds">5 minutes</output></label>
+              <input id="retention-seconds" type="range" min="60" max="600" step="30" value="300">
+              <div class="range-endpoints"><span>1 minute</span><span>10 minutes</span></div>
+              <p class="help">Keep recent speaker-labelled text even when you are talking to someone else. Older turns expire.</p>
+            </div>
+            <div class="hosted-setting">
+              <label class="checkbox-label" for="use-jev"><input id="use-jev" type="checkbox"><span>Enable Jev decisions<span class="optional">Optional · hosted</span></span></label>
+              <p class="help">Sends bounded transcript text and recent context to TypeSafe. Audio stays local. Unchecked means no hosted calls.</p>
+              <div id="jev-settings" class="number-settings">
+                <label for="confidence">Confidence threshold<input id="confidence" type="number" min="0" max="1" step="0.05" value="0.7" disabled></label>
+                <label for="max-requests">Maximum requests<input id="max-requests" type="number" min="1" max="100" step="1" value="20" disabled></label>
+              </div>
+              <p class="help">Scores are experimental. Low-confidence results abstain; reaching the request limit stops hosted decisions.</p>
+            </div>
+          </fieldset>
+          <div class="session-note"><span aria-hidden="true">↳</span><span>Sessions stop after 15 minutes, or when this page closes or loses its connection for 15 seconds.</span></div>
+        </aside>
+        <section class="conversation card" aria-labelledby="conversation-title">
+          <div class="section-heading conversation-heading"><div><p class="eyebrow">ROLLING CONVERSATION</p><h2 id="conversation-title">Recent context</h2></div><button id="copy-button" class="text-button" type="button" disabled>Copy context <span aria-hidden="true">↗</span></button></div>
+          <div class="metrics" aria-label="Session measurements">
+            <div><span class="metric-label">Retained turns</span><strong id="turn-count">0</strong></div>
+            <div><span class="metric-label">Context span</span><strong id="context-span">0:00</strong></div>
+            <div><span class="metric-label">Jev requests</span><strong id="request-count">0 / 20</strong></div>
+          </div>
+          <div class="attention-line"><span id="attention-dot" class="dot"></span><strong id="attention-status">Decisions off</strong><span id="attention-counts">Enable Jev to test addressedness.</span></div>
+          <p id="message" class="message" role="status" aria-live="polite">Connecting to your local session…</p>
+          <div id="empty-state" class="empty-state"><div class="empty-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><h3>The room is quiet here.</h3><p>Start a session to see speaker-labelled speech.<br>Try a conversation, then ask: “Hey, Hailing Station, what were we just discussing?”</p></div>
+          <ol id="transcript" class="transcript" aria-label="Retained transcript turns"></ol>
+          <div class="transcript-note"><strong>Experimental attribution.</strong> Speaker A/B labels are anonymous within this session. Unknown and overlapping speech remain marked. Timing and speaker alignment are heuristic; this prototype detects attention and hands off context, without replying or executing tools.</div>
+        </section>
+      </div>
+      <footer><span><span class="dot"></span> Local transcription · temporary context</span><span>Stop clears this session. No default audio archive or transcript log.</span></footer>
+    </main>
+  </div>
+</body>
+</html>

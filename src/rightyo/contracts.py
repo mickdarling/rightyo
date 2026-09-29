@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 LABELS = frozenset({"attend", "ignore", "uncertain"})
-PROVENANCE = frozenset({"synthetic", "recorded-file", "causal-replay"})
+PROVENANCE = frozenset({"synthetic", "recorded-file", "causal-replay", "live-microphone"})
 SPEAKER_PROVENANCE = frozenset({"authored-fixture", "diarization-timeline", "unknown"})
 MAX_TEXT_CHARS = 4000
 

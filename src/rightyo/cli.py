@@ -185,8 +185,24 @@ def main(argv: list[str] | None = None) -> int:
     timeline.add_argument(
         "--output", type=Path, required=True, help="new private JSON file outside repo"
     )
+    prototype = commands.add_parser("prototype", help="open an idle local Mac speech lab")
+    prototype.add_argument("--config", type=Path, required=True, help="local asset configuration")
+    prototype.add_argument("--port", type=int, default=8765)
     args = parser.parse_args(argv)
     try:
+        if args.command == "prototype":
+            from rightyo.prototype import PrototypeError, serve
+
+            try:
+                serve(args.config, args.port)
+            except (PrototypeError, OSError):
+                print(
+                    "rightyo: prototype setup failed; check local assets and port", file=sys.stderr
+                )
+                return 2
+            except KeyboardInterrupt:
+                return 0
+            return 0
         if args.command == "evaluate":
             result = evaluate(args)
         else:

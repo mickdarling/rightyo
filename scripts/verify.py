@@ -109,6 +109,12 @@ def main():
     )
     env = dict(os.environ, PYTHONPATH=str(ROOT / "src"))
     run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"], env=env)
+    browser_script = ROOT / "src" / "rightyo" / "web" / "app.js"
+    if browser_script.is_file():
+        node = shutil.which("node")
+        if not node:
+            raise SystemExit("Install Node.js 20+ for the prototype JavaScript syntax check")
+        run([node, "--check", browser_script])
     if (ROOT / "pyproject.toml").is_file() and (ROOT / "src").is_dir():
         with tempfile.TemporaryDirectory(prefix="rightyo-build-") as directory:
             temp = Path(directory)
@@ -147,6 +153,19 @@ def main():
                 cwd=temp,
                 env=dict(os.environ, PYTHONPATH=str(installed)),
             )
+            if browser_script.is_file():
+                run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "from pathlib import Path; import rightyo.prototype as lab; "
+                        "assets = Path(lab.__file__).parent / 'web'; "
+                        "assert all((assets / name).is_file() for name in "
+                        "('index.html', 'style.css', 'app.js'))",
+                    ],
+                    cwd=temp,
+                    env=dict(os.environ, PYTHONPATH=str(installed)),
+                )
     else:
         print("Package checks not applicable: no Python package exists in this checkout")
     print("All applicable local/CI checks passed")

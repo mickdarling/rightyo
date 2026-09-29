@@ -7,7 +7,7 @@ import json
 import socket
 import urllib.error
 import urllib.request
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from rightyo.contracts import LABELS, ContractError, ProviderDecision, probability
 
@@ -172,6 +172,7 @@ class JevProvider:
         max_requests: int = 20,
         timeout_seconds: float = 10,
         min_confidence: float = 0.7,
+        cancelled: Callable[[], bool] | None = None,
     ) -> None:
         if not allow_hosted:
             raise ProviderError("Jev requires explicit --allow-hosted consent to send text/context")
@@ -183,11 +184,14 @@ class JevProvider:
         self.max_requests = max_requests
         self.timeout_seconds = timeout_seconds
         self.min_confidence = min_confidence
+        self.cancelled = cancelled or (lambda: False)
         self.requests = 0
         # No environment proxies: destination and credentials remain tied to the official endpoint.
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
     def decide(self, state: dict[str, Any]) -> ProviderDecision:
+        if self.cancelled():
+            raise ProviderError("Jev processing was cancelled")
         if self.requests >= self.max_requests:
             raise ProviderError("Jev request budget exhausted")
         request_body, payload = bounded_request(state)
@@ -195,6 +199,9 @@ class JevProvider:
         from rightyo.credentials import load_jev_api_key
 
         api_key = load_jev_api_key()
+        if self.cancelled():
+            del api_key
+            raise ProviderError("Jev processing was cancelled")
         request = urllib.request.Request(
             JEV_ENDPOINT,
             data=payload,

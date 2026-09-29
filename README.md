@@ -2,11 +2,21 @@
 
 A compact audio attention system: recognize when speech is addressed to the system, then transcribe that speech and emit the text.
 
-**Status:** a transcript-first experiment MVP, with local whisper.cpp file transcription, explicit local Nemotron 3 diarization or imported anonymous speaker timelines, mock decisions and opt-in Jev decisions. No trained attention model or live microphone capture is included. Project name: **RightyO**; repository/package spelling: **rightyo**.
+**Status:** a transcript-first experiment MVP, with local whisper.cpp file transcription, explicit local Nemotron 3 diarization or imported anonymous speaker timelines, mock decisions and opt-in Jev decisions. An explicit local Mac microphone lab is available; no trained attention model is included. Project name: **RightyO**; repository/package spelling: **rightyo**.
 
 The first experiment transcribes locally and asks Jev whether the completed turn addresses the system and who its recipient is. Speaker A/B labels are sufficient initially; diarization alone cannot establish the addressee. This quickly tests whether existing models solve the product problem. A frozen audio encoder, compact attention head and gated decoder remain conditional research directions after quality and compute measurements justify them.
 
-## Try the MVP
+## Try the microphone lab
+
+See [the local prototype guide](docs/prototype.md) for Start/Stop controls, persistent
+Nemotron speaker labels, local Whisper text, five minutes of context, and opt-in Jev.
+The lab starts idle and uses separately provisioned native runtimes and models.
+
+```sh
+.venv/bin/rightyo prototype --config local/prototype.json --port 8766
+```
+
+## Try the replay MVP
 
 Python 3.11 or newer is sufficient for synthetic replay; the runtime has no Python dependencies. See [the MVP guide](docs/mvp.md) for secure credentials, local audio and speaker imports, and the limits of the experiment.
 
