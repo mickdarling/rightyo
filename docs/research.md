@@ -12,15 +12,15 @@ There is meaningful prior art in precisely this problem. The project should eval
 
 ## Comparison baselines
 
-[TypeSafe's model documentation](https://docs.typesafe.ai/models) specifies text-only input for Jev. A Jev decision over already-transcribed text is a comparison baseline or an existing Hailing Station option, not the proposed pre-ASR audio detector. No hosted requests have been made for this project.
+[TypeSafe's model documentation](https://docs.typesafe.ai/models) specifies text-only input for Jev. The first MVP uses it over locally transcribed text before deciding whether an audio-first detector is justified. Bounded hosted requests using authored synthetic text have now been made; see the [smoke record](mvp-smoke.md). This does not implement pre-ASR audio detection.
 
 General voice activity detectors, phrase wake-word detectors, and bounded speech-to-intent engines solve adjacent questions. Evaluate their components where useful, but require addressedness metrics and causal audio-only acquisition for this project's core claim.
 
 ## Whisper starting point
 
-[OpenAI's Whisper repository](https://github.com/openai/whisper) documents MIT licensing for code and model weights and sliding 30-second windows in the standard transcribe path. This permits investigation of a Whisper-derived AGPL project with upstream notices preserved; any chosen checkpoint, fork, dataset, and dependency must be audited individually. None has been imported or downloaded in this bootstrap.
+[OpenAI's Whisper repository](https://github.com/openai/whisper) documents MIT licensing for code and model weights and sliding 30-second windows in the standard transcribe path. This permits investigation of a Whisper-derived AGPL project with upstream notices preserved; any chosen checkpoint, fork, dataset, and dependency must be audited individually. The MVP provisions a pinned whisper.cpp runtime and base.en model outside Git; provenance is in the [smoke record](mvp-smoke.md).
 
-Whisper is the initial encoder/ASR family, not an already trained attention detector. Full-file transcription is not the desired attention-first runtime. The first experiment compares a trained head on frozen small-encoder features, limited causal audio windows, and a separately gated decoder. See the training process for staged fine-tuning/distillation options.
+Whisper is the initial ASR family, not an already trained attention detector. Full-file transcription plus Jev is the fastest first experiment. A trained head on frozen encoder features, causal audio windows and a gated decoder is conditional on this baseline's measured costs and failures. See the training process for staged fine-tuning/distillation options.
 
 ## Selected name
 

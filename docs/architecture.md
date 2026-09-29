@@ -1,5 +1,9 @@
 # Architecture: attention, then transcription
 
+This describes the conditional audio-first research option. The current first experiment
+uses local file ASR, anonymous speaker timelines and Jev over completed transcript turns;
+see [the MVP guide](mvp.md). It does not yet implement this streaming detector or decoder gate.
+
 ## Scope and assumptions
 
 The public-facing result is a transcript of speech the system has elected to attend to. Internal attention decisions are tightly typed and separate from application actions. There is no required trigger phrase and no open-ended language generation in the attention component.
@@ -17,7 +21,7 @@ Initially run a local, opt-in research rig on a Mac. Hailing Station's mobile cl
 5. An ASR backend receives the selected buffered onset and subsequent live frames, producing partial and final transcripts.
 6. A consumer receives transcript events. Tool execution and reply generation stay downstream.
 
-Attention and ASR implementations are separately injectable. The first candidate uses a small Whisper audio encoder plus a trained attention head, followed by Whisper decoding only for selected audio. A later shared encoder/decoder packaging is a research option, not a claim of existing code. Evaluate frozen features and head training before full encoder fine-tuning or training from scratch.
+Attention and ASR implementations are separately injectable. The conditional research candidate uses a small Whisper audio encoder plus a trained attention head, followed by Whisper decoding only for selected audio. A later shared encoder/decoder packaging is a research option, not a claim of existing code. Evaluate frozen features and head training before full encoder fine-tuning or training from scratch.
 
 Standard Whisper encoding/transcription uses fixed audio windows rather than an inherently causal streaming encoder. An experiment may re-encode sliding windows made only from already received audio, with measured cost. No future frames may enter a real-time decision. Establish latency, padding, window length, history, and memory behavior explicitly; an offline whole-utterance score is not evidence of real-time attention acquisition. Preserve a replaceable backend if a smaller distilled streaming student becomes necessary.
 

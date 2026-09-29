@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "session_id": "synthetic-speakers",
+  "recognizer_id": "synthetic-fixture",
+  "provenance": "synthetic",
+  "transcript": [
+    {"utterance_id": "u1", "revision": 1, "start_ms": 0, "end_ms": 1000, "text": "Assistant, start a timer.", "finalized": true},
+    {"utterance_id": "u2", "revision": 1, "start_ms": 1200, "end_ms": 2000, "text": "I was asking the other person.", "finalized": true},
+    {"utterance_id": "u3", "revision": 1, "start_ms": 2200, "end_ms": 3000, "text": "Assistant, make that two minutes.", "finalized": true},
+    {"utterance_id": "u4", "revision": 1, "start_ms": 3200, "end_ms": 4000, "text": "Two speakers are talking simultaneously.", "finalized": true},
+    {"utterance_id": "u5", "revision": 1, "start_ms": 4200, "end_ms": 5000, "text": "Speaker attribution is unavailable here.", "finalized": true},
+    {"utterance_id": "u6", "revision": 2, "start_ms": 5200, "end_ms": 6000, "text": "These speaker results are tentative.", "finalized": true}
+  ],
+  "speakers": [
+    {"start_ms": 0, "end_ms": 1000, "speaker_id": "fixture-voice-1", "finalized": true},
+    {"start_ms": 1200, "end_ms": 2000, "speaker_id": "fixture-voice-2", "finalized": true},
+    {"start_ms": 2200, "end_ms": 3000, "speaker_id": "fixture-voice-1", "finalized": true},
+    {"start_ms": 3200, "end_ms": 4000, "speaker_id": "fixture-voice-1", "finalized": true},
+    {"start_ms": 3400, "end_ms": 3800, "speaker_id": "fixture-voice-2", "finalized": true},
+    {"start_ms": 4200, "end_ms": 5000, "speaker_id": null, "finalized": true},
+    {"start_ms": 5200, "end_ms": 6000, "speaker_id": "fixture-voice-2", "finalized": false}
+  ]
+}

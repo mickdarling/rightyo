@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rightyo"
+version = "0.1.0"
+description = "Explicit local transcript replay and addressedness experiments"
+requires-python = ">=3.11"
+license = "AGPL-3.0-or-later"
+dependencies = []
+
+[project.scripts]
+rightyo = "rightyo.cli:main"
+
+[project.optional-dependencies]
+dev = ["ruff==0.11.13"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

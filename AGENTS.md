@@ -2,7 +2,7 @@
 
 Read README.md, CONTRIBUTING.md, SECURITY.md, and the architecture, training-process, evaluation, and licensing documents before implementation.
 
-This is a design-only, public Whisper-based audio-attention model research bootstrap named RightyO (repository rightyo). Do not imply a model is trained, inference is implemented, or performance is validated without evidence. Current Hailing Station iPhone/iPad on-device STT remains unchanged; mobile semantic deployment is out of scope.
+This is a public transcript-first MVP and audio-attention research project named RightyO (repository rightyo). Preserve the distinction between implemented replay/file adapters and unvalidated live capabilities. Do not imply a model is trained or performance is validated without evidence. Current Hailing Station iPhone/iPad on-device STT remains unchanged; mobile semantic deployment is out of scope.
 
 Use issue-linked PRs for changes after bootstrap, exact-head independent reviews, and honest verification records. Do not treat failed reviews as approval or bypass checks. Preserve source provenance and distinguish replay/stubs from live speech.
 
