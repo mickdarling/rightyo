@@ -32,7 +32,7 @@ def _id(value: Any) -> str:
     if (
         not isinstance(value, str)
         or not value.strip()
-        or not re.fullmatch(r"[A-Za-z0-9_.: -]{1,128}", value)
+        or not re.fullmatch(r"[A-Za-z0-9_. -]{1,96}", value)
     ):
         raise AudioError("Invalid identifier")
     return value
@@ -186,10 +186,10 @@ def join_transcript_timeline(
     for index, record in enumerate(_records(transcript)):
         start, end = _interval(record)
         text = record.get("text")
-        revision = record.get("revision", 0)
+        revision = record.get("revision", 1)
         if not isinstance(text, str) or not text.strip() or len(text) > 16_000:
             raise AudioError("Invalid transcript text")
-        if type(revision) is not int or not 0 <= revision <= 1_000_000:
+        if type(revision) is not int or not 1 <= revision <= 1_000_000:
             raise AudioError("Invalid revision")
         finalized = _boolean(record.get("finalized"))
         relevant = [s for s in segments if s["start_ms"] < end and s["end_ms"] > start]
@@ -261,7 +261,7 @@ def parse_whisper_cpp(document: dict[str, Any], *, session_id: str) -> list[dict
         transcript.append(
             {
                 "utterance_id": f"u{index + 1}",
-                "revision": 0,
+                "revision": 1,
                 "start_ms": offsets.get("from"),
                 "end_ms": offsets.get("to"),
                 "text": segment.get("text"),
@@ -272,7 +272,7 @@ def parse_whisper_cpp(document: dict[str, Any], *, session_id: str) -> list[dict
         transcript,
         [],
         session_id=session_id,
-        recognizer_id="whisper.cpp:external-cli",
+        recognizer_id="whisper.cpp-external-cli",
     )
 
 
@@ -347,6 +347,6 @@ def transcribe_whisper_cpp(
             turns,
             timeline,
             session_id=session_id,
-            recognizer_id="whisper.cpp:external-cli",
+            recognizer_id="whisper.cpp-external-cli",
         )
     return turns

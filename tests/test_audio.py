@@ -15,6 +15,7 @@ from rightyo.audio import (
     parse_whisper_cpp,
     transcribe_whisper_cpp,
 )
+from rightyo.contracts import Turn
 
 
 def transcript(start=0, end=1000, **extra):
@@ -154,6 +155,10 @@ class WhisperAdapterTests(unittest.TestCase):
         self.assertEqual(result["end_ms"], 1000)
         self.assertIsNone(result["speaker_id"])
         self.assertEqual(result["speaker_provenance"], "unknown")
+
+    def test_normalized_asr_output_satisfies_runner_contract(self):
+        result = parse_whisper_cpp(self.vendor_json, session_id="test")[0]
+        self.assertEqual(Turn.from_dict(result).recognizer_id, "whisper.cpp-external-cli")
 
     def test_explicit_local_process_argv_and_private_output_cleanup(self):
         outputs = []
