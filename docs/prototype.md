@@ -51,8 +51,10 @@ require Stop and another Start. No setting changes system volume.
 **Enable Jev** is initially unchecked. Enabling it before Start explicitly authorizes sending
 the current finalized transcript and bounded recent text to TypeSafe. Credentials use the
 [masked Keychain dialog](mvp.md#secure-jev-setup-on-macos), never the dashboard or its API.
-Local transcription continues if hosted processing fails or reaches its request limit;
-attention is then unavailable, rather than fabricated. There are no automatic retries.
+Local transcription continues if hosted processing fails, reaches its request limit,
+or falls behind enough to fill its bounded decision queue; queued hosted work is then
+cancelled and decisions disabled for this session.
+Attention is then unavailable, rather than fabricated. There are no automatic retries.
 The confidence slider is an experiment setting, not a calibrated accuracy guarantee.
 
 ## Context and stopping
@@ -84,6 +86,9 @@ including when switching tabs to a downstream application. Active sessions also 
 A completed replay's text ages out too. Refreshing loses the browser token; use the launch
 URL again. Only one session runs at a time.
 
+Capture reads are aggregated into 200 ms PCM blocks. The pending capture queue holds
+at most 32 seconds (1,024,000 bytes) by default, accommodating the local 30-second recognizer
+timeout. Sustained slower-than-real-time processing still fails closed at that bound.
 PCM buffers are bounded and temporary Whisper files are deleted after use; microphone audio
 is not archived. Expiry and Stop release application-owned plaintext references. This is
 not forensic zeroization of Python/native memory or a guarantee about OS swap or crash

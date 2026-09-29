@@ -28,9 +28,11 @@ class MacMicrophoneCapture:
     readiness from process launch: read() may wait while the user decides. Queue
     pressure fails the session rather than silently dropping samples. Platform
     audio route changes fail closed and require a deliberate restart.
+    Short native pipe reads are coalesced into 200 ms PCM chunks. The default
+    queue retains at most 32 seconds (1,024,000 bytes), plus a partial chunk.
     """
 
-    def __init__(self, helper: str | Path, *, queue_chunks: int = 32):
+    def __init__(self, helper: str | Path, *, queue_chunks: int = 160):
         if type(queue_chunks) is not int or not 1 <= queue_chunks <= 256:
             raise CaptureError("Invalid microphone queue bound")
         self.helper = Path(helper)
@@ -69,12 +71,13 @@ class MacMicrophoneCapture:
                 failed = True
             if failed:
                 raise CaptureError("Microphone helper could not start")
-            self._reader = threading.Thread(target=self._receive, daemon=True)
+            self._reader = threading.Thread(
+                target=self._receive, args=(self._process,), daemon=True
+            )
             self._reader.start()
 
-    def _receive(self) -> None:
-        process = self._process
-        assert process is not None and process.stdout is not None
+    def _receive(self, process: subprocess.Popen[bytes]) -> None:
+        assert process.stdout is not None
         failure = "Microphone capture ended unexpectedly"
         carry = b""
         try:
@@ -93,20 +96,23 @@ class MacMicrophoneCapture:
                     }.get(returncode, failure)
                     break
                 data = carry + data
-                even = len(data) - len(data) % PCM_SAMPLE_WIDTH
-                carry = data[even:]
-                if even:
-                    self._queue.put_nowait(data[:even])
+                while len(data) >= PCM_CHUNK_BYTES:
+                    self._queue.put_nowait(data[:PCM_CHUNK_BYTES])
+                    data = data[PCM_CHUNK_BYTES:]
+                carry = data
         except queue.Full:
             failure = "Microphone capture exceeded its buffer bound"
         except (OSError, ValueError, subprocess.TimeoutExpired):
             failure = "Microphone input failed"
+        # Stop/failure discards the incomplete chunk as well as the public queue.
+        carry = b""
+        data = b""
         if not self._stopped.is_set():
             self._failure = failure
             self.stop()
 
     def read(self, timeout: float = 0.25) -> bytes | None:
-        """Return even-length mono PCM16 bytes; None means no samples yet."""
+        """Return 200 ms mono PCM16 chunks; None means no complete chunk yet."""
         if (
             isinstance(timeout, bool)
             or not isinstance(timeout, (float, int))

@@ -12,7 +12,7 @@ import unittest
 import wave
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from rightyo.contracts import Turn
 from rightyo.credentials import CredentialError
@@ -283,6 +283,69 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(self.controller.snapshot()["phase"], "idle")
                 self.assertEqual(self.controller.snapshot()["turns"], [])
 
+    def test_audio_failure_between_decision_precheck_and_runner_entry_preserves_history(self):
+        class FailingProcessor(FakeProcessor):
+            def push_pcm16(self, pcm):
+                if self.index == 2:
+                    raise LiveAudioError("Synthetic failure after two valid turns")
+                super().push_pcm16(pcm)
+
+        provider = FakeHosted()
+        self.hosted.side_effect = None
+        self.hosted.return_value = provider
+        self.processor.side_effect = FailingProcessor
+        self.controller.start(
+            {
+                "mode": "microphone",
+                "use_jev": True,
+                "retention_seconds": 60,
+            }
+        )
+        await_condition(lambda: bool(FakeCapture.instances and FakeCapture.instances[0].started))
+        runner = self.controller._runner
+        original_process = runner.process
+        entered = threading.Event()
+        resume = threading.Event()
+        self.addCleanup(resume.set)
+
+        def blocked_process(turn):
+            # The controller has released its precheck lock, but the runner has
+            # not checked cancellation or initialized its session yet.
+            entered.set()
+            if not resume.wait(3):
+                raise AssertionError("Test did not release delayed runner entry")
+            return original_process(turn)
+
+        with patch.object(runner, "process", side_effect=blocked_process):
+            FakeCapture.instances[0].pcm.put(bytes(6400))
+            self.assertTrue(entered.wait(1))
+            FakeCapture.instances[0].pcm.put(bytes(6400))
+            await_condition(lambda: len(self.controller.snapshot()["turns"]) == 2)
+            FakeCapture.instances[0].pcm.put(bytes(6400))
+            await_condition(lambda: self.controller.snapshot()["phase"] == "error")
+            snapshot = self.controller.snapshot()
+            self.assertEqual(len(snapshot["turns"]), 2)
+            self.assertIsNone(runner.session_id)
+            self.assertTrue(runner.cancelled())
+            self.assertTrue(self.controller._decision_queue.empty())
+            resume.set()
+            await_condition(lambda: self.controller.snapshot()["pending_decisions"] == 0)
+        snapshot = self.controller.snapshot()
+        self.assertEqual(snapshot["phase"], "error")
+        self.assertEqual(len(snapshot["turns"]), 2)
+        self.assertEqual(
+            [item["speaker_id"] for item in snapshot["turns"]], ["Speaker A", "Speaker B"]
+        )
+        self.assertEqual(provider.requests, 0)
+        self.assertEqual(snapshot["jev_requests"], 0)
+        self.assertEqual(snapshot["decisions"], {})
+        with self.controller._lock:
+            self.controller._completed_at -= 61
+        self.assertEqual(self.controller.snapshot()["turns"], [])
+        self.controller.stop()
+        self.assertEqual(self.controller.snapshot()["phase"], "idle")
+        self.assertEqual(self.controller.snapshot()["turns"], [])
+
     def test_stop_waits_for_cancelled_startup_and_blocks_overlapping_start(self):
         for raise_on_cancel in (False, True):
             with self.subTest(raise_on_cancel=raise_on_cancel):
@@ -341,6 +404,47 @@ class ControllerTests(unittest.TestCase):
                 await_condition(lambda: self.controller.snapshot()["phase"] == "complete")
                 self.assertEqual(len(self.controller.snapshot()["turns"]), 3)
                 self.controller.stop()
+
+    def test_slow_hosted_backpressure_keeps_capture_and_local_history_running(self):
+        provider = FakeHosted()
+        provider.release.clear()
+        self.addCleanup(provider.release.set)
+        self.hosted.side_effect = None
+        self.hosted.return_value = provider
+        self.controller.start({"mode": "microphone", "use_jev": True})
+        await_condition(lambda: bool(FakeCapture.instances and FakeCapture.instances[0].started))
+        capture = FakeCapture.instances[0]
+        capture.pcm.put(bytes(6400))
+        self.assertTrue(provider.entered.wait(1))
+        for _ in range(39):
+            capture.pcm.put(bytes(6400))
+        await_condition(lambda: len(self.controller.snapshot()["turns"]) == 40)
+        snapshot = self.controller.snapshot()
+        self.assertEqual(snapshot["phase"], "listening")
+        self.assertIsNone(snapshot["error"])
+        self.assertEqual(snapshot["decision_status"], "unavailable")
+        self.assertEqual(snapshot["turns"][-1]["utterance_id"], "synthetic-40")
+        self.assertLessEqual(snapshot["pending_decisions"], 1)
+        self.assertTrue(self.controller._decision_queue.empty())
+        self.assertFalse(self.controller._stop.is_set())
+        self.assertTrue(self.hosted.call_args.kwargs["cancelled"]())
+        self.assertFalse(capture.stopped)
+        self.assertFalse(FakeProcessor.instances[0].closed)
+        provider.release.set()
+        await_condition(lambda: self.controller.snapshot()["pending_decisions"] == 0)
+        self.assertEqual(provider.requests, 1)
+        self.assertEqual(self.controller.snapshot()["decisions"], {})
+        capture.pcm.put(bytes(6400))
+        await_condition(lambda: len(self.controller.snapshot()["turns"]) == 41)
+        continued = self.controller.snapshot()
+        self.assertEqual(continued["phase"], "listening")
+        self.assertEqual(continued["turns"][-1]["utterance_id"], "synthetic-41")
+        self.assertEqual(continued["pending_decisions"], 0)
+        self.assertTrue(self.controller._decision_queue.empty())
+        self.assertEqual(provider.requests, 1)
+        self.assertEqual(continued["decisions"], {})
+        self.controller.stop()
+        self.assertEqual(self.controller.snapshot()["turns"], [])
 
     def test_missing_hosted_credentials_are_safe_configuration_error(self):
         self.hosted.side_effect = CredentialError("Synthetic missing credential")

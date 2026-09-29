@@ -9,7 +9,7 @@ from collections import deque
 from dataclasses import dataclass
 from functools import wraps
 from threading import RLock
-from typing import Any
+from typing import Any, Callable
 
 from rightyo.contracts import ContractError, DecisionEvent, Turn, identifier
 from rightyo.memory import TranscriptMemory
@@ -58,6 +58,7 @@ class ReplayRunner:
         playback_active: bool = False,
         expected_reply: str | None = None,
         memory: TranscriptMemory | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> None:
         if not 1 <= max_context_turns <= 32 or not 4000 <= max_context_chars <= 16000:
             raise ContractError("invalid context budget")
@@ -68,6 +69,9 @@ class ReplayRunner:
         ):
             raise ContractError("invalid expected reply context")
         self._lock = RLock()
+        if cancelled is not None and not callable(cancelled):
+            raise ContractError("invalid cancellation guard")
+        self.cancelled = cancelled or (lambda: False)
         self.provider = provider
         self.memory = memory
         self.failed_decisions = 0
@@ -186,6 +190,9 @@ class ReplayRunner:
     def process(self, turn: Turn) -> DecisionEvent | None:
         started = time.perf_counter()
         with self._lock:
+            if self.cancelled():
+                self.skipped += 1
+                return None
             if self.session_id is None:
                 self.restart(turn.session_id)
             if turn.session_id != self.session_id:
@@ -221,7 +228,11 @@ class ReplayRunner:
             decision = self.provider.decide(state)
         except Exception:
             with self._lock:
-                if self._epoch == epoch and self._latest.get(key) == current:
+                if (
+                    not self.cancelled()
+                    and self._epoch == epoch
+                    and self._latest.get(key) == current
+                ):
                     # ASR completed even when the hosted decision did not. Preserve
                     # local recall, without fabricating a completed attention event.
                     self._retain_final(turn, key)
@@ -229,7 +240,7 @@ class ReplayRunner:
             raise
         provider_ms = (time.perf_counter() - provider_started) * 1000
         with self._lock:
-            if self._epoch != epoch or self._latest.get(key) != current:
+            if self.cancelled() or self._epoch != epoch or self._latest.get(key) != current:
                 self.skipped += 1
                 return None
             self._emitted.add(key)

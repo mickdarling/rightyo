@@ -362,8 +362,6 @@ class ConservativeAlignmentTests(unittest.TestCase):
             {"text": ".", "offsets": {"from": 500, "to": 500}},
             {"text": "[_TT_30]"},
         ]
-        # Match the actual special token spelling used by whisper.cpp.
-        value["transcription"][0]["tokens"][-1]["text"] = "[_TT_30_]"
         self.assertEqual(
             _units(value, 600),
             [

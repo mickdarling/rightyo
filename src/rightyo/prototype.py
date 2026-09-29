@@ -104,6 +104,7 @@ class PrototypeController:
         self._processor = None
         self._audio_thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._decision_cancel = threading.Event()
         self._decision_queue: queue.Queue[Turn] = queue.Queue(maxsize=32)
         self._decisions: dict[str, dict[str, Any]] = {}
         self._pending = 0
@@ -172,6 +173,11 @@ class PrototypeController:
             if self._audio_thread is not None and self._audio_thread.is_alive():
                 raise PrototypeError("The previous audio runtime is still stopping")
             stop = threading.Event()
+            decision_cancel = threading.Event()
+
+            def cancelled():
+                return stop.is_set() or decision_cancel.is_set()
+
             memory = TranscriptMemory(retention_ms=retention * 1000)
             try:
                 provider = (
@@ -180,19 +186,20 @@ class PrototypeController:
                         max_requests=budget,
                         timeout_seconds=10,
                         min_confidence=confidence,
-                        cancelled=stop.is_set,
+                        cancelled=cancelled,
                     )
                     if hosted
                     else MockProvider()
                 )
             except (ProviderError, CredentialError):
                 raise PrototypeError("Hosted decisions could not be initialized") from None
-            runner = ReplayRunner(provider, memory=memory)
+            runner = ReplayRunner(provider, memory=memory, cancelled=cancelled)
             session = "prototype-" + uuid.uuid4().hex
             runner.restart(session)
             self._generation += 1
             generation = self._generation
             self._stop = stop
+            self._decision_cancel = decision_cancel
             self._memory = memory
             self._runner = runner
             self._decision_queue = work = queue.Queue(maxsize=32)
@@ -224,10 +231,16 @@ class PrototypeController:
             if generation != self._generation or self._stop.is_set():
                 return
             memory.append(turn)
+            if self._decision_cancel.is_set():
+                return
             try:
                 work.put_nowait(turn)
             except queue.Full:
-                raise PrototypeError("Decision queue reached its bound; session stopped") from None
+                self._decision_cancel.set()
+                if self._decision_status != "off":
+                    self._decision_status = "unavailable"
+                self._discard_pending()
+                return
             self._pending += 1
 
     def _audio(self, generation, stop, session, work, memory, mode):
@@ -342,6 +355,8 @@ class PrototypeController:
                 with self._lock:
                     if generation != self._generation or stop.is_set():
                         continue
+                    if self._decision_cancel.is_set():
+                        enabled = False
                     runner.expire(self._now_ms())
                     if turn.utterance_id not in self._memory.retained_ids:
                         continue
@@ -357,7 +372,12 @@ class PrototypeController:
                     continue
                 event = runner.process(turn)
                 with self._lock:
-                    if generation == self._generation and not stop.is_set() and event is not None:
+                    if (
+                        generation == self._generation
+                        and not stop.is_set()
+                        and not self._decision_cancel.is_set()
+                        and event is not None
+                    ):
                         self._requests = runner.provider.requests
                         self._decisions[turn.utterance_id] = {
                             **event.public_dict(),
@@ -443,6 +463,7 @@ class PrototypeController:
             self._generation += 1
             generation = self._generation
             self._stop.set()
+            self._decision_cancel.set()
             capture, processor, runner = self._capture, self._processor, self._runner
             audio_thread = self._audio_thread
             self._capture = self._processor = self._runner = None
