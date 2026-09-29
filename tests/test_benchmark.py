@@ -233,6 +233,40 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(main(self.argv(output=self.audio)), 1)
         inference.assert_not_called()
 
+    def test_missing_output_parent_fails_before_inference_without_partial_file(self):
+        output = self.root / "missing-parent" / "summary.json"
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            patch("scripts.benchmark_stack.benchmark") as inference,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = main(self.argv(output=output))
+        self.assertEqual(result, 1)
+        inference.assert_not_called()
+        self.assertFalse(output.exists())
+        self.assertFalse(output.parent.exists())
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "Benchmark failed; no complete result was produced\n")
+
+    def test_unsupported_hardlinks_fail_before_inference_and_clean_private_probes(self):
+        output = self.root / "summary.json"
+        before = set(self.root.iterdir())
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            patch("scripts.benchmark_stack.benchmark") as inference,
+            patch("scripts.benchmark_stack.os.link", side_effect=OSError("Private storage path")),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = main(self.argv(output=output))
+        self.assertEqual(result, 1)
+        inference.assert_not_called()
+        self.assertFalse(output.exists())
+        self.assertEqual(set(self.root.iterdir()), before)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "Benchmark failed; no complete result was produced\n")
+
 
 if __name__ == "__main__":
     unittest.main()

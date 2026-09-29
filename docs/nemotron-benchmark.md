@@ -129,6 +129,14 @@ The adapter passes an absolute existing model path and isolates native HOME/conf
 avoiding the inspected CLI's model-name download path. It is not a sandbox for arbitrary
 user-supplied executables. Put transcript outputs outside all Git checkouts.
 
+The command below reproduces only the repository harness's stage timings, artifact hashes
+and strict attribution counts on supplied files. The RSS/footprint and fresh SpeakerKit
+timings above used a separate cache-local `/usr/bin/time -l` wrapper; the authored-word
+diagnostic and complete hosted-trial timer also used measurement code outside this checkout.
+Those additional measurements cannot be reproduced by this command alone. Their detailed
+records and reference fixture are external, and their measurement helpers are not shipped.
+The separate Jev CLI replay is documented in the MVP guide; the harness never calls Jev.
+
 ```sh
 PYTHONPATH=src .venv/bin/python scripts/benchmark_stack.py \
   --audio /private/authored-two-voices.wav \

@@ -270,6 +270,29 @@ def benchmark(
     return report
 
 
+def preflight_output(path: Path) -> None:
+    """Probe output storage before inference without reserving the destination.
+
+    A private file in the parent tests file creation and writing; linking it
+    inside a private directory on the same filesystem tests the atomic final
+    save mechanism. Final creation still checks for collisions independently.
+    """
+    try:
+        if path.exists() or path.is_symlink():
+            raise AudioError("Benchmark output must be a new file")
+        with (
+            tempfile.NamedTemporaryFile(prefix="rightyo-metrics-probe-", dir=path.parent) as source,
+            tempfile.TemporaryDirectory(
+                prefix="rightyo-metrics-probe-", dir=path.parent
+            ) as directory,
+        ):
+            source.write(b"0")
+            source.flush()
+            os.link(source.name, Path(directory) / "probe")
+    except OSError:
+        raise AudioError("Cannot create new benchmark report") from None
+
+
 def save_report(path: Path, report: dict[str, Any]) -> None:
     """Create a complete new metrics file atomically; never overwrite any input."""
     try:
@@ -298,8 +321,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, help="create a new metrics-only JSON file")
     args = parser.parse_args(argv)
     try:
-        if args.output is not None and (args.output.exists() or args.output.is_symlink()):
-            raise AudioError("Benchmark output must be a new file")
+        if args.output is not None:
+            preflight_output(args.output)
         report = benchmark(
             audio=args.audio,
             whisper_executable=args.whisper_executable,
