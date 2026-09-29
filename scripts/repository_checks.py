@@ -191,7 +191,7 @@ def issue_references(event, repository):
     """Parse only explicit linkage lines from event data; never evaluate its text."""
     pr = event.get("pull_request", {})
     body = without_code(pr.get("body") or "")
-    own_url = rf"https://github\.com/{re.escape(repository)}/issues/(\d+)"
+    own_url = rf"https://github\.com/{re.escape(repository)}/issues/([1-9]\d*)"
     issue_pattern = re.compile(rf"(?:#([1-9]\d*)\b|{own_url}\b)")
     numbers = set()
     for line in body.splitlines():
@@ -206,6 +206,8 @@ def workflow_errors(path, document):
     errors = []
     if not isinstance(document, dict):
         return [f"{path}: workflow must be a mapping"]
+    if "secrets." in str(document):
+        errors.append(f"{path}: baseline workflow must not reference secrets")
     event = document.get("on", document.get(True, {}))  # YAML 1.1 parsers treat on as True.
     if isinstance(event, str):
         event = [event]
@@ -225,8 +227,6 @@ def workflow_errors(path, document):
             action = step.get("uses", "")
             if action and not re.fullmatch(r"[\w.-]+/[\w./-]+@[a-f0-9]{40}", action):
                 errors.append(f"{path}: external actions require full commit SHAs")
-            if "secrets." in str(step):
-                errors.append(f"{path}: baseline workflow must not reference secrets")
             if "${{" in step.get("run", ""):
                 errors.append(f"{path}: pass expressions as data via env, not shell interpolation")
     return errors

@@ -101,6 +101,8 @@ class TraceabilityTests(unittest.TestCase):
         for body in (
             "Refs #",
             "Refs #0",
+            "Refs https://github.com/mickdarling/rightyo/issues/0",
+            "Refs https://github.com/mickdarling/rightyo/issues/01",
             "Refs https://github.com/other/repo/issues/15",
             "<!-- Refs #15 -->",
             "```text\nRefs #15\n```",
@@ -133,6 +135,23 @@ class WorkflowPolicyTests(unittest.TestCase):
         doc = self.document()
         doc["on"] = {"pull_request_target": {}}
         self.assertTrue(workflow_errors("ci.yml", doc))
+
+    def test_secret_references_fail_outside_steps(self):
+        cases = (
+            ("root-env", {"env": {"TOKEN": "${{ secrets.EXAMPLE }}"}}),
+            ("job-env", {"env": {"TOKEN": "${{ secrets.EXAMPLE }}"}}),
+            ("container", {"container": {"credentials": {"password": "${{ secrets.EXAMPLE }}"}}}),
+            ("service", {"services": {"db": {"env": {"TOKEN": "${{ secrets.EXAMPLE }}"}}}}),
+        )
+        for location, fragment in cases:
+            with self.subTest(location=location):
+                doc = self.document()
+                target = doc if location == "root-env" else doc["jobs"]["checks"]
+                target.update(fragment)
+                self.assertEqual(
+                    workflow_errors("ci.yml", doc),
+                    ["ci.yml: baseline workflow must not reference secrets"],
+                )
 
     def test_mutable_action_permissions_timeout_and_interpolation_fail(self):
         doc = self.document()
