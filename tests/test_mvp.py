@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import http.client
 import io
 import json
 import tempfile
@@ -209,10 +210,31 @@ class JevTests(unittest.TestCase):
                 provider.decide(self.state)
             self.assertNotIn(secret, str(error.exception))
             self.assertNotIn("private response", str(error.exception))
+            self.assertIsNone(error.exception.__context__)
             self.assertEqual(provider._opener.open.call_args.kwargs["timeout"], 2)
             with self.assertRaisesRegex(ProviderError, "budget exhausted"):
                 provider.decide(self.state)
             self.assertEqual(provider._opener.open.call_count, 1)
+
+    def test_reflected_token_in_protocol_error_and_json_cannot_enter_exception_chain(self):
+        secret = "fictitious-test-credential"
+        provider = JevProvider(allow_hosted=True)
+        provider._opener = MagicMock()
+        with patch("rightyo.credentials.load_jev_api_key", return_value=secret):
+            provider._opener.open.side_effect = http.client.BadStatusLine(secret)
+            with self.assertRaises(ProviderError) as error:
+                provider.decide(self.state)
+            self.assertNotIn(secret, str(error.exception))
+            self.assertIsNone(error.exception.__context__)
+            request = provider._opener.open.call_args.args[0]
+            self.assertIsNone(request.get_header("Authorization"))
+            provider._opener.open.side_effect = None
+            stream = provider._opener.open.return_value.__enter__.return_value
+            stream.read.return_value = ('{"reflected":"' + secret).encode()
+            with self.assertRaises(ProviderError) as error:
+                provider.decide(self.state)
+            self.assertNotIn(secret, str(error.exception))
+            self.assertIsNone(error.exception.__context__)
 
     def test_valid_http_response_and_oversize_rejection_without_external_call(self):
         provider = JevProvider(allow_hosted=True)

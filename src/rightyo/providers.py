@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import urllib.error
@@ -133,6 +134,7 @@ def parse_response(raw: Any, request: dict[str, Any], min_confidence: float) -> 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req: Any, fp: Any, code: Any, msg: Any, headers: Any, newurl: Any):
         # Never forward a bearer credential to a redirected endpoint.
+        fp.close()
         raise ProviderError("Jev redirect refused")
 
 
@@ -178,18 +180,47 @@ class JevProvider:
         )
         del api_key
         self.requests += 1
+        failure = None
+        content = b""
         try:
             with self._opener.open(request, timeout=self.timeout_seconds) as response:
                 content = response.read(MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as error:
+            # urllib's response finalizer can emit a ResourceWarning containing
+            # the HTTPError repr (including its untrusted reason). Close it now.
+            try:
+                error.close()
+            except OSError:
+                pass
             if error.code in (429, 529):
-                raise ProviderError("Jev temporarily unavailable; no automatic retry") from None
-            raise ProviderError(f"Jev request failed (HTTP {error.code})") from None
-        except (urllib.error.URLError, TimeoutError, socket.timeout, OSError):
-            raise ProviderError("Jev connection failed or timed out") from None
+                failure = "Jev temporarily unavailable; no automatic retry"
+            elif type(error.code) is int and 100 <= error.code <= 599:
+                failure = f"Jev request failed (HTTP {error.code})"
+            else:
+                failure = "Jev request failed"
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            socket.timeout,
+            OSError,
+            http.client.HTTPException,
+        ):
+            failure = "Jev connection failed or timed out"
+        except ProviderError:
+            failure = "Jev redirect refused"
+        finally:
+            request.remove_header("Authorization")
+        # Raise outside exception handlers: reflected headers/bodies must not survive
+        # as an exception's __context__, even when callers inspect suppressed chains.
+        if failure is not None:
+            raise ProviderError(failure)
         if len(content) > MAX_RESPONSE_BYTES:
             raise ProviderError("Jev response exceeds size limit")
+        decision = None
         try:
-            return parse_response(json.loads(content), request_body, self.min_confidence)
-        except (ValueError, TypeError, KeyError, UnicodeError):
-            raise ProviderError("Jev returned an invalid structured response") from None
+            decision = parse_response(json.loads(content), request_body, self.min_confidence)
+        except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+            pass
+        if decision is None:
+            raise ProviderError("Jev returned an invalid structured response")
+        return decision
