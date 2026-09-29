@@ -62,6 +62,7 @@ PRIVATE_SUFFIXES = {
 }
 MAX_FILE_BYTES = 1024 * 1024
 IGNORE_CASES = {
+    "src/rightyo.egg-info/PKG-INFO": True,
     "recordings/sample.unfamiliar": True,
     "nested/transcripts/example.json": True,
     "datasets/sample.unfamiliar": True,
