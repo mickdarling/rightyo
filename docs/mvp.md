@@ -49,6 +49,9 @@ Provision whisper.cpp and a model outside Git, recording upstream revision, lice
 model size and checksum. Then use a supplied audio file; no capture or download happens
 implicitly. File inference is offline and its segment timestamps are not live finalization
 times. Put the generated transcript outside every public checkout.
+Imports deliberately reject empty-text or zero-duration segments instead of silently
+dropping or repairing transcript evidence. Exports use the evaluator's bounded input
+limits; larger recordings need explicit chunked sessions rather than an unbounded replay.
 
 ```sh
 rightyo audio-import --audio /private/conversation.wav \

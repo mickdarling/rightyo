@@ -68,6 +68,12 @@ def response(request: dict, label="attend", recipient="system") -> dict:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_turn_rejects_surrogate_without_retaining_text_in_exception(self):
+        with self.assertRaises(ContractError) as error:
+            turn(text="private-invalid-\ud800")
+        self.assertNotIn("private-invalid", str(error.exception))
+        self.assertIsNone(error.exception.__context__)
+
     def test_partial_duplicate_and_stale_turns_never_issue_extra_decisions(self):
         provider = MagicMock(wraps=MockProvider())
         runner = ReplayRunner(provider)

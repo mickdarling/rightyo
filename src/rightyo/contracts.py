@@ -62,6 +62,14 @@ class Turn:
             raise ContractError("turn timestamps are reversed")
         if not isinstance(self.text, str) or len(self.text) > MAX_TEXT_CHARS:
             raise ContractError("invalid turn text length")
+        valid_encoding = False
+        try:
+            self.text.encode("utf-8")
+            valid_encoding = True
+        except UnicodeError:
+            pass
+        if not valid_encoding:
+            raise ContractError("turn text must be valid UTF-8")
         if type(self.finalized) is not bool or type(self.overlap) is not bool:
             raise ContractError("invalid turn flags")
         if self.provenance not in PROVENANCE:

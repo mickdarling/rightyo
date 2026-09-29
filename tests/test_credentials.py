@@ -58,11 +58,24 @@ class CredentialTests(unittest.TestCase):
         ):
             with patch(
                 "rightyo.credentials.subprocess.run",
-                side_effect=subprocess.TimeoutExpired(TOKEN, 30),
+                side_effect=subprocess.TimeoutExpired(TOKEN, 120, output=TOKEN.encode()),
             ):
                 with self.assertRaises(CredentialError) as error:
                     load_jev_api_key()
                 self.assertNotIn(TOKEN, str(error.exception))
+                self.assertIsNone(error.exception.__context__)
+
+    def test_invalid_keychain_encoding_has_no_secret_exception_context(self):
+        response = subprocess.CompletedProcess([], 0, TOKEN.encode() + b"\xff", b"")
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("rightyo.credentials.sys.platform", "darwin"),
+            patch("rightyo.credentials.subprocess.run", return_value=response),
+        ):
+            with self.assertRaises(CredentialError) as error:
+                load_jev_api_key()
+            self.assertNotIn(TOKEN, str(error.exception))
+            self.assertIsNone(error.exception.__context__)
 
 
 if __name__ == "__main__":
