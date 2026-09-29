@@ -2,6 +2,7 @@
 
 import array
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -16,6 +17,7 @@ from rightyo.live_audio import (
     LiveConfig,
     LiveProcessor,
     _attribute,
+    _Diarizer,
     _units,
 )
 
@@ -218,6 +220,95 @@ class LiveProcessorTests(unittest.TestCase):
             values = vars(self.config) | {name: value}
             with self.assertRaises(LiveAudioError):
                 LiveConfig(**values)
+
+
+class NativeStartupCancellationTests(unittest.TestCase):
+    """A real sleeping Python child stands in for model initialization."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        asset = Path(self.directory.name) / "supplied-local-asset"
+        asset.touch()
+        self.stop = threading.Event()
+        self.config = LiveConfig(
+            "cancel-startup",
+            asset,
+            asset,
+            asset,
+            asset,
+            provenance="causal-replay",
+            cancelled=self.stop.is_set,
+        )
+        self.children = []
+        self.real_popen = subprocess.Popen
+        self.addCleanup(self.reap_children)
+
+    def reap_children(self):
+        for child in self.children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=2)
+            for stream in (child.stdin, child.stdout):
+                if stream is not None:
+                    stream.close()
+
+    def spawn_sleeping_child(self, _command, **options):
+        child = self.real_popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            **options,
+        )
+        self.children.append(child)
+        return child
+
+    def spawn_ready_then_sleeping_child(self, _command, **options):
+        child = self.real_popen(
+            [
+                sys.executable,
+                "-c",
+                "import time; print('{\"ok\":true}',flush=True); time.sleep(30)",
+            ],
+            **options,
+        )
+        self.children.append(child)
+        return child
+
+    def cancel_shortly(self):
+        timer = threading.Timer(0.1, self.stop.set)
+        timer.start()
+        self.addCleanup(timer.join)
+
+    def test_cancel_before_start_does_not_spawn_child(self):
+        self.stop.set()
+        with patch("rightyo.live_audio.subprocess.Popen") as spawn:
+            with self.assertRaisesRegex(LiveAudioError, "stopped"):
+                _Diarizer(self.config)
+        spawn.assert_not_called()
+
+    def test_stop_interrupts_real_child_initialization_and_reaps_it(self):
+        self.cancel_shortly()
+        started = time.monotonic()
+        with patch("rightyo.live_audio.subprocess.Popen", self.spawn_sleeping_child):
+            with self.assertRaisesRegex(LiveAudioError, "stopped"):
+                _Diarizer(self.config)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(len(self.children), 1)
+        self.assertIsNotNone(self.children[0].poll())
+
+    def test_stop_interrupts_waiting_for_native_response_and_reaps_it(self):
+        with patch("rightyo.live_audio.subprocess.Popen", self.spawn_ready_then_sleeping_child):
+            diarizer = _Diarizer(self.config)
+        self.addCleanup(diarizer.close)
+        self.cancel_shortly()
+        started = time.monotonic()
+        with self.assertRaisesRegex(LiveAudioError, "stopped"):
+            diarizer.segments()
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertIsNotNone(self.children[0].poll())
+
+    def test_cancel_guard_must_be_callable(self):
+        with self.assertRaisesRegex(LiveAudioError, "cancellation guard"):
+            LiveConfig(**(vars(self.config) | {"cancelled": True}))
 
 
 class ConservativeAlignmentTests(unittest.TestCase):

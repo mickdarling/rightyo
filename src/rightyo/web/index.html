@@ -20,8 +20,8 @@
         <div id="phase-pill" class="phase-pill" data-phase="idle"><span class="dot"></span><span id="phase-label">Idle · microphone off</span></div>
       </section>
       <section class="model-strip" aria-label="The model pipeline">
-        <div class="model-step"><span class="step-number">01</span><div><strong>Nemotron 3</strong><span>Who is speaking</span></div><span class="step-tag">LOCAL</span></div>
-        <div class="model-step"><span class="step-number">02</span><div><strong>Whisper base.en</strong><span>What was said</span></div><span class="step-tag">LOCAL</span></div>
+        <div class="model-step"><span class="step-number">01</span><div><strong>Nemotron 3</strong><span>Who is speaking · configured GGUF</span></div><span class="step-tag">LOCAL</span></div>
+        <div class="model-step"><span class="step-number">02</span><div><strong>Whisper</strong><span>What was said · configured model</span></div><span class="step-tag">LOCAL</span></div>
         <div class="model-step"><span class="step-number">03</span><div><strong>Jev</strong><span>Is this for the agent?</span></div><span id="jev-model-tag" class="step-tag">OFF</span></div>
       </section>
       <div class="workspace">
@@ -50,7 +50,7 @@
               <p class="help">Scores are experimental. Low-confidence results abstain; reaching the request limit stops hosted decisions.</p>
             </div>
           </fieldset>
-          <div class="session-note"><span aria-hidden="true">↳</span><span>Sessions stop after 15 minutes, or when this page closes or loses its connection for 15 seconds.</span></div>
+          <div class="session-note"><span aria-hidden="true">↳</span><span>Keep this page visible while listening. Sessions stop after 15 minutes or 15 seconds without updates; background tab throttling can stop capture.</span></div>
         </aside>
         <section class="conversation card" aria-labelledby="conversation-title">
           <div class="section-heading conversation-heading"><div><p class="eyebrow">ROLLING CONVERSATION</p><h2 id="conversation-title">Recent context</h2></div><button id="copy-button" class="text-button" type="button" disabled>Copy context <span aria-hidden="true">↗</span></button></div>

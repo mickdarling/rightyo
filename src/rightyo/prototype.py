@@ -102,6 +102,7 @@ class PrototypeController:
         self._runner: ReplayRunner | None = None
         self._capture = None
         self._processor = None
+        self._audio_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._decision_queue: queue.Queue[Turn] = queue.Queue(maxsize=32)
         self._decisions: dict[str, dict[str, Any]] = {}
@@ -168,6 +169,8 @@ class PrototypeController:
         with self._lock:
             if self._phase in {"starting", "listening", "replaying", "finishing", "stopping"}:
                 raise PrototypeError("Stop the active session before starting another")
+            if self._audio_thread is not None and self._audio_thread.is_alive():
+                raise PrototypeError("The previous audio runtime is still stopping")
             stop = threading.Event()
             memory = TranscriptMemory(retention_ms=retention * 1000)
             try:
@@ -204,16 +207,17 @@ class PrototypeController:
             self._decision_status = "ready" if hosted else "off"
             self._phase = "starting"
             self._started = self._last_browser = time.monotonic()
-        threading.Thread(
-            target=self._decide,
-            args=(generation, stop, work, runner, hosted),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=self._audio,
-            args=(generation, stop, session, work, memory, mode),
-            daemon=True,
-        ).start()
+            threading.Thread(
+                target=self._decide,
+                args=(generation, stop, work, runner, hosted),
+                daemon=True,
+            ).start()
+            self._audio_thread = threading.Thread(
+                target=self._audio,
+                args=(generation, stop, session, work, memory, mode),
+                daemon=True,
+            )
+            self._audio_thread.start()
 
     def _accept(self, generation: int, work: queue.Queue, memory: TranscriptMemory, turn: Turn):
         with self._lock:
@@ -237,6 +241,7 @@ class PrototypeController:
                     diarization_library=self.config.diarization_library,
                     diarization_model=self.config.diarization_model,
                     provenance="live-microphone" if mode == "microphone" else "causal-replay",
+                    cancelled=stop.is_set,
                 ),
                 lambda turn: self._accept(generation, work, memory, turn),
             )
@@ -285,10 +290,9 @@ class PrototypeController:
                     )
                     stop.set()
                     self._completed_at = time.monotonic()
-                    self._memory.clear()
-                    self._prune_pending()
+                    self._discard_pending()
                     if self._runner is not None:
-                        self._runner.clear()
+                        self._runner.clear(clear_memory=False)
         except Exception:
             with self._lock:
                 if generation == self._generation and not stop.is_set():
@@ -296,10 +300,9 @@ class PrototypeController:
                     self._error = "Audio processing failed; the session is incomplete."
                     stop.set()
                     self._completed_at = time.monotonic()
-                    self._memory.clear()
-                    self._prune_pending()
+                    self._discard_pending()
                     if self._runner is not None:
-                        self._runner.clear()
+                        self._runner.clear(clear_memory=False)
         finally:
             if capture is not None:
                 capture.stop()
@@ -308,6 +311,8 @@ class PrototypeController:
             with self._lock:
                 if generation == self._generation:
                     self._capture = self._processor = None
+                elif generation + 1 == self._generation and self._phase == "stopping":
+                    self._phase = "idle"
 
     def _feed(self, generation, processor, pcm, mode):
         with self._lock:
@@ -354,7 +359,10 @@ class PrototypeController:
                 with self._lock:
                     if generation == self._generation and not stop.is_set() and event is not None:
                         self._requests = runner.provider.requests
-                        self._decisions[turn.utterance_id] = event.public_dict()
+                        self._decisions[turn.utterance_id] = {
+                            **event.public_dict(),
+                            "recipient_speaker_id": event.decision.recipient_speaker_id,
+                        }
             except Exception:
                 enabled = False
                 with self._lock:
@@ -370,7 +378,16 @@ class PrototypeController:
                         if self._phase == "finishing" and self._pending == 0:
                             self._phase = "complete"
                 del turn
-        runner.clear()
+        runner.clear(clear_memory=False)
+
+    def _discard_pending(self):
+        while True:
+            try:
+                self._decision_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._decision_queue.task_done()
+            self._pending = max(0, self._pending - 1)
 
     def _prune_pending(self):
         """Release expired queued plaintext, including while hosted inference is slow."""
@@ -412,8 +429,8 @@ class PrototypeController:
                 "jev_request_limit": self._request_limit,
                 "demo_available": self.config.demo_audio is not None,
                 "models": {
-                    "diarization": "Nemotron 3 Q8",
-                    "asr": "Whisper base.en",
+                    "diarization": "Nemotron 3 (configured GGUF)",
+                    "asr": "Whisper (configured model)",
                     "decision": "Jev 1.13.0 (opt-in)",
                 },
                 "session_limit_seconds": SESSION_SECONDS,
@@ -427,6 +444,7 @@ class PrototypeController:
             generation = self._generation
             self._stop.set()
             capture, processor, runner = self._capture, self._processor, self._runner
+            audio_thread = self._audio_thread
             self._capture = self._processor = self._runner = None
             self._phase = "stopping"
             self._error = None
@@ -450,9 +468,13 @@ class PrototypeController:
                 capture.stop()
             if processor is not None:
                 processor.close()
+            if audio_thread is not None and audio_thread is not threading.current_thread():
+                audio_thread.join(timeout=5)
         finally:
             with self._lock:
-                if generation == self._generation:
+                if generation == self._generation and (
+                    audio_thread is None or not audio_thread.is_alive()
+                ):
                     self._phase = "idle"
 
     def close(self):

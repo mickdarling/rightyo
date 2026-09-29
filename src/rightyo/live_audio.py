@@ -52,9 +52,12 @@ class LiveConfig:
     pre_roll_ms: int = 240
     max_utterance_ms: int = 12000
     timeout_seconds: float = 30
+    cancelled: Callable[[], bool] | None = None
 
     def __post_init__(self) -> None:
         identifier(self.session_id, "session_id")
+        if self.cancelled is not None and not callable(self.cancelled):
+            raise LiveAudioError("Invalid cancellation guard")
         if self.provenance not in PROVENANCE:
             raise LiveAudioError("Invalid audio provenance")
         if (
@@ -278,6 +281,8 @@ def _native_worker(library: str, model: str) -> int:
 class _Diarizer:
     def __init__(self, config: LiveConfig):
         self.timeout = config.timeout_seconds
+        self.cancelled = config.cancelled if config.cancelled is not None else (lambda: False)
+        self._check_cancelled()
         source = str(Path(__file__).resolve().parent.parent)
         self.process = subprocess.Popen(
             [
@@ -301,20 +306,30 @@ class _Diarizer:
             self.close()
             raise
 
+    def _check_cancelled(self) -> None:
+        if self.cancelled():
+            raise LiveAudioError("Audio session was stopped")
+
     def _receive(self) -> dict[str, Any]:
         deadline = time.monotonic() + self.timeout
         assert self.process.stdout is not None
         with selectors.DefaultSelector() as selector:
             selector.register(self.process.stdout, selectors.EVENT_READ)
             while b"\n" not in self.buffer:
-                if not selector.select(max(0, deadline - time.monotonic())):
+                self._check_cancelled()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     raise LiveAudioError("Local diarizer timed out")
+                if not selector.select(min(0.05, remaining)):
+                    continue
+                self._check_cancelled()
                 chunk = os.read(self.process.stdout.fileno(), 65536)
                 if not chunk:
                     raise LiveAudioError("Local diarizer stopped unexpectedly")
                 self.buffer.extend(chunk)
                 if len(self.buffer) > MAX_RESPONSE_BYTES:
                     raise LiveAudioError("Local diarizer exceeded output limit")
+        self._check_cancelled()
         line, _, rest = self.buffer.partition(b"\n")
         self.buffer = bytearray(rest)
         try:
@@ -327,12 +342,15 @@ class _Diarizer:
 
     def request(self, command: str, **fields: Any) -> dict[str, Any]:
         try:
+            self._check_cancelled()
             assert self.process.stdin is not None
             self.process.stdin.write((json.dumps({"command": command, **fields}) + "\n").encode())
             return self._receive()
         except LiveAudioError:
+            self.close()
             raise
         except (BrokenPipeError, OSError, ValueError):
+            self.close()
             raise LiveAudioError("Local diarizer stopped unexpectedly") from None
 
     def push(self, pcm: bytes) -> None:

@@ -63,6 +63,11 @@ and its overlap is reported. Ignore and uncertain decisions remain in local cont
 request can refer to the preceding discussion. Copy context produces speaker-labelled text
 for manual use downstream, including unknown-speaker and overlap indications.
 
+A local audio/ASR failure stops capture and marks the session incomplete while preserving
+already valid transcript turns until their normal expiry or an explicit Stop. Malformed
+or padded-only ASR segments fail closed; they are not invented, silently dropped or
+converted into future speech.
+
 Jev receives a separate short context: up to eight past turns, at most 12,000 characters
 including the current turn, and at most 32 KiB encoded. The five-minute local history is
 not automatically sent to the hosted provider. A later downstream summarizer could consume
@@ -73,7 +78,9 @@ retained session text and queued decisions. An already-sent hosted request can f
 its result is discarded. A bounded context copy used by in-flight inference or Keychain
 lookup can remain until that operation returns (10-second HTTP timeout; Keychain lookup
 up to 120 seconds). Closing the page attempts Stop, and loss of browser heartbeats
-stops an active session after 15 seconds. Active sessions also stop after 15 minutes.
+stops an active session after 15 seconds. Browser background timer throttling can also
+trigger this lease, so keep the lab visible while listening. This is a prototype limitation,
+including when switching tabs to a downstream application. Active sessions also stop after 15 minutes.
 A completed replay's text ages out too. Refreshing loses the browser token; use the launch
 URL again. Only one session runs at a time.
 

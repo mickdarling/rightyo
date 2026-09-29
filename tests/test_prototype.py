@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 
 from rightyo.contracts import Turn
 from rightyo.credentials import CredentialError
+from rightyo.live_audio import LiveAudioError
 from rightyo.prototype import (
     PrototypeConfig,
     PrototypeController,
@@ -215,6 +216,131 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(snapshot["decisions"], {})
         self.assertEqual(snapshot["jev_requests"], 1)
         self.assertEqual(len(snapshot["turns"]), 3)
+
+    def test_unexpected_provider_failure_is_visible_without_losing_transcript(self):
+        class UnexpectedHosted(FakeHosted):
+            def decide(self, state):
+                self.requests += 1
+                raise RuntimeError("synthetic-private-provider-detail")
+
+        self.hosted.side_effect = UnexpectedHosted
+        self.controller.start({"mode": "demo", "use_jev": True})
+        await_condition(lambda: self.controller.snapshot()["phase"] == "complete")
+        snapshot = self.controller.snapshot()
+        self.assertEqual(snapshot["decision_status"], "unavailable")
+        self.assertEqual(snapshot["decisions"], {})
+        self.assertEqual(snapshot["jev_requests"], 1)
+        self.assertEqual(len(snapshot["turns"]), 3)
+        self.assertNotIn("synthetic-private-provider-detail", json.dumps(snapshot))
+
+    def test_audio_failure_preserves_valid_history_cancels_queue_and_ages(self):
+        for failure in (LiveAudioError, RuntimeError):
+            with self.subTest(failure=failure):
+                provider = FakeHosted()
+                provider.release.clear()
+                self.addCleanup(provider.release.set)
+                self.hosted.side_effect = None
+                self.hosted.return_value = provider
+
+                class FailingProcessor(FakeProcessor):
+                    def push_pcm16(self, pcm):
+                        if self.index == 2:
+                            raise failure("synthetic-private-audio-detail")
+                        super().push_pcm16(pcm)
+                        if self.index == 1 and not provider.entered.wait(1):
+                            raise AssertionError("Fake decision did not begin")
+
+                self.processor.side_effect = FailingProcessor
+                self.controller.start(
+                    {
+                        "mode": "demo",
+                        "use_jev": True,
+                        "retention_seconds": 60,
+                    }
+                )
+                await_condition(lambda: self.controller.snapshot()["phase"] == "error")
+                old_work = self.controller._decision_queue
+                snapshot = self.controller.snapshot()
+                self.assertEqual(len(snapshot["turns"]), 2)
+                self.assertEqual(snapshot["turns"][-1]["speaker_id"], "Speaker B")
+                self.assertTrue(old_work.empty())
+                self.assertEqual(snapshot["decisions"], {})
+                self.assertNotIn("synthetic-private-audio-detail", snapshot["error"])
+                provider.release.set()
+                await_condition(lambda: old_work.unfinished_tasks == 0)
+                self.assertEqual(provider.requests, 1)
+                self.assertEqual(self.controller.snapshot()["pending_decisions"], 0)
+                self.assertEqual(len(self.controller.snapshot()["turns"]), 2)
+                self.assertEqual(self.controller.snapshot()["decisions"], {})
+                with self.controller._lock:
+                    self.assertIsNotNone(self.controller._completed_at)
+                    self.controller._completed_at -= 61
+                expired = self.controller.snapshot()
+                self.assertEqual(expired["phase"], "error")
+                self.assertEqual(expired["turns"], [])
+                self.assertEqual(expired["retention"]["expired_turns"], 2)
+                self.controller.stop()
+                self.assertEqual(self.controller.snapshot()["phase"], "idle")
+                self.assertEqual(self.controller.snapshot()["turns"], [])
+
+    def test_stop_waits_for_cancelled_startup_and_blocks_overlapping_start(self):
+        for raise_on_cancel in (False, True):
+            with self.subTest(raise_on_cancel=raise_on_cancel):
+                entered = threading.Event()
+                cancelled = threading.Event()
+                release = threading.Event()
+                self.addCleanup(release.set)
+                returned = []
+
+                def delayed_factory(config, callback):
+                    entered.set()
+                    deadline = time.monotonic() + 2
+                    while not config.cancelled() and time.monotonic() < deadline:
+                        threading.Event().wait(0.005)
+                    if not config.cancelled():
+                        raise AssertionError("Startup did not receive cancellation")
+                    cancelled.set()
+                    if not release.wait(2):
+                        raise AssertionError("Test did not release fake startup")
+                    if raise_on_cancel:
+                        raise LiveAudioError("Synthetic cancelled initialization")
+                    processor = FakeProcessor(config, callback)
+                    returned.append(processor)
+                    return processor
+
+                self.processor.side_effect = delayed_factory
+                self.controller.start({"mode": "microphone"})
+                self.assertTrue(entered.wait(1))
+                old_audio = self.controller._audio_thread
+                stopped = threading.Event()
+
+                def stop():
+                    self.controller.stop()
+                    stopped.set()
+
+                stopper = threading.Thread(target=stop)
+                stopper.start()
+                try:
+                    self.assertTrue(cancelled.wait(1))
+                    self.assertEqual(self.controller.snapshot()["phase"], "stopping")
+                    self.assertEqual(self.controller.snapshot()["turns"], [])
+                    with self.assertRaises(PrototypeError):
+                        self.controller.start({"mode": "demo"})
+                    self.assertFalse(stopped.is_set())
+                    self.assertTrue(old_audio.is_alive())
+                    self.capture.assert_not_called()
+                finally:
+                    release.set()
+                    stopper.join(2)
+                self.assertTrue(stopped.is_set())
+                self.assertFalse(old_audio.is_alive())
+                self.assertEqual(self.controller.snapshot()["phase"], "idle")
+                self.assertTrue(all(processor.closed for processor in returned))
+                self.processor.side_effect = FakeProcessor
+                self.controller.start({"mode": "demo"})
+                await_condition(lambda: self.controller.snapshot()["phase"] == "complete")
+                self.assertEqual(len(self.controller.snapshot()["turns"]), 3)
+                self.controller.stop()
 
     def test_missing_hosted_credentials_are_safe_configuration_error(self):
         self.hosted.side_effect = CredentialError("Synthetic missing credential")

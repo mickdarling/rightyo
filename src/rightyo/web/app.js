@@ -138,6 +138,8 @@
       if (turn.overlap) notes.push("Overlapping speech");
       if (!turn.speaker_id) notes.push("Speaker attribution uncertain");
       if (decision) {
+        const recipient = decision.recipient_speaker_id || ({system: "agent", other_human: "another human", unknown: "unknown"}[decision.recipient_kind]) || "unknown";
+        notes.push(`Recipient: ${recipient}`);
         const confidence = Number(decision.confidence);
         if (Number.isFinite(confidence)) notes.push(`Decision score ${confidence.toFixed(2)}`);
         if (decision.policy_abstained) notes.push("Confidence or recipient policy abstained");

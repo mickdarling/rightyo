@@ -103,7 +103,7 @@ class ReplayRunner:
         self._last_end_ms = 0
 
     @_locked
-    def clear(self) -> None:
+    def clear(self, *, clear_memory: bool = True) -> None:
         """Invalidate outstanding decisions and release runner-owned conversation text."""
         self._epoch += 1
         self.session_id = None
@@ -114,7 +114,7 @@ class ReplayRunner:
         self.expected_reply = None
         self._last_end_ms = 0
         self.failed_decisions = 0
-        if self.memory is not None:
+        if self.memory is not None and clear_memory:
             self.memory.clear()
 
     @_locked
