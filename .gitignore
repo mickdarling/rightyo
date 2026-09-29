@@ -33,6 +33,11 @@ datasets/
 artifacts/
 runs/
 logs/
+features/
+feature_cache/
+consent/
+wandb/
+tensorboard/
 *.log
 *.wav
 *.aiff
@@ -44,6 +49,9 @@ logs/
 *.m4a
 *.flac
 *.ogg
+*.opus
+*.aac
+*.webm
 *.mp4
 
 # Downloaded weights/checkpoints; document sources instead
@@ -58,3 +66,9 @@ checkpoints/
 *.mlmodel
 *.mlmodelc/
 *.mlpackage/
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.pkl
+*.pickle
