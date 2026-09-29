@@ -6,7 +6,7 @@ import os
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -248,6 +248,31 @@ class WhisperAdapterTests(unittest.TestCase):
         self.assertEqual(result[0]["speaker_provenance"], "diarization-timeline")
         self.assertFalse(result[0]["overlap"])
 
+    def test_explicit_backend_without_native_diarizer_never_starts_process(self):
+        diarization = self.root / "speaker.rttm"
+        diarization.write_text("SPEAKER supplied 1 0.000 1.000 <NA> <NA> A <NA> <NA>")
+        for backend in ("auto", "cpu", "metal"):
+            for timeline in (None, diarization):
+                with (
+                    self.subTest(backend=backend, timeline=timeline),
+                    patch("rightyo.audio.subprocess.run") as process,
+                    self.assertRaises(AudioError),
+                ):
+                    self.invoke(diarization_backend=backend, diarization_path=timeline)
+                process.assert_not_called()
+
+    def test_omitted_native_backend_resolves_to_auto(self):
+        def vendor_process(argv, **kwargs):
+            output = Path(argv[argv.index("--output-file") + 1]).with_suffix(".json")
+            output.write_text(json.dumps(self.vendor_json))
+
+        with (
+            patch("rightyo.audio.diarize_nemotron_cpp", return_value=[]) as diarizer,
+            patch("rightyo.audio.subprocess.run", side_effect=vendor_process),
+        ):
+            self.invoke(diarization_executable=self.executable, diarization_model=self.model)
+        self.assertEqual(diarizer.call_args.kwargs["backend"], "auto")
+
     def test_other_session_timeline_never_starts_process(self):
         diarization = self.root / "speaker.json"
         diarization.write_text(
@@ -456,6 +481,67 @@ class NemotronAdapterTests(unittest.TestCase):
         self.assertEqual(importer.call_args.kwargs["diarization_backend"], "metal")
         self.assertEqual(json.loads(stdout.getvalue())["hosted_text_processing"], False)
         self.assertNotIn("Synthetic speech", stdout.getvalue())
+
+    def test_audio_import_cli_rejects_backend_without_native_diarizer(self):
+        diarization = self.root / "speaker.rttm"
+        diarization.write_text("SPEAKER supplied 1 0.000 1.000 <NA> <NA> A <NA> <NA>")
+        output = self.root / "private-turns.json"
+        for backend in ("auto", "cpu", "metal"):
+            for timeline in (None, diarization):
+                argv = [
+                    "audio-import",
+                    "--audio",
+                    str(self.audio),
+                    "--whisper-executable",
+                    str(self.executable),
+                    "--model",
+                    str(self.model),
+                    "--session-id",
+                    "test",
+                    "--output",
+                    str(output),
+                    "--diarization-backend",
+                    backend,
+                ]
+                if timeline is not None:
+                    argv.extend(["--diarization-input", str(timeline)])
+                with (
+                    self.subTest(backend=backend, timeline=timeline),
+                    patch("rightyo.audio.subprocess.run") as process,
+                    redirect_stdout(io.StringIO()),
+                    redirect_stderr(io.StringIO()),
+                ):
+                    self.assertEqual(main(argv), 2)
+                process.assert_not_called()
+                self.assertFalse(output.exists())
+
+    def test_audio_import_cli_preserves_omitted_backend(self):
+        turns = join([transcript()], [speaker()])
+        with (
+            patch("rightyo.audio.transcribe_whisper_cpp", return_value=turns) as importer,
+            redirect_stdout(io.StringIO()),
+        ):
+            status = main(
+                [
+                    "audio-import",
+                    "--audio",
+                    str(self.audio),
+                    "--whisper-executable",
+                    str(self.executable),
+                    "--model",
+                    str(self.model),
+                    "--session-id",
+                    "test",
+                    "--output",
+                    str(self.root / "private-turns.json"),
+                    "--diarization-executable",
+                    str(self.executable),
+                    "--diarization-model",
+                    str(self.model),
+                ]
+            )
+        self.assertEqual(status, 0)
+        self.assertIsNone(importer.call_args.kwargs["diarization_backend"])
 
 
 if __name__ == "__main__":

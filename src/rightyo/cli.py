@@ -169,7 +169,11 @@ def main(argv: list[str] | None = None) -> int:
     local.add_argument(
         "--diarization-model", type=Path, help="existing local Nemotron 3 GGUF; no downloads"
     )
-    local.add_argument("--diarization-backend", choices=("auto", "cpu", "metal"), default="auto")
+    local.add_argument(
+        "--diarization-backend",
+        choices=("auto", "cpu", "metal"),
+        help="native diarization backend (default: auto with a native executable)",
+    )
     local.add_argument(
         "--output", type=Path, required=True, help="new private JSON file outside repo"
     )

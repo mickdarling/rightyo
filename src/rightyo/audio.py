@@ -358,7 +358,7 @@ def transcribe_whisper_cpp(
     diarization_path: str | Path | None = None,
     diarization_executable: str | Path | None = None,
     diarization_model: str | Path | None = None,
-    diarization_backend: str = "auto",
+    diarization_backend: str | None = None,
 ) -> list[dict[str, Any]]:
     """Run an explicitly supplied existing CLI/model/file; never download.
 
@@ -368,6 +368,7 @@ def transcribe_whisper_cpp(
     No vendor stdout/stderr or paths are copied into errors/public provenance.
     Temporary transcripts are in a private directory removed on every exit.
     Alternatively, supply both a native diarization executable and local GGUF.
+    A supplied backend requires native diarization; omission uses native auto.
     Each local process receives the configured timeout independently.
     """
     _id(session_id)
@@ -376,6 +377,8 @@ def transcribe_whisper_cpp(
         raise AudioError("Both native diarization executable and model are required")
     if diarization_path is not None and diarization_executable is not None:
         raise AudioError("Choose an imported timeline or native diarization")
+    if diarization_backend is not None and diarization_executable is None:
+        raise AudioError("Diarization backend requires a native executable")
     executable, model_path, audio_path = map(Path, (executable, model_path, audio_path))
     if not all(p.is_file() for p in (executable, model_path, audio_path)):
         raise AudioError("Explicit existing executable, model, and audio file are required")
@@ -386,7 +389,7 @@ def transcribe_whisper_cpp(
             executable=diarization_executable,
             model_path=diarization_model,
             timeout_seconds=timeout_seconds,
-            backend=diarization_backend,
+            backend="auto" if diarization_backend is None else diarization_backend,
         )
     elif diarization_path is not None:
         payload = _read(diarization_path)
