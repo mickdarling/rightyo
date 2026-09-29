@@ -5,6 +5,8 @@ whisper.cpp v1.9.4 (927cfce34f31707e17f2bff35c349632fb9e2c3a),
 examples/cli/cli.cpp. RTTM was checked against Argmax OSS v1.1.0
 (1e2a163736dfa5a198e637ae44c114e1c6d5cc2d), SpeakerKit/RTTMLine.swift.
 This records the inspected schema, not the user's installed binary version.
+NeMo-Speech.cpp diarize flags/RTTM were checked against source revision
+0f706e43cf1fbc031bad1423e05460d3acaeaa1c, app/diarize.cpp.
 Whole-file output is an offline baseline, never evidence of causal latency.
 """
 
@@ -12,6 +14,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import subprocess
 import tempfile
@@ -276,6 +279,75 @@ def parse_whisper_cpp(document: dict[str, Any], *, session_id: str) -> list[dict
     )
 
 
+def _validate_timeout(timeout_seconds: float) -> None:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or not 0 < timeout_seconds <= 3600
+    ):
+        raise AudioError("Invalid timeout")
+
+
+def diarize_nemotron_cpp(
+    audio_path: str | Path,
+    *,
+    executable: str | Path,
+    model_path: str | Path,
+    timeout_seconds: float = 120,
+    backend: str = "auto",
+) -> list[dict[str, Any]]:
+    """Run supplied NeMo-Speech.cpp/local GGUF on one explicit audio file.
+
+    The explicit existing absolute model path prevents the inspected runtime's
+    automatic download path. The preset processes a supplied file using cached
+    streaming inference; this adapter does not expose a live audio session.
+    A private output directory and isolated environment keep ambient credentials,
+    proxies and NEMO_SPEECH configuration out of the native process. Vendor logs
+    are discarded and every exit removes the temporary speaker timeline.
+    """
+    _validate_timeout(timeout_seconds)
+    if not isinstance(backend, str) or backend not in {"auto", "cpu", "metal"}:
+        raise AudioError("Invalid diarization backend")
+    executable, model_path, audio_path = map(Path, (executable, model_path, audio_path))
+    if not all(p.is_file() for p in (executable, model_path, audio_path)):
+        raise AudioError("Explicit existing executable, model, and audio file are required")
+    with tempfile.TemporaryDirectory(prefix="rightyo-diarization-") as directory:
+        output = Path(directory) / "speakers.rttm"
+        try:
+            subprocess.run(
+                [
+                    str(executable.resolve()),
+                    "diarize",
+                    str(audio_path.resolve()),
+                    "--model",
+                    str(model_path.resolve()),
+                    "--backend",
+                    backend,
+                    "--preset",
+                    "v3-streaming",
+                    "--format",
+                    "rttm",
+                    "--recording-id",
+                    "rightyo-input",
+                    "--output",
+                    str(output),
+                ],
+                cwd=directory,
+                env={"PATH": os.defpath, "HOME": directory, "TMPDIR": directory},
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout_seconds,
+                check=True,
+            )
+        except subprocess.TimeoutExpired:
+            raise AudioError("Local diarizer timed out") from None
+        except (OSError, subprocess.CalledProcessError):
+            raise AudioError("Local diarizer failed") from None
+        return parse_rttm(_read(output), expected_file_id="rightyo-input")
+
+
 def transcribe_whisper_cpp(
     audio_path: str | Path,
     *,
@@ -284,6 +356,9 @@ def transcribe_whisper_cpp(
     session_id: str,
     timeout_seconds: float = 120,
     diarization_path: str | Path | None = None,
+    diarization_executable: str | Path | None = None,
+    diarization_model: str | Path | None = None,
+    diarization_backend: str = "auto",
 ) -> list[dict[str, Any]]:
     """Run an explicitly supplied existing CLI/model/file; never download.
 
@@ -292,20 +367,28 @@ def transcribe_whisper_cpp(
     share the audio timebase. RTTM recording ID must match the audio file stem.
     No vendor stdout/stderr or paths are copied into errors/public provenance.
     Temporary transcripts are in a private directory removed on every exit.
+    Alternatively, supply both a native diarization executable and local GGUF.
+    Each local process receives the configured timeout independently.
     """
     _id(session_id)
-    if (
-        isinstance(timeout_seconds, bool)
-        or not isinstance(timeout_seconds, (int, float))
-        or not math.isfinite(timeout_seconds)
-        or not 0 < timeout_seconds <= 3600
-    ):
-        raise AudioError("Invalid timeout")
+    _validate_timeout(timeout_seconds)
+    if (diarization_executable is None) != (diarization_model is None):
+        raise AudioError("Both native diarization executable and model are required")
+    if diarization_path is not None and diarization_executable is not None:
+        raise AudioError("Choose an imported timeline or native diarization")
     executable, model_path, audio_path = map(Path, (executable, model_path, audio_path))
     if not all(p.is_file() for p in (executable, model_path, audio_path)):
         raise AudioError("Explicit existing executable, model, and audio file are required")
     timeline = []
-    if diarization_path is not None:
+    if diarization_executable is not None:
+        timeline = diarize_nemotron_cpp(
+            audio_path,
+            executable=diarization_executable,
+            model_path=diarization_model,
+            timeout_seconds=timeout_seconds,
+            backend=diarization_backend,
+        )
+    elif diarization_path is not None:
         payload = _read(diarization_path)
         if Path(diarization_path).suffix.lower() == ".rttm":
             timeline = parse_rttm(payload, expected_file_id=audio_path.stem)
@@ -342,7 +425,7 @@ def transcribe_whisper_cpp(
         except (OSError, subprocess.CalledProcessError):
             raise AudioError("Local recognizer failed") from None
         turns = parse_whisper_cpp(_json(_read(output.with_suffix(".json"))), session_id=session_id)
-    if diarization_path is not None:
+    if diarization_path is not None or diarization_executable is not None:
         return join_transcript_timeline(
             turns,
             timeline,

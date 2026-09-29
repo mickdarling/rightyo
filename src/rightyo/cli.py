@@ -161,7 +161,15 @@ def main(argv: list[str] | None = None) -> int:
     local.add_argument("--whisper-executable", type=Path, required=True)
     local.add_argument("--model", type=Path, required=True)
     local.add_argument("--session-id", required=True)
-    local.add_argument("--diarization-input", type=Path)
+    diarization = local.add_mutually_exclusive_group()
+    diarization.add_argument("--diarization-input", type=Path)
+    diarization.add_argument(
+        "--diarization-executable", type=Path, help="existing local nemo-speech binary"
+    )
+    local.add_argument(
+        "--diarization-model", type=Path, help="existing local Nemotron 3 GGUF; no downloads"
+    )
+    local.add_argument("--diarization-backend", choices=("auto", "cpu", "metal"), default="auto")
     local.add_argument(
         "--output", type=Path, required=True, help="new private JSON file outside repo"
     )
@@ -190,6 +198,9 @@ def main(argv: list[str] | None = None) -> int:
                         model_path=args.model,
                         session_id=args.session_id,
                         diarization_path=args.diarization_input,
+                        diarization_executable=args.diarization_executable,
+                        diarization_model=args.diarization_model,
+                        diarization_backend=args.diarization_backend,
                         timeout_seconds=args.timeout,
                     )
                 )

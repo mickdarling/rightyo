@@ -1,20 +1,25 @@
 """Synthetic adapter tests; no real audio, models, or vendor runtime required."""
 
+import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from rightyo.audio import (
     AudioError,
+    diarize_nemotron_cpp,
     join_transcript_timeline,
     load_timeline,
     parse_rttm,
     parse_whisper_cpp,
     transcribe_whisper_cpp,
 )
+from rightyo.cli import main
 from rightyo.contracts import Turn
 
 
@@ -198,6 +203,51 @@ class WhisperAdapterTests(unittest.TestCase):
             self.invoke()
         process.assert_not_called()
 
+    def test_native_diarization_options_must_be_paired_and_exclusive(self):
+        for options in (
+            {"diarization_executable": self.executable},
+            {"diarization_model": self.model},
+            {
+                "diarization_executable": self.executable,
+                "diarization_model": self.model,
+                "diarization_path": self.root / "speakers.rttm",
+            },
+        ):
+            with (
+                self.subTest(options=options),
+                patch("rightyo.audio.subprocess.run") as process,
+                self.assertRaises(AudioError),
+            ):
+                self.invoke(**options)
+            process.assert_not_called()
+
+    def test_native_diarization_feeds_conservative_whisper_join(self):
+        calls = []
+
+        def vendor_process(argv, **kwargs):
+            calls.append(argv)
+            if "diarize" in argv:
+                output = Path(argv[argv.index("--output") + 1])
+                output.write_text(
+                    "SPEAKER rightyo-input 1 0.000 0.500 <NA> <NA> speaker_1 <NA> <NA>\n"
+                    "SPEAKER rightyo-input 1 0.500 0.500 <NA> <NA> speaker_2 <NA> <NA>"
+                )
+            else:
+                output = Path(argv[argv.index("--output-file") + 1]).with_suffix(".json")
+                output.write_text(json.dumps(self.vendor_json))
+
+        with patch("rightyo.audio.subprocess.run", side_effect=vendor_process):
+            result = self.invoke(
+                diarization_executable=self.executable,
+                diarization_model=self.model,
+                diarization_backend="cpu",
+            )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][calls[0].index("--backend") + 1], "cpu")
+        self.assertIsNone(result[0]["speaker_id"])
+        self.assertEqual(result[0]["speaker_provenance"], "diarization-timeline")
+        self.assertFalse(result[0]["overlap"])
+
     def test_other_session_timeline_never_starts_process(self):
         diarization = self.root / "speaker.json"
         diarization.write_text(
@@ -232,6 +282,180 @@ class WhisperAdapterTests(unittest.TestCase):
             self.assertRaises(AudioError),
         ):
             self.invoke()
+
+
+class NemotronAdapterTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.executable = self.root / "nemo-speech"
+        self.model = self.root / "local.gguf"
+        self.audio = self.root / "audio with spaces.wav"
+        for path in (self.executable, self.model, self.audio):
+            path.touch()
+
+    def invoke(self, **extra):
+        return diarize_nemotron_cpp(
+            self.audio, executable=self.executable, model_path=self.model, **extra
+        )
+
+    def test_explicit_argv_isolated_environment_and_private_cleanup(self):
+        outputs = []
+
+        def vendor_process(argv, **kwargs):
+            output = Path(argv[argv.index("--output") + 1])
+            outputs.append(output)
+            self.assertEqual(
+                argv,
+                [
+                    str(self.executable.resolve()),
+                    "diarize",
+                    str(self.audio.resolve()),
+                    "--model",
+                    str(self.model.resolve()),
+                    "--backend",
+                    "metal",
+                    "--preset",
+                    "v3-streaming",
+                    "--format",
+                    "rttm",
+                    "--recording-id",
+                    "rightyo-input",
+                    "--output",
+                    str(output),
+                ],
+            )
+            self.assertNotIn("shell", kwargs)
+            self.assertTrue(kwargs["check"])
+            self.assertEqual(kwargs["timeout"], 7)
+            for stream in ("stdin", "stdout", "stderr"):
+                self.assertEqual(kwargs[stream], subprocess.DEVNULL)
+            self.assertEqual(output.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(kwargs["cwd"], str(output.parent))
+            self.assertEqual(
+                kwargs["env"],
+                {"PATH": os.defpath, "HOME": str(output.parent), "TMPDIR": str(output.parent)},
+            )
+            output.write_text("SPEAKER rightyo-input 1 0.125 0.875 <NA> <NA> speaker_1 <NA> <NA>")
+
+        with (
+            patch.dict(os.environ, {"TYPESAFE_API_KEY": "invented-secret", "HTTPS_PROXY": "x"}),
+            patch("rightyo.audio.subprocess.run", side_effect=vendor_process),
+        ):
+            result = self.invoke(timeout_seconds=7, backend="metal")
+        self.assertEqual(result, [speaker(125, 1000, "speaker_1")])
+        self.assertFalse(outputs[0].parent.exists())
+
+    def test_invalid_timeout_backend_or_missing_local_model_never_starts_process(self):
+        options = [{"timeout_seconds": value} for value in (True, 0, -1, 3601, float("nan"))]
+        options.append({"backend": "private/path"})
+        for option in options:
+            with (
+                self.subTest(option=option),
+                patch("rightyo.audio.subprocess.run") as process,
+                self.assertRaises(AudioError),
+            ):
+                self.invoke(**option)
+            process.assert_not_called()
+        self.model.unlink()
+        with patch("rightyo.audio.subprocess.run") as process, self.assertRaises(AudioError):
+            self.invoke()
+        process.assert_not_called()
+
+    def test_process_failures_are_sanitized_and_remove_partial_output(self):
+        errors = (
+            (subprocess.TimeoutExpired(["private-path"], 1), "Local diarizer timed out"),
+            (
+                subprocess.CalledProcessError(2, ["private-path"], stderr="secret"),
+                "Local diarizer failed",
+            ),
+            (OSError("secret"), "Local diarizer failed"),
+        )
+        for error, message in errors:
+            outputs = []
+
+            def failed(argv, **kwargs):
+                output = Path(argv[argv.index("--output") + 1])
+                outputs.append(output)
+                output.write_text("partial private timeline")
+                raise error
+
+            with (
+                self.subTest(error=error),
+                patch("rightyo.audio.subprocess.run", side_effect=failed),
+                self.assertRaises(AudioError) as caught,
+            ):
+                self.invoke()
+            self.assertEqual(str(caught.exception), message)
+            self.assertIsNone(caught.exception.__cause__)
+            self.assertFalse(outputs[0].parent.exists())
+
+    def test_malformed_wrong_id_and_missing_rttm_fail_closed_with_cleanup(self):
+        for payload in (
+            None,
+            "private vendor text",
+            "SPEAKER other 1 0.000 1.000 <NA> <NA> speaker_1 <NA> <NA>",
+            "SPEAKER rightyo-input 1 0.000 nan <NA> <NA> speaker_1 <NA> <NA>",
+        ):
+            outputs = []
+
+            def malformed(argv, **kwargs):
+                output = Path(argv[argv.index("--output") + 1])
+                outputs.append(output)
+                if payload is not None:
+                    output.write_text(payload)
+
+            with (
+                self.subTest(payload=payload),
+                patch("rightyo.audio.subprocess.run", side_effect=malformed),
+                self.assertRaises(AudioError) as caught,
+            ):
+                self.invoke()
+            self.assertNotIn("private vendor text", str(caught.exception))
+            self.assertFalse(outputs[0].parent.exists())
+
+    def test_empty_successful_timeline_is_valid_silence(self):
+        def silent(argv, **kwargs):
+            Path(argv[argv.index("--output") + 1]).write_text("")
+
+        with patch("rightyo.audio.subprocess.run", side_effect=silent):
+            self.assertEqual(self.invoke(), [])
+
+    def test_audio_import_cli_forwards_explicit_native_options(self):
+        output = self.root / "private-turns.json"
+        turns = join([transcript()], [speaker()])
+        with (
+            patch("rightyo.audio.transcribe_whisper_cpp", return_value=turns) as importer,
+            redirect_stdout(io.StringIO()) as stdout,
+        ):
+            status = main(
+                [
+                    "audio-import",
+                    "--audio",
+                    str(self.audio),
+                    "--whisper-executable",
+                    str(self.executable),
+                    "--model",
+                    str(self.model),
+                    "--session-id",
+                    "test",
+                    "--output",
+                    str(output),
+                    "--diarization-executable",
+                    str(self.executable),
+                    "--diarization-model",
+                    str(self.model),
+                    "--diarization-backend",
+                    "metal",
+                ]
+            )
+        self.assertEqual(status, 0)
+        self.assertEqual(importer.call_args.kwargs["diarization_executable"], self.executable)
+        self.assertEqual(importer.call_args.kwargs["diarization_model"], self.model)
+        self.assertEqual(importer.call_args.kwargs["diarization_backend"], "metal")
+        self.assertEqual(json.loads(stdout.getvalue())["hosted_text_processing"], False)
+        self.assertNotIn("Synthetic speech", stdout.getvalue())
 
 
 if __name__ == "__main__":
