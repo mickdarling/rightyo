@@ -32,6 +32,11 @@ The hosted test below sends authored synthetic fixture text to TypeSafe. It uses
 `jev-1.13.0`, batches attention and recipient Choice questions, defaults to at most 20 calls
 with a 10-second timeout, and performs no automatic retries. It rejects redirects and
 environment proxies. A confidence threshold is an experiment setting, not measured accuracy.
+The full replay is validated against its call budget before hosted processing. A mid-run
+service failure still exits with a sanitized error and no decision output; earlier calls
+may already have sent text. Re-running can resend that context. Retaining explicit incomplete
+results is tracked in [#28](https://github.com/mickdarling/rightyo/issues/28), and a failed
+run must never count as a successful evaluation.
 
 ```sh
 rightyo evaluate --input examples/synthetic-turns.json --provider jev --allow-hosted
@@ -52,6 +57,8 @@ times. Put the generated transcript outside every public checkout.
 Imports deliberately reject empty-text or zero-duration segments instead of silently
 dropping or repairing transcript evidence. Exports use the evaluator's bounded input
 limits; larger recordings need explicit chunked sessions rather than an unbounded replay.
+The export guard rejects destinations beneath a `.git` marker, including a home directory
+managed as a Git checkout; choose a separate private destination in that case.
 
 ```sh
 rightyo audio-import --audio /private/conversation.wav \
