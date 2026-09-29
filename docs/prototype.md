@@ -60,8 +60,13 @@ The confidence slider is an experiment setting, not a calibrated accuracy guaran
 ## Context and stopping
 
 The local transcript retains five minutes by default, configurable from one to ten minutes,
-with a further 1,000-turn / 1 MiB cap. The whole turn overlapping the time boundary is retained
-and its overlap is reported. Ignore and uncertain decisions remain in local context: a later
+with retained text capped at 1,000 turns / 1 MiB. These retention caps evict older
+turns. Separately, each session permits at most 1,000 unique finalized turns in total,
+including turns already expired or evicted. Hash-only duplicate bookkeeping keeps this
+session bound; word-timed ASR fragments each count as a turn, so fragmented speech can
+reach it before the 15-minute session limit. Reaching 1,000 turns stops processing with
+an explicit message to start a new session, preserving valid history until expiry or Stop.
+The whole turn overlapping the time boundary is retained and its overlap is reported. Ignore and uncertain decisions remain in local context: a later
 request can refer to the preceding discussion. Copy context produces speaker-labelled text
 for manual use downstream, including unknown-speaker and overlap indications.
 
@@ -136,3 +141,28 @@ produced eleven groups (six speaker-known, five unknown), observed both A/B labe
 and made zero Jev calls. Stop returned idle with zero retained turns and zero pending
 decisions. No raw microphone text or recording was archived. This verifies the physical
 capture path, not word accuracy, diarization error rate or real-conversation quality.
+
+
+### VoiceBox replacement fixture
+
+The development lab now uses two existing VoiceBox profiles with its locally cached
+Qwen 1.7B engine for the replay button. The 22.962-second authored fixture uses the
+same words as the earlier fixture and alternates A/B/A, with short pauses between
+turns. Generated voice audio stays in the owner's private local cache; neither audio
+nor voice reference clips are distributed with this repository. VoiceBox generation
+is a fixture preparation step, separate from the runtime recognition pipeline.
+
+Causal controller replay completed in 1.496 seconds, producing eleven transcript groups,
+six speaker-known, with the known labels returning A/B/A and zero Jev calls. Comparing
+recognized words to the 62 authored words after lowercasing and removing punctuation
+produced four token edits, including a contraction. This is a small synthetic smoke
+check, not a held-out speech recognition benchmark or proof that synthesis preserved
+every word.
+
+The replacement was also played through the physical speakers and microphone for a
+30.64-second capture. The lab remained listening and produced four groups: two labelled
+Speaker A, one Speaker B and one unknown, with zero Jev calls. Stop returned idle with
+zero retained turns and pending decisions. Only capture counts were recorded; raw
+microphone text and audio were not archived. Room acoustics, endpointing and playback
+conditions make group counts unsuitable as a direct accuracy comparison with the
+previous fixture. Real conversations and overlap still need consented evaluation.

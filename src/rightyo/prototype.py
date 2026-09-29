@@ -20,7 +20,7 @@ from rightyo.capture import CaptureError, MacMicrophoneCapture
 from rightyo.contracts import ContractError, Turn
 from rightyo.credentials import CredentialError
 from rightyo.live_audio import LiveAudioError, LiveConfig, LiveProcessor
-from rightyo.memory import TranscriptMemory
+from rightyo.memory import MemorySessionLimitError, TranscriptMemory
 from rightyo.pipeline import ReplayRunner
 from rightyo.providers import JevProvider, MockProvider, ProviderError
 
@@ -294,12 +294,21 @@ class PrototypeController:
                         if generation == self._generation:
                             self._phase = "finishing" if self._pending else "complete"
                             self._completed_at = time.monotonic()
-        except (CaptureError, LiveAudioError, PrototypeError, ContractError, OSError, wave.Error):
+        except (
+            CaptureError,
+            LiveAudioError,
+            PrototypeError,
+            ContractError,
+            OSError,
+            wave.Error,
+        ) as error:
             with self._lock:
                 if generation == self._generation and not stop.is_set():
                     self._phase = "error"
                     self._error = (
-                        "Audio stopped. Check microphone permission and local model setup."
+                        "Session reached its 1,000-turn limit; start a new session."
+                        if isinstance(error, MemorySessionLimitError)
+                        else "Audio stopped. Check microphone permission and local model setup."
                     )
                     stop.set()
                     if self._decision_status != "off":

@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 from rightyo.contracts import Turn
 from rightyo.credentials import CredentialError
 from rightyo.live_audio import LiveAudioError
+from rightyo.memory import MemorySessionLimitError
 from rightyo.prototype import (
     PrototypeConfig,
     PrototypeController,
@@ -234,7 +235,7 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn("synthetic-private-provider-detail", json.dumps(snapshot))
 
     def test_audio_failure_preserves_valid_history_cancels_queue_and_ages(self):
-        for failure in (LiveAudioError, RuntimeError):
+        for failure in (LiveAudioError, RuntimeError, MemorySessionLimitError):
             with self.subTest(failure=failure):
                 provider = FakeHosted()
                 provider.release.clear()
@@ -267,6 +268,11 @@ class ControllerTests(unittest.TestCase):
                 self.assertTrue(old_work.empty())
                 self.assertEqual(snapshot["decisions"], {})
                 self.assertNotIn("synthetic-private-audio-detail", snapshot["error"])
+                if failure is MemorySessionLimitError:
+                    self.assertEqual(
+                        snapshot["error"],
+                        "Session reached its 1,000-turn limit; start a new session.",
+                    )
                 provider.release.set()
                 await_condition(lambda: old_work.unfinished_tasks == 0)
                 self.assertEqual(provider.requests, 1)

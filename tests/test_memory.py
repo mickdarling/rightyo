@@ -6,7 +6,7 @@ from dataclasses import replace
 from unittest.mock import MagicMock
 
 from rightyo.contracts import ContractError, Turn
-from rightyo.memory import TranscriptMemory
+from rightyo.memory import MemorySessionLimitError, TranscriptMemory
 from rightyo.pipeline import ReplayRunner
 from rightyo.providers import MockProvider, ProviderError
 
@@ -87,6 +87,22 @@ class TranscriptMemoryTests(unittest.TestCase):
         memory.clear()
         memory.append(turn(session_id="other"))
         self.assertEqual(memory.snapshot(10000)["retention"]["expired_turns"], 0)
+
+    def test_total_unique_turn_limit_survives_retention_expiry_until_clear(self):
+        memory = TranscriptMemory(max_turns=1)
+        for index in range(1000):
+            memory.append(turn(index, start_ms=index, end_ms=index + 1))
+        memory.expire(1000000)
+        memory.append(turn(999, start_ms=999, end_ms=1000))
+        snapshot = memory.snapshot(1000000)
+        self.assertEqual(snapshot["turns"], [])
+        self.assertEqual(snapshot["retention"]["session_turn_count"], 1000)
+        with self.assertRaises(MemorySessionLimitError):
+            memory.append(turn(1000, start_ms=1000000, end_ms=1000001))
+        self.assertEqual(memory.snapshot(1000001)["retention"]["session_turn_count"], 1000)
+        memory.clear()
+        memory.append(turn(session_id="new-session"))
+        self.assertEqual(memory.snapshot(10000)["retention"]["session_turn_count"], 1)
 
     def test_memory_budget_validation(self):
         for changes in (

@@ -21,6 +21,10 @@ def _locked(method):
     return guarded
 
 
+class MemorySessionLimitError(ContractError):
+    """Unique-turn bookkeeping reached the explicit per-session bound."""
+
+
 class TranscriptMemory:
     """Retain complete final turns by end time, with explicit boundary coverage.
 
@@ -84,7 +88,9 @@ class TranscriptMemory:
                 raise ContractError("final transcript memory turn cannot be revised")
             return
         if len(self._seen) >= 1000:
-            raise ContractError("memory session budget exhausted; explicitly start a new session")
+            raise MemorySessionLimitError(
+                "Session reached its 1,000-turn limit; start a new session."
+            )
         if turn.end_ms < self._last_end_ms:
             raise ContractError("memory final turns must arrive in timestamp order")
         self._seen[key] = digest
@@ -119,6 +125,7 @@ class TranscriptMemory:
                 "retention_ms": self.retention_ms,
                 "max_turns": self.max_turns,
                 "max_session_turns": 1000,
+                "session_turn_count": len(self._seen),
                 "max_bytes": self.max_bytes,
                 "now_ms": self._now_ms,
                 "cutoff_ms": cutoff,
