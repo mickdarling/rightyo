@@ -96,6 +96,7 @@ class TraceabilityTests(unittest.TestCase):
     def test_refs_and_own_urls(self):
         self.assertEqual(self.refs("Refs #15\nCloses #14"), [14, 15])
         self.assertEqual(self.refs("Refs https://github.com/mickdarling/rightyo/issues/15"), [15])
+        self.assertEqual(self.refs("Refs other/repo#15, #14"), [14])
 
     def test_template_foreign_reference_and_examples_do_not_pass(self):
         for body in (
@@ -104,6 +105,8 @@ class TraceabilityTests(unittest.TestCase):
             "Refs https://github.com/mickdarling/rightyo/issues/0",
             "Refs https://github.com/mickdarling/rightyo/issues/01",
             "Refs https://github.com/other/repo/issues/15",
+            "Refs other/repo#15",
+            "Refs other-repo#15",
             "<!-- Refs #15 -->",
             "```text\nRefs #15\n```",
             "This example says Refs #15",

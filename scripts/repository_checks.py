@@ -192,7 +192,7 @@ def issue_references(event, repository):
     pr = event.get("pull_request", {})
     body = without_code(pr.get("body") or "")
     own_url = rf"https://github\.com/{re.escape(repository)}/issues/([1-9]\d*)"
-    issue_pattern = re.compile(rf"(?:#([1-9]\d*)\b|{own_url}\b)")
+    issue_pattern = re.compile(rf"(?:(?<![\w/.-])#([1-9]\d*)\b|{own_url}\b)")
     numbers = set()
     for line in body.splitlines():
         if re.match(r"(?i)^\s*(?:refs?|fix(?:es)?|close[sd]?|resolve[sd]?)\s+", line):
