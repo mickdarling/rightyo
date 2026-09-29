@@ -261,6 +261,7 @@ class ControllerTests(unittest.TestCase):
                 await_condition(lambda: self.controller.snapshot()["phase"] == "error")
                 old_work = self.controller._decision_queue
                 snapshot = self.controller.snapshot()
+                self.assertEqual(snapshot["decision_status"], "unavailable")
                 self.assertEqual(len(snapshot["turns"]), 2)
                 self.assertEqual(snapshot["turns"][-1]["speaker_id"], "Speaker B")
                 self.assertTrue(old_work.empty())
@@ -424,6 +425,7 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(snapshot["error"])
         self.assertEqual(snapshot["decision_status"], "unavailable")
         self.assertEqual(snapshot["turns"][-1]["utterance_id"], "synthetic-40")
+        self.assertEqual(snapshot["jev_requests"], 1)
         self.assertLessEqual(snapshot["pending_decisions"], 1)
         self.assertTrue(self.controller._decision_queue.empty())
         self.assertFalse(self.controller._stop.is_set())
@@ -443,6 +445,7 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(self.controller._decision_queue.empty())
         self.assertEqual(provider.requests, 1)
         self.assertEqual(continued["decisions"], {})
+        self.assertEqual(continued["jev_requests"], 1)
         self.controller.stop()
         self.assertEqual(self.controller.snapshot()["turns"], [])
 

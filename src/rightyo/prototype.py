@@ -302,6 +302,8 @@ class PrototypeController:
                         "Audio stopped. Check microphone permission and local model setup."
                     )
                     stop.set()
+                    if self._decision_status != "off":
+                        self._decision_status = "unavailable"
                     self._completed_at = time.monotonic()
                     self._discard_pending()
                     if self._runner is not None:
@@ -312,6 +314,8 @@ class PrototypeController:
                     self._phase = "error"
                     self._error = "Audio processing failed; the session is incomplete."
                     stop.set()
+                    if self._decision_status != "off":
+                        self._decision_status = "unavailable"
                     self._completed_at = time.monotonic()
                     self._discard_pending()
                     if self._runner is not None:
@@ -434,6 +438,7 @@ class PrototypeController:
             if self._runner is not None:
                 self._runner.expire(now)
                 self._prune_pending()
+                self._requests = getattr(self._runner.provider, "requests", 0)
             snapshot = self._memory.snapshot(now)
             retained = {t["utterance_id"] for t in snapshot["turns"]}
             self._decisions = {k: v for k, v in self._decisions.items() if k in retained}
