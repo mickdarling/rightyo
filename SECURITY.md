@@ -1,6 +1,6 @@
 # Privacy and security
 
-No capture service or model runtime is shipped in this bootstrap. Future continuous observation must be explicitly enabled, visibly indicated, immediately stoppable, and memory bounded.
+No capture service is shipped. The MVP invokes explicitly supplied local model runtimes on supplied files and offers opt-in hosted transcript decisions. Future continuous observation must be explicitly enabled, visibly indicated, immediately stoppable, and memory bounded.
 
 Default: no recording, no private transcript logging, no external inference requests. Dataset collection requires consent and a retention/deletion policy. Store sensitive evaluation material outside the checkout; ignore rules are defense in depth, not a substitute for inspection before commit.
 

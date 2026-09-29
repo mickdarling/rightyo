@@ -65,7 +65,9 @@ also supported by `timeline-import`; see the authored example
 stable within the session. Gaps, speaker changes within an ASR segment and overlaps retain
 unknown attribution; turn boundaries never fabricate speaker identities.
 
-The RTTM import is a provider boundary, not an installed or validated diarization model.
+The repository does not bundle a diarization model. A local SpeakerKit test on generated
+two-voice speech is recorded in [the smoke record](mvp-smoke.md); it revealed gaps in ASR
+segment alignment, tracked in [#27](https://github.com/mickdarling/rightyo/issues/27).
 Compare real local diarization with plain ASR and an explicitly labeled oracle-speaker
 baseline under [#24](https://github.com/mickdarling/rightyo/issues/24) and
 [#25](https://github.com/mickdarling/rightyo/issues/25). ASR error, speaker confusion and

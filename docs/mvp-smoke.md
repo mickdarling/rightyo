@@ -38,5 +38,33 @@ compiled locally with Apple Silicon CPU/Accelerate/Metal support. Model: `base.e
 The model and local provenance manifest are outside Git. Runtime and model retain their
 upstream MIT notices. Acquisition is separate from ASR runtime validation.
 
+## Real local ASR and diarization on generated speech
+
+The Mac test used authored text rendered by built-in macOS voices, with all WAV/RTTM/turn
+files outside Git. A 4.606-second single-voice clip passed Whisper import in 0.366 seconds.
+It produced one finalized transcript turn with unknown speaker attribution.
+
+Argmax OSS v1.1.0, commit `1e2a163736dfa5a198e637ae44c114e1c6d5cc2d`, was built
+with Swift 6.2 using Swift 5 language compatibility. Strict Swift 6 compilation failed in
+an unrelated upstream TTS Sendable boundary; the compatibility build used unmodified sources.
+SpeakerKit assets were pinned to `argmaxinc/speakerkit-coreml` revision
+`556fc52a13327837688f02289457cded017802e9`: 24 files, 11,243,910 bytes, LFS SHA-256
+and small-file Git blob hashes checked, attribution manifest outside Git. The model assets
+retain their upstream CC-BY-4.0 terms; they are not redistributed in this repository.
+
+On a 23.697-second Samantha/Daniel/Samantha clip, the actual diarizer automatically found
+two speakers and produced nine RTTM spans with stable A/B/A ordering. Warmed whole-file
+diarization took 0.305 seconds. Whisper plus the RTTM importer took 0.622 seconds and
+produced seven turns. Only one retained a speaker label; six were unknown because full
+ASR-segment coverage crossed pauses or diarizer boundaries. This reveals the need for
+word/turn alignment rather than relaxing uncertainty silently.
+The follow-up is [#27](https://github.com/mickdarling/rightyo/issues/27).
+
+The imported seven turns then made seven Jev calls: 1887.756 milliseconds total, individual
+calls 176.696–343.286 milliseconds. At the unchanged 0.7 threshold two attended and five
+abstained. This exercises local audio → real diarization timeline → transcript → hosted
+decision plumbing. It is not a held-out accuracy, live latency, energy or causal streaming
+benchmark. All model/file processing was offline; no captured conversation was used.
+
 See [the MVP guide](mvp.md), [evaluation](evaluation.md), and
 [#25](https://github.com/mickdarling/rightyo/issues/25) for the comparison work remaining.
