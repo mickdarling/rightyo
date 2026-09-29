@@ -296,6 +296,22 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             save_turns(FIXTURE.parent / "never-write-private.json", [turn()])
 
+    def test_exports_reject_other_checkout_and_worktree_when_installed(self):
+        for is_worktree in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                marker = root / ".git"
+                if is_worktree:
+                    marker.write_text("gitdir: /external/worktrees/example\n")
+                else:
+                    marker.mkdir()
+                output = root / "nested" / "private.json"
+                output.parent.mkdir()
+                with patch("rightyo.cli.__file__", "/venv/lib/site-packages/rightyo/cli.py"):
+                    with self.assertRaises(ContractError):
+                        save_turns(output, [turn()])
+                self.assertFalse(output.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

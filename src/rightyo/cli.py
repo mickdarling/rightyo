@@ -47,9 +47,8 @@ def load_turns(path: Path) -> list[Turn]:
 
 def save_turns(path: Path, turns: list[Turn]) -> None:
     # Private transcript exports must stay outside the development checkout.
-    repository = Path(__file__).resolve().parents[2]
     resolved = path.resolve()
-    if (repository / ".git").exists() and resolved.is_relative_to(repository):
+    if any((parent / ".git").exists() for parent in resolved.parents):
         raise ContractError("transcript exports must be stored outside the repository")
     payload = (
         json.dumps(
