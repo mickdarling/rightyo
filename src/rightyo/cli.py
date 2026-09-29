@@ -46,6 +46,8 @@ def load_turns(path: Path) -> list[Turn]:
 
 
 def save_turns(path: Path, turns: list[Turn]) -> None:
+    if not 1 <= len(turns) <= MAX_INPUT_TURNS:
+        raise ContractError("output requires between 1 and 1000 turns")
     # Private transcript exports must stay outside the development checkout.
     resolved = path.resolve()
     if any((parent / ".git").exists() for parent in resolved.parents):
@@ -59,6 +61,8 @@ def save_turns(path: Path, turns: list[Turn]) -> None:
         )
         + "\n"
     )
+    if len(payload.encode("utf-8")) > MAX_INPUT_BYTES:
+        raise ContractError("output file exceeds replay input size limit")
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -69,6 +73,14 @@ def save_turns(path: Path, turns: list[Turn]) -> None:
 
 def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     turns = load_turns(args.input)
+    # Validate the entire session before sending any of it to a hosted provider.
+    # Count committed turns rather than raw revisions/partials/duplicates.
+    preflight = ReplayRunner(
+        MockProvider(), no_speakers=args.no_speakers, playback_active=args.playback
+    )
+    required_requests = sum(preflight.process(turn) is not None for turn in turns)
+    if args.provider == "jev" and required_requests > args.max_requests:
+        raise ProviderError("session exceeds Jev request budget; no requests were sent")
     provider = (
         MockProvider()
         if args.provider == "mock"

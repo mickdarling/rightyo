@@ -19,6 +19,7 @@ from rightyo.providers import (
     JevProvider,
     MockProvider,
     ProviderError,
+    bounded_request,
     build_request,
     parse_response,
 )
@@ -162,6 +163,45 @@ class JevTests(unittest.TestCase):
         self.assertTrue(all(q["type"] == "choice" for q in self.request["questions"].values()))
         self.assertEqual(parse_response(response(self.request), self.request, 0.7).label, "attend")
 
+    def test_multilingual_context_prunes_oldest_without_phantom_recipient_or_current_loss(self):
+        old = {**self.state["current_turn"], "speaker_id": "Speaker C", "text": "😀" * 4000}
+        recent = {**self.state["current_turn"], "speaker_id": "Speaker B", "text": "😀" * 4000}
+        current = {**self.state["current_turn"], "text": "😀" * 1000}
+        state = {
+            **self.state,
+            "past_turns": [old, recent],
+            "current_turn": current,
+            "known_participants": ["Speaker A", "Speaker B", "Speaker C"],
+        }
+        request, payload = bounded_request(state)
+        self.assertLessEqual(len(payload), 32768)
+        self.assertEqual(request["state"]["past_turns"], [recent])
+        self.assertEqual(request["state"]["current_turn"], current)
+        self.assertEqual(request["state"]["known_participants"], ["Speaker A", "Speaker B"])
+        criteria = request["questions"]["recipient"]["criteria"]
+        self.assertNotIn("Speaker C", json.dumps(criteria))
+        result = parse_response(
+            response(request, label="ignore", recipient="speaker_1"), request, 0.7
+        )
+        self.assertEqual(result.recipient_speaker_id, "Speaker B")
+        self.assertEqual(state["past_turns"], [old, recent])
+
+    def test_unshrinkable_current_context_fails_before_credential_or_network(self):
+        state = {
+            **self.state,
+            # An oversized direct provider caller must still fail safely even
+            # if it bypasses the normal Turn character limit.
+            "current_turn": {**self.state["current_turn"], "text": "\x00" * 6000},
+            "expected_reply": "\x00" * 1000,
+        }
+        provider = JevProvider(allow_hosted=True)
+        provider._opener = MagicMock()
+        with patch("rightyo.credentials.load_jev_api_key") as key:
+            with self.assertRaisesRegex(ProviderError, "payload budget"):
+                provider.decide(state)
+            key.assert_not_called()
+            provider._opener.open.assert_not_called()
+
     def test_unknown_low_confidence_or_conflicting_recipient_abstains(self):
         for recipient in ("other_human", "unknown"):
             parsed = parse_response(response(self.request, recipient=recipient), self.request, 0.7)
@@ -249,6 +289,71 @@ class JevTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_hosted_preflight_budget_overflow_and_late_revision_error_have_no_side_effects(self):
+        ordered = [
+            turn(utterance_id=f"turn-{i}", start_ms=i * 1000, end_ms=(i + 1) * 1000)
+            for i in range(21)
+        ]
+        invalid = [*ordered[:20], replace(ordered[0], revision=1, text="conflicting content")]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.json"
+            for turns in (ordered, invalid):
+                save_turns(path, turns)
+                with (
+                    contextlib.redirect_stderr(io.StringIO()),
+                    patch("rightyo.cli.JevProvider") as provider,
+                    patch("rightyo.credentials.load_jev_api_key") as key,
+                ):
+                    code = main(
+                        [
+                            "evaluate",
+                            "--input",
+                            str(path),
+                            "--provider",
+                            "jev",
+                            "--allow-hosted",
+                            "--max-requests",
+                            "20",
+                        ]
+                    )
+                    self.assertEqual(code, 2)
+                    provider.assert_not_called()
+                    key.assert_not_called()
+                path.unlink()
+
+    def test_preflight_counts_committed_turns_instead_of_partial_or_duplicate_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.json"
+            final = turn(revision=2)
+            save_turns(path, [turn(finalized=False), final, final])
+            actual = MagicMock(wraps=MockProvider())
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                patch("rightyo.cli.JevProvider", return_value=actual),
+            ):
+                code = main(
+                    [
+                        "evaluate",
+                        "--input",
+                        str(path),
+                        "--provider",
+                        "jev",
+                        "--allow-hosted",
+                        "--max-requests",
+                        "1",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertEqual(actual.decide.call_count, 1)
+
+    def test_oversized_exports_are_rejected_before_file_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.json"
+            for turns in ([turn()] * 1001, [turn(text="😀" * 4000)] * 100):
+                with self.assertRaises(ContractError):
+                    save_turns(path, turns)
+                self.assertFalse(path.exists())
+
     def test_fixture_smoke_output_omits_text_and_source_ids_by_default(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):

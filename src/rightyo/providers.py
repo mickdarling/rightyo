@@ -81,6 +81,32 @@ def build_request(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def bounded_request(state: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
+    """Drop oldest past turns until the encoded request fits, retaining current speech.
+
+    Character budgets alone cannot bound UTF-8 or JSON escaping. Rebuild the
+    anonymous participant list after pruning so recipient options match the
+    evidence that remains. The supplied state is never mutated.
+    """
+    bounded = dict(state)
+    bounded["past_turns"] = list(state["past_turns"])
+    while True:
+        bounded["known_participants"] = sorted(
+            {
+                turn["speaker_id"]
+                for turn in [*bounded["past_turns"], bounded["current_turn"]]
+                if turn["speaker_id"] is not None
+            }
+        )
+        body = build_request(bounded)
+        payload = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        if len(payload) <= MAX_REQUEST_BYTES:
+            return body, payload
+        if not bounded["past_turns"]:
+            raise ProviderError("Jev current turn/context exceeds payload budget")
+        bounded["past_turns"] = bounded["past_turns"][1:]
+
+
 def _choice(raw: Any, options: set[str]) -> tuple[str, float, dict[str, float]]:
     if not isinstance(raw, dict) or raw.get("type") != "choice":
         raise ContractError("invalid Jev Choice answer")
@@ -164,10 +190,7 @@ class JevProvider:
     def decide(self, state: dict[str, Any]) -> ProviderDecision:
         if self.requests >= self.max_requests:
             raise ProviderError("Jev request budget exhausted")
-        request_body = build_request(state)
-        payload = json.dumps(request_body, ensure_ascii=False, allow_nan=False).encode("utf-8")
-        if len(payload) > MAX_REQUEST_BYTES:
-            raise ProviderError("Jev request exceeds payload budget")
+        request_body, payload = bounded_request(state)
         # Load only at the point of use; never log/serialize the key or a Request object.
         from rightyo.credentials import load_jev_api_key
 
