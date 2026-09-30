@@ -113,6 +113,12 @@ class ReviewInvalidationTests(unittest.TestCase):
         self.execute(payload)
         self.assertEqual(len(self.requests), 1)
 
+    def test_nullable_top_level_workflow_uses_valid_run_path(self):
+        payload = notification()
+        payload["workflow"] = None
+        self.execute(payload)
+        self.assertEqual(len(self.requests), 1)
+
     def test_invalid_route_or_revision_never_publishes(self):
         for field, value in (
             ("repository", {"full_name": "outsider/repo"}),

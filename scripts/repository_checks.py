@@ -234,7 +234,7 @@ payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
 run = payload["workflow_run"]
 if run.get("name") != "Native review activity relay":
     raise SystemExit(0)
-paths = [value for value in (run.get("path"), payload.get("workflow", {}).get("path"))
+paths = [value for value in (run.get("path"), (payload.get("workflow") or {}).get("path"))
          if value is not None]
 if (run.get("repository", {}).get("full_name") != repository
         or not paths or any(path != ".github/workflows/review-activity.yml" for path in paths)
