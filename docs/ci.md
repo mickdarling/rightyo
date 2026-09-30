@@ -226,10 +226,20 @@ activity before rollout; unknown or ambiguous source metadata fails instead of g
 Before any fallible callback routing or checkout, a trusted inline bootstrap validates the
 review-relay webhook's repository/name/path/event and full GitHub-owned revision hints, then
 publishes required gate pending. It has only PR-read/status-write permission and cannot approve.
-The resolver depends on successful bootstrap invalidation, so source-run API failure or
-resolver timeout cannot leave a previous green status after new review activity. Hint data
-provides denial authority only; later routing, exact-head provenance and native positive
-proof still require authoritative API validation. The documented webhook schema and live
+For an empty embedded PR list, the source SHA can be a merge ref whose pending status does
+not protect the actual PR head. Before checkout, bootstrap reads one commit-association page;
+if that is empty, it reads one open-PR inventory page and matches the exact full source head
+or merge SHA. A unique same-repository open candidate is refetched, and its authoritative
+current head receives pending too, even if the earlier hint write failed. This empty-list
+path takes at most five network attempts, each with the five-second socket timeout.
+Full 100-item pages, ambiguous/missing matches, obsolete merge refs absent from current
+inventory and API failures block routing. When no authoritative head can be discovered,
+only known hints can be denied; an exact-revision manual recheck is needed. This head-discovery
+availability boundary remains #18. Once the actual head has been denied, subsequent source
+routing or checkout failure cannot leave its previous green status. Approval routing remains
+more restrictive and requires a unique exact-head association; denial discovery grants no
+approval. Hint data provides denial authority only; later routing, exact-head provenance and
+native positive proof still require authoritative API validation. The documented webhook schema and live
 relay run metadata establish these fields; actual default-branch callback execution remains
 a rollout verification. Status-API unavailability remains the #18 service/atomicity limit.
 The same no-checkout bootstrap recognizes first-line review commands from comment creation,

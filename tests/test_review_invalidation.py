@@ -113,6 +113,122 @@ class ReviewInvalidationTests(unittest.TestCase):
             all(json.loads(request.data)["state"] == "pending" for request in self.requests)
         )
 
+    def empty_relay(self):
+        payload = notification()
+        payload["workflow_run"]["head_sha"] = OTHER
+        payload["workflow_run"]["pull_requests"] = []
+        return payload
+
+    def association(self, *, head=HEAD, number=44, merge=OTHER):
+        return {
+            "number": number,
+            "state": "open",
+            "head": {"sha": head},
+            "base": {"repo": {"full_name": REPOSITORY}},
+            "merge_commit_sha": merge,
+        }
+
+    def empty_read(self, request):
+        if "/commits/" in request.full_url:
+            return []  # Actual GitHub merge-ref commits have no PR associations.
+        if "state=open" in request.full_url:
+            return [self.association()]
+        return self.association()
+
+    def test_empty_merge_association_denies_actual_head_before_resolver_failure(self):
+        payload = self.empty_relay()
+        self.execute(payload, read=self.empty_read)
+        self.assertEqual(
+            [
+                (request.get_method(), request.full_url.rsplit("/", 1)[1])
+                for request in self.requests
+            ],
+            [
+                ("POST", OTHER),
+                ("GET", "pulls?per_page=100&page=1"),
+                ("GET", "pulls?state=open&per_page=100&page=1"),
+                ("GET", "44"),
+                ("POST", HEAD),
+            ],
+        )
+        with patch(
+            "scripts.subscription_review.api", side_effect=GateError("checkout/API failure")
+        ):
+            with self.assertRaises(GateError):
+                event_pr("workflow_run", payload)
+        writes = [request for request in self.requests if request.get_method() == "POST"]
+        self.assertEqual([json.loads(request.data)["state"] for request in writes], ["pending"] * 2)
+
+    def test_empty_commit_association_uses_authoritative_current_head(self):
+        def read(request):
+            if "/commits/" in request.full_url:
+                return [self.association(head=OTHER)]
+            return self.association()
+
+        self.execute(self.empty_relay(), read=read)
+        self.assertEqual(self.requests[-1].full_url.rsplit("/", 1)[1], HEAD)
+        self.assertEqual(len(self.requests), 4)
+
+    def test_failed_source_hint_write_still_denies_discovered_current_head(self):
+        with self.assertRaisesRegex(SystemExit, "capture failed"):
+            self.execute(
+                self.empty_relay(),
+                read=self.empty_read,
+                failure=lambda request: request.get_method() == "POST"
+                and request.full_url.endswith(OTHER),
+            )
+        self.assertEqual(self.requests[-1].full_url.rsplit("/", 1)[1], HEAD)
+        self.assertEqual(json.loads(self.requests[-1].data)["state"], "pending")
+
+    def test_missing_ambiguous_overflow_and_nonmatching_inventory_fail_after_hint_denial(self):
+        for inventory in (
+            [],
+            [self.association(), self.association(number=45)],
+            [self.association(merge="c" * 40, head="c" * 40)],
+            [self.association()] * 100,
+        ):
+
+            def read(request):
+                return [] if "/commits/" in request.full_url else inventory
+
+            with (
+                self.subTest(inventory=inventory),
+                self.assertRaisesRegex(SystemExit, "capture failed"),
+            ):
+                self.execute(self.empty_relay(), read=read)
+            self.assertEqual(json.loads(self.requests[0].data)["state"], "pending")
+            self.assertEqual(sum(request.get_method() == "POST" for request in self.requests), 1)
+
+    def test_empty_association_lookup_failure_preserves_hint_denial(self):
+        with self.assertRaisesRegex(SystemExit, "capture failed"):
+            self.execute(
+                self.empty_relay(),
+                read=self.empty_read,
+                failure=lambda request: request.get_method() == "GET",
+            )
+        self.assertEqual(json.loads(self.requests[0].data)["state"], "pending")
+        self.assertEqual(len(self.requests), 2)
+
+    def test_discovered_current_pr_must_match_repository_number_and_full_revision(self):
+        for changes in (
+            {"number": 45},
+            {"state": "closed"},
+            {"head": {"sha": "a" * 7}},
+            {"base": {"repo": {"full_name": "other/repo"}}},
+        ):
+
+            def read(request):
+                if "state=open" in request.full_url or "/commits/" in request.full_url:
+                    return self.empty_read(request)
+                return {**self.association(), **changes}
+
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(SystemExit, "capture failed"),
+            ):
+                self.execute(self.empty_relay(), read=read)
+            self.assertEqual(sum(request.get_method() == "POST" for request in self.requests), 1)
+
     def test_top_level_workflow_path_can_supply_missing_run_path(self):
         payload = notification()
         del payload["workflow_run"]["path"]

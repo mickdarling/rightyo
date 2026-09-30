@@ -394,6 +394,47 @@ try:
                 pending(head, "Native review activity; awaiting source resolution")
             except Exception:
                 failed = True
+        if not prs:
+            # A review relay may report a merge SHA with no embedded PRs.
+            # Discover denial targets before checkout; this never grants approval.
+            revision = run["head_sha"]
+            associated = api(f"/commits/{revision}/pulls?per_page=100&page=1")
+            if not isinstance(associated, list) or len(associated) >= 100:
+                raise RuntimeError("Review invalidation associations exceed bound")
+            inventory = not associated
+            if inventory:
+                associated = api("/pulls?state=open&per_page=100&page=1")
+                if not isinstance(associated, list) or len(associated) >= 100:
+                    raise RuntimeError("Review invalidation PR inventory exceeds bound")
+            candidates = set()
+            for candidate in associated:
+                if not isinstance(candidate, dict):
+                    raise RuntimeError("Review invalidation PR metadata is invalid")
+                if (candidate.get("state") != "open"
+                        or candidate.get("base", {}).get("repo", {}).get("full_name")
+                        != repository):
+                    continue
+                if inventory and revision not in {
+                        candidate.get("merge_commit_sha"), candidate.get("head", {}).get("sha")}:
+                    continue
+                number = candidate.get("number")
+                if type(number) is not int or number < 1:
+                    raise RuntimeError("Review invalidation PR identity is invalid")
+                candidates.add(number)
+            if len(candidates) != 1:
+                raise RuntimeError("Review invalidation PR association is not unique")
+            number = candidates.pop()
+            current_pr = api(f"/pulls/{number}")
+            current_head = current_pr.get("head", {}).get("sha")
+            if (current_pr.get("number") != number or current_pr.get("state") != "open"
+                    or current_pr.get("base", {}).get("repo", {}).get("full_name") != repository
+                    or not isinstance(current_head, str)
+                    or not re.fullmatch(r"[0-9a-f]{40}", current_head)):
+                raise RuntimeError("Review invalidation current PR revision is invalid")
+            try:
+                pending(current_head, "Native review activity; authoritative PR head invalidated")
+            except Exception:
+                failed = True
         if failed:
             raise RuntimeError("Review invalidation pending publication failed")
 except Exception:
