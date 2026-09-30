@@ -322,14 +322,23 @@ def materialize(directory, expected):
     return data
 
 
-def sandbox_check(directory, expected):
-    materialize(directory, expected)
+def configure_linux_sandbox():
     # Match the official Action's GitHub-hosted Ubuntu setup before credentials exist.
     for setting in (
         "kernel.unprivileged_userns_clone",
         "kernel.apparmor_restrict_unprivileged_userns",
     ):
         value = "1" if setting.endswith("userns_clone") else "0"
+        query = subprocess.run(
+            ["sysctl", "-n", setting],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+        # Upstream kernels need not expose Ubuntu's optional namespace sysctls.
+        # The actual sandbox control and denial probes below still must pass.
+        if query.returncode != 0 or query.stdout.strip() == value.encode():
+            continue
         try:
             subprocess.run(
                 ["sudo", "sysctl", "-w", setting + "=" + value],
@@ -340,10 +349,29 @@ def sandbox_check(directory, expected):
             )
         except subprocess.SubprocessError:
             raise ReviewError("Codex preflight kernel setup failed: " + setting) from None
+
+
+def sandbox_check(directory, expected):
+    materialize(directory, expected)
+    configure_linux_sandbox()
     canary = Path("/tmp/rightyo-review-denied-canary")
     canary.write_text("invented-secret-canary")
     env = dict(os.environ, CODEX_HOME="/tmp/rightyo-codex-home")
-    executable = ROOT / ".github/reviews/node_modules/.bin/codex"
+    # Linux bwrap re-executes Codex inside the denied-filesystem profile. Place
+    # only the locked official binary in the existing minimal system read root,
+    # matching the Action's global CLI installation without exposing checkout.
+    native = ROOT / (
+        ".github/reviews/node_modules/@openai/codex-linux-x64/"
+        "vendor/x86_64-unknown-linux-musl/codex/codex"
+    )
+    executable = Path("/usr/local/bin/rightyo-codex-preflight")
+    subprocess.run(
+        ["sudo", "install", "-m", "755", str(native), str(executable)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=15,
+    )
     prefix = [
         str(executable),
         "sandbox",

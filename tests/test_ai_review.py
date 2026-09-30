@@ -41,6 +41,44 @@ JOBS = {job: {"result": "success"} for job in ("prepare", "codex", "claude")}
 
 
 class ReviewValidationTests(unittest.TestCase):
+    def test_linux_missing_or_correct_optional_sysctls_need_no_write(self):
+        for result in (
+            review.subprocess.CompletedProcess([], 1, b""),
+            None,
+        ):
+            with self.subTest(missing=result is not None):
+                results = (
+                    [result, result]
+                    if result
+                    else [
+                        review.subprocess.CompletedProcess([], 0, b"1\n"),
+                        review.subprocess.CompletedProcess([], 0, b"0\n"),
+                    ]
+                )
+                with patch.object(review.subprocess, "run", side_effect=results) as run:
+                    review.configure_linux_sandbox()
+                    self.assertEqual(run.call_count, 2)
+                    self.assertTrue(
+                        all(call.args[0][:2] == ["sysctl", "-n"] for call in run.call_args_list)
+                    )
+
+    def test_linux_present_wrong_setting_must_be_updated_or_fail(self):
+        query = review.subprocess.CompletedProcess([], 0, b"0\n")
+        missing = review.subprocess.CompletedProcess([], 1, b"")
+        with patch.object(review.subprocess, "run", side_effect=[query, missing, missing]) as run:
+            review.configure_linux_sandbox()
+            self.assertEqual(
+                run.call_args_list[1].args[0],
+                ["sudo", "sysctl", "-w", "kernel.unprivileged_userns_clone=1"],
+            )
+        with patch.object(
+            review.subprocess,
+            "run",
+            side_effect=[query, review.subprocess.CalledProcessError(1, "sysctl")],
+        ):
+            with self.assertRaisesRegex(review.ReviewError, "kernel setup failed"):
+                review.configure_linux_sandbox()
+
     def test_line_locations_use_git_lf_coordinates_not_unicode_separators(self):
         self.assertEqual(review.github_line_count("one\u2028two\vthree\nlast\n"), 2)
         self.assertEqual(review.github_line_count(""), 0)
