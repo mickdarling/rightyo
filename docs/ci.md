@@ -179,6 +179,16 @@ Review/inline-review callbacks recheck findings even when a failed re-review pos
 completion comment. Callback PR association must be verified on real review and inline
 activity before rollout; unknown or ambiguous source metadata fails instead of guessing.
 
+Before any fallible callback routing or checkout, a trusted inline bootstrap validates the
+review-relay webhook's repository/name/path/event and full GitHub-owned revision hints, then
+publishes required gate pending. It has only status-write permission and cannot approve.
+The resolver depends on successful bootstrap invalidation, so source-run API failure or
+resolver timeout cannot leave a previous green status after new review activity. Hint data
+provides denial authority only; later routing, exact-head provenance and native positive
+proof still require authoritative API validation. The documented webhook schema and live
+relay run metadata establish these fields; actual default-branch callback execution remains
+a rollout verification. Status-API unavailability remains the #18 service/atomicity limit.
+
 The publisher uses GitHub's commit-status API rather than custom Actions check runs.
 GitHub documents that checks created by Actions jobs on dispatch, comment and workflow-run
 events may not satisfy required protection. The initial live reviewed-branch dispatch showed

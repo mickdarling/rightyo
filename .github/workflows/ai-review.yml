@@ -26,8 +26,87 @@ on:
 permissions: {}
 
 jobs:
+  invalidate:
+    name: Deny review-activity hints before fallible resolution
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      statuses: write
+    steps:
+      - name: Publish denial only from validated GitHub event revision hints
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+          from pathlib import Path
+
+          repository = "mickdarling/rightyo"
+          if os.environ.get("GITHUB_REPOSITORY") != repository:
+              raise SystemExit("Review invalidation repository mismatch")
+          if os.environ.get("GITHUB_EVENT_NAME") != "workflow_run":
+              raise SystemExit(0)
+          payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+          run = payload["workflow_run"]
+          if run.get("name") != "Native review activity relay":
+              raise SystemExit(0)
+          paths = [value for value in (run.get("path"), payload.get("workflow", {}).get("path"))
+                   if value is not None]
+          if (run.get("repository", {}).get("full_name") != repository
+                  or not paths or any(path != ".github/workflows/review-activity.yml" for path in paths)
+                  or run.get("event") not in {"pull_request_review", "pull_request_review_comment"}
+                  or run.get("status") != "completed"):
+              raise SystemExit("Review invalidation source hints are invalid")
+          prs = run.get("pull_requests")
+          if not isinstance(prs, list) or len(prs) > 20:
+              raise SystemExit("Review invalidation association hints are invalid")
+          heads = [run.get("head_sha")]
+          for pr in prs:
+              if not isinstance(pr, dict) or not isinstance(pr.get("head"), dict):
+                  raise SystemExit("Review invalidation association hints are invalid")
+              heads.append(pr["head"].get("sha"))
+          if not heads or any(not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)
+                              for head in heads):
+              raise SystemExit("Review invalidation revision hints are invalid")
+          run_id = os.environ.get("GITHUB_RUN_ID", "")
+          token = os.environ.get("GITHUB_TOKEN", "")
+          if not re.fullmatch(r"[1-9][0-9]*", run_id) or not token:
+              raise SystemExit("Review invalidation publisher identity is unavailable")
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  raise RuntimeError("Review invalidation redirect refused")
+
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+          failed = False
+          for head in sorted(set(heads)):
+              request = urllib.request.Request(
+                  f"https://api.github.com/repos/{repository}/statuses/{head}",
+                  data=json.dumps({"state": "pending", "context": "rightyo/review-gate",
+                                   "description": "Native review activity; awaiting source resolution",
+                                   "target_url": f"https://github.com/{repository}/actions/runs/{run_id}"}).encode(),
+                  method="POST", headers={"Authorization": "Bearer " + token,
+                                          "Accept": "application/vnd.github+json",
+                                          "Content-Type": "application/json",
+                                          "X-GitHub-Api-Version": "2022-11-28"},
+              )
+              try:
+                  with opener.open(request, timeout=20) as response:
+                      if response.status != 201:
+                          raise RuntimeError("Review invalidation status publication failed")
+              except Exception:
+                  failed = True
+          if failed:
+              raise SystemExit("Review invalidation pending publication failed")
+          print("Native review activity denied prior approval before source resolution")
+          PY
+
   resolve:
     name: Resolve trusted PR metadata
+    needs: invalidate
     if: ${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
