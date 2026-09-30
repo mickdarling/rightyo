@@ -139,14 +139,15 @@ GitHub GraphQL. Explicit verdicts must never have been edited; summaries may be 
 or last edited by the connector's immutable Bot identity. A maintainer-edited bot comment
 cannot supply positive evidence. A new authorized first-line `@codex review` / `@codex security review` request invalidates
 older clean evidence immediately. A separate recorder runs before the publisher mutex and
-persists authorized request time plus comment ID in immutable `rightyo/review-request`
-commit-status history. It can write only denial markers and gate pending, never approval.
+persists authorized request time plus comment ID as a typed pending marker in immutable
+`rightyo/review-gate` commit-status history. It can write only denial markers and gate pending, never approval.
 Editing or deleting the command cannot erase that barrier. Both the requester and event
 actor need current repository write/maintain/admin permission. Removed commands retain an
 already-recorded timestamp, so cleanup after a completed review does not demand another
 review; if initial capture was missed, the original event payload gives a conservative cutoff.
-The required gate-pending status also carries the typed denial cutoff, so either immutable
-record preserves it when one API write fails. Authorization/history API failures conservatively
+Both bounded best-effort writes use the same required-context pending marker: any successful
+write simultaneously blocks approval and preserves the cutoff. Fresh validated success can
+replace the latest required status without erasing its immutable request-marker history. Authorization/history API failures conservatively
 persist denial and fail the recorder; known unauthorized or benign comments do not create
 permanent markers. If both writes are unavailable, capture fails and cannot approve; durable
 external atomic publication remains an #18 limitation.

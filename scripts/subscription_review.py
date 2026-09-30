@@ -196,7 +196,7 @@ def persist_request(head, comment_id, cutoff):
     try:
         commit_status(head, "pending", description)
     finally:
-        commit_status(head, "pending", description, context=REQUEST_CONTEXT)
+        commit_status(head, "pending", description)
 
 
 def record_request(number, event_name, event):
@@ -477,7 +477,7 @@ def commit_status(head, state, description, *, context="rightyo/review-gate"):
     if not isinstance(head, str) or not SHA.fullmatch(head):
         raise GateError("Invalid status revision")
     if context not in {"rightyo/review-gate", REQUEST_CONTEXT} or (
-        context == REQUEST_CONTEXT and state != "pending"
+        (context == REQUEST_CONTEXT or description.startswith("v1 comment:")) and state != "pending"
     ):
         raise GateError("Invalid denial-marker status scope")
     if state not in {"pending", "success", "failure", "error"}:

@@ -20,6 +20,7 @@ from scripts.subscription_review import (
     inline_revision,
     main,
     pages,
+    persist_request,
     publish,
     record_request,
     request_markers,
@@ -656,7 +657,7 @@ class DurableRequestTests(unittest.TestCase):
 
     def marker(self, cutoff="2026-09-30T07:09:50Z"):
         return {
-            "context": REQUEST_CONTEXT,
+            "context": "rightyo/review-gate",
             "description": f"v1 comment:99 requested:{cutoff}",
             "creator": {"id": ACTIONS_BOT_ID, "login": "github-actions[bot]", "type": "Bot"},
         }
@@ -701,7 +702,12 @@ class DurableRequestTests(unittest.TestCase):
             record_request(44, "issue_comment", self.event())
         self.assertEqual(status.call_count, 2)
         self.assertTrue(all(call.args[1] == "pending" for call in status.call_args_list))
-        self.assertEqual(status.call_args_list[-1].kwargs["context"], REQUEST_CONTEXT)
+        self.assertTrue(
+            all(
+                call.kwargs.get("context", "rightyo/review-gate") == "rightyo/review-gate"
+                for call in status.call_args_list
+            )
+        )
 
     def test_removed_command_payload_is_recorded_if_original_capture_was_missed(self):
         edited = self.event("edited", "request removed")
@@ -715,7 +721,10 @@ class DurableRequestTests(unittest.TestCase):
                 patch("scripts.subscription_review.commit_status") as status,
             ):
                 record_request(44, "issue_comment", event)
-                self.assertEqual(status.call_args.kwargs["context"], REQUEST_CONTEXT)
+                self.assertEqual(
+                    status.call_args.kwargs.get("context", "rightyo/review-gate"),
+                    "rightyo/review-gate",
+                )
 
     def test_cleanup_preserves_existing_request_time_without_new_pending_write(self):
         edited = self.event("edited", "request removed")
@@ -759,7 +768,7 @@ class DurableRequestTests(unittest.TestCase):
             status.assert_not_called()
 
     def test_malformed_trusted_marker_fails_closed_and_other_creators_cannot_approve(self):
-        bad = {**self.marker(), "description": "unsupported"}
+        bad = {**self.marker(), "description": "v1 comment:unsupported"}
         with patch("scripts.subscription_review.pages", return_value=[bad]):
             with self.assertRaises(GateError):
                 request_markers(HEAD)
@@ -833,3 +842,19 @@ class DurableRequestTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_second_successful_required_marker_both_denies_and_persists_after_first_failure(self):
+        calls = []
+
+        def write(head, state, description, **kwargs):
+            calls.append((head, state, description, kwargs.get("context", "rightyo/review-gate")))
+            if len(calls) == 1:
+                raise GateError("First status write failed")
+
+        with patch("scripts.subscription_review.commit_status", side_effect=write):
+            with self.assertRaises(GateError):
+                persist_request(HEAD, 99, timestamp("2026-09-30T07:09:50Z"))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[-1][1], "pending")
+        self.assertEqual(calls[-1][3], "rightyo/review-gate")
+        self.assertTrue(calls[-1][2].startswith("v1 comment:99 requested:"))
