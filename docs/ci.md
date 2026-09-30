@@ -60,7 +60,7 @@ over 1 MiB require a deliberately reviewed policy change. Synthetic JSON/source 
 potentially identifying paths. Ignore rules and these checks cannot prove that arbitrary
 text lacks private content or that data consent exists.
 
-Ordinary CI remains secretless. The narrowly specified AI review workflow is a separate
+Ordinary CI remains secretless. The subscription review gate is a separate metadata-only
 privileged boundary, validated by structural policy and mutation tests. Hardware workflows
 still need their own reviewed policy boundary. Actions use full commit SHAs, Python tools
 use explicit versions, and Dependabot proposes bounded weekly updates. There are no shared
@@ -74,14 +74,14 @@ and narrow checks from [#14](https://github.com/mickdarling/rightyo/issues/14) a
 advisory audits, a full static type checker and external-link network checks remain follow-up
 work. No broad privacy/security certification is claimed.
 
-The dual reviewer workflow implements the Actions layer of
-[#17](https://github.com/mickdarling/rightyo/issues/17); deployment and credentials must be
-verified on real PRs. The stronger independent publisher identity in
+The subscription review gate implements the current Actions layer of
+[#17](https://github.com/mickdarling/rightyo/issues/17); native subscription setup and completed
+reviews must be verified on real PRs. The stronger independent publisher identity in
 [#18](https://github.com/mickdarling/rightyo/issues/18) remains open. PR-modified ordinary
 workflows can spoof statuses under the shared GitHub Actions app identity; these check names
 alone do not solve that attack. Merge queues and hardware lanes are not configured. CI
-does not capture audio, acquire models or train; reviewer jobs send bounded public source
-to their explicitly configured providers.
+does not capture audio, acquire models or train. The native Codex GitHub integration reviews
+public repository source through the connected account. The gate makes no model requests.
 
 See [GitHub's secure-use guidance](https://docs.github.com/en/actions/reference/security/secure-use)
 for the trust boundaries and
@@ -89,96 +89,63 @@ for the trust boundaries and
 for workflow validation.
 
 
-## Claude and Codex PR checks
+## Subscription-backed Codex PR reviews
 
-After the reviewed workflow is installed on the default branch, `ai-review.yml` triggers
-for opened, updated, reopened, edited and ready PRs, including drafts and documentation
-changes. Ordinary `rightyo/ci` continues independently. It publishes three check runs
-on the exact PR head: `rightyo/codex-review`, `rightyo/claude-review`, and
-`rightyo/review-gate`. Target-event workflow jobs themselves run against the trusted base,
-so the explicit head check runs are necessary for visibility in the PR Checks tab.
+Codex reviews use the built-in GitHub integration connected to the owner's Codex subscription,
+not `openai/codex-action`. Enable RightyO in Codex code-review settings, select **Review all
+PRs**, and select **On every push**. Automatic native reviews and manual `@codex review`
+requests use the subscription's review allowance. No `OPENAI_API_KEY` is required by any
+active workflow. Separately purchased credits, quota behavior and account preferences remain
+managed in Codex settings; the workflow does not grant extra allowance.
 
-The preparer uses the immutable workflow revision, reads PR metadata and public source
-through GitHub's API, and never checks out or executes PR programs. Both reviewers receive
-the same digest-checked snapshot of complete before/after changed files and trusted policy.
-Immutable Git tree modes reject symlinks and submodules before any blob content is fetched;
-the immutable comparison determines file coverage rather than a moving PR endpoint.
-Coverage is bounded to fewer than 100 files and 400,000 encoded bytes; an oversized,
-private-path, binary, non-UTF-8 or unsupported change fails rather than silently truncating.
-These are upper bounds, not guaranteed provider capacity: context limits, unusually dense
-tokenization or the inference budget can still reject smaller snapshots. Keep PRs focused;
-failed/inconclusive reviews never pass the gate.
-This source filter cannot prove that arbitrary public text lacks secrets or private content.
+`ai-review.yml` now runs only a metadata validator. It checks native results after trusted
+PR updates, issue-comment creation/edit/deletion, and completed ordinary PR CI. It never
+runs or checks out PR-controlled programs, installs a model CLI, requests inference, or
+passes provider credentials. Its checkout is the immutable trusted workflow SHA. Review
+and inline-review events are deliberately absent because those workflow revisions can come
+from the PR merge tree. Native completion comments and summary updates supply the trusted
+comment-event route. A manual dispatch rechecks a PR using its full current head and base
+SHAs, without requesting or running another model.
 
-Codex uses the official pinned Action and matching CLI/proxy 0.159.2. Its fresh configuration
-turns off command/image/app/plugin/MCP-related capabilities, denies reads outside minimal
-system runtime files, denies writes and command network access, and drops elevated privileges.
-A Linux control-command/canary-read probe runs before provider credentials are supplied.
-Codex retains its patch tool registration; filesystem denial is the boundary, not a claim
-that every tool is absent. Claude uses the official locked CLI 2.1.285, without the Action's
-GitHub MCP integration: restricted mode, no tools or MCP, no settings sources, no persistent
-session, empty working directory, and an environment excluding GitHub credentials.
+The stable `rightyo/review-gate` check runs on the exact current PR head. Passing requires
+an explicit **Codex Review: Didn't find any major issues.** completion comment from the
+verified connector bot identity and GitHub app. Creation/update timestamps must match; edits
+visible in GitHub's REST timestamps are rejected. These timestamps have second precision,
+so this heuristic is not immutable attestation; stronger verification remains #18 work.
+The displayed commit abbreviation must
+uniquely resolve through GitHub's commit API to the full current head. An activity summary,
+request comment, reaction, absence of suggestions, old-head result or another user's copied
+verdict never passes. Some automatic native reviews only leave a reaction or activity
+summary; request `@codex review` on the PR to obtain an explicit verdict while the gate
+remains blocked. Any connector review or inline finding on the current head blocks,
+even if someone resolves its thread or dismisses its review: fix the issue on a new head
+and obtain a fresh clean review. Unknown output formats, quota failures, missing completion,
+API errors and bounded-history overflow fail closed. Current head/base are refetched before
+publication; a changed revision invalidates that attempt.
 
-Reviewers cannot publish checks. A separate trusted publisher validates successful jobs,
-structured completion, exact head/base, snapshot digest, run provenance and complete changed
-file coverage, then refetches current head/base before updating checks. Missing credentials,
-timeout, quota failure, cancelled/skipped jobs, malformed results or stale revisions fail.
-Priorities 0–2 block; priority 3 findings remain visible. A no-findings response counts only
-after completed coverage. This is static AI review, not proof of correctness or reproduced
-hardware measurements. The check summary records limitations and immutable identities.
+Native Codex normally reports P0/P1 findings. It does not provide the previous API workflow's
+structured complete-file attestation or P0–P2 policy, and the gate does not claim those
+properties. Its completion attests the reviewed head, not the current merge base. Ordinary
+`rightyo/ci` remains separately required with strict branch freshness. AI review does not
+prove correctness. Shared GitHub Actions publisher identity remains the unresolved
+[#18](https://github.com/mickdarling/rightyo/issues/18) limitation.
 
-Each provider has a ten-minute job timeout; Claude inference is bounded to five minutes,
-two turns and a $3 API budget. Codex uses a bounded snapshot and no agent command execution;
-set a separate OpenAI project spending limit because job duration is not a dollar cap.
-There are no automatic provider retries. Concurrency is partitioned by PR, immutable head and manual/automatic/ignored route.
-Automatic metadata events reuse existing exact-head/base records, while fork events are
-inert until maintainer dispatch. They cannot cancel or replace a pending manual run.
-Only explicit dispatch cancels another manual run of the same head; bounded older-head
-automatic reviews may finish, but stale results fail publication.
-Source snapshots and validated result artifacts expire after one day; no raw CLI diagnostic
-logs or credential-bearing artifacts are uploaded.
+### Claude deferred
 
-Automatic credentialed review requires a same-repository PR and a maintainer trigger
-(or the explicitly allowed Dependabot identity). A trusted `workflow_run` callback after
-ordinary PR CI also covers stacked branches that predate the target workflow and avoids
-Dependabot target-event credential restrictions. The source run and exact current head
-are checked before snapshotting, and source actor permissions are required. Target and
-callback events reuse existing exact-head/base reviews. Non-PR callbacks cannot displace
-real reviews. Fork review checks remain
-missing until a maintainer runs **Independent AI reviews → Run workflow** with the PR
-number and full current head/base SHAs; a required missing gate blocks merging.
-Dispatch rechecks maintainer permission and requires that the approved head/base still
-match before snapshotting; an update invalidates it and requires a new dispatch. Do not use persistent fork
-approval labels. The same dispatch can backfill existing PRs, including stacked PRs whose
-base branch predates this workflow. Base/head are checked again at publication; stronger
-continuous base invalidation and exclusive publisher attestation remain #18 work.
+Claude review is intentionally deferred until the owner configures subscription authentication
+with `claude setup-token`. It is not required by the current gate and no Claude job runs
+implicitly. The old dual-provider snapshot helpers and masked secret-setup utility remain
+available as inactive groundwork; invoking them is not part of the subscription Codex lane.
+Do not add an OpenAI API key to use native Codex reviews. Reintroducing Claude requires a
+reviewed workflow change and verification of a completed exact-head subscription review.
 
-### Credentials and rollout
+Roll out using an issue-linked, independently reviewed PR. Enable the reviewed workflow,
+dispatch that immutable reviewed branch with the PR's full current revisions, verify its
+actual native completion and classic checks, and merge through ordinary protection. The
+workflow file alone does not configure the account's native review settings or branch
+protection. Keep #17 open until live setup is verified and #18 open until stronger publisher
+identity and protection tests exist.
 
-Configure repository secrets `OPENAI_API_KEY` and exactly one of
-`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY`. The OpenAI Action uses API billing;
-Claude subscription authentication uses a token generated locally with `claude setup-token`.
-Never paste either value into a PR, terminal command argument or chat. On this Mac:
-
-```sh
-python3 scripts/setup_review_secrets.py --claude-auth subscription
-# Alternatively: --claude-auth api
-```
-
-The native dialog has masked fields and explicitly names GitHub.com / `mickdarling/rightyo`.
-Its Store button pipes values directly into `gh secret set`, discarding CLI diagnostics and
-keeping values out of files, arguments and environment. Cancel performs no writes. It does
-not read existing local credentials or reuse the Jev key. Compilation checks are available
-with `--check`. The owner must already authenticate GitHub CLI. If changing Claude auth modes,
-remove the obsolete alternate GitHub secret yourself; ambiguous dual credentials fail.
-
-Install through an issue-linked, independently reviewed PR. Bootstrap can use manual
-exact-head reviews because target/dispatch workflows must first exist on the default branch.
-Then configure secrets, dispatch existing PRs, verify actual completed head check runs, and
-add `rightyo/review-gate` to branch protection after it has run. A workflow file or local
-review does not establish active GitHub checks. Keep #17 open until live setup is verified,
-and keep #18 open until its independent identity and protection tests are implemented.
-
-References: [Codex Action](https://learn.chatgpt.com/docs/github-action),
-[Codex permission profiles](https://learn.chatgpt.com/docs/permissions),
-[Claude authentication](https://code.claude.com/docs/en/github-actions).
+References: [Codex GitHub integration](https://learn.chatgpt.com/docs/third-party/github),
+[Codex review billing](https://learn.chatgpt.com/docs/pricing),
+[Claude authentication](https://code.claude.com/docs/en/authentication#generate-a-long-lived-token).
