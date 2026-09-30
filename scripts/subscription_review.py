@@ -497,6 +497,78 @@ def commit_status(head, state, description, *, context="rightyo/review-gate"):
     )
 
 
+def approval_run_guard():
+    """Withhold approval while another trusted callback is unfinished, regardless of order."""
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    if not re.fullmatch(r"[1-9][0-9]*", run_id):
+        raise GateError("Approval publisher run identity is unavailable")
+    own = api(f"/repos/{REPOSITORY}/actions/runs/{run_id}")
+    if not isinstance(own, dict):
+        raise GateError("Approval publisher run metadata is invalid")
+    workflow_id = own.get("workflow_id")
+    unfinished = {"queued", "in_progress", "requested", "waiting", "pending"}
+
+    def validate(run):
+        if (
+            not isinstance(run, dict)
+            or type(run.get("id")) is not int
+            or run["id"] < 1
+            or type(run.get("workflow_id")) is not int
+            or run["workflow_id"] != workflow_id
+            or run.get("path") != ".github/workflows/ai-review.yml"
+            or not isinstance(run.get("repository"), dict)
+            or run["repository"].get("full_name") != REPOSITORY
+            or run.get("status") not in unfinished | {"completed"}
+        ):
+            raise GateError("Approval workflow inventory metadata is invalid")
+
+    if type(workflow_id) is not int or workflow_id < 1:
+        raise GateError("Approval workflow identity is invalid")
+    validate(own)
+    if (
+        own["id"] != int(run_id)
+        or own["status"] != "in_progress"
+        or own.get("name") != "Subscription Codex review gate"
+        or not isinstance(own.get("head_sha"), str)
+        or not SHA.fullmatch(own["head_sha"])
+    ):
+        raise GateError("Approval publisher is not the current active workflow run")
+    for state in sorted(unfinished):
+        count = 0
+        seen = set()
+        for page in range(1, 11):
+            result = api(
+                f"/repos/{REPOSITORY}/actions/workflows/{workflow_id}/runs"
+                f"?status={state}&per_page=100&page={page}"
+            )
+            if (
+                not isinstance(result, dict)
+                or type(result.get("total_count")) is not int
+                or not 0 <= result["total_count"] <= 1000
+                or not isinstance(result.get("workflow_runs"), list)
+                or len(result["workflow_runs"]) > 100
+            ):
+                raise GateError("Approval workflow inventory exceeds valid bounds")
+            batch = result["workflow_runs"]
+            count += len(batch)
+            for run in batch:
+                validate(run)
+                if run["id"] in seen:
+                    raise GateError("Approval workflow inventory contains duplicate runs")
+                seen.add(run["id"])
+                if run["id"] != int(run_id) and run["status"] in unfinished:
+                    raise GateError(
+                        "Another trusted review callback is unfinished; approval withheld. "
+                        "Recheck this PR after the queue drains if no later callback targets it."
+                    )
+            if len(batch) < 100:
+                if count != result["total_count"]:
+                    raise GateError("Approval workflow inventory pagination is inconsistent")
+                break
+        else:
+            raise GateError("Approval workflow inventory exceeds bounded pagination")
+
+
 def publish(number, expected=None):
     pr = current_pr(number)
     if pr.get("state") != "open":
@@ -575,6 +647,16 @@ def publish(number, expected=None):
         "failure": "Awaiting clean native review; missing evidence or findings; see run log",
         "error": "Native review metadata validation failed; see run log",
     }[conclusion]
+    if conclusion == "success":
+        try:
+            # This is the final metadata read before POST, closing deliberate queue delay.
+            # GitHub provides no atomic compare-and-set between this inventory and status.
+            approval_run_guard()
+        except (GateError, KeyError, TypeError, ValueError) as error:
+            failure = error
+            conclusion = "error"
+            description = "Approval withheld by trusted callback inventory; see run log"
+            print(str(error) if isinstance(error, GateError) else "Approval inventory failed")
     commit_status(head, conclusion, description)
     if failure or conclusion != "success":
         raise GateError("Subscription review gate has not passed")

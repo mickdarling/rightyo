@@ -12,6 +12,7 @@ from scripts.subscription_review import (
     BOT_NODE_ID,
     REQUEST_CONTEXT,
     GateError,
+    approval_run_guard,
     authorized_request,
     clean_completion,
     comment_provenance,
@@ -340,6 +341,7 @@ class AutomaticCompletionTests(unittest.TestCase):
             patch("scripts.subscription_review.pages", side_effect=batches),
             patch("scripts.subscription_review.comment_provenance", return_value=True),
             patch("scripts.subscription_review.time.sleep") as sleep,
+            patch("scripts.subscription_review.approval_run_guard"),
         ):
             publish(44)
         sleep.assert_called_once_with(5)
@@ -858,3 +860,177 @@ class DurableRequestTests(unittest.TestCase):
         self.assertEqual(calls[-1][1], "pending")
         self.assertEqual(calls[-1][3], "rightyo/review-gate")
         self.assertTrue(calls[-1][2].startswith("v1 comment:99 requested:"))
+
+
+class ApprovalInventoryTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.dict(os.environ, {"GITHUB_RUN_ID": "12345"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def own(self, **changes):
+        return {
+            "id": 12345,
+            "workflow_id": 370760066,
+            "name": "Subscription Codex review gate",
+            "head_sha": HEAD,
+            "repository": {"full_name": "mickdarling/rightyo"},
+            "path": ".github/workflows/ai-review.yml",
+            "status": "in_progress",
+            **changes,
+        }
+
+    def inventory(self, others=()):
+        def request(path, method="GET", data=None):
+            self.assertEqual(method, "GET")
+            if path.endswith("/actions/runs/12345"):
+                return self.own()
+            self.assertIn("/actions/workflows/370760066/runs?status=", path)
+            state = path.split("status=", 1)[1].split("&", 1)[0]
+            records = ([self.own()] if state == "in_progress" else []) + list(others)
+            return {"total_count": len(records), "workflow_runs": records}
+
+        return request
+
+    def test_only_current_run_and_completed_history_can_pass(self):
+        for history in ([], [self.own(id=1, status="completed")]):
+            with patch(
+                "scripts.subscription_review.api", side_effect=self.inventory(history)
+            ) as api:
+                approval_run_guard()
+            self.assertEqual(api.call_count, 6)
+            queried = {
+                call.args[0].split("status=", 1)[1].split("&", 1)[0]
+                for call in api.call_args_list[1:]
+            }
+            self.assertEqual(queried, {"queued", "pending", "requested", "waiting", "in_progress"})
+
+    def test_any_other_unfinished_run_blocks_without_order_or_pr_assumptions(self):
+        for state in ("queued", "pending", "requested", "waiting", "in_progress"):
+            for run_id in (1, 12346):
+                other = self.own(id=run_id, status=state, pull_requests=[{"number": 77}])
+                with patch("scripts.subscription_review.api", side_effect=self.inventory([other])):
+                    with self.assertRaisesRegex(GateError, "unfinished"):
+                        approval_run_guard()
+
+    def test_unknown_status_wrong_workflow_or_repository_fail_closed(self):
+        for change in (
+            {"status": "unknown"},
+            {"workflow_id": 3},
+            {"workflow_id": True},
+            {"repository": {"full_name": "outsider/repo"}},
+            {"repository": None},
+            {"path": ".github/workflows/ci.yml"},
+            {"id": True},
+        ):
+            with patch(
+                "scripts.subscription_review.api",
+                side_effect=self.inventory([self.own(**{"id": 2, **change})]),
+            ):
+                with self.assertRaises(GateError):
+                    approval_run_guard()
+
+    def test_own_active_run_identity_is_required(self):
+        for change in (
+            {"id": 2},
+            {"status": "completed"},
+            {"workflow_id": 0},
+            {"workflow_id": True},
+            {"name": "Other workflow"},
+            {"head_sha": "invalid"},
+        ):
+            with patch("scripts.subscription_review.api", return_value=self.own(**change)):
+                with self.assertRaises(GateError):
+                    approval_run_guard()
+        with (
+            patch.dict(os.environ, {"GITHUB_RUN_ID": "invalid"}),
+            patch("scripts.subscription_review.api") as api,
+        ):
+            with self.assertRaises(GateError):
+                approval_run_guard()
+            api.assert_not_called()
+
+    def test_api_failure_and_invalid_collection_never_pass(self):
+        with patch("scripts.subscription_review.api", side_effect=GateError("API failed")):
+            with self.assertRaises(GateError):
+                approval_run_guard()
+        for result in (
+            {},
+            {"total_count": True, "workflow_runs": []},
+            {"total_count": 1001, "workflow_runs": []},
+            {"total_count": 1, "workflow_runs": []},
+            {"total_count": 0, "workflow_runs": None},
+            {"total_count": 2, "workflow_runs": [self.own(), self.own()]},
+        ):
+            with patch("scripts.subscription_review.api", side_effect=[self.own(), result]):
+                with self.assertRaises(GateError):
+                    approval_run_guard()
+        with patch(
+            "scripts.subscription_review.api", side_effect=[self.own(), GateError("API failed")]
+        ):
+            with self.assertRaises(GateError):
+                approval_run_guard()
+
+    def test_full_page_overflow_cannot_be_mistaken_for_complete_inventory(self):
+        calls = []
+
+        def request(path, method="GET", data=None):
+            calls.append(path)
+            if path.endswith("/actions/runs/12345"):
+                return self.own()
+            page = int(path.rsplit("=", 1)[1])
+            return {
+                "total_count": 1000,
+                "workflow_runs": [
+                    self.own(id=page * 100 + index, status="completed") for index in range(100)
+                ],
+            }
+
+        with patch("scripts.subscription_review.api", side_effect=request):
+            with self.assertRaisesRegex(GateError, "pagination"):
+                approval_run_guard()
+        self.assertEqual(len(calls), 11)
+
+    def publish_with_inventory(self, others):
+        writes = []
+        calls = []
+        inventory = self.inventory(others)
+        pr = {
+            "state": "open",
+            "head": {"sha": HEAD},
+            "base": {"sha": BASE, "repo": {"full_name": "mickdarling/rightyo"}},
+        }
+
+        def request(path, method="GET", data=None):
+            calls.append((path, method))
+            if method == "POST":
+                writes.append(data["state"])
+                return {}
+            if "/actions/" in path:
+                return inventory(path, method, data)
+            return {"sha": HEAD} if "/commits/" in path else pr
+
+        batches = [[summary()], [], [], [], [reaction()]] * 2
+        with (
+            patch("scripts.subscription_review.api", side_effect=request),
+            patch("scripts.subscription_review.pages", side_effect=batches),
+            patch("scripts.subscription_review.comment_provenance", return_value=True),
+        ):
+            if others:
+                with self.assertRaises(GateError):
+                    publish(44)
+            else:
+                publish(44)
+        return writes, calls
+
+    def test_queued_callback_after_clean_collection_prevents_success(self):
+        writes, calls = self.publish_with_inventory([self.own(id=2, status="queued")])
+        self.assertEqual(writes, ["pending", "error"])
+        self.assertIn("/actions/workflows/", calls[-2][0])
+        self.assertEqual(calls[-1][1], "POST")
+
+    def test_current_only_inventory_is_last_read_before_success(self):
+        writes, calls = self.publish_with_inventory([])
+        self.assertEqual(writes, ["pending", "success"])
+        self.assertIn("status=waiting", calls[-2][0])
+        self.assertEqual(calls[-1], (f"/repos/mickdarling/rightyo/statuses/{HEAD}", "POST"))

@@ -126,6 +126,18 @@ a verdict and the relay's PR merge tree never executes in the privileged lane. Q
 follows waiting start, not event creation; all callbacks reread current metadata and durable
 barriers. Overflow beyond 100 waiting runs is canceled by GitHub and requires a later
 recheck; this bounded service limit remains part of #18.
+Immediately before a success status POST, the publisher validates its own active Actions
+run and inventories every documented unfinished lifecycle of this same trusted workflow.
+Any other queued, requested, waiting, pending or active run withholds approval, including
+callbacks for other PRs; IDs, timestamps and event order are not used as a freshness proxy.
+Malformed metadata, API failure or bounded pagination overflow also block success. The
+queue can then drain and a later callback can revalidate current native evidence. If the
+last queued callback belongs to another PR, manually recheck the suppressed PR after the
+queue drains; suppression does not manufacture a fresh native review.
+This guard removes the deliberate queued-denial delay after known callback arrival.
+GitHub's inventory and status POST remain separate, non-atomic API operations: an event can
+arrive between the final read and write, and webhook/API propagation is asynchronous. The
+adapter does not claim a zero-window synchronous gate; that stronger guarantee remains #18.
 Completion comments and summary updates also supply the trusted comment-event route. A manual dispatch rechecks a PR using its full current head and base
 SHAs, without requesting or running another model.
 
