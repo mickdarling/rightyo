@@ -220,7 +220,17 @@ the gate blocks; a later trusted event or exact-revision manual gate dispatch ca
 Unknown formats, quota failure, API/GraphQL errors and bounded-history overflow fail closed.
 Current head/base are refetched before publication; revision changes invalidate the attempt.
 Review/inline-review callbacks recheck findings even when a failed re-review posts no issue
-completion comment. Callback PR association must be verified on real review and inline
+completion comment.
+
+Existing PR merge trees that predate the notification relay need an update from protected
+main before review/inline events can run that relay. Strict branch protection separately
+requires an up-to-date branch. Ordinary PR comments use the default-branch publisher. For
+normal exact-revision manual rechecks, select main as the workflow ref; a manual recheck does
+not install the relay in an older merge tree. After simultaneous callbacks on different PRs drain, recheck a suppressed open PR
+to validate its current native evidence again. Callbacks for closed PRs cannot grant a
+new approval.
+
+Callback PR association must be verified on real review and inline
 activity before rollout; unknown or ambiguous source metadata fails instead of guessing.
 
 Before any fallible callback routing or checkout, a trusted inline bootstrap validates the
