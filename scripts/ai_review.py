@@ -360,18 +360,21 @@ def sandbox_check(directory, expected):
     # Linux bwrap re-executes Codex inside the denied-filesystem profile. Place
     # only the locked official binary in the existing minimal system read root,
     # matching the Action's global CLI installation without exposing checkout.
-    native = ROOT / (
-        ".github/reviews/node_modules/@openai/codex-linux-x64/"
-        "vendor/x86_64-unknown-linux-musl/bin/codex"
+    runtime = ROOT / (
+        ".github/reviews/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl"
     )
     executable = Path("/usr/local/bin/rightyo-codex-preflight")
-    subprocess.run(
-        ["sudo", "install", "-m", "755", str(native), str(executable)],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=15,
-    )
+    for source, target in (
+        (runtime / "bin/codex", executable),
+        (runtime / "codex-resources/bwrap", Path("/usr/local/bin/codex-resources/bwrap")),
+    ):
+        subprocess.run(
+            ["sudo", "install", "-D", "-m", "755", str(source), str(target)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
     prefix = [
         str(executable),
         "sandbox",
@@ -393,7 +396,9 @@ def sandbox_check(directory, expected):
         # Only this trusted, credential-free fixed command may report diagnostics.
         # Neither the source snapshot nor provider credentials are passed to it.
         diagnostic = (error.stderr or b"").decode("utf-8", errors="replace")[:1000]
-        raise ReviewError("Codex preflight harmless control command failed: " + diagnostic) from None
+        raise ReviewError(
+            "Codex preflight harmless control command failed: " + diagnostic
+        ) from None
     except subprocess.SubprocessError:
         raise ReviewError("Codex preflight harmless control command timed out") from None
     denied = subprocess.run(

@@ -113,7 +113,8 @@ This source filter cannot prove that arbitrary public text lacks secrets or priv
 Codex uses the official pinned Action and matching CLI/proxy 0.159.2. Its fresh configuration
 turns off command/image/app/plugin/MCP-related capabilities, uses a default-deny custom
 filesystem profile with minimal system reads and the empty working directory, and denies
-reads outside those paths. The Linux preflight copies only the locked native CLI into
+reads outside those paths. The Linux preflight copies only the locked native CLI and its
+bundled bubblewrap executable into
 the minimal system runtime so bubblewrap can re-execute it without reading the checkout.
 It verifies a harmless command succeeds and an unrelated invented-secret canary remains
 unreadable before provider credentials are introduced. This avoids an explicit root deny

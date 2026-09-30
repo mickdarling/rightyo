@@ -3,6 +3,7 @@
 import json
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from scripts.repository_checks import (
     MAX_FILE_BYTES,
     artifact_errors,
     artifact_reason,
+    codex_profile_errors,
     ignore_errors,
     issue_references,
     markdown_errors,
@@ -201,6 +203,92 @@ class WorkflowPolicyTests(unittest.TestCase):
             {"run": "echo example", "env": {"TOKEN": "${{ secrets.EXAMPLE }}"}},
         ]
         self.assertGreaterEqual(len(workflow_errors("ci.yml", doc)), 5)
+
+
+class CodexProfilePolicyTests(unittest.TestCase):
+    def document(self):
+        return tomllib.loads((ROOT / ".github/reviews/codex-config.toml").read_text())
+
+    def test_checked_in_profile_matches_the_reviewed_denial_boundary(self):
+        self.assertEqual(codex_profile_errors(self.document()), [])
+
+    def test_disabled_features_cannot_be_enabled_omitted_or_mistyped(self):
+        for feature in self.document()["features"]:
+            for change in ("enable", "omit", "integer"):
+                with self.subTest(feature=feature, change=change):
+                    document = self.document()
+                    if change == "omit":
+                        del document["features"][feature]
+                    else:
+                        document["features"][feature] = True if change == "enable" else 0
+                    self.assertTrue(codex_profile_errors(document))
+
+    def test_customization_inheritance_and_unknown_settings_fail(self):
+        for field, value in (
+            ("approval_policy", "on-request"),
+            ("project_doc_max_bytes", 1024),
+            ("web_search", "live"),
+            ("shell_environment_policy", {"inherit": "all"}),
+            ("mcp_servers", {"example": {"command": "untrusted"}}),
+            ("features", {}),
+        ):
+            with self.subTest(field=field):
+                document = self.document()
+                document[field] = value
+                self.assertTrue(codex_profile_errors(document))
+        for field in self.document():
+            with self.subTest(missing=field):
+                document = self.document()
+                del document[field]
+                self.assertTrue(codex_profile_errors(document))
+
+    def test_root_private_home_and_writable_grants_fail(self):
+        for path in (
+            ":root",
+            "/",
+            ":project_roots",
+            ":tmp",
+            "/home",
+            "/root",
+            "/home/runner",
+            "/home/runner/.codex",
+            "/tmp/private-canary",
+        ):
+            for permission in ("read", "write"):
+                with self.subTest(path=path, permission=permission):
+                    document = self.document()
+                    filesystem = document["permissions"]["review-data-only"]["filesystem"]
+                    filesystem[path] = permission
+                    self.assertTrue(codex_profile_errors(document))
+
+    def test_runtime_and_empty_cwd_grants_cannot_be_removed_or_made_writable(self):
+        for path in (":minimal", "/tmp/rightyo-review-empty"):
+            for change in ("missing", "write"):
+                with self.subTest(path=path, change=change):
+                    document = self.document()
+                    filesystem = document["permissions"]["review-data-only"]["filesystem"]
+                    if change == "missing":
+                        del filesystem[path]
+                    else:
+                        filesystem[path] = "write"
+                    self.assertTrue(codex_profile_errors(document))
+
+    def test_explicit_root_mask_extra_profiles_and_network_access_fail(self):
+        for change in ("root-mask", "extra-profile", "network", "missing-profile", "malformed"):
+            with self.subTest(change=change):
+                document = self.document()
+                permissions = document["permissions"]
+                if change == "root-mask":
+                    permissions["review-data-only"]["filesystem"][":root"] = "deny"
+                elif change == "extra-profile":
+                    permissions["unsafe"] = {"filesystem": {":root": "read"}}
+                elif change == "network":
+                    permissions["review-data-only"]["network"]["enabled"] = True
+                elif change == "missing-profile":
+                    document.pop("permissions")
+                else:
+                    document = None
+                self.assertTrue(codex_profile_errors(document))
 
 
 class AIReviewPolicyTests(unittest.TestCase):

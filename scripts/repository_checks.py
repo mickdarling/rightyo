@@ -260,6 +260,68 @@ AI_REVIEW_CONCURRENCY = {
 }
 
 
+CODEX_REVIEW_PERMISSIONS = {
+    "review-data-only": {
+        "filesystem": {":minimal": "read", "/tmp/rightyo-review-empty": "read"},
+        "network": {"enabled": False},
+    },
+}
+
+CODEX_REVIEW_CONFIG = {
+    "approval_policy": "never",
+    "project_doc_max_bytes": 0,
+    "web_search": "disabled",
+    "shell_environment_policy": {"inherit": "none"},
+    "features": {
+        feature: False
+        for feature in (
+            "shell_tool",
+            "unified_exec",
+            "shell_snapshot",
+            "view_image",
+            "apps",
+            "plugins",
+            "collab",
+            "multi_agent",
+            "js_repl",
+            "code_mode",
+            "hooks",
+            "codex_hooks",
+            "memory_tool",
+            "memories",
+            "search_tool",
+            "skill_search",
+            "workspace_dependencies",
+            "image_generation",
+        )
+    },
+    "permissions": CODEX_REVIEW_PERMISSIONS,
+}
+
+
+def codex_profile_errors(document):
+    """Freeze the entire trusted CLI config; preflight proves runner enforcement.
+
+    Explicit root denial can mask allowed runtime mounts on Linux. The reviewed
+    profile grants only minimal runtime files and the literal empty cwd; all other
+    paths remain denied by default. The complete config also freezes disabled tools,
+    customization discovery, environment inheritance and network access.
+    """
+
+    def matches(actual, expected):
+        if type(actual) is not type(expected):
+            return False
+        if isinstance(expected, dict):
+            return set(actual) == set(expected) and all(
+                matches(actual[key], value) for key, value in expected.items()
+            )
+        return actual == expected
+
+    if not matches(document, CODEX_REVIEW_CONFIG):
+        return ["Codex review config must match the complete reviewed capability policy"]
+    return []
+
+
 def approved_ai_review_steps():
     """The credentialed lane may execute only this reviewed orchestration surface.
 
