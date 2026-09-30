@@ -322,7 +322,14 @@ class RequestRecorderPolicyTests(unittest.TestCase):
 
 class ReviewInvalidationPolicyTests(unittest.TestCase):
     def test_denial_precedes_routing_and_cannot_checkout_or_approve(self):
-        for mutation in ("skip-denial", "checkout", "write-more", "approve", "skip-dependency"):
+        for mutation in (
+            "skip-denial",
+            "checkout",
+            "write-more",
+            "no-head-read",
+            "approve",
+            "skip-dependency",
+        ):
             doc = yaml.safe_load((ROOT / AI_REVIEW_WORKFLOW).read_text())
             job = doc["jobs"]["invalidate"]
             if mutation == "skip-denial":
@@ -331,6 +338,8 @@ class ReviewInvalidationPolicyTests(unittest.TestCase):
                 job["steps"].insert(0, {"uses": "actions/checkout@v4"})
             elif mutation == "write-more":
                 job["permissions"]["contents"] = "write"
+            elif mutation == "no-head-read":
+                del job["permissions"]["pull-requests"]
             elif mutation == "approve":
                 job["steps"][0]["run"] = job["steps"][0]["run"].replace('"pending"', '"success"')
             else:

@@ -208,13 +208,29 @@ activity before rollout; unknown or ambiguous source metadata fails instead of g
 
 Before any fallible callback routing or checkout, a trusted inline bootstrap validates the
 review-relay webhook's repository/name/path/event and full GitHub-owned revision hints, then
-publishes required gate pending. It has only status-write permission and cannot approve.
+publishes required gate pending. It has only PR-read/status-write permission and cannot approve.
 The resolver depends on successful bootstrap invalidation, so source-run API failure or
 resolver timeout cannot leave a previous green status after new review activity. Hint data
 provides denial authority only; later routing, exact-head provenance and native positive
 proof still require authoritative API validation. The documented webhook schema and live
 relay run metadata establish these fields; actual default-branch callback execution remains
 a rollout verification. Status-API unavailability remains the #18 service/atomicity limit.
+The same no-checkout bootstrap recognizes first-line review commands from comment creation,
+current edits, edits' prior body and deleted comments. It reads the authoritative open PR
+head using fixed repository API endpoints, then sets required pending before permission or
+history reads. Authorized original requesters and actors get immutable typed request markers
+before any resolver/recorder checkout. Removed commands preserve an existing marker's time;
+cleanup after a completed review does not manufacture a newer request. The later recorder
+remains a second capture/refetch within the same workflow lock.
+Known unauthorized commands create no permanent marker; their temporary pending status can
+be revalidated normally. Permission/history failures conservatively preserve a typed denial
+and fail; failure of the initial pending write still attempts both required typed writes.
+If the authoritative PR-head read fails, the bootstrap cannot safely choose a revision to
+invalidate. If every status write is unavailable, it cannot publish denial or durability.
+Those direct API-availability boundaries remain #18; no event hint substitutes for a verified
+PR head, and no checkout-dependent code must run before capture. Bootstrap requests use
+five-second socket timeouts and bounded history pages within its two-minute job budget;
+these are bounded attempts, not a guaranteed wall-clock or GitHub availability bound.
 
 The publisher uses GitHub's commit-status API rather than custom Actions check runs.
 GitHub documents that checks created by Actions jobs on dispatch, comment and workflow-run
