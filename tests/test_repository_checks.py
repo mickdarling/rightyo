@@ -138,9 +138,11 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(workflow_errors("ci.yml", self.document()), [])
 
     def test_privileged_event_fails(self):
-        doc = self.document()
-        doc["on"] = {"pull_request_target": {}}
-        self.assertTrue(workflow_errors("ci.yml", doc))
+        for event in ("pull_request_target", "workflow_run"):
+            with self.subTest(event=event):
+                doc = self.document()
+                doc["on"] = {event: {}}
+                self.assertTrue(workflow_errors("ci.yml", doc))
 
     def test_secret_references_fail_outside_steps(self):
         cases = (
@@ -236,6 +238,34 @@ class AIReviewPolicyTests(unittest.TestCase):
             else:
                 doc["on"]["workflow_dispatch"]["inputs"]["shell"] = {"type": "string"}
             self.assertTrue(self.check(doc))
+
+    def test_workflow_callback_scope_and_bot_routing_cannot_be_broadened(self):
+        for change in ("workflow-name", "workflow-type", "prepare-route", "publish-route"):
+            with self.subTest(change=change):
+                doc = self.document()
+                if change == "workflow-name":
+                    doc["on"]["workflow_run"]["workflows"] = ["*"]
+                elif change == "workflow-type":
+                    doc["on"]["workflow_run"]["types"] = ["requested", "completed"]
+                elif change == "prepare-route":
+                    doc["jobs"]["prepare"].pop("if")
+                else:
+                    doc["jobs"]["publish"]["if"] = "${{ always() }}"
+                self.assertTrue(self.check(doc))
+
+    def test_ignored_callbacks_and_fork_events_cannot_cancel_authorized_runs(self):
+        for change in ("no-partition", "cancel-everything", "missing-concurrency"):
+            with self.subTest(change=change):
+                doc = self.document()
+                if change == "no-partition":
+                    doc["concurrency"]["group"] = (
+                        "rightyo-ai-${{ github.event.pull_request.number }}"
+                    )
+                elif change == "cancel-everything":
+                    doc["concurrency"]["cancel-in-progress"] = True
+                else:
+                    doc.pop("concurrency")
+                self.assertTrue(self.check(doc))
 
     def test_missing_review_job_skip_or_publisher_dependency_fails(self):
         for change in ("missing", "skip", "needs", "publisher-if", "authorization-output"):

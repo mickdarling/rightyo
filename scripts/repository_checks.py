@@ -214,7 +214,7 @@ def mentions_secrets(value):
 
 AI_REVIEW_WORKFLOW = ".github/workflows/ai-review.yml"
 AI_REVIEW_JOBS = {"prepare", "codex", "claude", "publish"}
-AI_REVIEW_EVENTS = {"pull_request_target", "workflow_dispatch"}
+AI_REVIEW_EVENTS = {"pull_request_target", "workflow_dispatch", "workflow_run"}
 AI_REVIEW_TYPES = {"opened", "synchronize", "reopened", "ready_for_review", "edited"}
 AI_REVIEW_PERMISSIONS = {
     "prepare": {"contents": "read", "pull-requests": "read", "checks": "write"},
@@ -234,6 +234,28 @@ AI_REVIEW_ACTIONS = {
 }
 CLAUDE_REVIEW_COMMAND = "python3 scripts/ai_review.py claude --directory review-data"
 PROVIDER_ALLOWED_CONDITION = "${{ needs.prepare.outputs.allowed == 'true' }}"
+
+AI_REVIEW_ROUTE = (
+    "(github.event_name != 'workflow_run' || "
+    "github.event.workflow_run.actor.login == 'dependabot[bot]') && "
+    "(github.event_name != 'pull_request_target' || github.actor != 'dependabot[bot]')"
+)
+AI_REVIEW_PREPARE_CONDITION = "${{ " + AI_REVIEW_ROUTE + " }}"
+AI_REVIEW_PUBLISH_CONDITION = "${{ always() && (" + AI_REVIEW_ROUTE + ") }}"
+AI_REVIEW_CONCURRENCY = {
+    "group": (
+        "rightyo-ai-${{ github.event.pull_request.number || inputs.pr_number || "
+        "github.event.workflow_run.pull_requests[0].number }}-${{ "
+        "github.event_name == 'workflow_run' && "
+        "github.event.workflow_run.actor.login != 'dependabot[bot]' && 'ignored' || 'reviews' }}"
+    ),
+    "cancel-in-progress": (
+        "${{ github.event_name == 'workflow_dispatch' || "
+        "github.event.pull_request.head.repo.full_name == github.repository || "
+        "(github.event_name == 'workflow_run' && "
+        "github.event.workflow_run.actor.login == 'dependabot[bot]') }}"
+    ),
+}
 
 
 def approved_ai_review_steps():
@@ -368,9 +390,11 @@ def ai_review_workflow_errors(path, document):
         reject("workflow contains unsupported root settings")
     if document.get("permissions") != {}:
         reject("root permissions must be empty")
+    if document.get("concurrency") != AI_REVIEW_CONCURRENCY:
+        reject("concurrency must isolate ignored callbacks and preserve authorized fork runs")
     event = document.get("on", document.get(True, {}))
     if not isinstance(event, dict) or set(event) != AI_REVIEW_EVENTS:
-        reject("requires only pull_request_target and workflow_dispatch")
+        reject("requires only pull_request_target, workflow_dispatch and trusted workflow_run")
     else:
         target = event["pull_request_target"]
         if (
@@ -381,6 +405,8 @@ def ai_review_workflow_errors(path, document):
             or set(target["types"]) != AI_REVIEW_TYPES
         ):
             reject("target events must cover all prescribed PR changes without filters")
+        if event["workflow_run"] != {"workflows": ["RightyO CI"], "types": ["completed"]}:
+            reject("workflow_run must consume only completed RightyO CI events")
         dispatch = event["workflow_dispatch"]
         inputs = dispatch.get("inputs", {}) if isinstance(dispatch, dict) else {}
         number = inputs.get("pr_number", {}) if isinstance(inputs, dict) else {}
@@ -438,13 +464,13 @@ def ai_review_workflow_errors(path, document):
         ):
             reject(f"{name} dependencies do not enforce the review boundary")
         if name == "publish":
-            if job.get("if") != "${{ always() }}":
-                reject("publisher must run after failed, skipped or cancelled providers")
+            if job.get("if") != AI_REVIEW_PUBLISH_CONDITION:
+                reject("publisher must always handle authorized routes and skip ignored callbacks")
         elif name in {"codex", "claude"}:
             if job.get("if") != PROVIDER_ALLOWED_CONDITION:
                 reject(f"{name} job must respect the trusted snapshot authorization output")
-        elif "if" in job:
-            reject(f"{name} job cannot have an unreviewed skip condition")
+        elif job.get("if") != AI_REVIEW_PREPARE_CONDITION:
+            reject("preparation must reject restricted bot targets and ignored workflow callbacks")
         expected_outputs = (
             {
                 "allowed": "${{ steps.snapshot.outputs.allowed }}",

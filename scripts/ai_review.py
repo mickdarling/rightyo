@@ -12,6 +12,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 
 from repository_checks import artifact_reason
@@ -79,14 +80,22 @@ def source_path(value):
     return value
 
 
+@lru_cache(maxsize=2)
+def source_tree(revision):
+    tree = api(f"/repos/{REPOSITORY}/git/trees/{sha(revision)}?recursive=1")
+    if tree.get("truncated") is not False or not isinstance(tree.get("tree"), list):
+        raise ReviewError("Immutable source tree coverage is incomplete")
+    return {entry["path"]: entry for entry in tree["tree"]}
+
+
 def source(path, revision):
     path = source_path(path)
-    endpoint = (
-        f"/repos/{REPOSITORY}/contents/{urllib.parse.quote(path, safe='/')}?ref={sha(revision)}"
-    )
-    item = api(endpoint)
-    if item.get("type") != "file" or item.get("encoding") != "base64":
-        raise ReviewError("PR source is not an ordinary bounded file")
+    entry = source_tree(sha(revision)).get(path, {})
+    if entry.get("type") != "blob" or entry.get("mode") not in {"100644", "100755"}:
+        raise ReviewError("PR source is missing, a symlink, submodule or unsupported file")
+    item = api(f"/repos/{REPOSITORY}/git/blobs/{sha(entry['sha'])}")
+    if item.get("encoding") != "base64":
+        raise ReviewError("PR source is not an ordinary bounded blob")
     raw = base64.b64decode(item["content"], validate=False)
     if artifact_reason(path, raw):
         raise ReviewError("PR contains protected or binary source content")
@@ -107,7 +116,7 @@ def current_pr(number):
     return pr
 
 
-def check(name, head, *, conclusion=None, summary="Review is running", check_id=None):
+def check(name, head, *, base, conclusion=None, summary="Review is running", check_id=None):
     payload = {
         "name": "rightyo/" + name,
         "head_sha": sha(head),
@@ -115,7 +124,10 @@ def check(name, head, *, conclusion=None, summary="Review is running", check_id=
         "details_url": (
             f"https://github.com/{REPOSITORY}/actions/runs/{int(os.environ['GITHUB_RUN_ID'])}"
         ),
-        "output": {"title": "Independent AI review", "summary": summary[:60_000]},
+        "output": {
+            "title": "Independent AI review",
+            "summary": (f"Head: `{head}`; Base: `{sha(base)}`.\n\n" + summary)[:60_000],
+        },
     }
     if conclusion:
         payload["conclusion"] = conclusion
@@ -139,11 +151,13 @@ def metadata(pr, number):
 
 
 def allowed(pr, event_name, actor):
+    same_repo = (pr["head"].get("repo") or {}).get("full_name") == REPOSITORY
+    if event_name in {"pull_request_target", "workflow_run"} and actor == "dependabot[bot]":
+        return same_repo
     permission = api(
         f"/repos/{REPOSITORY}/collaborators/{urllib.parse.quote(actor, safe='')}/permission"
     ).get("permission")
     maintainer = permission in {"admin", "maintain", "write"}
-    same_repo = (pr["head"].get("repo") or {}).get("full_name") == REPOSITORY
     if event_name == "workflow_dispatch":
         return maintainer
     return same_repo and (maintainer or actor == "dependabot[bot]")
@@ -152,7 +166,7 @@ def allowed(pr, event_name, actor):
 def snapshot(pr, meta):
     comparison = api(f"/repos/{REPOSITORY}/compare/{meta['base']}...{meta['head']}")
     merge_base = sha(comparison["merge_base_commit"]["sha"])
-    files = api(f"/repos/{REPOSITORY}/pulls/{meta['pr']}/files?per_page=100&page=1")
+    files = comparison.get("files")
     if (
         not isinstance(files, list)
         or not files
@@ -193,13 +207,33 @@ def output(values):
             stream.write(f"{key}={value}\n")
 
 
-def prepare(directory, number):
+def prepare(directory, number, expected_head=None):
     if os.environ.get("GITHUB_REPOSITORY") != REPOSITORY:
         raise ReviewError("Repository scope mismatch")
     pr = current_pr(number)
+    if expected_head is not None and pr["head"]["sha"] != expected_head:
+        raise ReviewError("Source CI revision changed before snapshot preparation")
     meta = metadata(pr, number)
+    same_repo = (pr["head"].get("repo") or {}).get("full_name") == REPOSITORY
+    if os.environ["GITHUB_EVENT_NAME"] == "pull_request_target" and not same_repo:
+        existing = api(
+            f"/repos/{REPOSITORY}/commits/{meta['head']}/check-runs?filter=latest&per_page=100"
+        )
+        prefix = f"Head: `{meta['head']}`; Base: `{meta['base']}`."
+        names = {
+            item.get("name")
+            for item in existing.get("check_runs", [])
+            if (item.get("app") or {}).get("id") == 15368
+            and ((item.get("output") or {}).get("summary") or "").startswith(prefix)
+        }
+        if {"rightyo/codex-review", "rightyo/claude-review", "rightyo/review-gate"} <= names:
+            meta["preserve_checks"] = True
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "snapshot.json").write_text(json.dumps({"preserve_checks": True}))
+            output({"metadata": json.dumps(meta, separators=(",", ":")), "allowed": "false"})
+            return
     ids = {
-        name: check(name, meta["head"])["id"]
+        name: check(name, meta["head"], base=meta["base"])["id"]
         for name in ("codex-review", "claude-review", "review-gate")
     }
     meta["check_ids"] = ids
@@ -488,6 +522,8 @@ def summary(provider, payload):
 
 
 def publish(directory, meta, expected, jobs):
+    if meta.get("preserve_checks") is True:
+        return  # No new approval: keep existing exact-head/base fork check runs untouched.
     pr = current_pr(meta["pr"])
     fresh = pr["head"]["sha"] == meta["head"] and pr["base"]["sha"] == meta["base"]
     conclusions = []
@@ -521,6 +557,7 @@ def publish(directory, meta, expected, jobs):
         check(
             name,
             meta["head"],
+            base=meta["base"],
             conclusion=conclusion,
             summary=detail,
             check_id=meta["check_ids"][name],
@@ -530,6 +567,7 @@ def publish(directory, meta, expected, jobs):
     check(
         "review-gate",
         meta["head"],
+        base=meta["base"],
         conclusion=gate,
         summary=(
             "Both current-head reviews completed without blocking findings."
@@ -553,12 +591,32 @@ def main():
     try:
         if args.command == "prepare":
             event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-            number = (
-                int(event.get("inputs", {}).get("pr_number", "0"))
-                if os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
-                else event["pull_request"]["number"]
-            )
-            prepare(args.directory, number)
+            event_name = os.environ["GITHUB_EVENT_NAME"]
+            expected_head = None
+            if event_name == "workflow_dispatch":
+                number = int(event.get("inputs", {}).get("pr_number", "0"))
+            elif event_name == "workflow_run":
+                run = event["workflow_run"]
+                prs = run.get("pull_requests", [])
+                if (
+                    run.get("actor", {}).get("login") != "dependabot[bot]"
+                    or run.get("event") != "pull_request"
+                    or len(prs) != 1
+                    or run.get("repository", {}).get("full_name") != REPOSITORY
+                ):
+                    raise ReviewError("Untrusted source CI run")
+                number = prs[0]["number"]
+                expected_head = sha(run["head_sha"])
+                pr = current_pr(number)
+                if (
+                    pr["user"]["login"] != "dependabot[bot]"
+                    or pr["head"]["sha"] != sha(run["head_sha"])
+                    or (pr["head"].get("repo") or {}).get("full_name") != REPOSITORY
+                ):
+                    raise ReviewError("Bot CI source revision is stale or unauthorized")
+            else:
+                number = event["pull_request"]["number"]
+            prepare(args.directory, number, expected_head)
         elif args.command == "publish":
             publish(
                 args.directory,

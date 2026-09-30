@@ -3,6 +3,9 @@ name: Independent AI reviews
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review, edited]
+  workflow_run:
+    workflows: ['RightyO CI']
+    types: [completed]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -13,12 +16,13 @@ on:
 permissions: {}
 
 concurrency:
-  group: rightyo-ai-${{ github.event.pull_request.number || inputs.pr_number }}
-  cancel-in-progress: true
+  group: rightyo-ai-${{ github.event.pull_request.number || inputs.pr_number || github.event.workflow_run.pull_requests[0].number }}-${{ github.event_name == 'workflow_run' && github.event.workflow_run.actor.login != 'dependabot[bot]' && 'ignored' || 'reviews' }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository || (github.event_name == 'workflow_run' && github.event.workflow_run.actor.login == 'dependabot[bot]') }}
 
 jobs:
   prepare:
     name: Prepare immutable review snapshot
+    if: ${{ (github.event_name != 'workflow_run' || github.event.workflow_run.actor.login == 'dependabot[bot]') && (github.event_name != 'pull_request_target' || github.actor != 'dependabot[bot]') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -128,7 +132,7 @@ jobs:
 
   publish:
     name: Publish exact-head review checks
-    if: ${{ always() }}
+    if: ${{ always() && ((github.event_name != 'workflow_run' || github.event.workflow_run.actor.login == 'dependabot[bot]') && (github.event_name != 'pull_request_target' || github.actor != 'dependabot[bot]')) }}
     needs: [prepare, codex, claude]
     runs-on: ubuntu-24.04
     timeout-minutes: 5

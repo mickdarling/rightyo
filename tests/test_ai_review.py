@@ -1,5 +1,6 @@
 """Offline trust-boundary tests; no provider calls, credentials or GitHub writes."""
 
+import base64
 import copy
 import hashlib
 import importlib.util
@@ -78,6 +79,60 @@ class ReviewValidationTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(review.ReviewError):
                 review.validate({**RESULT, "findings": [{**finding, **change}]}, DATA)
 
+    def test_symlinks_and_submodules_are_refused_before_blob_fetch(self):
+        for mode in ("120000", "160000"):
+            tree = {"src/demo.py": {"type": "blob", "mode": mode, "sha": HEAD}}
+            with (
+                self.subTest(mode=mode),
+                patch.object(review, "source_tree", return_value=tree),
+                patch.object(review, "api") as api,
+                self.assertRaises(review.ReviewError),
+            ):
+                review.source("src/demo.py", HEAD)
+            api.assert_not_called()
+        tree = {"src/demo.py": {"type": "blob", "mode": "100644", "sha": HEAD}}
+        with (
+            patch.object(review, "source_tree", return_value=tree),
+            patch.object(
+                review,
+                "api",
+                return_value={
+                    "encoding": "base64",
+                    "content": base64.b64encode(b"ordinary source").decode(),
+                },
+            ),
+        ):
+            self.assertEqual(review.source("src/demo.py", HEAD), "ordinary source")
+
+    def test_truncated_tree_cannot_silently_omit_source(self):
+        review.source_tree.cache_clear()
+        with (
+            patch.object(review, "api", return_value={"truncated": True, "tree": []}),
+            self.assertRaises(review.ReviewError),
+        ):
+            review.source_tree(HEAD)
+        review.source_tree.cache_clear()
+
+    def test_dependabot_allowlist_precedes_collaborator_lookup(self):
+        pr = {"head": {"repo": {"full_name": review.REPOSITORY}}}
+        with patch.object(review, "api") as api:
+            self.assertTrue(review.allowed(pr, "workflow_run", "dependabot[bot]"))
+            api.assert_not_called()
+
+    def test_file_coverage_comes_from_immutable_comparison_not_live_pr_endpoint(self):
+        comparison = {
+            "merge_base_commit": {"sha": BASE},
+            "files": [{"filename": "src/demo.py", "status": "modified"}],
+        }
+        with (
+            patch.object(review, "api", return_value=comparison) as api,
+            patch.object(review, "source", side_effect=["old", "new"]),
+        ):
+            data = json.loads(review.snapshot({"changed_files": 1}, META))
+        self.assertEqual(data["files"][0]["after"], "new")
+        self.assertEqual(api.call_count, 1)
+        self.assertIn(f"/compare/{BASE}...{HEAD}", api.call_args.args[0])
+
     def test_protected_paths_are_refused_before_fetch(self):
         for path in (
             "../secret",
@@ -112,7 +167,7 @@ class ReviewValidationTests(unittest.TestCase):
 
     def test_complete_file_count_is_required_not_truncated_api_patch(self):
         pr = {"changed_files": 2}
-        replies = [{"merge_base_commit": {"sha": BASE}}, [{"filename": "src/demo.py"}]]
+        replies = [{"merge_base_commit": {"sha": BASE}, "files": [{"filename": "src/demo.py"}]}]
         with (
             patch.object(review, "api", side_effect=replies),
             self.assertRaises(review.ReviewError),
@@ -126,6 +181,40 @@ class ReviewValidationTests(unittest.TestCase):
             self.assertTrue(review.allowed(fork, "workflow_dispatch", "maintainer"))
         with patch.object(review, "api", return_value={"permission": "read"}):
             self.assertFalse(review.allowed(fork, "workflow_dispatch", "outsider"))
+
+
+class ForkPreservationTests(unittest.TestCase):
+    def test_auto_fork_metadata_event_preserves_current_dispatched_checks(self):
+        fork = {"head": {"sha": HEAD, "repo": {"full_name": "someone/fork"}}, "base": {"sha": BASE}}
+        prefix = f"Head: `{HEAD}`; Base: `{BASE}`."
+        existing = {
+            "check_runs": [
+                {"name": "rightyo/" + name, "app": {"id": 15368}, "output": {"summary": prefix}}
+                for name in ("codex-review", "claude-review", "review-gate")
+            ]
+            + [{"name": "unrelated", "app": {"id": 15368}, "output": {"summary": None}}]
+        }
+        environment = {
+            "GITHUB_REPOSITORY": review.REPOSITORY,
+            "GITHUB_EVENT_NAME": "pull_request_target",
+            "GITHUB_WORKFLOW_SHA": WORKFLOW,
+            "GITHUB_RUN_ID": "123",
+            "GITHUB_RUN_ATTEMPT": "1",
+        }
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.dict(os.environ, environment),
+            patch.object(review, "current_pr", return_value=fork),
+            patch.object(review, "api", return_value=existing),
+            patch.object(review, "check") as check,
+            patch.object(review, "output") as output,
+        ):
+            review.prepare(Path(temp), 39)
+            meta = json.loads(output.call_args.args[0]["metadata"])
+            self.assertTrue(meta["preserve_checks"])
+            check.assert_not_called()
+            review.publish(Path(temp), meta, "", {})
+            check.assert_not_called()
 
 
 class PublisherTests(unittest.TestCase):

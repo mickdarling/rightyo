@@ -101,6 +101,8 @@ so the explicit head check runs are necessary for visibility in the PR Checks ta
 The preparer uses the immutable workflow revision, reads PR metadata and public source
 through GitHub's API, and never checks out or executes PR programs. Both reviewers receive
 the same digest-checked snapshot of complete before/after changed files and trusted policy.
+Immutable Git tree modes reject symlinks and submodules before any blob content is fetched;
+the immutable comparison determines file coverage rather than a moving PR endpoint.
 Coverage is bounded to fewer than 100 files and 900,000 encoded bytes; an oversized,
 private-path, binary, non-UTF-8 or unsupported change fails rather than silently truncating.
 This source filter cannot prove that arbitrary public text lacks secrets or private content.
@@ -125,12 +127,17 @@ hardware measurements. The check summary records limitations and immutable ident
 Each provider has a ten-minute job timeout; Claude inference is bounded to five minutes,
 two turns and a $3 API budget. Codex uses a bounded snapshot and no agent command execution;
 set a separate OpenAI project spending limit because job duration is not a dollar cap.
-There are no automatic provider retries. New PR revisions cancel superseded workflow runs.
+There are no automatic provider retries. Same-repository updates cancel superseded reviews.
+Automatic fork events queue behind a maintainer dispatch and preserve existing checks for
+the exact head/base; metadata edits do not cancel or overwrite an authorized review.
 Source snapshots and validated result artifacts expire after one day; no raw CLI diagnostic
 logs or credential-bearing artifacts are uploaded.
 
 Automatic credentialed review requires a same-repository PR and a maintainer trigger
-(or the explicitly allowed Dependabot identity). Forks receive failing review checks until
+(or the explicitly allowed Dependabot identity). Dependabot reviews use a trusted
+`workflow_run` callback after its ordinary CI completes, avoiding target-event credential
+restrictions; the source run, PR author and current head are checked before snapshotting.
+Non-bot callbacks do not cancel or displace real reviews. Forks receive failing review checks until
 a maintainer runs **Independent AI reviews → Run workflow** with the current PR number.
 Dispatch rechecks maintainer permission and binds the snapshot to the head/base observed at
 that run; an update invalidates it and requires a new dispatch. Do not use persistent fork
