@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
+import yaml
+
 PRIVATE_PARTS = {
     "recordings",
     "transcripts",
@@ -308,6 +310,11 @@ def ai_review_workflow_errors(path, document):
     expected = {
         "on": expected_events,
         "permissions": {},
+        "concurrency": {
+            "group": "rightyo-subscription-status",
+            "queue": "max",
+            "cancel-in-progress": False,
+        },
         "jobs": {
             "invalidate": {
                 "runs-on": "ubuntu-24.04",
@@ -375,10 +382,6 @@ def ai_review_workflow_errors(path, document):
             "gate": {
                 "needs": ["resolve", "record"],
                 "if": "${{ needs.resolve.outputs.pr_number != '' }}",
-                "concurrency": {
-                    "group": "rightyo-subscription-${{ needs.resolve.outputs.pr_number }}",
-                    "cancel-in-progress": False,
-                },
                 "runs-on": "ubuntu-24.04",
                 "timeout-minutes": 5,
                 "permissions": {
@@ -493,6 +496,19 @@ def review_activity_workflow_errors(path, document):
     if not equal(actual, expected) or mentions_secrets(document):
         return [f"{path}: review relay exceeds fixed unprivileged notification surface"]
     return []
+
+
+def actionlint_source(path, source):
+    """Only the frozen queue field is omitted for the pinned pre-queue actionlint parser."""
+    if str(path) != AI_REVIEW_WORKFLOW:
+        return source
+    try:
+        document = yaml.safe_load(source)
+    except yaml.YAMLError:
+        raise ValueError("Review workflow compatibility input is invalid") from None
+    if workflow_errors(path, document) or source.count("  queue: max\n") != 1:
+        raise ValueError("Review workflow compatibility requires exact frozen queue policy")
+    return source.replace("  queue: max\n", "", 1)
 
 
 def workflow_errors(path, document):

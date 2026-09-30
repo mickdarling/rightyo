@@ -15,6 +15,13 @@ the workflow has run; a file in Git does not establish branch protection.
 Use Python 3.11 or newer. Python 3.11 is the CI baseline. Initial setup explicitly downloads
 small development tools from PyPI and the official actionlint release; it downloads no
 models or datasets. The actionlint archive's SHA-256 is checked before installation.
+Released actionlint parsers, including current v1.7.12, do not recognize GitHub's new
+`concurrency.queue` field. Verification keeps the existing checksummed v1.7.7: repository
+policy first validates the exact reviewed workflow mutex, then actionlint reads that one
+workflow through stdin with only its literal `queue: max` line removed. All other source
+bytes and other workflows are linted normally. Invalid queue values, missing cancellation
+policy, other scopes or added executable surface fail before normalization. Remove this
+narrow compatibility path once a pinned official release supports the field.
 
 ```sh
 python3 -m venv .venv
@@ -87,6 +94,7 @@ See [GitHub's status-check troubleshooting](https://docs.github.com/en/pull-requ
 [commit-status API](https://docs.github.com/en/rest/commits/statuses),
 [GitHub's secure-use guidance](https://docs.github.com/en/actions/reference/security/secure-use)
 for the trust boundaries and
+[workflow concurrency and queue limits](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency),
 [actionlint documentation](https://github.com/rhysd/actionlint/blob/v1.7.7/docs/usage.md)
 for workflow validation.
 
@@ -107,10 +115,17 @@ passes provider credentials. Its checkout is the immutable trusted workflow SHA.
 permissions, no checkout, artifacts, credentials or event-controlled commands. The privileged
 publisher subscribes only to its completion callback and refetches the source run through
 GitHub API, validating repository, workflow name/path, event, completion and unique PR
-association. A separate read-only resolver supplies the publisher's PR-specific concurrency
-key, preventing unrelated PR notifications from dropping each other and preventing an empty
-event association from escaping serialization. The publisher re-resolves and requires the
-same numeric PR before any status write. It never uses relay outputs as a verdict or executes the relay's PR merge tree.
+association. A fixed repository-wide workflow concurrency group serializes the entire
+bootstrap, resolver, recorder and publisher pipeline. GitHub's `queue: max` retains up to
+100 waiting runs with cancellation disabled, rather than replacing a single pending run.
+Every status writer shares that lock, so an older publisher cannot overwrite a newer
+pipeline's pending denial after collecting its evidence. The read-only resolver and
+publisher independently re-resolve the same numeric PR before status writes; there is no
+PR-specific or job-level lock outside the shared workflow scope. Relay outputs never supply
+a verdict and the relay's PR merge tree never executes in the privileged lane. Queue order
+follows waiting start, not event creation; all callbacks reread current metadata and durable
+barriers. Overflow beyond 100 waiting runs is canceled by GitHub and requires a later
+recheck; this bounded service limit remains part of #18.
 Completion comments and summary updates also supply the trusted comment-event route. A manual dispatch rechecks a PR using its full current head and base
 SHAs, without requesting or running another model.
 
@@ -138,7 +153,7 @@ resurrect a legacy verdict. Every accepted comment's exact body, update time and
 GitHub GraphQL. Explicit verdicts must never have been edited; summaries may be unedited
 or last edited by the connector's immutable Bot identity. A maintainer-edited bot comment
 cannot supply positive evidence. A new authorized first-line `@codex review` / `@codex security review` request invalidates
-older clean evidence immediately. A separate recorder runs before the publisher mutex and
+older clean evidence during validation. A separate recorder runs within the shared workflow mutex before publication and
 persists authorized request time plus comment ID as a typed pending marker in immutable
 `rightyo/review-gate` commit-status history. It can write only denial markers and gate pending, never approval.
 Editing or deleting the command cannot erase that barrier. Both the requester and event

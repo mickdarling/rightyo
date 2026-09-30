@@ -25,6 +25,11 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: rightyo-subscription-status
+  queue: max
+  cancel-in-progress: false
+
 jobs:
   invalidate:
     name: Deny review-activity hints before fallible resolution
@@ -128,7 +133,7 @@ jobs:
         run: python3 scripts/subscription_review.py resolve
 
   record:
-    name: Persist review request before publisher serialization
+    name: Persist review request within serialized status pipeline
     needs: resolve
     if: ${{ needs.resolve.outputs.pr_number != '' }}
     runs-on: ubuntu-24.04
@@ -153,9 +158,6 @@ jobs:
     name: Validate completed subscription review
     needs: [resolve, record]
     if: ${{ needs.resolve.outputs.pr_number != '' }}
-    concurrency:
-      group: rightyo-subscription-${{ needs.resolve.outputs.pr_number }}
-      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
