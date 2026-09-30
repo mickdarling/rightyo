@@ -116,7 +116,8 @@ filesystem profile with minimal system reads and the empty working directory, an
 reads outside those paths. The Linux preflight copies only the locked native CLI and its
 bundled bubblewrap executable into
 the minimal system runtime so bubblewrap can re-execute it without reading the checkout.
-It verifies a harmless command succeeds and an unrelated invented-secret canary remains
+It verifies the same command reads an allowed test file and an unrelated invented-secret
+canary remains
 unreadable before provider credentials are introduced. This avoids an explicit root deny
 mount masking required Linux runtime mounts. Writes and command network access remain
 denied, and the official Action drops elevated privileges.

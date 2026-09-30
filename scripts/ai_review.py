@@ -383,15 +383,19 @@ def sandbox_check(directory, expected):
         "-C",
         "/tmp/rightyo-review-empty",
     ]
+    readable = Path("/tmp/rightyo-review-empty/readable-canary")
+    readable.write_text("invented-readable-canary")
     try:
-        subprocess.run(
-            prefix + ["/usr/bin/true"],
+        control = subprocess.run(
+            prefix + ["/bin/cat", str(readable)],
             check=True,
             env=env,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=30,
         )
+        if control.stdout != b"invented-readable-canary":
+            raise ReviewError("Codex preflight allowed-file read did not match its canary")
     except subprocess.CalledProcessError as error:
         # Only this trusted, credential-free fixed command may report diagnostics.
         # Neither the source snapshot nor provider credentials are passed to it.
@@ -401,6 +405,8 @@ def sandbox_check(directory, expected):
         ) from None
     except subprocess.SubprocessError:
         raise ReviewError("Codex preflight harmless control command timed out") from None
+    finally:
+        readable.unlink()
     denied = subprocess.run(
         prefix + ["/bin/cat", str(canary)],
         env=env,
