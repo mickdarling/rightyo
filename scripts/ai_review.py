@@ -386,11 +386,16 @@ def sandbox_check(directory, expected):
             check=True,
             env=env,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             timeout=30,
         )
+    except subprocess.CalledProcessError as error:
+        # Only this trusted, credential-free fixed command may report diagnostics.
+        # Neither the source snapshot nor provider credentials are passed to it.
+        diagnostic = (error.stderr or b"").decode("utf-8", errors="replace")[:1000]
+        raise ReviewError("Codex preflight harmless control command failed: " + diagnostic) from None
     except subprocess.SubprocessError:
-        raise ReviewError("Codex preflight harmless control command failed") from None
+        raise ReviewError("Codex preflight harmless control command timed out") from None
     denied = subprocess.run(
         prefix + ["/bin/cat", str(canary)],
         env=env,
