@@ -263,8 +263,36 @@ def ai_review_workflow_errors(path, document):
                     },
                 ],
             },
-            "gate": {
+            "record": {
                 "needs": "resolve",
+                "if": "${{ needs.resolve.outputs.pr_number != '' }}",
+                "runs-on": "ubuntu-24.04",
+                "timeout-minutes": 5,
+                "permissions": {
+                    "actions": "read",
+                    "contents": "read",
+                    "pull-requests": "read",
+                    "statuses": "write",
+                },
+                "steps": [
+                    {
+                        "uses": CHECKOUT_ACTION,
+                        "with": {
+                            "ref": "${{ github.workflow_sha }}",
+                            "persist-credentials": False,
+                        },
+                    },
+                    {
+                        "run": "python3 scripts/subscription_review.py record",
+                        "env": {
+                            "GITHUB_TOKEN": "${{ github.token }}",
+                            "GATE_PR_NUMBER": "${{ needs.resolve.outputs.pr_number }}",
+                        },
+                    },
+                ],
+            },
+            "gate": {
+                "needs": ["resolve", "record"],
                 "if": "${{ needs.resolve.outputs.pr_number != '' }}",
                 "concurrency": {
                     "group": "rightyo-subscription-${{ needs.resolve.outputs.pr_number }}",

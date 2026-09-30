@@ -5,10 +5,12 @@ import unittest
 from unittest.mock import patch
 
 from scripts.subscription_review import (
+    ACTIONS_BOT_ID,
     APP_ID,
     BOT_ID,
     BOT_LOGIN,
     BOT_NODE_ID,
+    REQUEST_CONTEXT,
     GateError,
     authorized_request,
     clean_completion,
@@ -19,6 +21,10 @@ from scripts.subscription_review import (
     main,
     pages,
     publish,
+    record_request,
+    request_markers,
+    review_candidates,
+    timestamp,
 )
 
 HEAD = "a" * 40
@@ -172,7 +178,8 @@ class RoutingTests(unittest.TestCase):
         with (
             patch("scripts.subscription_review.api", side_effect=request),
             patch(
-                "scripts.subscription_review.pages", side_effect=[[completion()], [], [], []] * 2
+                "scripts.subscription_review.pages",
+                side_effect=[[completion()], [], [], [], []] * 2,
             ),
             patch("scripts.subscription_review.comment_provenance", return_value=True),
         ):
@@ -322,20 +329,11 @@ class AutomaticCompletionTests(unittest.TestCase):
             return pr
 
         # Initial valid summary has no reaction, then the native +1 arrives after 5 seconds.
-        batches = [
-            [summary()],
-            [],
-            [],
-            [],
-            [summary()],
-            [],
-            [],
-            [reaction()],
-            [summary()],
-            [],
-            [],
-            [reaction()],
-        ]
+        batches = (
+            [[summary()], [], [], [], []]
+            + [[summary()], [], [], [], [reaction()]]
+            + [[summary()], [], [], [], [reaction()]]
+        )
         with (
             patch("scripts.subscription_review.api", side_effect=request),
             patch("scripts.subscription_review.pages", side_effect=batches),
@@ -362,7 +360,7 @@ class AutomaticCompletionTests(unittest.TestCase):
             return {"sha": HEAD} if "/commits/" in path else pr
 
         finding = {"user": completion()["user"], "commit_id": HEAD}
-        batches = [[summary()], [], [], [], [summary()], [finding], [], [reaction()]]
+        batches = [[summary()], [], [], [], [], [summary()], [finding], [], [], [reaction()]]
         with (
             patch("scripts.subscription_review.api", side_effect=request),
             patch("scripts.subscription_review.pages", side_effect=batches),
@@ -648,3 +646,190 @@ class InlineSourceBindingTests(unittest.TestCase):
         ):
             with self.assertRaises(GateError):
                 inline_revision(self.inline(), parents)
+
+
+class DurableRequestTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.dict(os.environ, {"GITHUB_RUN_ID": "12345"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def marker(self, cutoff="2026-09-30T07:09:50Z"):
+        return {
+            "context": REQUEST_CONTEXT,
+            "description": f"v1 comment:99 requested:{cutoff}",
+            "creator": {"id": ACTIONS_BOT_ID, "login": "github-actions[bot]", "type": "Bot"},
+        }
+
+    def event(self, action="created", body="@codex review"):
+        return {
+            "action": action,
+            "comment": {
+                "id": 99,
+                "body": body,
+                "updated_at": "2026-09-30T07:09:50Z",
+                "user": {"login": "maintainer", "type": "User"},
+            },
+            "sender": {"login": "maintainer", "type": "User"},
+        }
+
+    def test_immutable_marker_blocks_old_completion_after_command_edit_or_delete(self):
+        for current_comments in ([summary(), completion()], [summary()]):
+            with patch("scripts.subscription_review.pages", return_value=[self.marker()]):
+                persisted = request_markers(HEAD)
+            self.assertIsNone(
+                review_candidates(
+                    HEAD,
+                    current_comments,
+                    [],
+                    [],
+                    lambda short: HEAD,
+                    lambda item, summary: True,
+                    persisted=persisted,
+                )
+                or None
+            )
+
+    def test_request_recording_is_denial_only_and_not_inside_publisher_mutex(self):
+        pr = {"state": "open", "head": {"sha": HEAD}}
+        with (
+            patch("scripts.subscription_review.current_pr", return_value=pr),
+            patch("scripts.subscription_review.authorized_request", return_value=True),
+            patch("scripts.subscription_review.request_markers", return_value={}),
+            patch("scripts.subscription_review.commit_status") as status,
+        ):
+            record_request(44, "issue_comment", self.event())
+        self.assertEqual(status.call_count, 2)
+        self.assertTrue(all(call.args[1] == "pending" for call in status.call_args_list))
+        self.assertEqual(status.call_args_list[-1].kwargs["context"], REQUEST_CONTEXT)
+
+    def test_removed_command_payload_is_recorded_if_original_capture_was_missed(self):
+        edited = self.event("edited", "request removed")
+        edited["changes"] = {"body": {"from": "@codex review"}}
+        pr = {"state": "open", "head": {"sha": HEAD}}
+        for event in (edited, self.event("deleted")):
+            with (
+                patch("scripts.subscription_review.current_pr", return_value=pr),
+                patch("scripts.subscription_review.authorized_request", return_value=True),
+                patch("scripts.subscription_review.request_markers", return_value={}),
+                patch("scripts.subscription_review.commit_status") as status,
+            ):
+                record_request(44, "issue_comment", event)
+                self.assertEqual(status.call_args.kwargs["context"], REQUEST_CONTEXT)
+
+    def test_cleanup_preserves_existing_request_time_without_new_pending_write(self):
+        edited = self.event("edited", "request removed")
+        edited["changes"] = {"body": {"from": "@codex review"}}
+        with (
+            patch(
+                "scripts.subscription_review.current_pr",
+                return_value={"state": "open", "head": {"sha": HEAD}},
+            ),
+            patch("scripts.subscription_review.authorized_request", return_value=True),
+            patch(
+                "scripts.subscription_review.request_markers",
+                return_value={99: timestamp("2026-09-30T07:08:00Z")},
+            ),
+            patch("scripts.subscription_review.commit_status") as status,
+        ):
+            record_request(44, "issue_comment", edited)
+            status.assert_not_called()
+        candidates = review_candidates(
+            HEAD,
+            [summary(), completion()],
+            [],
+            [],
+            lambda short: HEAD,
+            lambda item, summary: True,
+            persisted={99: timestamp("2026-09-30T07:08:00Z")},
+        )
+        self.assertTrue(candidates)
+
+    def test_unprivileged_or_benign_comment_is_noop(self):
+        with (
+            patch(
+                "scripts.subscription_review.current_pr",
+                return_value={"state": "open", "head": {"sha": HEAD}},
+            ),
+            patch("scripts.subscription_review.authorized_request", return_value=False),
+            patch("scripts.subscription_review.commit_status") as status,
+        ):
+            record_request(44, "issue_comment", self.event())
+            record_request(44, "issue_comment", self.event(body="ordinary discussion"))
+            status.assert_not_called()
+
+    def test_malformed_trusted_marker_fails_closed_and_other_creators_cannot_approve(self):
+        bad = {**self.marker(), "description": "unsupported"}
+        with patch("scripts.subscription_review.pages", return_value=[bad]):
+            with self.assertRaises(GateError):
+                request_markers(HEAD)
+        outsider = {**self.marker(), "creator": {"id": 3, "login": "other"}}
+        with patch("scripts.subscription_review.pages", return_value=[outsider]):
+            self.assertEqual(request_markers(HEAD), {})
+
+    def test_marker_context_can_never_write_success(self):
+        with patch("scripts.subscription_review.api") as api:
+            with self.assertRaises(GateError):
+                commit_status(HEAD, "success", "forged approval", context=REQUEST_CONTEXT)
+            api.assert_not_called()
+
+    def test_edited_command_records_new_cutoff_then_removal_preserves_that_time(self):
+        edited = self.event("edited", "@codex review\nnew instructions")
+        edited["changes"] = {"body": {"from": "@codex review"}}
+        old = timestamp("2026-09-30T07:08:00Z")
+        with (
+            patch(
+                "scripts.subscription_review.current_pr",
+                return_value={"state": "open", "head": {"sha": HEAD}},
+            ),
+            patch("scripts.subscription_review.authorized_request", return_value=True),
+            patch("scripts.subscription_review.request_markers", return_value={99: old}),
+            patch("scripts.subscription_review.commit_status") as status,
+        ):
+            record_request(44, "issue_comment", edited)
+        self.assertIn("07:09:50Z", status.call_args.args[2])
+
+    def test_permission_or_history_failure_persists_denial_for_later_removed_comment(self):
+        for failure in ("authorization", "history"):
+            with (
+                patch(
+                    "scripts.subscription_review.current_pr",
+                    return_value={"state": "open", "head": {"sha": HEAD}},
+                ),
+                patch(
+                    "scripts.subscription_review.authorized_request",
+                    side_effect=GateError("API failure") if failure == "authorization" else None,
+                    return_value=True,
+                ),
+                patch(
+                    "scripts.subscription_review.request_markers",
+                    side_effect=GateError("API failure"),
+                ),
+                patch("scripts.subscription_review.commit_status") as status,
+            ):
+                with self.assertRaises(GateError):
+                    record_request(44, "issue_comment", self.event())
+                self.assertEqual(status.call_count, 2)
+                self.assertTrue(all(call.args[1] == "pending" for call in status.call_args_list))
+
+    def test_required_pending_marker_alone_preserves_cutoff_if_second_write_fails(self):
+        fallback = {**self.marker(), "context": "rightyo/review-gate"}
+        with patch("scripts.subscription_review.pages", return_value=[fallback]):
+            markers = request_markers(HEAD)
+        self.assertEqual(markers[99], timestamp("2026-09-30T07:09:50Z"))
+
+    def test_durable_request_also_requires_a_newer_completed_summary_cycle(self):
+        fresh = completion()
+        fresh["created_at"] = fresh["updated_at"] = "2026-09-30T07:10:50Z"
+        self.assertEqual(
+            review_candidates(
+                HEAD,
+                [summary(), fresh],
+                [],
+                [],
+                lambda short: HEAD,
+                lambda item, summary: True,
+                persisted={99: timestamp("2026-09-30T07:09:50Z")},
+            ),
+            [],
+        )

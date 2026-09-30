@@ -304,3 +304,16 @@ class ResolverPolicyTests(unittest.TestCase):
             else:
                 del doc["jobs"]["gate"]["steps"][1]["env"]["GATE_PR_NUMBER"]
             self.assertTrue(workflow_errors(AI_REVIEW_WORKFLOW, doc))
+
+
+class RequestRecorderPolicyTests(unittest.TestCase):
+    def test_marker_is_required_before_publisher_and_cannot_be_dropped_by_gate_mutex(self):
+        for mutation in ("skip-recorder", "recorder-mutex", "gate-without-recorder"):
+            doc = yaml.safe_load((ROOT / AI_REVIEW_WORKFLOW).read_text())
+            if mutation == "skip-recorder":
+                doc["jobs"]["record"]["if"] = "false"
+            elif mutation == "recorder-mutex":
+                doc["jobs"]["record"]["concurrency"] = {"group": "all", "cancel-in-progress": True}
+            else:
+                doc["jobs"]["gate"]["needs"] = ["resolve"]
+            self.assertTrue(workflow_errors(AI_REVIEW_WORKFLOW, doc))

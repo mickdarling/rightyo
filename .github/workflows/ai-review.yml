@@ -48,9 +48,31 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/subscription_review.py resolve
 
+  record:
+    name: Persist review request before publisher serialization
+    needs: resolve
+    if: ${{ needs.resolve.outputs.pr_number != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Persist authorized review request as denial-only metadata
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GATE_PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+        run: python3 scripts/subscription_review.py record
+
   gate:
     name: Validate completed subscription review
-    needs: resolve
+    needs: [resolve, record]
     if: ${{ needs.resolve.outputs.pr_number != '' }}
     concurrency:
       group: rightyo-subscription-${{ needs.resolve.outputs.pr_number }}

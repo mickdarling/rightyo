@@ -18,6 +18,9 @@ BOT_LOGIN = "chatgpt-codex-connector[bot]"
 BOT_ID = 199175422
 BOT_NODE_ID = "BOT_kgDOC98s_g"
 APP_ID = 1144995
+ACTIONS_BOT_ID = 41898282
+REQUEST_CONTEXT = "rightyo/review-request"
+REQUEST_MARKER = re.compile(r"v1 comment:([1-9][0-9]*) requested:(.+)\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 COMPLETION = re.compile(
     r"\ACodex Review: Didn't find any major issues\.[^\n]*\s+"
@@ -157,14 +160,94 @@ def authorized_request(comment):
     return permission.get("permission") in {"admin", "maintain", "write"}
 
 
-def freshness_barrier(comments, head, resolve, attest, authorize):
-    barriers = []
+def request_command(body):
+    return (
+        isinstance(body, str)
+        and re.match(r"\A\s*@codex (?:security )?review(?:\s|\Z)", body, re.I) is not None
+    )
+
+
+def request_markers(head):
+    if not isinstance(head, str) or not SHA.fullmatch(head):
+        raise GateError("Invalid persisted request revision")
+    markers = {}
+    for status in pages(f"/repos/{REPOSITORY}/commits/{head}/statuses"):
+        context = status.get("context")
+        description = status.get("description") or ""
+        if context != REQUEST_CONTEXT and not (
+            context == "rightyo/review-gate" and description.startswith("v1 comment:")
+        ):
+            continue
+        creator = status.get("creator") or {}
+        if creator.get("id") != ACTIONS_BOT_ID or creator.get("login") != "github-actions[bot]":
+            continue
+        match = REQUEST_MARKER.fullmatch(status.get("description") or "")
+        if not match:
+            raise GateError("Persisted review request marker is malformed")
+        comment_id, cutoff = int(match[1]), timestamp(match[2]).replace(microsecond=0)
+        markers[comment_id] = max(markers.get(comment_id, cutoff), cutoff)
+    return markers
+
+
+def persist_request(head, comment_id, cutoff):
+    description = f"v1 comment:{comment_id} requested:{cutoff.isoformat().replace('+00:00', 'Z')}"
+    # Each immutable record independently carries the denial cutoff. The second write
+    # still runs if the first fails, preserving best-effort durability without retries.
+    try:
+        commit_status(head, "pending", description)
+    finally:
+        commit_status(head, "pending", description, context=REQUEST_CONTEXT)
+
+
+def record_request(number, event_name, event):
+    if event_name != "issue_comment":
+        return
+    comment = event.get("comment") or {}
+    action = event.get("action")
+    old_body = event.get("changes", {}).get("body", {}).get("from")
+    current_request = request_command(comment.get("body"))
+    removed_request = (request_command(old_body) and not current_request) or (
+        action == "deleted" and current_request
+    )
+    if action not in {"created", "edited", "deleted"} or not (current_request or removed_request):
+        return
+    pr = current_pr(number)
+    if pr.get("state") != "open":
+        return
+    head = pr["head"]["sha"]
+    comment_id = comment.get("id")
+    if type(comment_id) is not int or comment_id < 1:
+        raise GateError("Review request comment identity is invalid")
+    cutoff = timestamp(comment.get("updated_at")).replace(microsecond=0)
+    # Freeze approval before permission/history requests that might fail. This job never
+    # writes gate success, and a failed recorder prevents the publisher from running.
+    try:
+        allowed = authorized_request(comment) and authorized_request({"user": event.get("sender")})
+    except GateError:
+        persist_request(head, comment_id, cutoff)
+        raise
+    if not allowed:
+        return
+    try:
+        markers = request_markers(head)
+    except GateError:
+        persist_request(head, comment_id, cutoff)
+        raise
+    if removed_request and comment_id in markers:
+        cutoff = markers[comment_id]
+    if markers.get(comment_id) == cutoff:
+        return
+    persist_request(head, comment_id, cutoff)
+
+
+def freshness_barrier(comments, head, resolve, attest, authorize, persisted=None):
+    barriers = list((persisted or {}).values())
     summaries = []
     for comment in comments:
         body = comment.get("body") or ""
         # Only a command at the start of the comment is a request; quoted/code examples
         # and unprivileged copied text are not treated as reviewer authorization.
-        if re.match(r"\A\s*@codex (?:security )?review(?:\s|\Z)", body, re.I):
+        if request_command(body):
             if authorize(comment):
                 barriers.append(timestamp(comment.get("updated_at")))
         if not native(comment, require_app=True):
@@ -212,7 +295,14 @@ def inline_revision(comment, reviews):
 
 
 def review_candidates(
-    head, comments, reviews, inline_comments, resolve, attest, authorize=authorized_request
+    head,
+    comments,
+    reviews,
+    inline_comments,
+    resolve,
+    attest,
+    authorize=authorized_request,
+    persisted=None,
 ):
     """Require positive authenticated evidence, never absence of findings alone."""
     if not isinstance(head, str) or not SHA.fullmatch(head):
@@ -223,7 +313,9 @@ def review_candidates(
     for record in inline_comments:
         if native(record) and inline_revision(record, reviews) == head:
             return []
-    barrier, completed_cycle = freshness_barrier(comments, head, resolve, attest, authorize)
+    barrier, completed_cycle = freshness_barrier(
+        comments, head, resolve, attest, authorize, persisted
+    )
     if not completed_cycle:
         return []
     candidates = []
@@ -380,10 +472,14 @@ def revisions(pr):
     return pr["head"]["sha"], pr["base"]["sha"]
 
 
-def commit_status(head, state, description):
+def commit_status(head, state, description, *, context="rightyo/review-gate"):
     """Publish the stable context without workflow-event check-suite restrictions."""
     if not isinstance(head, str) or not SHA.fullmatch(head):
         raise GateError("Invalid status revision")
+    if context not in {"rightyo/review-gate", REQUEST_CONTEXT} or (
+        context == REQUEST_CONTEXT and state != "pending"
+    ):
+        raise GateError("Invalid denial-marker status scope")
     if state not in {"pending", "success", "failure", "error"}:
         raise GateError("Invalid status state")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
@@ -394,7 +490,7 @@ def commit_status(head, state, description):
         "POST",
         {
             "state": state,
-            "context": "rightyo/review-gate",
+            "context": context,
             "description": description[:140],
             "target_url": f"https://github.com/{REPOSITORY}/actions/runs/{run_id}",
         },
@@ -427,6 +523,7 @@ def publish(number, expected=None):
                 inline,
                 lambda short: api(f"{prefix}/commits/{short}")["sha"],
                 comment_provenance,
+                persisted=request_markers(head),
             )
 
         candidates = collect()
@@ -485,7 +582,9 @@ def publish(number, expected=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", choices=["resolve", "publish"], default="publish")
+    parser.add_argument(
+        "command", nargs="?", choices=["resolve", "record", "publish"], default="publish"
+    )
     args = parser.parse_args()
     try:
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
@@ -500,7 +599,10 @@ def main():
             routed = os.environ.get("GATE_PR_NUMBER", "")
             if not re.fullmatch(r"[1-9][0-9]*", routed) or int(routed) != number:
                 raise GateError("Publisher PR association changed after serialized routing")
-            publish(number, expected)
+            if args.command == "record":
+                record_request(number, os.environ["GITHUB_EVENT_NAME"], event)
+            else:
+                publish(number, expected)
         else:
             print("Non-PR event ignored")
     except (OSError, ValueError, KeyError, TypeError) as error:
