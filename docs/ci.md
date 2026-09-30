@@ -108,20 +108,33 @@ comment-event route. A manual dispatch rechecks a PR using its full current head
 SHAs, without requesting or running another model.
 
 The stable `rightyo/review-gate` check runs on the exact current PR head. Passing requires
-an explicit **Codex Review: Didn't find any major issues.** completion comment from the
-verified connector bot identity and GitHub app. Creation/update timestamps must match; edits
-visible in GitHub's REST timestamps are rejected. These timestamps have second precision,
-so this heuristic is not immutable attestation; stronger verification remains #18 work.
-The displayed commit abbreviation must
-uniquely resolve through GitHub's commit API to the full current head. An activity summary,
-request comment, reaction, absence of suggestions, old-head result or another user's copied
-verdict never passes. Some automatic native reviews only leave a reaction or activity
-summary; request `@codex review` on the PR to obtain an explicit verdict while the gate
-remains blocked. Any connector review or inline finding on the current head blocks,
-even if someone resolves its thread or dismisses its review: fix the issue on a new head
-and obtain a fresh clean review. Unknown output formats, quota failures, missing completion,
-API errors and bounded-history overflow fail closed. Current head/base are refetched before
-publication; a changed revision invalidates that attempt.
+positive evidence from the verified connector bot identity and GitHub app, through either:
+
+- An explicit **Codex Review: Didn't find any major issues.** completion comment with its
+  reviewed commit uniquely resolved through GitHub's commit API to the full current head.
+- An authentic summary containing exactly one **Code Review / Completed** row for the
+  uniquely resolved current head, together with a genuine connector thumbs-up reaction on
+  the PR created at or after that completion. The app's own summary describes thumbs-up
+  as completion without findings; this path is verified against RightyO's automatic review.
+
+Neither a request, summary alone, reaction alone, copied verdict nor old-head evidence
+passes. Every accepted comment's exact body, update time and identity are checked through
+GitHub GraphQL. Explicit verdicts must never have been edited; summaries may be unedited
+or last edited by the connector's immutable Bot identity. A maintainer-edited bot comment
+cannot supply positive evidence. Current-head connector reviews or inline findings block
+even after thread resolution or dismissal: fix on a new head and obtain a fresh review.
+
+Summary completion times include fractions of a second while reaction timestamps use
+whole seconds; comparison floors the completion time to that same precision. PR reactions
+are not cryptographically bound to a commit, so this is a conservative observed native
+protocol adapter, not immutable review attestation. Stronger verification remains #18 work.
+The workflow briefly retries metadata up to three times at five-second intervals because
+native reactions can appear after the completion-comment event; it never retries inference.
+Finding streams and comment provenance are refetched before positive publication. If the
+native format changes, the reaction is delayed beyond this window, or review is incomplete,
+the gate blocks; a later trusted event or exact-revision manual gate dispatch can recheck.
+Unknown formats, quota failure, API/GraphQL errors and bounded-history overflow fail closed.
+Current head/base are refetched before publication; revision changes invalidate the attempt.
 
 Native Codex normally reports P0/P1 findings. It does not provide the previous API workflow's
 structured complete-file attestation or P0–P2 policy, and the gate does not claim those

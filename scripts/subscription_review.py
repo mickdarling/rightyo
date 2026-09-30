@@ -6,6 +6,7 @@ No model is invoked here. Provider credentials and PR-controlled code are never 
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -14,11 +15,23 @@ from pathlib import Path
 REPOSITORY = "mickdarling/rightyo"
 BOT_LOGIN = "chatgpt-codex-connector[bot]"
 BOT_ID = 199175422
+BOT_NODE_ID = "BOT_kgDOC98s_g"
 APP_ID = 1144995
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 COMPLETION = re.compile(
     r"\ACodex Review: Didn't find any major issues\.[^\n]*\s+"
     r"\*\*Reviewed commit:\*\* `([0-9a-f]{10,40})`(?:\s|\Z)"
+)
+
+SUMMARY = re.compile(
+    r"^\| 📝 \*\*Code Review\*\* \| ✅ \*\*Completed\*\* "
+    r'<relative-time datetime="([^"\n]+)">\1</relative-time> '
+    r"\| `([0-9a-f]{7,40})` \| [^|\n]+\|$",
+    re.M,
+)
+COMMENT_QUERY = (
+    "query($id:ID!){node(id:$id){... on IssueComment{"
+    "id body databaseId updatedAt lastEditedAt editor{__typename login ... on Bot{id}}}}}"
 )
 
 
@@ -33,7 +46,14 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def api(path, method="GET", data=None):
     token = os.environ.get("GITHUB_TOKEN", "")
-    if not token or not path.startswith(f"/repos/{REPOSITORY}/"):
+    graphql_request = (
+        path == "/graphql"
+        and method == "POST"
+        and isinstance(data, dict)
+        and set(data) == {"query", "variables"}
+        and data["query"] == COMMENT_QUERY
+    )
+    if not token or not (path.startswith(f"/repos/{REPOSITORY}/") or graphql_request):
         raise GateError("GitHub authentication or repository scope unavailable")
     request = urllib.request.Request(
         "https://api.github.com" + path,
@@ -79,35 +99,117 @@ def native(record, *, require_app=False):
     )
 
 
-def clean_completion(head, comments, reviews, inline_comments, resolve):
-    """Require positive authenticated completion; absence of findings alone is insufficient."""
+def timestamp(value):
+    if not isinstance(value, str) or not re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z", value
+    ):
+        raise GateError("Invalid native review timestamp")
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as error:
+        raise GateError("Invalid native review timestamp") from error
+
+
+def comment_provenance(comment, summary):
+    """Bind edit provenance to the exact REST body, not just the original author."""
+    node_id = comment.get("node_id")
+    if not isinstance(node_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", node_id):
+        raise GateError("Native comment node is unavailable")
+    payload = api("/graphql", "POST", {"query": COMMENT_QUERY, "variables": {"id": node_id}})
+    if payload.get("errors"):
+        raise GateError("Native comment provenance query failed")
+    node = payload.get("data", {}).get("node")
+    if (
+        not isinstance(node, dict)
+        or not {"id", "databaseId", "body", "updatedAt", "lastEditedAt", "editor"}.issubset(node)
+        or (
+            node.get("id") != node_id
+            or node.get("databaseId") != comment.get("id")
+            or node.get("body") != comment.get("body")
+            or node.get("updatedAt") != comment.get("updated_at")
+        )
+    ):
+        raise GateError("Native comment changed during provenance validation")
+    if node.get("lastEditedAt") is None:
+        return node.get("editor") is None
+    if not summary:
+        return False
+    timestamp(node["lastEditedAt"])
+    editor = node.get("editor") or {}
+    return (
+        editor.get("__typename") == "Bot"
+        and editor.get("id") == BOT_NODE_ID
+        and editor.get("login") == "chatgpt-codex-connector"
+    )
+
+
+def review_candidates(head, comments, reviews, inline_comments, resolve, attest):
+    """Require positive authenticated evidence, never absence of findings alone."""
     if not isinstance(head, str) or not SHA.fullmatch(head):
         raise GateError("Invalid immutable PR head")
-    # A completed native review with suggestions is never silently converted to approval,
-    # even if its threads were resolved or its review dismissed. A fresh fixed head is needed.
     for record in reviews + inline_comments:
         if native(record) and record.get("commit_id") == head:
-            return None
+            return []
+    candidates = []
     for comment in reversed(comments):
         if not native(comment, require_app=True):
             continue
-        created = comment.get("created_at")
-        if not isinstance(created, str) or created != comment.get("updated_at"):
+        body = comment.get("body") or ""
+        match = COMPLETION.match(body)
+        summary = False
+        if not match:
+            if not body.startswith(
+                "<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n"
+            ):
+                continue
+            rows = SUMMARY.findall(body)
+            if len(rows) != 1 or len(re.findall(r"(?m)^\|[^\n]*\*\*Code Review\*\*", body)) != 1:
+                continue
+            completed_at, short = rows[0]
+            completed = timestamp(completed_at).replace(microsecond=0)
+            if completed > timestamp(comment.get("updated_at")):
+                raise GateError("Native summary completion timestamp is inconsistent")
+            summary = True
+        else:
+            short = match[1]
+            completed = timestamp(comment.get("created_at"))
+        if not head.startswith(short) or resolve(short) != head:
             continue
-        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", created):
+        if not attest(comment, summary):
             continue
-        try:
-            datetime.fromisoformat(created)
-        except ValueError:
-            continue
-        match = COMPLETION.match(comment.get("body") or "")
-        if not match or not head.startswith(match[1]):
-            continue
-        # The displayed abbreviation must uniquely resolve to the entire current commit.
-        # An ambiguous commit prefix, API failure or another SHA fails closed.
-        if resolve(match[1]) == head:
-            return comment
+        candidates.append(
+            {
+                "id": comment["id"],
+                "kind": "summary" if summary else "explicit",
+                "completed_at": completed,
+            }
+        )
+    return candidates
+
+
+def select_completion(candidates, reactions):
+    for candidate in candidates:
+        if candidate["kind"] == "explicit":
+            return candidate
+        for reaction in reactions:
+            user = reaction.get("user") or {}
+            # GitHub's reactions REST endpoint exposes the genuine connector as User,
+            # unlike comment/review endpoints. Its immutable ID and login still match.
+            if (
+                reaction.get("content") == "+1"
+                and user.get("id") == BOT_ID
+                and user.get("login") == BOT_LOGIN
+                and user.get("type") in {"User", "Bot"}
+                and timestamp(reaction.get("created_at")) >= candidate["completed_at"]
+            ):
+                return {**candidate, "reaction_id": reaction["id"]}
     return None
+
+
+def clean_completion(head, comments, reviews, inline_comments, resolve, attest, reactions):
+    return select_completion(
+        review_candidates(head, comments, reviews, inline_comments, resolve, attest), reactions
+    )
 
 
 def event_pr(event_name, event):
@@ -172,7 +274,7 @@ def publish(number, expected=None):
             "output": {
                 "title": "Checking subscription Codex review",
                 "summary": (
-                    "Requires an explicit current-head native completion. Claude is deferred."
+                    "Requires positive current-head native completion evidence. Claude is deferred."
                 ),
             },
         },
@@ -182,31 +284,52 @@ def publish(number, expected=None):
     failure = None
     try:
         prefix = f"/repos/{REPOSITORY}"
-        comments = pages(f"{prefix}/issues/{number}/comments")
-        reviews = pages(f"{prefix}/pulls/{number}/reviews")
-        inline = pages(f"{prefix}/pulls/{number}/comments")
-        completion = clean_completion(
-            head,
-            comments,
-            reviews,
-            inline,
-            lambda short: api(f"{prefix}/commits/{short}")["sha"],
-        )
+
+        def collect():
+            comments = pages(f"{prefix}/issues/{number}/comments")
+            reviews = pages(f"{prefix}/pulls/{number}/reviews")
+            inline = pages(f"{prefix}/pulls/{number}/comments")
+            return review_candidates(
+                head,
+                comments,
+                reviews,
+                inline,
+                lambda short: api(f"{prefix}/commits/{short}")["sha"],
+                comment_provenance,
+            )
+
+        candidates = collect()
+        completion = select_completion(candidates, pages(f"{prefix}/issues/{number}/reactions"))
+        for _ in range(3):
+            if completion is not None or not any(c["kind"] == "summary" for c in candidates):
+                break
+            # Summary updates can precede the clean PR reaction by a few seconds.
+            # There is no reaction webhook event, so briefly retry metadata, not inference.
+            time.sleep(5)
+            if revisions(current_pr(number)) != (head, base):
+                raise GateError("PR revisions changed while waiting for native reaction")
+            candidates = collect()
+            completion = select_completion(candidates, pages(f"{prefix}/issues/{number}/reactions"))
+        if completion is not None:
+            # Refetch finding streams and current body/provenance before publication.
+            completion = select_completion(collect(), pages(f"{prefix}/issues/{number}/reactions"))
         if revisions(current_pr(number)) != (head, base):
             raise GateError("PR revisions changed while validating review")
         if completion is None:
             conclusion = "action_required"
             message = (
-                "Awaiting an explicit clean native Codex review of this exact head. "
-                "A request, reaction, summary table, old review or resolved finding "
-                "is insufficient. "
-                "If native review only left a reaction/summary, request @codex review on the PR."
+                "Awaiting clean native Codex completion evidence for this exact head. "
+                "Requires a native explicit clean verdict, or an authentic completed summary "
+                "plus a fresh connector thumbs-up reaction. "
+                "Old or incomplete evidence is insufficient."
             )
         else:
             conclusion = "success"
             message = (
                 f"Native Codex reported no major issues for full head {head}. "
-                f"Completion comment ID: {completion['id']}; current base: {base}. "
+                f"Evidence: {completion['kind']}; comment ID: {completion['id']}; "
+                f"reaction ID: {completion.get('reaction_id', 'not required')}; "
+                f"current base: {base}. "
                 "This is subscription-backed native review, normally P0/P1; "
                 "it does not attest complete file coverage or a review of the current base. "
                 "Claude remains deferred. Classic CI is independently required."
