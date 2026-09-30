@@ -330,13 +330,16 @@ def sandbox_check(directory, expected):
         "kernel.apparmor_restrict_unprivileged_userns",
     ):
         value = "1" if setting.endswith("userns_clone") else "0"
-        subprocess.run(
-            ["sudo", "sysctl", "-w", setting + "=" + value],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=15,
-        )
+        try:
+            subprocess.run(
+                ["sudo", "sysctl", "-w", setting + "=" + value],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+        except subprocess.SubprocessError:
+            raise ReviewError("Codex preflight kernel setup failed: " + setting) from None
     canary = Path("/tmp/rightyo-review-denied-canary")
     canary.write_text("invented-secret-canary")
     env = dict(os.environ, CODEX_HOME="/tmp/rightyo-codex-home")
@@ -349,14 +352,17 @@ def sandbox_check(directory, expected):
         "-C",
         "/tmp/rightyo-review-empty",
     ]
-    subprocess.run(
-        prefix + ["/usr/bin/true"],
-        check=True,
-        env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=30,
-    )
+    try:
+        subprocess.run(
+            prefix + ["/usr/bin/true"],
+            check=True,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except subprocess.SubprocessError:
+        raise ReviewError("Codex preflight harmless control command failed") from None
     denied = subprocess.run(
         prefix + ["/bin/cat", str(canary)],
         env=env,
