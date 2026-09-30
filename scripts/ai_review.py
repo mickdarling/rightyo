@@ -18,7 +18,7 @@ from pathlib import Path, PurePosixPath
 from repository_checks import artifact_reason
 
 ROOT = Path(__file__).resolve().parents[1]
-MAX_SNAPSHOT = 900_000
+MAX_SNAPSHOT = 400_000
 MAX_FILES = 100
 MAX_RESULT = 64_000
 SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -207,15 +207,25 @@ def output(values):
             stream.write(f"{key}={value}\n")
 
 
-def prepare(directory, number, expected_head=None):
+def prepare(directory, number, expected_head=None, expected_base=None):
     if os.environ.get("GITHUB_REPOSITORY") != REPOSITORY:
         raise ReviewError("Repository scope mismatch")
     pr = current_pr(number)
     if expected_head is not None and pr["head"]["sha"] != expected_head:
         raise ReviewError("Source CI revision changed before snapshot preparation")
+    if expected_base is not None and pr["base"]["sha"] != expected_base:
+        raise ReviewError("Authorized base revision changed before snapshot preparation")
     meta = metadata(pr, number)
     same_repo = (pr["head"].get("repo") or {}).get("full_name") == REPOSITORY
     if os.environ["GITHUB_EVENT_NAME"] == "pull_request_target" and not same_repo:
+        # Inert fork events must never overwrite or displace a maintainer's check runs.
+        # Missing head checks stay missing (and block required-check protection) until dispatch.
+        meta["preserve_checks"] = True
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "snapshot.json").write_text(json.dumps({"preserve_checks": True}))
+        output({"metadata": json.dumps(meta, separators=(",", ":")), "allowed": "false"})
+        return
+    if os.environ["GITHUB_EVENT_NAME"] != "workflow_dispatch":
         existing = api(
             f"/repos/{REPOSITORY}/commits/{meta['head']}/check-runs?filter=latest&per_page=100"
         )
@@ -359,6 +369,11 @@ def sandbox_check(directory, expected):
         raise ReviewError("Codex permission boundary did not deny the canary read")
 
 
+def github_line_count(text):
+    # GitHub/Git line coordinates use LF, not Python's additional Unicode separators.
+    return len(text.split("\n")) - int(text.endswith("\n")) if text else 0
+
+
 def validate(result, data):
     if not isinstance(result, dict) or set(result) != {
         "status",
@@ -402,7 +417,7 @@ def validate(result, data):
             or type(finding["line"]) is not int
             or not 1
             <= finding["line"]
-            <= len(entries[finding["path"]][finding["side"]].splitlines())
+            <= github_line_count(entries[finding["path"]][finding["side"]])
             or not isinstance(finding["evidence"], str)
             or not 1 <= len(finding["evidence"]) <= 4000
         ):
@@ -593,8 +608,11 @@ def main():
             event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
             event_name = os.environ["GITHUB_EVENT_NAME"]
             expected_head = None
+            expected_base = None
             if event_name == "workflow_dispatch":
                 number = int(event.get("inputs", {}).get("pr_number", "0"))
+                expected_head = sha(event["inputs"]["expected_head"])
+                expected_base = sha(event["inputs"]["expected_base"])
             elif event_name == "workflow_run":
                 run = event["workflow_run"]
                 prs = run.get("pull_requests", [])
@@ -616,7 +634,7 @@ def main():
                     raise ReviewError("Bot CI source revision is stale or unauthorized")
             else:
                 number = event["pull_request"]["number"]
-            prepare(args.directory, number, expected_head)
+            prepare(args.directory, number, expected_head, expected_base)
         elif args.command == "publish":
             publish(
                 args.directory,

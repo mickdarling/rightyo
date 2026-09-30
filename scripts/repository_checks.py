@@ -246,15 +246,17 @@ AI_REVIEW_CONCURRENCY = {
     "group": (
         "rightyo-ai-${{ github.event.pull_request.number || inputs.pr_number || "
         "github.event.workflow_run.pull_requests[0].number }}-${{ "
-        "github.event_name == 'workflow_run' && "
-        "github.event.workflow_run.actor.login != 'dependabot[bot]' && 'ignored' || 'reviews' }}"
+        "github.event.pull_request.head.sha || inputs.expected_head || "
+        "github.event.workflow_run.head_sha }}-${{ "
+        "github.event_name == 'workflow_dispatch' && 'manual' || "
+        "((github.event_name == 'workflow_run' && "
+        "github.event.workflow_run.actor.login != 'dependabot[bot]') || "
+        "(github.event_name == 'pull_request_target' && "
+        "(github.actor == 'dependabot[bot]' || "
+        "github.event.pull_request.head.repo.full_name != github.repository))) "
+        "&& 'ignored' || 'automatic' }}"
     ),
-    "cancel-in-progress": (
-        "${{ github.event_name == 'workflow_dispatch' || "
-        "github.event.pull_request.head.repo.full_name == github.repository || "
-        "(github.event_name == 'workflow_run' && "
-        "github.event.workflow_run.actor.login == 'dependabot[bot]') }}"
-    ),
+    "cancel-in-progress": "${{ github.event_name == 'workflow_dispatch' }}",
 }
 
 
@@ -409,18 +411,20 @@ def ai_review_workflow_errors(path, document):
             reject("workflow_run must consume only completed RightyO CI events")
         dispatch = event["workflow_dispatch"]
         inputs = dispatch.get("inputs", {}) if isinstance(dispatch, dict) else {}
-        number = inputs.get("pr_number", {}) if isinstance(inputs, dict) else {}
         if (
             not isinstance(dispatch, dict)
             or set(dispatch) != {"inputs"}
             or not isinstance(inputs, dict)
-            or set(inputs) != {"pr_number"}
-            or not isinstance(number, dict)
-            or number.get("required") is not True
-            or number.get("type") != "string"
-            or set(number) - {"description", "required", "type"}
+            or set(inputs) != {"pr_number", "expected_head", "expected_base"}
+            or any(
+                not isinstance(spec, dict)
+                or spec.get("required") is not True
+                or spec.get("type") != "string"
+                or set(spec) - {"description", "required", "type"}
+                for spec in inputs.values()
+            )
         ):
-            reject("manual dispatch requires only a required PR number string")
+            reject("manual dispatch requires PR number, expected head and expected base strings")
     jobs = document.get("jobs", {})
     if not isinstance(jobs, dict) or set(jobs) != AI_REVIEW_JOBS:
         reject("requires prepare, codex, claude and publish jobs")

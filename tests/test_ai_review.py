@@ -41,6 +41,23 @@ JOBS = {job: {"result": "success"} for job in ("prepare", "codex", "claude")}
 
 
 class ReviewValidationTests(unittest.TestCase):
+    def test_line_locations_use_git_lf_coordinates_not_unicode_separators(self):
+        self.assertEqual(review.github_line_count("one\u2028two\vthree\nlast\n"), 2)
+        self.assertEqual(review.github_line_count(""), 0)
+        self.assertEqual(review.github_line_count("one\n"), 1)
+
+    def test_dispatch_rejects_changed_approved_head_or_base_before_writes(self):
+        pr = {"head": {"sha": HEAD}, "base": {"sha": BASE}}
+        with (
+            patch.dict(os.environ, {"GITHUB_REPOSITORY": review.REPOSITORY}),
+            patch.object(review, "current_pr", return_value=pr),
+            patch.object(review, "check") as check,
+        ):
+            for changes in ({"expected_head": WORKFLOW}, {"expected_base": WORKFLOW}):
+                with self.assertRaises(review.ReviewError):
+                    review.prepare(Path("unused"), 39, **changes)
+            check.assert_not_called()
+
     def test_clean_completed_coverage_is_valid(self):
         self.assertEqual(review.validate(copy.deepcopy(RESULT), DATA), RESULT)
 

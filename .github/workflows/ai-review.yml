@@ -12,12 +12,20 @@ on:
         description: 'Open PR number; dispatch authorizes this current head, including forks'
         required: true
         type: string
+      expected_head:
+        description: 'Full current PR head SHA; approval is bound to this revision'
+        required: true
+        type: string
+      expected_base:
+        description: 'Full current PR base SHA'
+        required: true
+        type: string
 
 permissions: {}
 
 concurrency:
-  group: rightyo-ai-${{ github.event.pull_request.number || inputs.pr_number || github.event.workflow_run.pull_requests[0].number }}-${{ github.event_name == 'workflow_run' && github.event.workflow_run.actor.login != 'dependabot[bot]' && 'ignored' || 'reviews' }}
-  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository || (github.event_name == 'workflow_run' && github.event.workflow_run.actor.login == 'dependabot[bot]') }}
+  group: rightyo-ai-${{ github.event.pull_request.number || inputs.pr_number || github.event.workflow_run.pull_requests[0].number }}-${{ github.event.pull_request.head.sha || inputs.expected_head || github.event.workflow_run.head_sha }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || ((github.event_name == 'workflow_run' && github.event.workflow_run.actor.login != 'dependabot[bot]') || (github.event_name == 'pull_request_target' && (github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.full_name != github.repository))) && 'ignored' || 'automatic' }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 jobs:
   prepare:

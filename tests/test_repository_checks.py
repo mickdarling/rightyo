@@ -267,6 +267,46 @@ class AIReviewPolicyTests(unittest.TestCase):
                     doc.pop("concurrency")
                 self.assertTrue(self.check(doc))
 
+    def test_every_route_and_revision_partition_is_required(self):
+        fragments = {
+            "manual": "github.event_name == 'workflow_dispatch' && 'manual' || ",
+            "nonbot-callback": "github.event.workflow_run.actor.login != 'dependabot[bot]'",
+            "bot-target": "github.actor == 'dependabot[bot]'",
+            "fork-target": "github.event.pull_request.head.repo.full_name != github.repository",
+            "pr-head": "github.event.pull_request.head.sha",
+            "dispatch-head": "inputs.expected_head",
+            "callback-head": "github.event.workflow_run.head_sha",
+        }
+        for route, fragment in fragments.items():
+            with self.subTest(route=route):
+                doc = self.document()
+                group = doc["concurrency"]["group"]
+                self.assertIn(fragment, group)
+                doc["concurrency"]["group"] = group.replace(fragment, "'removed'", 1)
+                self.assertTrue(self.check(doc))
+        doc = self.document()
+        doc["concurrency"]["cancel-in-progress"] = (
+            "${{ github.event_name == 'workflow_dispatch' || "
+            "github.event_name == 'pull_request_target' }}"
+        )
+        self.assertTrue(self.check(doc))
+
+    def test_dispatch_approval_requires_both_exact_revision_inputs(self):
+        for field in ("pr_number", "expected_head", "expected_base"):
+            for mutation in ("missing", "optional", "number", "default"):
+                with self.subTest(field=field, mutation=mutation):
+                    doc = self.document()
+                    inputs = doc["on"]["workflow_dispatch"]["inputs"]
+                    if mutation == "missing":
+                        del inputs[field]
+                    elif mutation == "optional":
+                        inputs[field]["required"] = False
+                    elif mutation == "number":
+                        inputs[field]["type"] = "number"
+                    else:
+                        inputs[field]["default"] = "current"
+                    self.assertTrue(self.check(doc))
+
     def test_missing_review_job_skip_or_publisher_dependency_fails(self):
         for change in ("missing", "skip", "needs", "publisher-if", "authorization-output"):
             doc = self.document()

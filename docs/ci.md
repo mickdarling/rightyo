@@ -103,8 +103,11 @@ through GitHub's API, and never checks out or executes PR programs. Both reviewe
 the same digest-checked snapshot of complete before/after changed files and trusted policy.
 Immutable Git tree modes reject symlinks and submodules before any blob content is fetched;
 the immutable comparison determines file coverage rather than a moving PR endpoint.
-Coverage is bounded to fewer than 100 files and 900,000 encoded bytes; an oversized,
+Coverage is bounded to fewer than 100 files and 400,000 encoded bytes; an oversized,
 private-path, binary, non-UTF-8 or unsupported change fails rather than silently truncating.
+These are upper bounds, not guaranteed provider capacity: context limits, unusually dense
+tokenization or the inference budget can still reject smaller snapshots. Keep PRs focused;
+failed/inconclusive reviews never pass the gate.
 This source filter cannot prove that arbitrary public text lacks secrets or private content.
 
 Codex uses the official pinned Action and matching CLI/proxy 0.159.2. Its fresh configuration
@@ -127,9 +130,11 @@ hardware measurements. The check summary records limitations and immutable ident
 Each provider has a ten-minute job timeout; Claude inference is bounded to five minutes,
 two turns and a $3 API budget. Codex uses a bounded snapshot and no agent command execution;
 set a separate OpenAI project spending limit because job duration is not a dollar cap.
-There are no automatic provider retries. Same-repository updates cancel superseded reviews.
-Automatic fork events queue behind a maintainer dispatch and preserve existing checks for
-the exact head/base; metadata edits do not cancel or overwrite an authorized review.
+There are no automatic provider retries. Concurrency is partitioned by PR, immutable head and manual/automatic/ignored route.
+Automatic metadata events reuse existing exact-head/base records, while fork events are
+inert until maintainer dispatch. They cannot cancel or replace a pending manual run.
+Only explicit dispatch cancels another manual run of the same head; bounded older-head
+automatic reviews may finish, but stale results fail publication.
 Source snapshots and validated result artifacts expire after one day; no raw CLI diagnostic
 logs or credential-bearing artifacts are uploaded.
 
@@ -137,10 +142,11 @@ Automatic credentialed review requires a same-repository PR and a maintainer tri
 (or the explicitly allowed Dependabot identity). Dependabot reviews use a trusted
 `workflow_run` callback after its ordinary CI completes, avoiding target-event credential
 restrictions; the source run, PR author and current head are checked before snapshotting.
-Non-bot callbacks do not cancel or displace real reviews. Forks receive failing review checks until
-a maintainer runs **Independent AI reviews → Run workflow** with the current PR number.
-Dispatch rechecks maintainer permission and binds the snapshot to the head/base observed at
-that run; an update invalidates it and requires a new dispatch. Do not use persistent fork
+Non-bot callbacks do not cancel or displace real reviews. Fork review checks remain
+missing until a maintainer runs **Independent AI reviews → Run workflow** with the PR
+number and full current head/base SHAs; a required missing gate blocks merging.
+Dispatch rechecks maintainer permission and requires that the approved head/base still
+match before snapshotting; an update invalidates it and requires a new dispatch. Do not use persistent fork
 approval labels. The same dispatch can backfill existing PRs, including stacked PRs whose
 base branch predates this workflow. Base/head are checked again at publication; stronger
 continuous base invalidation and exclusive publisher attestation remain #18 work.
