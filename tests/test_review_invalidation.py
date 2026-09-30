@@ -333,3 +333,14 @@ class RequestBootstrapTests(unittest.TestCase):
         self.assertEqual(posts, 3)
         self.assertTrue(self.writes()[-1]["description"].startswith("v1 comment:55"))
         self.assertTrue(all(status["state"] == "pending" for status in self.writes()))
+
+    def test_unknown_permission_metadata_gets_conservative_denial(self):
+        for malformed in ({}, {"permission": "future-role"}):
+
+            def read(request):
+                return malformed if "/permission" in request.full_url else self.read(request)
+
+            with self.assertRaisesRegex(SystemExit, "capture failed"):
+                self.execute(self.request_event(), event="issue_comment", read=read)
+            self.assertEqual(len(self.writes()), 3)
+            self.assertTrue(self.writes()[-1]["description"].startswith("v1 comment:55"))

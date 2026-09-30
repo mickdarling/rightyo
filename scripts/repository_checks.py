@@ -333,7 +333,8 @@ def authorized(user):
     if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login):
         return False
     result = api(f"/collaborators/{login}/permission")
-    if not isinstance(result, dict):
+    if (not isinstance(result, dict) or result.get("permission") not in {
+            "none", "read", "triage", "write", "maintain", "admin"}):
         raise RuntimeError("Review request permission metadata is invalid")
     return result.get("permission") in {"admin", "maintain", "write"}
 
