@@ -25,6 +25,8 @@ on:
 
 permissions: {}
 
+# GitHub supports queue:max; preserve callbacks rather than replacing pending denial.
+# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency
 concurrency:
   group: rightyo-subscription-status
   queue: max

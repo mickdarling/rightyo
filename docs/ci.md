@@ -22,6 +22,11 @@ workflow through stdin with only its literal `queue: max` line removed. All othe
 bytes and other workflows are linted normally. Invalid queue values, missing cancellation
 policy, other scopes or added executable surface fail before normalization. Remove this
 narrow compatibility path once a pinned official release supports the field.
+GitHub also executed the supported queue configuration in
+[run 36756099916](https://github.com/mickdarling/rightyo/actions/runs/36756099916): all four
+jobs started on prior head `5a08fad`, and the last job conservatively failed its unfinished
+callback guard. This is evidence of syntax acceptance for the unchanged concurrency block,
+not a claim that the current prototype passed runtime validation.
 
 ```sh
 python3 -m venv .venv
@@ -128,8 +133,20 @@ barriers. Overflow beyond 100 waiting runs is canceled by GitHub and requires a 
 recheck; this bounded service limit remains part of #18.
 Immediately before a success status POST, the publisher validates its own active Actions
 run and inventories every documented unfinished lifecycle of this same trusted workflow.
-Any other queued, requested, waiting, pending or active run withholds approval, including
-callbacks for other PRs; IDs, timestamps and event order are not used as a freshness proxy.
+Every active, requested, waiting or pending run withholds approval. Queued PR/comment/review
+callbacks also withhold approval, including callbacks for other PRs; IDs, timestamps and
+event order are not used as a freshness proxy. A queued manual `workflow_dispatch` is a
+metadata-only recheck rather than receipt of a new review request or finding, and is exempt
+only after immutable producer verification. Both `.github/workflows/ai-review.yml` and
+`scripts/subscription_review.py` are fetched at the run's full authoritative head SHA from
+fixed repository Contents API paths. Exact path/type/base64 schema, decoded UTF-8 byte
+length, size bounds and both SHA-256 fingerprints must match either the current immutable
+trusted checkout pair or registered independently reviewed pairs from `5a08fad` / `6ebced0`.
+Those audited sources share the same whole-workflow mutex and native metadata-only
+publisher. Changed helpers, older API lanes, unknown sources and API errors remain blocking.
+Once a manual run is active/requested/waiting/pending it blocks like every writer and still
+rechecks native evidence under the shared lock. This is an event-classification rule; no
+run IDs, PR numbers or ages grant exceptions, and source compatibility cannot approve a PR.
 Malformed metadata, API failure or bounded pagination overflow also block success. The
 queue can then drain and a later callback can revalidate current native evidence. If the
 last queued callback belongs to another PR, manually recheck the suppressed PR after the

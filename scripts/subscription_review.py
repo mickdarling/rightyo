@@ -4,6 +4,8 @@ No model is invoked here. Provider credentials and PR-controlled code are never 
 """
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import re
@@ -20,6 +22,19 @@ BOT_NODE_ID = "BOT_kgDOC98s_g"
 APP_ID = 1144995
 ACTIONS_BOT_ID = 41898282
 REQUEST_CONTEXT = "rightyo/review-request"
+RECHECK_SOURCE_PATHS = (".github/workflows/ai-review.yml", "scripts/subscription_review.py")
+# Independently reviewed metadata-only producers: 5a08fad and 6ebced0. These are
+# file-content pairs, not exceptions for a particular run, PR, branch or age.
+AUDITED_RECHECK_PAIRS = {
+    (
+        "68cea8fe6d5acd4b1f1afa2eb9f5c58def8b2deca8daa56bb0747e559acf08ff",
+        "57b8eaf9b6805b9f2e16017608249b53961fc090afe2bb3457c91a1fbaca15dd",
+    ),
+    (
+        "25c8e13a74608bd3f1e6c317a7d0d8f6ca9054f0a690eeb26fa4865a017ff62e",
+        "57b8eaf9b6805b9f2e16017608249b53961fc090afe2bb3457c91a1fbaca15dd",
+    ),
+}
 REQUEST_MARKER = re.compile(r"v1 comment:([1-9][0-9]*) requested:(.+)\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 COMPLETION = re.compile(
@@ -497,6 +512,61 @@ def commit_status(head, state, description, *, context="rightyo/review-gate"):
     )
 
 
+def recheck_source_digest(revision, path):
+    """Authenticate bounded immutable Contents API bytes at fixed producer paths."""
+    if (
+        not isinstance(revision, str)
+        or not SHA.fullmatch(revision)
+        or path not in RECHECK_SOURCE_PATHS
+    ):
+        raise GateError("Manual recheck source identity is invalid")
+    result = api(f"/repos/{REPOSITORY}/contents/{path}?ref={revision}")
+    if (
+        not isinstance(result, dict)
+        or result.get("path") != path
+        or result.get("type") != "file"
+        or result.get("encoding") != "base64"
+        or type(result.get("size")) is not int
+        or not 1 <= result["size"] <= 262144
+        or not isinstance(result.get("content"), str)
+        or len(result["content"]) > 360000
+    ):
+        raise GateError("Manual recheck source metadata is invalid")
+    content = result["content"]
+    lines = content.split("\n")
+    if (
+        lines[-1] != ""
+        or not lines[:-1]
+        or any(len(line) != 60 for line in lines[:-2])
+        or not 1 <= len(lines[-2]) <= 60
+    ):
+        raise GateError("Manual recheck source base64 formatting is invalid")
+    try:
+        raw = base64.b64decode(content.replace("\n", ""), validate=True)
+        raw.decode("utf-8")
+    except (ValueError, UnicodeError):
+        raise GateError("Manual recheck source encoding is invalid") from None
+    if len(raw) != result["size"]:
+        raise GateError("Manual recheck source byte length is invalid")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def queued_metadata_recheck(run, current_pair):
+    if run["status"] != "queued" or run["event"] != "workflow_dispatch":
+        return False
+    revision = run.get("head_sha")
+    if (
+        run.get("name") != "Subscription Codex review gate"
+        or not isinstance(run.get("head_repository"), dict)
+        or run["head_repository"].get("full_name") != REPOSITORY
+        or not isinstance(revision, str)
+        or not SHA.fullmatch(revision)
+    ):
+        raise GateError("Queued manual recheck producer identity is invalid")
+    pair = tuple(recheck_source_digest(revision, path) for path in RECHECK_SOURCE_PATHS)
+    return pair in AUDITED_RECHECK_PAIRS or pair == current_pair
+
+
 def approval_run_guard():
     """Withhold approval while another trusted callback is unfinished, regardless of order."""
     run_id = os.environ.get("GITHUB_RUN_ID", "")
@@ -507,6 +577,13 @@ def approval_run_guard():
         raise GateError("Approval publisher run metadata is invalid")
     workflow_id = own.get("workflow_id")
     unfinished = {"queued", "in_progress", "requested", "waiting", "pending"}
+    events = {"workflow_dispatch", "issue_comment", "workflow_run", "pull_request_target"}
+    trusted_root = Path(__file__).resolve().parents[1]
+    current_pair = tuple(
+        hashlib.sha256((trusted_root / path).read_bytes()).hexdigest()
+        for path in RECHECK_SOURCE_PATHS
+    )
+    rechecks = {}
 
     def validate(run):
         if (
@@ -518,7 +595,10 @@ def approval_run_guard():
             or run.get("path") != ".github/workflows/ai-review.yml"
             or not isinstance(run.get("repository"), dict)
             or run["repository"].get("full_name") != REPOSITORY
-            or run.get("status") not in unfinished | {"completed"}
+            or not isinstance(run.get("status"), str)
+            or run["status"] not in unfinished | {"completed"}
+            or not isinstance(run.get("event"), str)
+            or run["event"] not in events
         ):
             raise GateError("Approval workflow inventory metadata is invalid")
 
@@ -557,6 +637,21 @@ def approval_run_guard():
                     raise GateError("Approval workflow inventory contains duplicate runs")
                 seen.add(run["id"])
                 if run["id"] != int(run_id) and run["status"] in unfinished:
+                    if run["status"] == "queued" and run["event"] == "workflow_dispatch":
+                        revision = run.get("head_sha")
+                        # Metadata/identity checks precede cached immutable source lookup.
+                        if (
+                            run.get("name") != "Subscription Codex review gate"
+                            or not isinstance(run.get("head_repository"), dict)
+                            or run["head_repository"].get("full_name") != REPOSITORY
+                            or not isinstance(revision, str)
+                            or not SHA.fullmatch(revision)
+                        ):
+                            raise GateError("Queued manual recheck producer identity is invalid")
+                        if revision not in rechecks:
+                            rechecks[revision] = queued_metadata_recheck(run, current_pair)
+                        if rechecks[revision]:
+                            continue
                     raise GateError(
                         "Another trusted review callback is unfinished; approval withheld. "
                         "Recheck this PR after the queue drains if no later callback targets it."

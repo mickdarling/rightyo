@@ -1,15 +1,20 @@
 """Metadata-only regressions; no real provider or credentials are used."""
 
+import base64
+import hashlib
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from scripts.subscription_review import (
     ACTIONS_BOT_ID,
     APP_ID,
+    AUDITED_RECHECK_PAIRS,
     BOT_ID,
     BOT_LOGIN,
     BOT_NODE_ID,
+    RECHECK_SOURCE_PATHS,
     REQUEST_CONTEXT,
     GateError,
     approval_run_guard,
@@ -23,6 +28,8 @@ from scripts.subscription_review import (
     pages,
     persist_request,
     publish,
+    queued_metadata_recheck,
+    recheck_source_digest,
     record_request,
     request_markers,
     review_candidates,
@@ -874,6 +881,8 @@ class ApprovalInventoryTests(unittest.TestCase):
             "workflow_id": 370760066,
             "name": "Subscription Codex review gate",
             "head_sha": HEAD,
+            "head_repository": {"full_name": "mickdarling/rightyo"},
+            "event": "issue_comment",
             "repository": {"full_name": "mickdarling/rightyo"},
             "path": ".github/workflows/ai-review.yml",
             "status": "in_progress",
@@ -1034,3 +1043,165 @@ class ApprovalInventoryTests(unittest.TestCase):
         self.assertEqual(writes, ["pending", "success"])
         self.assertIn("status=waiting", calls[-2][0])
         self.assertEqual(calls[-1], (f"/repos/mickdarling/rightyo/statuses/{HEAD}", "POST"))
+
+
+class ManualRecheckSourceTests(unittest.TestCase):
+    own = ApprovalInventoryTests.own
+
+    def setUp(self):
+        patcher = patch.dict(os.environ, {"GITHUB_RUN_ID": "12345"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        root = Path(__file__).resolve().parents[1]
+        self.sources = {path: (root / path).read_bytes() for path in RECHECK_SOURCE_PATHS}
+        self.current_pair = tuple(
+            hashlib.sha256(self.sources[path]).hexdigest() for path in RECHECK_SOURCE_PATHS
+        )
+
+    def contents(self, path, raw=None):
+        raw = self.sources[path] if raw is None else raw
+        encoded = base64.b64encode(raw).decode("ascii")
+        return {
+            "path": path,
+            "type": "file",
+            "encoding": "base64",
+            "size": len(raw),
+            "content": "".join(
+                encoded[index : index + 60] + "\n" for index in range(0, len(encoded), 60)
+            ),
+        }
+
+    def source_api(self, path, method="GET", data=None):
+        self.assertEqual(method, "GET")
+        for source in RECHECK_SOURCE_PATHS:
+            if path == f"/repos/mickdarling/rightyo/contents/{source}?ref={HEAD}":
+                return self.contents(source)
+        self.fail("Unexpected source API route")
+
+    def manual(self, **changes):
+        return self.own(id=2, status="queued", event="workflow_dispatch", **changes)
+
+    def test_exact_current_producer_pair_qualifies_as_queued_recheck(self):
+        with patch("scripts.subscription_review.api", side_effect=self.source_api) as api:
+            self.assertTrue(queued_metadata_recheck(self.manual(), self.current_pair))
+        self.assertEqual(api.call_count, 2)
+
+    def test_both_registered_historical_pairs_are_accepted_as_pairs(self):
+        for pair in AUDITED_RECHECK_PAIRS:
+            with patch("scripts.subscription_review.recheck_source_digest", side_effect=pair):
+                self.assertTrue(queued_metadata_recheck(self.manual(), self.current_pair))
+        workflow, helper = next(iter(AUDITED_RECHECK_PAIRS))
+        for pair in ((workflow, "0" * 64), ("0" * 64, helper), ("0" * 64, "1" * 64)):
+            with patch("scripts.subscription_review.recheck_source_digest", side_effect=pair):
+                self.assertFalse(queued_metadata_recheck(self.manual(), self.current_pair))
+
+    def test_changed_workflow_helper_or_legacy_api_lane_is_not_exempt(self):
+        for changed in RECHECK_SOURCE_PATHS:
+
+            def api(path, method="GET", data=None):
+                result = self.source_api(path, method, data)
+                if f"/contents/{changed}?" in path:
+                    return self.contents(changed, self.sources[changed] + b"\n# changed producer\n")
+                return result
+
+            with patch("scripts.subscription_review.api", side_effect=api):
+                self.assertFalse(queued_metadata_recheck(self.manual(), self.current_pair))
+        with patch(
+            "scripts.subscription_review.recheck_source_digest", side_effect=["a" * 64, "b" * 64]
+        ):
+            self.assertFalse(queued_metadata_recheck(self.manual(), self.current_pair))
+
+    def test_bad_candidate_identity_is_rejected_before_source_reads(self):
+        for changes in (
+            {"name": "Legacy API review"},
+            {"head_sha": HEAD[:7]},
+            {"head_repository": None},
+            {"head_repository": {"full_name": "outsider/repo"}},
+        ):
+            with patch("scripts.subscription_review.api") as api:
+                with self.assertRaises(GateError):
+                    queued_metadata_recheck(self.manual(**changes), self.current_pair)
+                api.assert_not_called()
+
+    def test_contents_identity_size_and_encoding_errors_fail_closed(self):
+        path = RECHECK_SOURCE_PATHS[0]
+        good = self.contents(path)
+        for field, value in (
+            ("path", "other.yml"),
+            ("type", "symlink"),
+            ("encoding", "none"),
+            ("size", True),
+            ("size", 262145),
+            ("size", good["size"] + 1),
+            ("content", "!\n"),
+            ("content", good["content"].replace("\n", "")),
+            ("content", good["content"].replace("\n", "\r\n")),
+            ("content", "a" * 360001),
+        ):
+            with patch("scripts.subscription_review.api", return_value={**good, field: value}):
+                with self.assertRaises(GateError):
+                    recheck_source_digest(HEAD, path)
+        with patch("scripts.subscription_review.api", return_value=self.contents(path, b"\xff")):
+            with self.assertRaises(GateError):
+                recheck_source_digest(HEAD, path)
+        with patch("scripts.subscription_review.api", return_value={}):
+            with self.assertRaises(GateError):
+                recheck_source_digest(HEAD, path)
+        with patch("scripts.subscription_review.api", side_effect=GateError("API unavailable")):
+            with self.assertRaises(GateError):
+                recheck_source_digest(HEAD, path)
+
+    def inventory(self, other):
+        def api(path, method="GET", data=None):
+            if "/contents/" in path:
+                return self.source_api(path, method, data)
+            if path.endswith("/actions/runs/12345"):
+                return self.own()
+            state = path.split("status=", 1)[1].split("&", 1)[0]
+            records = [self.own()] if state == "in_progress" else []
+            if state == other["status"]:
+                records.append(other)
+            return {"total_count": len(records), "workflow_runs": records}
+
+        return api
+
+    def test_verified_queued_manual_run_no_longer_blocks_inventory(self):
+        with patch("scripts.subscription_review.api", side_effect=self.inventory(self.manual())):
+            approval_run_guard()
+
+    def test_manual_active_pending_waiting_requested_runs_always_block(self):
+        for state in ("in_progress", "pending", "waiting", "requested"):
+            other = self.manual()
+            other["status"] = state
+            with (
+                patch("scripts.subscription_review.api", side_effect=self.inventory(other)),
+                patch("scripts.subscription_review.queued_metadata_recheck") as exemption,
+            ):
+                with self.assertRaisesRegex(GateError, "unfinished"):
+                    approval_run_guard()
+                exemption.assert_not_called()
+
+    def test_real_queued_events_and_unknown_events_are_not_exempt(self):
+        for event in ("issue_comment", "pull_request_target", "workflow_run", "unknown"):
+            other = self.manual()
+            other["event"] = event
+            with (
+                patch("scripts.subscription_review.api", side_effect=self.inventory(other)),
+                patch("scripts.subscription_review.queued_metadata_recheck") as exemption,
+            ):
+                with self.assertRaises(GateError):
+                    approval_run_guard()
+                exemption.assert_not_called()
+
+    def test_queued_source_api_failure_or_unknown_pair_blocks_inventory(self):
+        for error in (GateError("API unavailable"), False):
+            with (
+                patch("scripts.subscription_review.api", side_effect=self.inventory(self.manual())),
+                patch(
+                    "scripts.subscription_review.queued_metadata_recheck",
+                    side_effect=error if isinstance(error, Exception) else None,
+                    return_value=error,
+                ),
+            ):
+                with self.assertRaises(GateError):
+                    approval_run_guard()
