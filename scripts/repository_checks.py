@@ -237,7 +237,7 @@ PROVIDER_ALLOWED_CONDITION = "${{ needs.prepare.outputs.allowed == 'true' }}"
 
 AI_REVIEW_ROUTE = (
     "(github.event_name != 'workflow_run' || "
-    "github.event.workflow_run.actor.login == 'dependabot[bot]') && "
+    "github.event.workflow_run.event == 'pull_request') && "
     "(github.event_name != 'pull_request_target' || github.actor != 'dependabot[bot]')"
 )
 AI_REVIEW_PREPARE_CONDITION = "${{ " + AI_REVIEW_ROUTE + " }}"
@@ -250,7 +250,7 @@ AI_REVIEW_CONCURRENCY = {
         "github.event.workflow_run.head_sha }}-${{ "
         "github.event_name == 'workflow_dispatch' && 'manual' || "
         "((github.event_name == 'workflow_run' && "
-        "github.event.workflow_run.actor.login != 'dependabot[bot]') || "
+        "github.event.workflow_run.event != 'pull_request') || "
         "(github.event_name == 'pull_request_target' && "
         "(github.actor == 'dependabot[bot]' || "
         "github.event.pull_request.head.repo.full_name != github.repository))) "
@@ -474,7 +474,7 @@ def ai_review_workflow_errors(path, document):
             if job.get("if") != PROVIDER_ALLOWED_CONDITION:
                 reject(f"{name} job must respect the trusted snapshot authorization output")
         elif job.get("if") != AI_REVIEW_PREPARE_CONDITION:
-            reject("preparation must reject restricted bot targets and ignored workflow callbacks")
+            reject("preparation must reject restricted bot targets and non-PR workflow callbacks")
         expected_outputs = (
             {
                 "allowed": "${{ steps.snapshot.outputs.allowed }}",

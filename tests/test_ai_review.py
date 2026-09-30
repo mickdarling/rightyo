@@ -201,6 +201,59 @@ class ReviewValidationTests(unittest.TestCase):
 
 
 class ForkPreservationTests(unittest.TestCase):
+    def test_stacked_pr_callback_binds_current_source_head(self):
+        run = {
+            "event": "pull_request",
+            "repository": {"full_name": review.REPOSITORY},
+            "pull_requests": [{"number": 39}],
+            "head_sha": HEAD,
+            "actor": {"login": "maintainer"},
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            event = Path(temp) / "event.json"
+            event.write_text(json.dumps({"workflow_run": run}))
+            with (
+                patch.dict(
+                    os.environ,
+                    {"GITHUB_EVENT_NAME": "workflow_run", "GITHUB_EVENT_PATH": str(event)},
+                ),
+                patch.object(sys, "argv", ["ai_review.py", "prepare", "--directory", temp]),
+                patch.object(review, "current_pr", return_value={"head": {"sha": HEAD}}),
+                patch.object(review, "prepare") as prepare,
+            ):
+                review.main()
+                prepare.assert_called_once_with(Path(temp), 39, HEAD, None)
+
+    def test_stale_or_non_pr_callback_never_prepares_review(self):
+        for source_event, source_head in (("push", HEAD), ("pull_request", BASE)):
+            with self.subTest(source_event=source_event), tempfile.TemporaryDirectory() as temp:
+                event = Path(temp) / "event.json"
+                event.write_text(
+                    json.dumps(
+                        {
+                            "workflow_run": {
+                                "event": source_event,
+                                "repository": {"full_name": review.REPOSITORY},
+                                "pull_requests": [{"number": 39}],
+                                "head_sha": source_head,
+                            }
+                        }
+                    )
+                )
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"GITHUB_EVENT_NAME": "workflow_run", "GITHUB_EVENT_PATH": str(event)},
+                    ),
+                    patch.object(sys, "argv", ["ai_review.py", "prepare", "--directory", temp]),
+                    patch.object(review, "current_pr", return_value={"head": {"sha": HEAD}}),
+                    patch.object(review, "prepare") as prepare,
+                    patch("builtins.print"),
+                    self.assertRaises(SystemExit),
+                ):
+                    review.main()
+                prepare.assert_not_called()
+
     def test_auto_fork_metadata_event_preserves_current_dispatched_checks(self):
         fork = {"head": {"sha": HEAD, "repo": {"full_name": "someone/fork"}}, "base": {"sha": BASE}}
         prefix = f"Head: `{HEAD}`; Base: `{BASE}`."
@@ -226,12 +279,14 @@ class ForkPreservationTests(unittest.TestCase):
             patch.object(review, "check") as check,
             patch.object(review, "output") as output,
         ):
-            review.prepare(Path(temp), 39)
-            meta = json.loads(output.call_args.args[0]["metadata"])
-            self.assertTrue(meta["preserve_checks"])
-            check.assert_not_called()
-            review.publish(Path(temp), meta, "", {})
-            check.assert_not_called()
+            for event_name in ("pull_request_target", "workflow_run"):
+                os.environ["GITHUB_EVENT_NAME"] = event_name
+                review.prepare(Path(temp), 39)
+                meta = json.loads(output.call_args.args[0]["metadata"])
+                self.assertTrue(meta["preserve_checks"])
+                check.assert_not_called()
+                review.publish(Path(temp), meta, "", {})
+                check.assert_not_called()
 
 
 class PublisherTests(unittest.TestCase):

@@ -239,7 +239,7 @@ class AIReviewPolicyTests(unittest.TestCase):
                 doc["on"]["workflow_dispatch"]["inputs"]["shell"] = {"type": "string"}
             self.assertTrue(self.check(doc))
 
-    def test_workflow_callback_scope_and_bot_routing_cannot_be_broadened(self):
+    def test_workflow_callback_scope_and_trusted_routing_cannot_be_broadened(self):
         for change in ("workflow-name", "workflow-type", "prepare-route", "publish-route"):
             with self.subTest(change=change):
                 doc = self.document()
@@ -252,6 +252,21 @@ class AIReviewPolicyTests(unittest.TestCase):
                 else:
                     doc["jobs"]["publish"]["if"] = "${{ always() }}"
                 self.assertTrue(self.check(doc))
+
+    def test_callbacks_require_source_pull_request_event_at_both_writer_jobs(self):
+        fragment = "github.event.workflow_run.event == 'pull_request'"
+        for job in ("prepare", "publish"):
+            for replacement in (
+                "true",
+                "github.event.workflow_run.event == 'push'",
+                "github.event.workflow_run.actor.login == 'dependabot[bot]'",
+            ):
+                with self.subTest(job=job, replacement=replacement):
+                    doc = self.document()
+                    condition = doc["jobs"][job]["if"]
+                    self.assertIn(fragment, condition)
+                    doc["jobs"][job]["if"] = condition.replace(fragment, replacement, 1)
+                    self.assertTrue(self.check(doc))
 
     def test_ignored_callbacks_and_fork_events_cannot_cancel_authorized_runs(self):
         for change in ("no-partition", "cancel-everything", "missing-concurrency"):
@@ -270,7 +285,7 @@ class AIReviewPolicyTests(unittest.TestCase):
     def test_every_route_and_revision_partition_is_required(self):
         fragments = {
             "manual": "github.event_name == 'workflow_dispatch' && 'manual' || ",
-            "nonbot-callback": "github.event.workflow_run.actor.login != 'dependabot[bot]'",
+            "non-pr-callback": "github.event.workflow_run.event != 'pull_request'",
             "bot-target": "github.actor == 'dependabot[bot]'",
             "fork-target": "github.event.pull_request.head.repo.full_name != github.repository",
             "pr-head": "github.event.pull_request.head.sha",

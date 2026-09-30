@@ -217,7 +217,7 @@ def prepare(directory, number, expected_head=None, expected_base=None):
         raise ReviewError("Authorized base revision changed before snapshot preparation")
     meta = metadata(pr, number)
     same_repo = (pr["head"].get("repo") or {}).get("full_name") == REPOSITORY
-    if os.environ["GITHUB_EVENT_NAME"] == "pull_request_target" and not same_repo:
+    if os.environ["GITHUB_EVENT_NAME"] != "workflow_dispatch" and not same_repo:
         # Inert fork events must never overwrite or displace a maintainer's check runs.
         # Missing head checks stay missing (and block required-check protection) until dispatch.
         meta["preserve_checks"] = True
@@ -617,8 +617,7 @@ def main():
                 run = event["workflow_run"]
                 prs = run.get("pull_requests", [])
                 if (
-                    run.get("actor", {}).get("login") != "dependabot[bot]"
-                    or run.get("event") != "pull_request"
+                    run.get("event") != "pull_request"
                     or len(prs) != 1
                     or run.get("repository", {}).get("full_name") != REPOSITORY
                 ):
@@ -626,12 +625,8 @@ def main():
                 number = prs[0]["number"]
                 expected_head = sha(run["head_sha"])
                 pr = current_pr(number)
-                if (
-                    pr["user"]["login"] != "dependabot[bot]"
-                    or pr["head"]["sha"] != sha(run["head_sha"])
-                    or (pr["head"].get("repo") or {}).get("full_name") != REPOSITORY
-                ):
-                    raise ReviewError("Bot CI source revision is stale or unauthorized")
+                if pr["head"]["sha"] != expected_head:
+                    raise ReviewError("Source CI revision is stale")
             else:
                 number = event["pull_request"]["number"]
             prepare(args.directory, number, expected_head, expected_base)

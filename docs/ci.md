@@ -139,10 +139,12 @@ Source snapshots and validated result artifacts expire after one day; no raw CLI
 logs or credential-bearing artifacts are uploaded.
 
 Automatic credentialed review requires a same-repository PR and a maintainer trigger
-(or the explicitly allowed Dependabot identity). Dependabot reviews use a trusted
-`workflow_run` callback after its ordinary CI completes, avoiding target-event credential
-restrictions; the source run, PR author and current head are checked before snapshotting.
-Non-bot callbacks do not cancel or displace real reviews. Fork review checks remain
+(or the explicitly allowed Dependabot identity). A trusted `workflow_run` callback after
+ordinary PR CI also covers stacked branches that predate the target workflow and avoids
+Dependabot target-event credential restrictions. The source run and exact current head
+are checked before snapshotting, and source actor permissions are required. Target and
+callback events reuse existing exact-head/base reviews. Non-PR callbacks cannot displace
+real reviews. Fork review checks remain
 missing until a maintainer runs **Independent AI reviews → Run workflow** with the PR
 number and full current head/base SHAs; a required missing gate blocks merging.
 Dispatch rechecks maintainer permission and requires that the approved head/base still
