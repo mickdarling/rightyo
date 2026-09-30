@@ -236,7 +236,15 @@ class AIReviewPolicyTests(unittest.TestCase):
                 self.assertTrue(self.check(doc))
 
     def test_event_routes_revision_input_and_publisher_permissions_are_frozen(self):
-        for mutation in ("event", "dispatch", "permission", "runner", "concurrency", "condition"):
+        for mutation in (
+            "event",
+            "dispatch",
+            "permission",
+            "checks-permission",
+            "runner",
+            "concurrency",
+            "condition",
+        ):
             with self.subTest(mutation=mutation):
                 doc = self.document()
                 if mutation == "event":
@@ -248,6 +256,10 @@ class AIReviewPolicyTests(unittest.TestCase):
                 else:
                     field, value = {
                         "permission": ("permissions", {"contents": "write"}),
+                        "checks-permission": (
+                            "permissions",
+                            {"contents": "read", "pull-requests": "read", "checks": "write"},
+                        ),
                         "runner": ("runs-on", "self-hosted"),
                         "condition": ("if", "false"),
                     }[mutation]

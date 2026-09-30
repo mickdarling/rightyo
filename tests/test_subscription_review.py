@@ -1,5 +1,6 @@
 """Metadata-only regressions; no real provider or credentials are used."""
 
+import os
 import unittest
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ from scripts.subscription_review import (
     GateError,
     clean_completion,
     comment_provenance,
+    commit_status,
     event_pr,
     pages,
     publish,
@@ -108,6 +110,11 @@ class CompletionTests(unittest.TestCase):
 
 
 class RoutingTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.dict(os.environ, {"GITHUB_RUN_ID": "12345"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_dispatch_requires_full_head_and_base(self):
         event = {"inputs": {"pr_number": "44", "expected_head": HEAD, "expected_base": BASE}}
         self.assertEqual(event_pr("workflow_dispatch", event), (44, (HEAD, BASE)))
@@ -135,9 +142,9 @@ class RoutingTests(unittest.TestCase):
         calls = []
 
         def request(path, method="GET", data=None):
-            calls.append((method, data))
+            calls.append((path, method, data))
             if path.endswith("/pulls/44"):
-                return initial if len([m for m, _ in calls if m == "GET"]) == 1 else changed
+                return initial if len([m for _, m, _ in calls if m == "GET"]) == 1 else changed
             if method == "POST":
                 return {"id": 8}
             if method == "PATCH":
@@ -153,8 +160,9 @@ class RoutingTests(unittest.TestCase):
         ):
             with self.assertRaises(GateError):
                 publish(44)
-        self.assertEqual(calls[-1][1]["conclusion"], "failure")
-        self.assertEqual(calls[1][1]["head_sha"], HEAD)
+        self.assertEqual(calls[-1][2]["state"], "error")
+        self.assertEqual(calls[1][0], f"/repos/mickdarling/rightyo/statuses/{HEAD}")
+        self.assertEqual(calls[1][2]["state"], "pending")
 
 
 def summary():
@@ -181,6 +189,11 @@ def reaction(stamp="2026-09-30T07:08:49Z"):
 
 
 class AutomaticCompletionTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.dict(os.environ, {"GITHUB_RUN_ID": "12345"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def check(self, item=None, reactions=None, reviews=None, attest=True, resolved=HEAD):
         return clean_completion(
             HEAD,
@@ -282,8 +295,6 @@ class AutomaticCompletionTests(unittest.TestCase):
 
         def request(path, method="GET", data=None):
             if method == "POST":
-                return {"id": 8}
-            if method == "PATCH":
                 changes.append(data)
                 return {}
             if "/commits/" in path:
@@ -313,7 +324,8 @@ class AutomaticCompletionTests(unittest.TestCase):
         ):
             publish(44)
         sleep.assert_called_once_with(5)
-        self.assertEqual(changes[-1]["conclusion"], "success")
+        self.assertEqual(changes[-1]["state"], "success")
+        self.assertEqual(changes[0]["state"], "pending")
 
     def test_late_current_head_finding_invalidates_initial_clean_summary(self):
         pr = {
@@ -325,8 +337,6 @@ class AutomaticCompletionTests(unittest.TestCase):
 
         def request(path, method="GET", data=None):
             if method == "POST":
-                return {"id": 8}
-            if method == "PATCH":
                 changes.append(data)
                 return {}
             return {"sha": HEAD} if "/commits/" in path else pr
@@ -341,4 +351,35 @@ class AutomaticCompletionTests(unittest.TestCase):
         ):
             with self.assertRaises(GateError):
                 publish(44)
-        self.assertEqual(changes[-1]["conclusion"], "action_required")
+        self.assertEqual(changes[-1]["state"], "failure")
+
+
+class StatusPublicationTests(unittest.TestCase):
+    def test_status_context_exact_head_and_run_link_are_preserved(self):
+        with (
+            patch.dict(os.environ, {"GITHUB_RUN_ID": "12345"}),
+            patch("scripts.subscription_review.api", return_value={}) as request,
+        ):
+            commit_status(HEAD, "pending", "public description")
+        request.assert_called_once_with(
+            f"/repos/mickdarling/rightyo/statuses/{HEAD}",
+            "POST",
+            {
+                "state": "pending",
+                "context": "rightyo/review-gate",
+                "description": "public description",
+                "target_url": "https://github.com/mickdarling/rightyo/actions/runs/12345",
+            },
+        )
+
+    def test_invalid_run_identity_revision_or_state_never_writes(self):
+        with patch("scripts.subscription_review.api") as request:
+            for head, state, run in (
+                (HEAD, "success", ""),
+                ("bad", "success", "123"),
+                (HEAD, "neutral", "123"),
+                (HEAD, "success", "https://other"),
+            ):
+                with patch.dict(os.environ, {"GITHUB_RUN_ID": run}), self.assertRaises(GateError):
+                    commit_status(head, state, "example")
+            request.assert_not_called()

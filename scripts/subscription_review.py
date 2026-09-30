@@ -256,6 +256,27 @@ def revisions(pr):
     return pr["head"]["sha"], pr["base"]["sha"]
 
 
+def commit_status(head, state, description):
+    """Publish the stable context without workflow-event check-suite restrictions."""
+    if not isinstance(head, str) or not SHA.fullmatch(head):
+        raise GateError("Invalid status revision")
+    if state not in {"pending", "success", "failure", "error"}:
+        raise GateError("Invalid status state")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    if not re.fullmatch(r"[1-9][0-9]*", run_id):
+        raise GateError("Status publisher run identity is unavailable")
+    return api(
+        f"/repos/{REPOSITORY}/statuses/{head}",
+        "POST",
+        {
+            "state": state,
+            "context": "rightyo/review-gate",
+            "description": description[:140],
+            "target_url": f"https://github.com/{REPOSITORY}/actions/runs/{run_id}",
+        },
+    )
+
+
 def publish(number, expected=None):
     pr = current_pr(number)
     if pr.get("state") != "open":
@@ -264,21 +285,7 @@ def publish(number, expected=None):
     head, base = revisions(pr)
     if expected is not None and (head, base) != expected:
         raise GateError("Dispatch revisions are stale")
-    check = api(
-        f"/repos/{REPOSITORY}/check-runs",
-        "POST",
-        {
-            "name": "rightyo/review-gate",
-            "head_sha": head,
-            "status": "in_progress",
-            "output": {
-                "title": "Checking subscription Codex review",
-                "summary": (
-                    "Requires positive current-head native completion evidence. Claude is deferred."
-                ),
-            },
-        },
-    )
+    commit_status(head, "pending", "Validating current-head subscription Codex completion")
     conclusion = "failure"
     message = "Review metadata could not be validated"
     failure = None
@@ -316,7 +323,7 @@ def publish(number, expected=None):
         if revisions(current_pr(number)) != (head, base):
             raise GateError("PR revisions changed while validating review")
         if completion is None:
-            conclusion = "action_required"
+            conclusion = "failure"
             message = (
                 "Awaiting clean native Codex completion evidence for this exact head. "
                 "Requires a native explicit clean verdict, or an authentic completed summary "
@@ -336,18 +343,18 @@ def publish(number, expected=None):
             )
     except (GateError, KeyError, TypeError, ValueError) as error:
         failure = error
+        conclusion = "error"
         if isinstance(error, GateError):
             message = str(error)
-    api(
-        f"/repos/{REPOSITORY}/check-runs/{check['id']}",
-        "PATCH",
-        {
-            "status": "completed",
-            "conclusion": conclusion,
-            "output": {"title": "Subscription Codex review", "summary": message},
-        },
-    )
+    # Full native evidence and limitations live in the linked run log; commit statuses
+    # have a short description rather than the Checks API's rich output fields.
     print(message)
+    description = {
+        "success": "Validated clean subscription Codex completion; see run log for native evidence",
+        "failure": "Awaiting clean native review; missing evidence or findings; see run log",
+        "error": "Native review metadata validation failed; see run log",
+    }[conclusion]
+    commit_status(head, conclusion, description)
     if failure or conclusion != "success":
         raise GateError("Subscription review gate has not passed")
 

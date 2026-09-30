@@ -83,7 +83,9 @@ alone do not solve that attack. Merge queues and hardware lanes are not configur
 does not capture audio, acquire models or train. The native Codex GitHub integration reviews
 public repository source through the connected account. The gate makes no model requests.
 
-See [GitHub's secure-use guidance](https://docs.github.com/en/actions/reference/security/secure-use)
+See [GitHub's status-check troubleshooting](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks),
+[commit-status API](https://docs.github.com/en/rest/commits/statuses),
+[GitHub's secure-use guidance](https://docs.github.com/en/actions/reference/security/secure-use)
 for the trust boundaries and
 [actionlint documentation](https://github.com/rhysd/actionlint/blob/v1.7.7/docs/usage.md)
 for workflow validation.
@@ -107,7 +109,12 @@ from the PR merge tree. Native completion comments and summary updates supply th
 comment-event route. A manual dispatch rechecks a PR using its full current head and base
 SHAs, without requesting or running another model.
 
-The stable `rightyo/review-gate` check runs on the exact current PR head. Passing requires
+The stable `rightyo/review-gate` commit status is published on the exact current PR head.
+It starts pending before validation, succeeds only with positive native evidence, and reports
+failure/error for missing evidence, findings or validation errors. Its link opens the actual
+Actions run with detailed head/base, native evidence and limitations in the log. The publisher
+has only `statuses: write`, alongside repository metadata read access; it cannot create
+check runs. Passing requires
 positive evidence from the verified connector bot identity and GitHub app, through either:
 
 - An explicit **Codex Review: Didn't find any major issues.** completion comment with its
@@ -135,6 +142,16 @@ native format changes, the reaction is delayed beyond this window, or review is 
 the gate blocks; a later trusted event or exact-revision manual gate dispatch can recheck.
 Unknown formats, quota failure, API/GraphQL errors and bounded-history overflow fail closed.
 Current head/base are refetched before publication; revision changes invalidate the attempt.
+
+The publisher uses GitHub's commit-status API rather than custom Actions check runs.
+GitHub documents that checks created by Actions jobs on dispatch, comment and workflow-run
+events may not satisfy required protection. The initial live reviewed-branch dispatch showed
+successful custom check runs still left the required gate Expected. Commit statuses are a
+separate supported API reflected on PRs, with the same stable context and existing publisher
+identity. Verify actual protected-branch recognition during rollout; no protection bypass or
+manual fabricated approval is part of this change. If a check run and a commit status share
+the required name, GitHub requires both to pass, so old blocked check runs on an existing
+head cannot be erased by a success status; a fresh head and fresh review avoid that conflict.
 
 Native Codex normally reports P0/P1 findings. It does not provide the previous API workflow's
 structured complete-file attestation or P0–P2 policy, and the gate does not claim those

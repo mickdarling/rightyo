@@ -250,7 +250,7 @@ def ai_review_workflow_errors(path, document):
                 ),
                 "runs-on": "ubuntu-24.04",
                 "timeout-minutes": 5,
-                "permissions": {"contents": "read", "pull-requests": "read", "checks": "write"},
+                "permissions": {"contents": "read", "pull-requests": "read", "statuses": "write"},
                 "steps": [
                     {
                         "uses": CHECKOUT_ACTION,
