@@ -10,10 +10,12 @@ from scripts.subscription_review import (
     BOT_LOGIN,
     BOT_NODE_ID,
     GateError,
+    authorized_request,
     clean_completion,
     comment_provenance,
     commit_status,
     event_pr,
+    main,
     pages,
     publish,
 )
@@ -39,11 +41,14 @@ class CompletionTests(unittest.TestCase):
     def check(self, comments, reviews=None, inline=None, resolved=HEAD):
         return clean_completion(
             HEAD,
-            comments,
+            [summary()] + comments,
             reviews or [],
             inline or [],
             lambda short: resolved,
-            lambda item, summary: item["created_at"] == item["updated_at"],
+            lambda item, is_summary: item["body"].startswith(
+                "<!-- codex-pull-request-review-summary -->"
+            )
+            or item["created_at"] == item["updated_at"],
             [],
         )
 
@@ -80,7 +85,8 @@ class CompletionTests(unittest.TestCase):
         for stamp in (None, "2026-09-30T07:08:50Z", "invalid"):
             item = completion()
             item["updated_at"] = stamp
-            self.assertIsNone(self.check([item]))
+            with self.assertRaises(GateError):
+                self.check([item])
         item = completion()
         item["created_at"] = item["updated_at"] = "2026-99-99T07:07:50Z"
         with self.assertRaises(GateError):
@@ -103,7 +109,9 @@ class CompletionTests(unittest.TestCase):
             raise GateError("GitHub API request failed")
 
         with self.assertRaises(GateError):
-            clean_completion(HEAD, [completion()], [], [], fail, lambda item, summary: True, [])
+            clean_completion(
+                HEAD, [summary(), completion()], [], [], fail, lambda item, summary: True, []
+            )
         with patch("scripts.subscription_review.api", return_value=[{}] * 100):
             with self.assertRaises(GateError):
                 pages("/collection")
@@ -126,9 +134,11 @@ class RoutingTests(unittest.TestCase):
 
     def test_non_pr_events_do_not_publish(self):
         self.assertEqual(event_pr("issue_comment", {"issue": {"number": 4}}), (None, None))
-        self.assertEqual(
-            event_pr("workflow_run", {"workflow_run": {"event": "push"}}), (None, None)
-        )
+        with patch(
+            "scripts.subscription_review.api",
+            return_value={"event": "push", "path": ".github/workflows/ci.yml"},
+        ):
+            self.assertEqual(event_pr("workflow_run", {"workflow_run": {"id": 123}}), (None, None))
         with self.assertRaises(GateError):
             event_pr("pull_request_review", {})
 
@@ -237,10 +247,12 @@ class AutomaticCompletionTests(unittest.TestCase):
         self.assertIsNone(self.check(item))
         item = summary()
         item["body"] += item["body"].splitlines()[-1] + "\n"
-        self.assertIsNone(self.check(item))
+        with self.assertRaises(GateError):
+            self.check(item)
         finding = {"user": completion()["user"], "commit_id": HEAD}
         self.assertIsNone(self.check(reviews=[finding]))
-        self.assertIsNone(self.check(attest=False))
+        with self.assertRaises(GateError):
+            self.check(attest=False)
 
     def test_summary_timestamp_must_be_valid_and_consistent(self):
         item = summary()
@@ -383,3 +395,180 @@ class StatusPublicationTests(unittest.TestCase):
                 with patch.dict(os.environ, {"GITHUB_RUN_ID": run}), self.assertRaises(GateError):
                     commit_status(head, state, "example")
             request.assert_not_called()
+
+
+class ReviewRefreshTests(unittest.TestCase):
+    def check(self, comments, reviews=None, authorize=True):
+        return clean_completion(
+            HEAD,
+            [summary()] + comments,
+            reviews or [],
+            [],
+            lambda short: HEAD,
+            lambda item, is_summary: True,
+            [reaction()],
+            lambda item: authorize,
+        )
+
+    def request(self, stamp="2026-09-30T07:09:50Z"):
+        return {
+            "body": "@codex review\n\nPlease review this exact head.",
+            "updated_at": stamp,
+            "created_at": stamp,
+            "user": {"type": "User", "login": "maintainer"},
+        }
+
+    def test_authorized_rereview_request_invalidates_old_explicit_and_automatic_clean(self):
+        self.assertIsNone(self.check([completion(), self.request()]))
+        self.assertIsNone(self.check([summary(), self.request()]))
+        fresh = completion()
+        fresh["created_at"] = fresh["updated_at"] = "2026-09-30T07:10:50Z"
+        anchor = summary()
+        anchor["updated_at"] = "2026-09-30T07:10:50Z"
+        anchor["body"] = anchor["body"].replace("07:08:49.384854Z", "07:10:49.384854Z")
+        self.assertIsNotNone(self.check([completion(), self.request(), fresh, anchor]))
+        fresh["created_at"] = fresh["updated_at"] = "2026-09-30T07:09:50Z"
+        self.assertIsNone(self.check([self.request(), fresh]))
+
+    def test_unprivileged_or_quoted_request_does_not_invalidate(self):
+        self.assertIsNotNone(self.check([completion(), self.request()], authorize=False))
+        for prefix in ("> ", "```text\n", "An example: "):
+            request = self.request()
+            request["body"] = prefix + request["body"]
+            self.assertIsNotNone(self.check([completion(), request]))
+
+    def test_authentic_current_head_running_or_unknown_summary_blocks_old_clean(self):
+        for status in ("Running", "Queued", "Unknown"):
+            running = summary()
+            running["body"] = running["body"].replace("**Completed**", f"**{status}**")
+            self.assertIsNone(self.check([completion(), running]))
+        running = summary()
+        running["body"] = running["body"].replace("**Completed**", "**Running**")
+        running["body"] = running["body"].replace("`aaaaaaa`", "`bbbbbbb`")
+        self.assertIsNotNone(self.check([completion(), running]))
+
+    def test_rereview_finding_blocks_even_with_previous_clean_and_no_completion_comment(self):
+        finding = {"user": completion()["user"], "commit_id": HEAD}
+        self.assertIsNone(self.check([completion(), self.request()], [finding]))
+
+    def test_request_authorization_uses_current_repository_permission(self):
+        for permission, expected in (
+            ("write", True),
+            ("admin", True),
+            ("maintain", True),
+            ("read", False),
+            ("triage", False),
+        ):
+            with patch("scripts.subscription_review.api", return_value={"permission": permission}):
+                self.assertEqual(authorized_request(self.request()), expected)
+        bad = self.request()
+        bad["user"]["login"] = "../other"
+        with patch("scripts.subscription_review.api") as api:
+            self.assertFalse(authorized_request(bad))
+            api.assert_not_called()
+
+
+class ReviewCallbackTests(unittest.TestCase):
+    def source(self, event="pull_request_review"):
+        return {
+            "id": 123,
+            "repository": {"full_name": "mickdarling/rightyo"},
+            "status": "completed",
+            "name": "Native review activity relay",
+            "path": ".github/workflows/review-activity.yml",
+            "event": event,
+            "pull_requests": [{"number": 44}],
+            "head_sha": HEAD,
+        }
+
+    def test_authoritative_review_and_inline_callbacks_recheck_associated_pr(self):
+        for event in ("pull_request_review", "pull_request_review_comment"):
+            with patch("scripts.subscription_review.api", return_value=self.source(event)) as api:
+                self.assertEqual(
+                    event_pr("workflow_run", {"workflow_run": {"id": 123}}), (44, None)
+                )
+                api.assert_called_once_with("/repos/mickdarling/rightyo/actions/runs/123")
+
+    def test_forged_wrong_workflow_repository_or_event_is_rejected(self):
+        for field, value in (
+            ("path", ".github/workflows/attacker.yml"),
+            ("event", "workflow_dispatch"),
+            ("name", "Other"),
+            ("status", "in_progress"),
+            ("id", 9),
+            ("repository", {"full_name": "other/repository"}),
+        ):
+            source = {**self.source(), field: value}
+            with patch("scripts.subscription_review.api", return_value=source):
+                with self.assertRaises(GateError):
+                    event_pr("workflow_run", {"workflow_run": {"id": 123}})
+
+    def test_empty_association_requires_unique_open_exact_head_repository_pr(self):
+        source = {**self.source(), "pull_requests": []}
+        pr = {
+            "number": 44,
+            "state": "open",
+            "head": {"sha": HEAD},
+            "base": {"repo": {"full_name": "mickdarling/rightyo"}},
+        }
+        with (
+            patch("scripts.subscription_review.api", return_value=source),
+            patch("scripts.subscription_review.pages", return_value=[pr]),
+        ):
+            self.assertEqual(event_pr("workflow_run", {"workflow_run": {"id": 123}}), (44, None))
+        for associated in ([], [pr, pr], [{**pr, "head": {"sha": BASE}}]):
+            with (
+                patch("scripts.subscription_review.api", return_value=source),
+                patch("scripts.subscription_review.pages", return_value=associated),
+            ):
+                with self.assertRaises(GateError):
+                    event_pr("workflow_run", {"workflow_run": {"id": 123}})
+
+
+class NativeMetadataTamperingTests(unittest.TestCase):
+    def test_removed_header_or_duplicate_rows_never_resurrect_old_clean(self):
+        for removed in (True, False):
+            edited = summary()
+            if removed:
+                edited["body"] = edited["body"].replace("Codex Review Summary", "Other summary")
+            else:
+                edited["body"] += edited["body"].splitlines()[-1] + "\n"
+            with self.assertRaises(GateError):
+                clean_completion(
+                    HEAD,
+                    [completion(), edited],
+                    [],
+                    [],
+                    lambda short: HEAD,
+                    lambda item, is_summary: item is not edited,
+                    [],
+                )
+
+    def test_explicit_verdict_without_current_completed_cycle_cannot_pass(self):
+        self.assertIsNone(
+            clean_completion(
+                HEAD, [completion()], [], [], lambda short: HEAD, lambda item, summary: True, []
+            )
+        )
+
+
+class PublisherRouteBindingTests(unittest.TestCase):
+    def test_changed_resolved_pr_never_publishes_outside_serialized_route(self):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GITHUB_REPOSITORY": "mickdarling/rightyo",
+                    "GITHUB_EVENT_NAME": "issue_comment",
+                    "GITHUB_EVENT_PATH": "/unused/event.json",
+                    "GATE_PR_NUMBER": "45",
+                },
+            ),
+            patch("sys.argv", ["subscription_review.py"]),
+            patch("scripts.subscription_review.Path.read_text", return_value="{}"),
+            patch("scripts.subscription_review.event_pr", return_value=(44, None)),
+            patch("scripts.subscription_review.publish") as publish,
+        ):
+            with self.assertRaises(SystemExit):
+                main()
+            publish.assert_not_called()

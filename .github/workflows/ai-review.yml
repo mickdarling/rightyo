@@ -6,7 +6,7 @@ on:
   issue_comment:
     types: [created, edited, deleted]
   workflow_run:
-    workflows: ['RightyO CI']
+    workflows: ['RightyO CI', 'Native review activity relay']
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -25,18 +25,40 @@ on:
 
 permissions: {}
 
-# Serialize publishers; an older event always refetches the current PR revision.
-concurrency:
-  group: rightyo-subscription-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr_number || github.event.workflow_run.pull_requests[0].number || github.run_id }}
-  cancel-in-progress: false
-
 jobs:
-  gate:
-    name: Validate completed subscription review
+  resolve:
+    name: Resolve trusted PR metadata
     if: ${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      pr_number: ${{ steps.route.outputs.pr_number }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Resolve authoritative callback PR association
+        id: route
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/subscription_review.py resolve
+
+  gate:
+    name: Validate completed subscription review
+    needs: resolve
+    if: ${{ needs.resolve.outputs.pr_number != '' }}
+    concurrency:
+      group: rightyo-subscription-${{ needs.resolve.outputs.pr_number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
       contents: read
       pull-requests: read
       statuses: write
@@ -48,4 +70,5 @@ jobs:
       - name: Verify native Codex completion on the current head
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GATE_PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
         run: python3 scripts/subscription_review.py

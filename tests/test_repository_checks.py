@@ -11,6 +11,7 @@ import yaml
 from scripts.repository_checks import (
     AI_REVIEW_WORKFLOW,
     MAX_FILE_BYTES,
+    REVIEW_RELAY_WORKFLOW,
     artifact_errors,
     artifact_reason,
     ignore_errors,
@@ -252,7 +253,7 @@ class AIReviewPolicyTests(unittest.TestCase):
                 elif mutation == "dispatch":
                     del doc["on"]["workflow_dispatch"]["inputs"]["expected_head"]
                 elif mutation == "concurrency":
-                    doc["concurrency"]["cancel-in-progress"] = True
+                    doc["jobs"]["gate"]["concurrency"]["cancel-in-progress"] = True
                 else:
                     field, value = {
                         "permission": ("permissions", {"contents": "write"}),
@@ -269,3 +270,37 @@ class AIReviewPolicyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewRelayPolicyTests(unittest.TestCase):
+    def test_only_fixed_unprivileged_notification_is_allowed(self):
+        doc = yaml.safe_load((ROOT / REVIEW_RELAY_WORKFLOW).read_text())
+        self.assertEqual(workflow_errors(REVIEW_RELAY_WORKFLOW, doc), [])
+        for mutation in ("permissions", "checkout", "secret", "event-code", "wrong-trigger"):
+            changed = yaml.safe_load((ROOT / REVIEW_RELAY_WORKFLOW).read_text())
+            if mutation == "permissions":
+                changed["jobs"]["notify"]["permissions"] = {"statuses": "write"}
+            elif mutation == "checkout":
+                changed["jobs"]["notify"]["steps"].append({"uses": "actions/checkout@" + "a" * 40})
+            elif mutation == "secret":
+                changed["env"] = {"KEY": "${{ secrets.OPENAI_API_KEY }}"}
+            elif mutation == "event-code":
+                changed["jobs"]["notify"]["steps"][0]["run"] = "${{ github.event.review.body }}"
+            else:
+                changed[True]["pull_request_target"] = {}
+            self.assertTrue(workflow_errors(REVIEW_RELAY_WORKFLOW, changed))
+
+
+class ResolverPolicyTests(unittest.TestCase):
+    def test_resolver_cannot_publish_and_gate_mutex_requires_authoritative_route(self):
+        for mutation in ("resolver-write", "global-mutex", "wrong-job-mutex", "unchecked-route"):
+            doc = yaml.safe_load((ROOT / AI_REVIEW_WORKFLOW).read_text())
+            if mutation == "resolver-write":
+                doc["jobs"]["resolve"]["permissions"]["statuses"] = "write"
+            elif mutation == "global-mutex":
+                doc["concurrency"] = {"group": "all", "cancel-in-progress": False}
+            elif mutation == "wrong-job-mutex":
+                doc["jobs"]["gate"]["concurrency"]["group"] = "${{ github.run_id }}"
+            else:
+                del doc["jobs"]["gate"]["steps"][1]["env"]["GATE_PR_NUMBER"]
+            self.assertTrue(workflow_errors(AI_REVIEW_WORKFLOW, doc))

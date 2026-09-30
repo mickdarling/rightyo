@@ -101,12 +101,17 @@ active workflow. Separately purchased credits, quota behavior and account prefer
 managed in Codex settings; the workflow does not grant extra allowance.
 
 `ai-review.yml` now runs only a metadata validator. It checks native results after trusted
-PR updates, issue-comment creation/edit/deletion, and completed ordinary PR CI. It never
+PR updates, issue-comment creation/edit/deletion, and completed ordinary PR CI or the read-only native review activity relay. It never
 runs or checks out PR-controlled programs, installs a model CLI, requests inference, or
-passes provider credentials. Its checkout is the immutable trusted workflow SHA. Review
-and inline-review events are deliberately absent because those workflow revisions can come
-from the PR merge tree. Native completion comments and summary updates supply the trusted
-comment-event route. A manual dispatch rechecks a PR using its full current head and base
+passes provider credentials. Its checkout is the immutable trusted workflow SHA. Review and inline-review events run a separate fixed notification relay with empty
+permissions, no checkout, artifacts, credentials or event-controlled commands. The privileged
+publisher subscribes only to its completion callback and refetches the source run through
+GitHub API, validating repository, workflow name/path, event, completion and unique PR
+association. A separate read-only resolver supplies the publisher's PR-specific concurrency
+key, preventing unrelated PR notifications from dropping each other and preventing an empty
+event association from escaping serialization. The publisher re-resolves and requires the
+same numeric PR before any status write. It never uses relay outputs as a verdict or executes the relay's PR merge tree.
+Completion comments and summary updates also supply the trusted comment-event route. A manual dispatch rechecks a PR using its full current head and base
 SHAs, without requesting or running another model.
 
 The stable `rightyo/review-gate` commit status is published on the exact current PR head.
@@ -125,10 +130,19 @@ positive evidence from the verified connector bot identity and GitHub app, throu
   as completion without findings; this path is verified against RightyO's automatic review.
 
 Neither a request, summary alone, reaction alone, copied verdict nor old-head evidence
-passes. Every accepted comment's exact body, update time and identity are checked through
+passes. All native app-authored comments are checked for edit provenance, including metadata whose
+header was removed or rows malformed. Human edits or ambiguous native summaries fail closed
+even when an older explicit clean verdict remains. A current authenticated Completed review
+summary is required for both positive paths; a deleted or Running cycle indicator cannot
+resurrect a legacy verdict. Every accepted comment's exact body, update time and identity are checked through
 GitHub GraphQL. Explicit verdicts must never have been edited; summaries may be unedited
 or last edited by the connector's immutable Bot identity. A maintainer-edited bot comment
-cannot supply positive evidence. Current-head connector reviews or inline findings block
+cannot supply positive evidence. A new authorized first-line `@codex review` / `@codex security review` request invalidates
+older clean evidence immediately. Current write/maintain/admin permission is checked through
+GitHub; quoted examples and unauthorized requests do not establish a review barrier. A
+current-head native Running, Queued or unknown activity summary also invalidates older
+verdicts. Fresh completion must postdate the barrier at whole-second precision.
+Current-head connector reviews or inline findings block
 even after thread resolution or dismissal: fix on a new head and obtain a fresh review.
 
 Summary completion times include fractions of a second while reaction timestamps use
@@ -142,6 +156,9 @@ native format changes, the reaction is delayed beyond this window, or review is 
 the gate blocks; a later trusted event or exact-revision manual gate dispatch can recheck.
 Unknown formats, quota failure, API/GraphQL errors and bounded-history overflow fail closed.
 Current head/base are refetched before publication; revision changes invalidate the attempt.
+Review/inline-review callbacks recheck findings even when a failed re-review posts no issue
+completion comment. Callback PR association must be verified on real review and inline
+activity before rollout; unknown or ambiguous source metadata fails instead of guessing.
 
 The publisher uses GitHub's commit-status API rather than custom Actions check runs.
 GitHub documents that checks created by Actions jobs on dispatch, comment and workflow-run

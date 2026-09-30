@@ -3,6 +3,7 @@
 No model is invoked here. Provider credentials and PR-controlled code are never used.
 """
 
+import argparse
 import json
 import os
 import re
@@ -143,13 +144,71 @@ def comment_provenance(comment, summary):
     )
 
 
-def review_candidates(head, comments, reviews, inline_comments, resolve, attest):
+def authorized_request(comment):
+    user = comment.get("user") or {}
+    login = user.get("login")
+    if (
+        user.get("type") != "User"
+        or not isinstance(login, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login)
+    ):
+        return False
+    permission = api(f"/repos/{REPOSITORY}/collaborators/{login}/permission")
+    return permission.get("permission") in {"admin", "maintain", "write"}
+
+
+def freshness_barrier(comments, head, resolve, attest, authorize):
+    barriers = []
+    summaries = []
+    for comment in comments:
+        body = comment.get("body") or ""
+        # Only a command at the start of the comment is a request; quoted/code examples
+        # and unprivileged copied text are not treated as reviewer authorization.
+        if re.match(r"\A\s*@codex (?:security )?review(?:\s|\Z)", body, re.I):
+            if authorize(comment):
+                barriers.append(timestamp(comment.get("updated_at")))
+        if not native(comment, require_app=True):
+            continue
+        if not attest(comment, True):
+            raise GateError("Native comment edit provenance is invalid")
+        if not body.startswith(
+            "<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n"
+        ):
+            continue
+        row = re.findall(r"(?m)^\|[^\n]*\*\*Code Review\*\*[^\n]*\| `([0-9a-f]{7,40})` \|", body)
+        if len(row) != 1:
+            raise GateError("Native review activity summary is ambiguous or unsupported")
+        if not head.startswith(row[0]) or resolve(row[0]) != head:
+            continue
+        updated = timestamp(comment.get("updated_at"))
+        completed = SUMMARY.findall(body)
+        if len(completed) == 1:
+            summaries.append((updated, timestamp(completed[0][0]).replace(microsecond=0)))
+        else:
+            barriers.append(updated)
+            summaries.append((updated, None))
+    barrier = max(barriers) if barriers else None
+    latest = max((updated for updated, _ in summaries), default=None)
+    completed_cycle = latest is not None and all(
+        completion is not None and (barrier is None or completion > barrier)
+        for updated, completion in summaries
+        if updated == latest
+    )
+    return barrier, completed_cycle
+
+
+def review_candidates(
+    head, comments, reviews, inline_comments, resolve, attest, authorize=authorized_request
+):
     """Require positive authenticated evidence, never absence of findings alone."""
     if not isinstance(head, str) or not SHA.fullmatch(head):
         raise GateError("Invalid immutable PR head")
     for record in reviews + inline_comments:
         if native(record) and record.get("commit_id") == head:
             return []
+    barrier, completed_cycle = freshness_barrier(comments, head, resolve, attest, authorize)
+    if not completed_cycle:
+        return []
     candidates = []
     for comment in reversed(comments):
         if not native(comment, require_app=True):
@@ -173,6 +232,8 @@ def review_candidates(head, comments, reviews, inline_comments, resolve, attest)
         else:
             short = match[1]
             completed = timestamp(comment.get("created_at"))
+        if barrier is not None and completed <= barrier:
+            continue
         if not head.startswith(short) or resolve(short) != head:
             continue
         if not attest(comment, summary):
@@ -206,9 +267,19 @@ def select_completion(candidates, reactions):
     return None
 
 
-def clean_completion(head, comments, reviews, inline_comments, resolve, attest, reactions):
+def clean_completion(
+    head,
+    comments,
+    reviews,
+    inline_comments,
+    resolve,
+    attest,
+    reactions,
+    authorize=authorized_request,
+):
     return select_completion(
-        review_candidates(head, comments, reviews, inline_comments, resolve, attest), reactions
+        review_candidates(head, comments, reviews, inline_comments, resolve, attest, authorize),
+        reactions,
     )
 
 
@@ -226,10 +297,46 @@ def event_pr(event_name, event):
             raise GateError("Dispatch requires a full immutable base")
         return int(raw_number), (expected, base)
     if event_name == "workflow_run":
-        run = event.get("workflow_run", {})
-        prs = run.get("pull_requests", [])
-        if run.get("event") != "pull_request" or len(prs) != 1:
+        notification = event.get("workflow_run", {})
+        run_id = notification.get("id")
+        if type(run_id) is not int or run_id < 1:
+            raise GateError("Review callback run identity is invalid")
+        run = api(f"/repos/{REPOSITORY}/actions/runs/{run_id}")
+        routes = {
+            ".github/workflows/ci.yml": ("RightyO CI", {"pull_request"}),
+            ".github/workflows/review-activity.yml": (
+                "Native review activity relay",
+                {"pull_request_review", "pull_request_review_comment"},
+            ),
+        }
+        if run.get("event") == "push" and run.get("path") == ".github/workflows/ci.yml":
             return None, None
+        route = routes.get(run.get("path"))
+        if (
+            run.get("id") != run_id
+            or run.get("repository", {}).get("full_name") != REPOSITORY
+            or run.get("status") != "completed"
+            or route is None
+            or run.get("name") != route[0]
+            or run.get("event") not in route[1]
+        ):
+            raise GateError("Review callback source workflow is invalid")
+        prs = run.get("pull_requests", [])
+        if not isinstance(prs, list) or len(prs) != 1:
+            revision = run.get("head_sha", "")
+            if not isinstance(revision, str) or not SHA.fullmatch(revision):
+                raise GateError("Review callback PR association is unavailable")
+            # No source-run artifacts or programs are consulted. A bounded GitHub-owned
+            # association is accepted only for one open PR with the exact source head.
+            prs = [
+                pr
+                for pr in pages(f"/repos/{REPOSITORY}/commits/{revision}/pulls")
+                if pr.get("state") == "open"
+                and pr.get("head", {}).get("sha") == revision
+                and pr.get("base", {}).get("repo", {}).get("full_name") == REPOSITORY
+            ]
+        if len(prs) != 1 or type(prs[0].get("number")) is not int or prs[0]["number"] < 1:
+            raise GateError("Review callback PR association is ambiguous")
         return prs[0]["number"], None
     if event_name == "issue_comment":
         issue = event.get("issue", {})
@@ -360,12 +467,22 @@ def publish(number, expected=None):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", nargs="?", choices=["resolve", "publish"], default="publish")
+    args = parser.parse_args()
     try:
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
         if os.environ.get("GITHUB_REPOSITORY") != REPOSITORY:
             raise GateError("Workflow repository mismatch")
         number, expected = event_pr(os.environ["GITHUB_EVENT_NAME"], event)
-        if number is not None:
+        if args.command == "resolve":
+            with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+                output.write(f"pr_number={number if number is not None else ''}\n")
+            print("Trusted PR association resolved")
+        elif number is not None:
+            routed = os.environ.get("GATE_PR_NUMBER", "")
+            if not re.fullmatch(r"[1-9][0-9]*", routed) or int(routed) != number:
+                raise GateError("Publisher PR association changed after serialized routing")
             publish(number, expected)
         else:
             print("Non-PR event ignored")

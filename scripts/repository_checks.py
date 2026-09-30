@@ -214,6 +214,7 @@ def mentions_secrets(value):
 
 
 AI_REVIEW_WORKFLOW = ".github/workflows/ai-review.yml"
+REVIEW_RELAY_WORKFLOW = ".github/workflows/review-activity.yml"
 CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 
 
@@ -224,7 +225,10 @@ def ai_review_workflow_errors(path, document):
             "types": ["opened", "synchronize", "reopened", "ready_for_review", "edited"]
         },
         "issue_comment": {"types": ["created", "edited", "deleted"]},
-        "workflow_run": {"workflows": ["RightyO CI"], "types": ["completed"]},
+        "workflow_run": {
+            "workflows": ["RightyO CI", "Native review activity relay"],
+            "types": ["completed"],
+        },
         "workflow_dispatch": {
             "inputs": {
                 field: {"required": True, "type": "string"}
@@ -235,22 +239,45 @@ def ai_review_workflow_errors(path, document):
     expected = {
         "on": expected_events,
         "permissions": {},
-        "concurrency": {
-            "group": (
-                "rightyo-subscription-${{ github.event.pull_request.number || "
-                "github.event.issue.number || inputs.pr_number || "
-                "github.event.workflow_run.pull_requests[0].number || github.run_id }}"
-            ),
-            "cancel-in-progress": False,
-        },
         "jobs": {
-            "gate": {
+            "resolve": {
                 "if": (
                     "${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}"
                 ),
                 "runs-on": "ubuntu-24.04",
                 "timeout-minutes": 5,
-                "permissions": {"contents": "read", "pull-requests": "read", "statuses": "write"},
+                "permissions": {"actions": "read", "contents": "read", "pull-requests": "read"},
+                "outputs": {"pr_number": "${{ steps.route.outputs.pr_number }}"},
+                "steps": [
+                    {
+                        "uses": CHECKOUT_ACTION,
+                        "with": {
+                            "ref": "${{ github.workflow_sha }}",
+                            "persist-credentials": False,
+                        },
+                    },
+                    {
+                        "id": "route",
+                        "run": "python3 scripts/subscription_review.py resolve",
+                        "env": {"GITHUB_TOKEN": "${{ github.token }}"},
+                    },
+                ],
+            },
+            "gate": {
+                "needs": "resolve",
+                "if": "${{ needs.resolve.outputs.pr_number != '' }}",
+                "concurrency": {
+                    "group": "rightyo-subscription-${{ needs.resolve.outputs.pr_number }}",
+                    "cancel-in-progress": False,
+                },
+                "runs-on": "ubuntu-24.04",
+                "timeout-minutes": 5,
+                "permissions": {
+                    "actions": "read",
+                    "contents": "read",
+                    "pull-requests": "read",
+                    "statuses": "write",
+                },
                 "steps": [
                     {
                         "uses": CHECKOUT_ACTION,
@@ -261,10 +288,13 @@ def ai_review_workflow_errors(path, document):
                     },
                     {
                         "run": "python3 scripts/subscription_review.py",
-                        "env": {"GITHUB_TOKEN": "${{ github.token }}"},
+                        "env": {
+                            "GITHUB_TOKEN": "${{ github.token }}",
+                            "GATE_PR_NUMBER": "${{ needs.resolve.outputs.pr_number }}",
+                        },
                     },
                 ],
-            }
+            },
         },
     }
 
@@ -306,6 +336,56 @@ def ai_review_workflow_errors(path, document):
     return []
 
 
+def review_activity_workflow_errors(path, document):
+    """The PR-merge-tree relay has no credentials, checkout or event-controlled programs."""
+    actual = copy.deepcopy(document)
+    actual.pop("name", None)
+    if True in actual:
+        actual["on"] = actual.pop(True)
+    jobs = actual.get("jobs")
+    if isinstance(jobs, dict):
+        for job in jobs.values():
+            if isinstance(job, dict):
+                job.pop("name", None)
+                if isinstance(job.get("steps"), list):
+                    for step in job["steps"]:
+                        if isinstance(step, dict):
+                            step.pop("name", None)
+    expected = {
+        "on": {
+            "pull_request_review": {"types": ["submitted", "edited", "dismissed"]},
+            "pull_request_review_comment": {"types": ["created", "edited", "deleted"]},
+        },
+        "permissions": {},
+        "jobs": {
+            "notify": {
+                "runs-on": "ubuntu-24.04",
+                "timeout-minutes": 1,
+                "permissions": {},
+                "steps": [
+                    {
+                        "run": "echo 'Review activity notification; "
+                        "the trusted publisher reads GitHub metadata independently'"
+                    }
+                ],
+            }
+        },
+    }
+
+    def equal(left, right):
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, dict):
+            return left.keys() == right.keys() and all(equal(left[k], right[k]) for k in left)
+        if isinstance(left, list):
+            return len(left) == len(right) and all(equal(a, b) for a, b in zip(left, right))
+        return left == right
+
+    if not equal(actual, expected) or mentions_secrets(document):
+        return [f"{path}: review relay exceeds fixed unprivileged notification surface"]
+    return []
+
+
 def workflow_errors(path, document):
     """Narrow baseline policy; reject the secrets token even in harmless text labels."""
     errors = []
@@ -314,6 +394,8 @@ def workflow_errors(path, document):
 
     if str(path) == AI_REVIEW_WORKFLOW:
         return ai_review_workflow_errors(path, document)
+    if str(path) == REVIEW_RELAY_WORKFLOW:
+        return review_activity_workflow_errors(path, document)
 
     # Walk actual strings: repr/JSON escaping can hide word boundaries around newlines.
     if mentions_secrets(document):
