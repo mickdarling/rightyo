@@ -1,10 +1,13 @@
 """Small, offline checks for public repository hygiene, not privacy certification."""
 
+import copy
 import json
 import re
 import subprocess
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
+
+import yaml
 
 PRIVATE_PARTS = {
     "recordings",
@@ -213,353 +216,454 @@ def mentions_secrets(value):
 
 
 AI_REVIEW_WORKFLOW = ".github/workflows/ai-review.yml"
-AI_REVIEW_JOBS = {"prepare", "codex", "claude", "publish"}
-AI_REVIEW_EVENTS = {"pull_request_target", "workflow_dispatch", "workflow_run"}
-AI_REVIEW_TYPES = {"opened", "synchronize", "reopened", "ready_for_review", "edited"}
-AI_REVIEW_PERMISSIONS = {
-    "prepare": {"contents": "read", "pull-requests": "read", "checks": "write"},
-    "codex": {"contents": "read"},
-    "claude": {"contents": "read"},
-    "publish": {"contents": "read", "checks": "write", "pull-requests": "read"},
-}
+REVIEW_RELAY_WORKFLOW = ".github/workflows/review-activity.yml"
 CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
-CODEX_REVIEW_ACTION = "openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e"
-UPLOAD_REVIEW_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
-DOWNLOAD_REVIEW_ACTION = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
-AI_REVIEW_ACTIONS = {
-    CHECKOUT_ACTION,
-    CODEX_REVIEW_ACTION,
-    UPLOAD_REVIEW_ACTION,
-    DOWNLOAD_REVIEW_ACTION,
-}
-CLAUDE_REVIEW_COMMAND = "python3 scripts/ai_review.py claude --directory review-data"
-PROVIDER_ALLOWED_CONDITION = "${{ needs.prepare.outputs.allowed == 'true' }}"
-
-AI_REVIEW_ROUTE = (
-    "(github.event_name != 'workflow_run' || "
-    "github.event.workflow_run.event == 'pull_request') && "
-    "(github.event_name != 'pull_request_target' || github.actor != 'dependabot[bot]')"
-)
-AI_REVIEW_PREPARE_CONDITION = "${{ " + AI_REVIEW_ROUTE + " }}"
-AI_REVIEW_PUBLISH_CONDITION = "${{ always() && (" + AI_REVIEW_ROUTE + ") }}"
-AI_REVIEW_CONCURRENCY = {
-    "group": (
-        "rightyo-ai-${{ github.event.pull_request.number || inputs.pr_number || "
-        "github.event.workflow_run.pull_requests[0].number }}-${{ "
-        "github.event.pull_request.head.sha || inputs.expected_head || "
-        "github.event.workflow_run.head_sha }}-${{ "
-        "github.event_name == 'workflow_dispatch' && 'manual' || "
-        "((github.event_name == 'workflow_run' && "
-        "github.event.workflow_run.event != 'pull_request') || "
-        "(github.event_name == 'pull_request_target' && "
-        "(github.actor == 'dependabot[bot]' || "
-        "github.event.pull_request.head.repo.full_name != github.repository))) "
-        "&& 'ignored' || 'automatic' }}"
-    ),
-    "cancel-in-progress": "${{ github.event_name == 'workflow_dispatch' }}",
-}
 
 
-def approved_ai_review_steps():
-    """The credentialed lane may execute only this reviewed orchestration surface.
+REVIEW_INVALIDATION_COMMAND = r"""python3 - <<'PY'
+import json
+import os
+import re
+import urllib.request
+from datetime import datetime
+from pathlib import Path
 
-    Human-readable step names may change. Commands, ordering, inputs, env, conditions,
-    output IDs and artifact locations must be reviewed here alongside the workflow.
-    """
-    checkout = {
-        "uses": CHECKOUT_ACTION,
-        "with": {
-            "ref": "${{ github.workflow_sha }}",
-            "persist-credentials": False,
-        },
-    }
-    download = {
-        "uses": DOWNLOAD_REVIEW_ACTION,
-        "with": {
-            "name": "rightyo-review-snapshot",
-            "path": "review-data",
-        },
-    }
-    install = {"run": "npm ci --ignore-scripts --no-audit --no-fund --prefix .github/reviews"}
-    snapshot_env = {"SNAPSHOT_SHA": "${{ needs.prepare.outputs.snapshot_sha }}"}
+repository = "mickdarling/rightyo"
+if os.environ.get("GITHUB_REPOSITORY") != repository:
+    raise SystemExit("Review invalidation repository mismatch")
+event = os.environ.get("GITHUB_EVENT_NAME")
+if event not in {"workflow_run", "issue_comment"}:
+    raise SystemExit(0)
+payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
 
-    def upload(provider):
-        name = "snapshot" if provider == "snapshot" else provider
-        return {
-            "uses": UPLOAD_REVIEW_ACTION,
-            "with": {
-                "name": "rightyo-review-" + name,
-                "path": "review-data/" + name + ".json",
-                "if-no-files-found": "error",
-                "retention-days": 1,
-            },
-        }
+def command(body):
+    return isinstance(body, str) and re.match(
+        r"\A\s*@codex (?:security )?review(?:\s|\Z)", body, re.I) is not None
 
-    return {
-        "prepare": [
-            checkout,
-            {
-                "id": "snapshot",
-                "run": "python3 scripts/ai_review.py prepare --directory review-data",
-                "env": {
-                    "GITHUB_TOKEN": "${{ github.token }}",
-                    "GITHUB_WORKFLOW_SHA": "${{ github.workflow_sha }}",
-                },
-            },
-            upload("snapshot"),
-        ],
-        "codex": [
-            checkout,
-            download,
-            install,
-            {
-                "run": "python3 scripts/ai_review.py sandbox-check --directory review-data",
-                "env": snapshot_env,
-            },
-            {
-                "uses": CODEX_REVIEW_ACTION,
-                "with": {
-                    "openai-api-key": "${{ secrets.OPENAI_API_KEY }}",
-                    "codex-version": "0.159.2",
-                    "prompt-file": "review-data/prompt.txt",
-                    "output-schema-file": "review-data/schema.json",
-                    "output-file": "review-data/codex-output.json",
-                    "working-directory": "/tmp/rightyo-review-empty",
-                    "codex-home": "/tmp/rightyo-codex-home",
-                    "permission-profile": "review-data-only",
-                    "safety-strategy": "drop-sudo",
-                    "allow-bot-users": "dependabot[bot]",
-                    "codex-args": '["--ephemeral", "--skip-git-repo-check"]',
-                },
-            },
-            {
-                "run": "python3 scripts/ai_review.py codex --directory review-data",
-                "env": snapshot_env,
-            },
-            upload("codex"),
-        ],
-        "claude": [
-            checkout,
-            download,
-            install,
-            {
-                "run": CLAUDE_REVIEW_COMMAND,
-                "env": {
-                    **snapshot_env,
-                    "ANTHROPIC_API_KEY": "${{ secrets.ANTHROPIC_API_KEY }}",
-                    "CLAUDE_CODE_OAUTH_TOKEN": "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}",
-                },
-            },
-            upload("claude"),
-        ],
-        "publish": [
-            checkout,
-            {
-                "uses": DOWNLOAD_REVIEW_ACTION,
-                "with": {
-                    "pattern": "rightyo-review-*",
-                    "path": "review-data",
-                    "merge-multiple": True,
-                },
-            },
-            {
-                "run": "python3 scripts/ai_review.py publish --directory review-data",
-                "if": "${{ always() }}",
-                "env": {
-                    "GITHUB_TOKEN": "${{ github.token }}",
-                    "REVIEW_METADATA": "${{ needs.prepare.outputs.metadata }}",
-                    "SNAPSHOT_SHA": "${{ needs.prepare.outputs.snapshot_sha }}",
-                    "JOB_RESULTS": "${{ toJSON(needs) }}",
-                },
-            },
-        ],
-    }
+def stamp(value):
+    if not isinstance(value, str) or not re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z", value):
+        raise RuntimeError("Invalid request timestamp")
+    return datetime.fromisoformat(value).replace(microsecond=0)
+
+if event == "issue_comment":
+    comment = payload.get("comment") or {}
+    action = payload.get("action")
+    old_body = payload.get("changes", {}).get("body", {}).get("from")
+    current = command(comment.get("body"))
+    removed = (command(old_body) and not current) or (action == "deleted" and current)
+    issue = payload.get("issue") or {}
+    if (action not in {"created", "edited", "deleted"} or not (current or removed)
+            or not issue.get("pull_request")):
+        raise SystemExit(0)
+    number, comment_id = issue.get("number"), comment.get("id")
+    if type(number) is not int or number < 1 or type(comment_id) is not int or comment_id < 1:
+        raise SystemExit("Review request event identity is invalid")
+    try:
+        cutoff = stamp(comment.get("updated_at"))
+    except Exception:
+        raise SystemExit("Review request timestamp is invalid") from None
+else:
+    run = payload["workflow_run"]
+    if run.get("name") != "Native review activity relay":
+        raise SystemExit(0)
+    paths = [value for value in (run.get("path"), (payload.get("workflow") or {}).get("path"))
+             if value is not None]
+    if (run.get("repository", {}).get("full_name") != repository
+            or not paths or any(path != ".github/workflows/review-activity.yml" for path in paths)
+            or run.get("event") not in {"pull_request_review", "pull_request_review_comment"}
+            or run.get("status") != "completed"):
+        raise SystemExit("Review invalidation source hints are invalid")
+    prs = run.get("pull_requests")
+    if not isinstance(prs, list) or len(prs) > 20:
+        raise SystemExit("Review invalidation association hints are invalid")
+    heads = [run.get("head_sha")]
+    for pr in prs:
+        if not isinstance(pr, dict) or not isinstance(pr.get("head"), dict):
+            raise SystemExit("Review invalidation association hints are invalid")
+        heads.append(pr["head"].get("sha"))
+    if any(not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head) for head in heads):
+        raise SystemExit("Review invalidation revision hints are invalid")
+
+run_id = os.environ.get("GITHUB_RUN_ID", "")
+token = os.environ.get("GITHUB_TOKEN", "")
+if not re.fullmatch(r"[1-9][0-9]*", run_id) or not token:
+    raise SystemExit("Review invalidation publisher identity is unavailable")
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RuntimeError("Review invalidation redirect refused")
+
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+def api(path, method="GET", data=None):
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repository}{path}",
+        data=None if data is None else json.dumps(data).encode(), method=method,
+        headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+                 "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28"},
+    )
+    with opener.open(request, timeout=5) as response:
+        if response.status != (201 if method == "POST" else 200):
+            raise RuntimeError("Review bootstrap API failed")
+        if method == "POST":
+            return None
+        raw = response.read(3_000_001)
+    if len(raw) > 3_000_000:
+        raise RuntimeError("Review bootstrap response exceeds bound")
+    return json.loads(raw)
+
+def pending(head, description):
+    api(f"/statuses/{head}", "POST", {
+        "state": "pending", "context": "rightyo/review-gate", "description": description,
+        "target_url": f"https://github.com/{repository}/actions/runs/{run_id}",
+    })
+
+def persist(head, cutoff):
+    description = f"v1 comment:{comment_id} requested:{cutoff.isoformat().replace('+00:00', 'Z')}"
+    try:
+        pending(head, description)
+    finally:
+        pending(head, description)
+
+def authorized(user):
+    if not isinstance(user, dict) or user.get("type") != "User":
+        return False
+    login = user.get("login")
+    if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login):
+        return False
+    result = api(f"/collaborators/{login}/permission")
+    if (not isinstance(result, dict) or result.get("permission") not in {
+            "none", "read", "triage", "write", "maintain", "admin"}):
+        raise RuntimeError("Review request permission metadata is invalid")
+    return result.get("permission") in {"admin", "maintain", "write"}
+
+def previous(head):
+    latest = None
+    for page in range(1, 11):
+        batch = api(f"/commits/{head}/statuses?per_page=100&page={page}")
+        if not isinstance(batch, list) or len(batch) > 100:
+            raise RuntimeError("Review request history is invalid")
+        for status in batch:
+            creator = status.get("creator") or {}
+            description = status.get("description") or ""
+            if (creator.get("id") != 41898282 or creator.get("login") != "github-actions[bot]"
+                    or status.get("context") not in {
+                        "rightyo/review-gate", "rightyo/review-request"}
+                    or not description.startswith("v1 comment:")):
+                continue
+            match = re.fullmatch(r"v1 comment:([1-9][0-9]*) requested:(.+)", description)
+            if not match:
+                raise RuntimeError("Review request history marker is invalid")
+            value = stamp(match[2])
+            if int(match[1]) == comment_id:
+                latest = max(latest, value) if latest is not None else value
+        if len(batch) < 100:
+            return latest
+    raise RuntimeError("Review request history exceeds bound")
+
+try:
+    if event == "issue_comment":
+        pr = api(f"/pulls/{number}")
+        if pr.get("state") != "open":
+            raise SystemExit(0)
+        head = pr.get("head", {}).get("sha")
+        if (pr.get("base", {}).get("repo", {}).get("full_name") != repository
+                or not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)):
+            raise RuntimeError("Review request PR revision is invalid")
+        try:
+            pending(head, "Review request received; authenticating durable request barrier")
+        except Exception:
+            persist(head, cutoff)
+            raise
+        try:
+            if not authorized(comment.get("user")) or not authorized(payload.get("sender")):
+                raise SystemExit(0)
+            if removed:
+                existing = previous(head)
+                if existing is not None:
+                    raise SystemExit(0)
+        except Exception:
+            persist(head, cutoff)
+            raise
+        persist(head, cutoff)
+    else:
+        failed = False
+        for head in sorted(set(heads)):
+            try:
+                pending(head, "Native review activity; awaiting source resolution")
+            except Exception:
+                failed = True
+        if not prs:
+            # A review relay may report a merge SHA with no embedded PRs.
+            # Discover denial targets before checkout; this never grants approval.
+            revision = run["head_sha"]
+            associated = api(f"/commits/{revision}/pulls?per_page=100&page=1")
+            if not isinstance(associated, list) or len(associated) >= 100:
+                raise RuntimeError("Review invalidation associations exceed bound")
+            inventory = not associated
+            if inventory:
+                associated = api("/pulls?state=open&per_page=100&page=1")
+                if not isinstance(associated, list) or len(associated) >= 100:
+                    raise RuntimeError("Review invalidation PR inventory exceeds bound")
+            candidates = set()
+            for candidate in associated:
+                if not isinstance(candidate, dict):
+                    raise RuntimeError("Review invalidation PR metadata is invalid")
+                if (candidate.get("state") != "open"
+                        or candidate.get("base", {}).get("repo", {}).get("full_name")
+                        != repository):
+                    continue
+                if inventory and revision not in {
+                        candidate.get("merge_commit_sha"), candidate.get("head", {}).get("sha")}:
+                    continue
+                number = candidate.get("number")
+                if type(number) is not int or number < 1:
+                    raise RuntimeError("Review invalidation PR identity is invalid")
+                candidates.add(number)
+            if len(candidates) != 1:
+                raise RuntimeError("Review invalidation PR association is not unique")
+            number = candidates.pop()
+            current_pr = api(f"/pulls/{number}")
+            current_head = current_pr.get("head", {}).get("sha")
+            if (current_pr.get("number") != number or current_pr.get("state") != "open"
+                    or current_pr.get("base", {}).get("repo", {}).get("full_name") != repository
+                    or not isinstance(current_head, str)
+                    or not re.fullmatch(r"[0-9a-f]{40}", current_head)):
+                raise RuntimeError("Review invalidation current PR revision is invalid")
+            try:
+                pending(current_head, "Native review activity; authoritative PR head invalidated")
+            except Exception:
+                failed = True
+        if failed:
+            raise RuntimeError("Review invalidation pending publication failed")
+except Exception:
+    raise SystemExit("Review bootstrap pending or durable capture failed") from None
+print("Review denial captured before checkout and source resolution")
+PY
+"""
 
 
 def ai_review_workflow_errors(path, document):
-    """Allow the separately reviewed trusted lane without weakening ordinary CI.
-
-    This is a structural guard, not proof of the trusted snapshot/validator programs.
-    Changes to those programs and this policy still require independent exact-head review.
-    """
-    errors = []
-
-    def reject(reason):
-        errors.append(f"{path}: AI review {reason}")
-
-    allowed_root = {"name", "on", True, "permissions", "concurrency", "jobs"}
-    if set(document) - allowed_root:
-        reject("workflow contains unsupported root settings")
-    if document.get("permissions") != {}:
-        reject("root permissions must be empty")
-    if document.get("concurrency") != AI_REVIEW_CONCURRENCY:
-        reject("concurrency must isolate ignored callbacks and preserve authorized fork runs")
-    event = document.get("on", document.get(True, {}))
-    if not isinstance(event, dict) or set(event) != AI_REVIEW_EVENTS:
-        reject("requires only pull_request_target, workflow_dispatch and trusted workflow_run")
-    else:
-        target = event["pull_request_target"]
-        if (
-            not isinstance(target, dict)
-            or set(target) != {"types"}
-            or not isinstance(target["types"], list)
-            or not all(isinstance(item, str) for item in target["types"])
-            or set(target["types"]) != AI_REVIEW_TYPES
-        ):
-            reject("target events must cover all prescribed PR changes without filters")
-        if event["workflow_run"] != {"workflows": ["RightyO CI"], "types": ["completed"]}:
-            reject("workflow_run must consume only completed RightyO CI events")
-        dispatch = event["workflow_dispatch"]
-        inputs = dispatch.get("inputs", {}) if isinstance(dispatch, dict) else {}
-        if (
-            not isinstance(dispatch, dict)
-            or set(dispatch) != {"inputs"}
-            or not isinstance(inputs, dict)
-            or set(inputs) != {"pr_number", "expected_head", "expected_base"}
-            or any(
-                not isinstance(spec, dict)
-                or spec.get("required") is not True
-                or spec.get("type") != "string"
-                or set(spec) - {"description", "required", "type"}
-                for spec in inputs.values()
-            )
-        ):
-            reject("manual dispatch requires PR number, expected head and expected base strings")
-    jobs = document.get("jobs", {})
-    if not isinstance(jobs, dict) or set(jobs) != AI_REVIEW_JOBS:
-        reject("requires prepare, codex, claude and publish jobs")
-        return errors
-    allowed_job = {
-        "name",
-        "runs-on",
-        "timeout-minutes",
-        "permissions",
-        "needs",
-        "outputs",
-        "if",
-        "steps",
-    }
-    allowed_step = {"id", "name", "uses", "with", "run", "env", "if"}
-    approved_steps = approved_ai_review_steps()
-    for name, job in jobs.items():
-        if not isinstance(job, dict):
-            reject(f"{name} job must be a mapping")
-            continue
-        if set(job) - allowed_job:
-            reject(f"{name} job contains unsupported runner settings")
-        if job.get("runs-on") != "ubuntu-24.04":
-            reject(f"{name} requires an ephemeral ubuntu-24.04 runner")
-        timeout = job.get("timeout-minutes")
-        if type(timeout) is not int or not 1 <= timeout <= 15:
-            reject(f"{name} timeout must be 1-15 minutes")
-        permission = job.get("permissions")
-        expected = AI_REVIEW_PERMISSIONS[name]
-        if permission != expected and not (name in {"codex", "claude"} and permission == {}):
-            reject(f"{name} permissions exceed its role")
-        needed = job.get("needs", [])
-        needed = [needed] if isinstance(needed, str) else needed
-        expected_needs = [] if name == "prepare" else ["prepare"]
-        if name == "publish":
-            expected_needs = ["prepare", "codex", "claude"]
-        if (
-            not isinstance(needed, list)
-            or not all(isinstance(item, str) for item in needed)
-            or set(needed) != set(expected_needs)
-        ):
-            reject(f"{name} dependencies do not enforce the review boundary")
-        if name == "publish":
-            if job.get("if") != AI_REVIEW_PUBLISH_CONDITION:
-                reject("publisher must always handle authorized routes and skip ignored callbacks")
-        elif name in {"codex", "claude"}:
-            if job.get("if") != PROVIDER_ALLOWED_CONDITION:
-                reject(f"{name} job must respect the trusted snapshot authorization output")
-        elif job.get("if") != AI_REVIEW_PREPARE_CONDITION:
-            reject("preparation must reject restricted bot targets and non-PR workflow callbacks")
-        expected_outputs = (
-            {
-                "allowed": "${{ steps.snapshot.outputs.allowed }}",
-                "metadata": "${{ steps.snapshot.outputs.metadata }}",
-                "snapshot_sha": "${{ steps.snapshot.outputs.snapshot_sha }}",
+    """Freeze the trusted metadata-only publisher; it never invokes model providers."""
+    expected_events = {
+        "pull_request_target": {
+            "types": ["opened", "synchronize", "reopened", "ready_for_review", "edited"]
+        },
+        "issue_comment": {"types": ["created", "edited", "deleted"]},
+        "workflow_run": {
+            "workflows": ["RightyO CI", "Native review activity relay"],
+            "types": ["completed"],
+        },
+        "workflow_dispatch": {
+            "inputs": {
+                field: {"required": True, "type": "string"}
+                for field in ("pr_number", "expected_head", "expected_base")
             }
-            if name == "prepare"
-            else None
-        )
-        if job.get("outputs") != expected_outputs:
-            reject(f"{name} outputs must come only from the trusted preparation step")
-        steps = job.get("steps", [])
-        if not isinstance(steps, list) or not steps:
-            reject(f"{name} requires explicit trusted steps")
-            continue
-        stripped_steps = [
-            {key: value for key, value in step.items() if key != "name"}
-            if isinstance(step, dict)
-            else step
-            for step in steps
-        ]
-        if stripped_steps != approved_steps[name]:
-            reject(f"{name} step sequence, commands, inputs or environment exceed reviewed surface")
-        for step in steps:
-            if not isinstance(step, dict):
-                reject(f"{name} step must be a mapping")
-                continue
-            if set(step) - allowed_step:
-                reject(f"{name} step contains unsupported settings")
-            action = step.get("uses", "")
-            if action:
-                if (
-                    not isinstance(action, str)
-                    or not re.fullmatch(r"[\w.-]+/[\w./-]+@[a-f0-9]{40}", action)
-                    or action not in AI_REVIEW_ACTIONS
-                ):
-                    reject("actions require an approved official repository and full commit SHA")
-                elif action.startswith("openai/codex-action@"):
-                    if name != "codex" or action != CODEX_REVIEW_ACTION:
-                        reject("Codex action must use the reviewed pin in its own job")
-                elif action.startswith("actions/checkout@"):
-                    options = step.get("with", {})
-                    if (
-                        action != CHECKOUT_ACTION
-                        or not isinstance(options, dict)
-                        or options.get("ref") != "${{ github.workflow_sha }}"
-                        or options.get("persist-credentials") is not False
-                        or set(options) - {"ref", "persist-credentials", "fetch-depth", "path"}
-                    ):
-                        reject(
-                            "checkout must use trusted immutable workflow SHA without credentials"
-                        )
-            command = step.get("run", "")
-            if not isinstance(command, str):
-                reject("shell commands must be strings")
-            elif "${{" in command:
-                reject("pass expressions through env instead of shell interpolation")
-            for field in ("with", "env"):
-                if field in step and not isinstance(step[field], dict):
-                    reject(f"step {field} must be a mapping")
-            # Remove only explicitly allowed credential slots, then inspect the whole step.
-            # Labels, bracket access, fallback expressions and any other scope still fail.
-            credential_free = dict(step)
-            if name == "codex" and action == CODEX_REVIEW_ACTION:
-                options = step.get("with", {})
-                options = dict(options) if isinstance(options, dict) else {}
-                if options.get("openai-api-key") == "${{ secrets.OPENAI_API_KEY }}":
-                    del options["openai-api-key"]
-                credential_free["with"] = options
-            if name == "claude" and step.get("run") == CLAUDE_REVIEW_COMMAND:
-                environment = step.get("env", {})
-                environment = dict(environment) if isinstance(environment, dict) else {}
-                for variable in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):
-                    if environment.get(variable) == "${{ secrets." + variable + " }}":
-                        del environment[variable]
-                credential_free["env"] = environment
-            if mentions_secrets(credential_free):
-                reject("credentials are permitted only in the scoped provider invocation")
-        nonsteps = {key: value for key, value in job.items() if key != "steps"}
-        if mentions_secrets(nonsteps):
-            reject("credentials are forbidden outside provider steps")
-    root_without_jobs = {key: value for key, value in document.items() if key != "jobs"}
-    if mentions_secrets(root_without_jobs):
-        reject("credentials are forbidden at workflow scope")
-    return errors
+        },
+    }
+    expected = {
+        "on": expected_events,
+        "permissions": {},
+        "concurrency": {
+            "group": "rightyo-subscription-status",
+            "queue": "max",
+            "cancel-in-progress": False,
+        },
+        "jobs": {
+            "invalidate": {
+                "runs-on": "ubuntu-24.04",
+                "timeout-minutes": 2,
+                "permissions": {"pull-requests": "read", "statuses": "write"},
+                "steps": [
+                    {
+                        "env": {"GITHUB_TOKEN": "${{ github.token }}"},
+                        "run": REVIEW_INVALIDATION_COMMAND,
+                    }
+                ],
+            },
+            "resolve": {
+                "needs": "invalidate",
+                "if": (
+                    "${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}"
+                ),
+                "runs-on": "ubuntu-24.04",
+                "timeout-minutes": 5,
+                "permissions": {"actions": "read", "contents": "read", "pull-requests": "read"},
+                "outputs": {"pr_number": "${{ steps.route.outputs.pr_number }}"},
+                "steps": [
+                    {
+                        "uses": CHECKOUT_ACTION,
+                        "with": {
+                            "ref": "${{ github.workflow_sha }}",
+                            "persist-credentials": False,
+                        },
+                    },
+                    {
+                        "id": "route",
+                        "run": "python3 scripts/subscription_review.py resolve",
+                        "env": {"GITHUB_TOKEN": "${{ github.token }}"},
+                    },
+                ],
+            },
+            "record": {
+                "needs": "resolve",
+                "if": "${{ needs.resolve.outputs.pr_number != '' }}",
+                "runs-on": "ubuntu-24.04",
+                "timeout-minutes": 5,
+                "permissions": {
+                    "actions": "read",
+                    "contents": "read",
+                    "pull-requests": "read",
+                    "statuses": "write",
+                },
+                "steps": [
+                    {
+                        "uses": CHECKOUT_ACTION,
+                        "with": {
+                            "ref": "${{ github.workflow_sha }}",
+                            "persist-credentials": False,
+                        },
+                    },
+                    {
+                        "run": "python3 scripts/subscription_review.py record",
+                        "env": {
+                            "GITHUB_TOKEN": "${{ github.token }}",
+                            "GATE_PR_NUMBER": "${{ needs.resolve.outputs.pr_number }}",
+                        },
+                    },
+                ],
+            },
+            "gate": {
+                "needs": ["resolve", "record"],
+                "if": "${{ needs.resolve.outputs.pr_number != '' }}",
+                "runs-on": "ubuntu-24.04",
+                "timeout-minutes": 5,
+                "permissions": {
+                    "actions": "read",
+                    "contents": "read",
+                    "pull-requests": "read",
+                    "statuses": "write",
+                },
+                "steps": [
+                    {
+                        "uses": CHECKOUT_ACTION,
+                        "with": {
+                            "ref": "${{ github.workflow_sha }}",
+                            "persist-credentials": False,
+                        },
+                    },
+                    {
+                        "run": "python3 scripts/subscription_review.py",
+                        "env": {
+                            "GITHUB_TOKEN": "${{ github.token }}",
+                            "GATE_PR_NUMBER": "${{ needs.resolve.outputs.pr_number }}",
+                        },
+                    },
+                ],
+            },
+        },
+    }
+
+    actual = copy.deepcopy(document)
+    actual.pop("name", None)
+    if True in actual:
+        actual["on"] = actual.pop(True)
+    jobs = actual.get("jobs")
+    if isinstance(jobs, dict):
+        for job in jobs.values():
+            if isinstance(job, dict):
+                job.pop("name", None)
+                steps = job.get("steps")
+                if isinstance(steps, list):
+                    for step in steps:
+                        if isinstance(step, dict):
+                            step.pop("name", None)
+    event = actual.get("on")
+    if isinstance(event, dict):
+        dispatch = event.get("workflow_dispatch")
+        inputs = dispatch.get("inputs") if isinstance(dispatch, dict) else None
+        if isinstance(inputs, dict):
+            for spec in inputs.values():
+                if isinstance(spec, dict):
+                    spec.pop("description", None)
+
+    def equal(left, right):
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, dict):
+            return left.keys() == right.keys() and all(equal(left[k], right[k]) for k in left)
+        if isinstance(left, list):
+            return len(left) == len(right) and all(equal(a, b) for a, b in zip(left, right))
+        return left == right
+
+    if not equal(actual, expected) or mentions_secrets(document):
+        return [f"{path}: subscription review workflow exceeds reviewed metadata-only surface"]
+
+    return []
+
+
+def review_activity_workflow_errors(path, document):
+    """The PR-merge-tree relay has no credentials, checkout or event-controlled programs."""
+    actual = copy.deepcopy(document)
+    actual.pop("name", None)
+    if True in actual:
+        actual["on"] = actual.pop(True)
+    jobs = actual.get("jobs")
+    if isinstance(jobs, dict):
+        for job in jobs.values():
+            if isinstance(job, dict):
+                job.pop("name", None)
+                if isinstance(job.get("steps"), list):
+                    for step in job["steps"]:
+                        if isinstance(step, dict):
+                            step.pop("name", None)
+    expected = {
+        "on": {
+            "pull_request_review": {"types": ["submitted", "edited", "dismissed"]},
+            "pull_request_review_comment": {"types": ["created", "edited", "deleted"]},
+        },
+        "permissions": {},
+        "jobs": {
+            "notify": {
+                "runs-on": "ubuntu-24.04",
+                "timeout-minutes": 1,
+                "permissions": {},
+                "steps": [
+                    {
+                        "run": "echo 'Review activity notification; "
+                        "the trusted publisher reads GitHub metadata independently'"
+                    }
+                ],
+            }
+        },
+    }
+
+    def equal(left, right):
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, dict):
+            return left.keys() == right.keys() and all(equal(left[k], right[k]) for k in left)
+        if isinstance(left, list):
+            return len(left) == len(right) and all(equal(a, b) for a, b in zip(left, right))
+        return left == right
+
+    if not equal(actual, expected) or mentions_secrets(document):
+        return [f"{path}: review relay exceeds fixed unprivileged notification surface"]
+    return []
+
+
+def actionlint_source(path, source):
+    """Only the frozen queue field is omitted for the pinned pre-queue actionlint parser."""
+    if str(path) != AI_REVIEW_WORKFLOW:
+        return source
+    try:
+        document = yaml.safe_load(source)
+    except yaml.YAMLError:
+        raise ValueError("Review workflow compatibility input is invalid") from None
+    if workflow_errors(path, document) or source.count("  queue: max\n") != 1:
+        raise ValueError("Review workflow compatibility requires exact frozen queue policy")
+    return source.replace("  queue: max\n", "", 1)
 
 
 def workflow_errors(path, document):
@@ -570,6 +674,8 @@ def workflow_errors(path, document):
 
     if str(path) == AI_REVIEW_WORKFLOW:
         return ai_review_workflow_errors(path, document)
+    if str(path) == REVIEW_RELAY_WORKFLOW:
+        return review_activity_workflow_errors(path, document)
 
     # Walk actual strings: repr/JSON escaping can hide word boundaries around newlines.
     if mentions_secrets(document):

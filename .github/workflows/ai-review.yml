@@ -1,19 +1,21 @@
-name: Independent AI reviews
+name: Subscription Codex review gate
 
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review, edited]
+  issue_comment:
+    types: [created, edited, deleted]
   workflow_run:
-    workflows: ['RightyO CI']
+    workflows: ['RightyO CI', 'Native review activity relay']
     types: [completed]
   workflow_dispatch:
     inputs:
       pr_number:
-        description: 'Open PR number; dispatch authorizes this current head, including forks'
+        description: 'Open PR number to recheck; this does not request or run a model'
         required: true
         type: string
       expected_head:
-        description: 'Full current PR head SHA; approval is bound to this revision'
+        description: 'Full current PR head SHA'
         required: true
         type: string
       expected_base:
@@ -23,146 +25,311 @@ on:
 
 permissions: {}
 
+# GitHub supports queue:max; preserve callbacks rather than replacing pending denial.
+# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency
 concurrency:
-  group: rightyo-ai-${{ github.event.pull_request.number || inputs.pr_number || github.event.workflow_run.pull_requests[0].number }}-${{ github.event.pull_request.head.sha || inputs.expected_head || github.event.workflow_run.head_sha }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || ((github.event_name == 'workflow_run' && github.event.workflow_run.event != 'pull_request') || (github.event_name == 'pull_request_target' && (github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.full_name != github.repository))) && 'ignored' || 'automatic' }}
-  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+  group: rightyo-subscription-status
+  queue: max
+  cancel-in-progress: false
 
 jobs:
-  prepare:
-    name: Prepare immutable review snapshot
-    if: ${{ (github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request') && (github.event_name != 'pull_request_target' || github.actor != 'dependabot[bot]') }}
+  invalidate:
+    name: Capture denial before checkout and fallible resolution
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: Capture request barriers and review-activity denial without checkout
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+          from datetime import datetime
+          from pathlib import Path
+
+          repository = "mickdarling/rightyo"
+          if os.environ.get("GITHUB_REPOSITORY") != repository:
+              raise SystemExit("Review invalidation repository mismatch")
+          event = os.environ.get("GITHUB_EVENT_NAME")
+          if event not in {"workflow_run", "issue_comment"}:
+              raise SystemExit(0)
+          payload = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+
+          def command(body):
+              return isinstance(body, str) and re.match(
+                  r"\A\s*@codex (?:security )?review(?:\s|\Z)", body, re.I) is not None
+
+          def stamp(value):
+              if not isinstance(value, str) or not re.fullmatch(
+                      r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z", value):
+                  raise RuntimeError("Invalid request timestamp")
+              return datetime.fromisoformat(value).replace(microsecond=0)
+
+          if event == "issue_comment":
+              comment = payload.get("comment") or {}
+              action = payload.get("action")
+              old_body = payload.get("changes", {}).get("body", {}).get("from")
+              current = command(comment.get("body"))
+              removed = (command(old_body) and not current) or (action == "deleted" and current)
+              issue = payload.get("issue") or {}
+              if (action not in {"created", "edited", "deleted"} or not (current or removed)
+                      or not issue.get("pull_request")):
+                  raise SystemExit(0)
+              number, comment_id = issue.get("number"), comment.get("id")
+              if type(number) is not int or number < 1 or type(comment_id) is not int or comment_id < 1:
+                  raise SystemExit("Review request event identity is invalid")
+              try:
+                  cutoff = stamp(comment.get("updated_at"))
+              except Exception:
+                  raise SystemExit("Review request timestamp is invalid") from None
+          else:
+              run = payload["workflow_run"]
+              if run.get("name") != "Native review activity relay":
+                  raise SystemExit(0)
+              paths = [value for value in (run.get("path"), (payload.get("workflow") or {}).get("path"))
+                       if value is not None]
+              if (run.get("repository", {}).get("full_name") != repository
+                      or not paths or any(path != ".github/workflows/review-activity.yml" for path in paths)
+                      or run.get("event") not in {"pull_request_review", "pull_request_review_comment"}
+                      or run.get("status") != "completed"):
+                  raise SystemExit("Review invalidation source hints are invalid")
+              prs = run.get("pull_requests")
+              if not isinstance(prs, list) or len(prs) > 20:
+                  raise SystemExit("Review invalidation association hints are invalid")
+              heads = [run.get("head_sha")]
+              for pr in prs:
+                  if not isinstance(pr, dict) or not isinstance(pr.get("head"), dict):
+                      raise SystemExit("Review invalidation association hints are invalid")
+                  heads.append(pr["head"].get("sha"))
+              if any(not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head) for head in heads):
+                  raise SystemExit("Review invalidation revision hints are invalid")
+
+          run_id = os.environ.get("GITHUB_RUN_ID", "")
+          token = os.environ.get("GITHUB_TOKEN", "")
+          if not re.fullmatch(r"[1-9][0-9]*", run_id) or not token:
+              raise SystemExit("Review invalidation publisher identity is unavailable")
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  raise RuntimeError("Review invalidation redirect refused")
+
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+          def api(path, method="GET", data=None):
+              request = urllib.request.Request(
+                  f"https://api.github.com/repos/{repository}{path}",
+                  data=None if data is None else json.dumps(data).encode(), method=method,
+                  headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+                           "Content-Type": "application/json", "X-GitHub-Api-Version": "2022-11-28"},
+              )
+              with opener.open(request, timeout=5) as response:
+                  if response.status != (201 if method == "POST" else 200):
+                      raise RuntimeError("Review bootstrap API failed")
+                  if method == "POST":
+                      return None
+                  raw = response.read(3_000_001)
+              if len(raw) > 3_000_000:
+                  raise RuntimeError("Review bootstrap response exceeds bound")
+              return json.loads(raw)
+
+          def pending(head, description):
+              api(f"/statuses/{head}", "POST", {
+                  "state": "pending", "context": "rightyo/review-gate", "description": description,
+                  "target_url": f"https://github.com/{repository}/actions/runs/{run_id}",
+              })
+
+          def persist(head, cutoff):
+              description = f"v1 comment:{comment_id} requested:{cutoff.isoformat().replace('+00:00', 'Z')}"
+              try:
+                  pending(head, description)
+              finally:
+                  pending(head, description)
+
+          def authorized(user):
+              if not isinstance(user, dict) or user.get("type") != "User":
+                  return False
+              login = user.get("login")
+              if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", login):
+                  return False
+              result = api(f"/collaborators/{login}/permission")
+              if (not isinstance(result, dict) or result.get("permission") not in {
+                      "none", "read", "triage", "write", "maintain", "admin"}):
+                  raise RuntimeError("Review request permission metadata is invalid")
+              return result.get("permission") in {"admin", "maintain", "write"}
+
+          def previous(head):
+              latest = None
+              for page in range(1, 11):
+                  batch = api(f"/commits/{head}/statuses?per_page=100&page={page}")
+                  if not isinstance(batch, list) or len(batch) > 100:
+                      raise RuntimeError("Review request history is invalid")
+                  for status in batch:
+                      creator = status.get("creator") or {}
+                      description = status.get("description") or ""
+                      if (creator.get("id") != 41898282 or creator.get("login") != "github-actions[bot]"
+                              or status.get("context") not in {
+                                  "rightyo/review-gate", "rightyo/review-request"}
+                              or not description.startswith("v1 comment:")):
+                          continue
+                      match = re.fullmatch(r"v1 comment:([1-9][0-9]*) requested:(.+)", description)
+                      if not match:
+                          raise RuntimeError("Review request history marker is invalid")
+                      value = stamp(match[2])
+                      if int(match[1]) == comment_id:
+                          latest = max(latest, value) if latest is not None else value
+                  if len(batch) < 100:
+                      return latest
+              raise RuntimeError("Review request history exceeds bound")
+
+          try:
+              if event == "issue_comment":
+                  pr = api(f"/pulls/{number}")
+                  if pr.get("state") != "open":
+                      raise SystemExit(0)
+                  head = pr.get("head", {}).get("sha")
+                  if (pr.get("base", {}).get("repo", {}).get("full_name") != repository
+                          or not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)):
+                      raise RuntimeError("Review request PR revision is invalid")
+                  try:
+                      pending(head, "Review request received; authenticating durable request barrier")
+                  except Exception:
+                      persist(head, cutoff)
+                      raise
+                  try:
+                      if not authorized(comment.get("user")) or not authorized(payload.get("sender")):
+                          raise SystemExit(0)
+                      if removed:
+                          existing = previous(head)
+                          if existing is not None:
+                              raise SystemExit(0)
+                  except Exception:
+                      persist(head, cutoff)
+                      raise
+                  persist(head, cutoff)
+              else:
+                  failed = False
+                  for head in sorted(set(heads)):
+                      try:
+                          pending(head, "Native review activity; awaiting source resolution")
+                      except Exception:
+                          failed = True
+                  if not prs:
+                      # A review relay may report a merge SHA with no embedded PRs.
+                      # Discover denial targets before checkout; this never grants approval.
+                      revision = run["head_sha"]
+                      associated = api(f"/commits/{revision}/pulls?per_page=100&page=1")
+                      if not isinstance(associated, list) or len(associated) >= 100:
+                          raise RuntimeError("Review invalidation associations exceed bound")
+                      inventory = not associated
+                      if inventory:
+                          associated = api("/pulls?state=open&per_page=100&page=1")
+                          if not isinstance(associated, list) or len(associated) >= 100:
+                              raise RuntimeError("Review invalidation PR inventory exceeds bound")
+                      candidates = set()
+                      for candidate in associated:
+                          if not isinstance(candidate, dict):
+                              raise RuntimeError("Review invalidation PR metadata is invalid")
+                          if (candidate.get("state") != "open"
+                                  or candidate.get("base", {}).get("repo", {}).get("full_name")
+                                  != repository):
+                              continue
+                          if inventory and revision not in {
+                                  candidate.get("merge_commit_sha"), candidate.get("head", {}).get("sha")}:
+                              continue
+                          number = candidate.get("number")
+                          if type(number) is not int or number < 1:
+                              raise RuntimeError("Review invalidation PR identity is invalid")
+                          candidates.add(number)
+                      if len(candidates) != 1:
+                          raise RuntimeError("Review invalidation PR association is not unique")
+                      number = candidates.pop()
+                      current_pr = api(f"/pulls/{number}")
+                      current_head = current_pr.get("head", {}).get("sha")
+                      if (current_pr.get("number") != number or current_pr.get("state") != "open"
+                              or current_pr.get("base", {}).get("repo", {}).get("full_name") != repository
+                              or not isinstance(current_head, str)
+                              or not re.fullmatch(r"[0-9a-f]{40}", current_head)):
+                          raise RuntimeError("Review invalidation current PR revision is invalid")
+                      try:
+                          pending(current_head, "Native review activity; authoritative PR head invalidated")
+                      except Exception:
+                          failed = True
+                  if failed:
+                      raise RuntimeError("Review invalidation pending publication failed")
+          except Exception:
+              raise SystemExit("Review bootstrap pending or durable capture failed") from None
+          print("Review denial captured before checkout and source resolution")
+          PY
+
+  resolve:
+    name: Resolve trusted PR metadata
+    needs: invalidate
+    if: ${{ github.event_name != 'issue_comment' || github.event.issue.pull_request }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
+      actions: read
       contents: read
       pull-requests: read
-      checks: write
     outputs:
-      allowed: ${{ steps.snapshot.outputs.allowed }}
-      metadata: ${{ steps.snapshot.outputs.metadata }}
-      snapshot_sha: ${{ steps.snapshot.outputs.snapshot_sha }}
+      pr_number: ${{ steps.route.outputs.pr_number }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
-      - name: Build source-only snapshot and start head checks
-        id: snapshot
+      - name: Resolve authoritative callback PR association
+        id: route
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
-        run: python3 scripts/ai_review.py prepare --directory review-data
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: rightyo-review-snapshot
-          path: review-data/snapshot.json
-          if-no-files-found: error
-          retention-days: 1
+        run: python3 scripts/subscription_review.py resolve
 
-  codex:
-    name: Codex independent review
-    needs: prepare
-    if: ${{ needs.prepare.outputs.allowed == 'true' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: rightyo-review-snapshot
-          path: review-data
-      - name: Install locked official review CLIs without lifecycle scripts
-        run: npm ci --ignore-scripts --no-audit --no-fund --prefix .github/reviews
-      - name: Verify snapshot and Codex filesystem denial before credentials
-        env:
-          SNAPSHOT_SHA: ${{ needs.prepare.outputs.snapshot_sha }}
-        run: python3 scripts/ai_review.py sandbox-check --directory review-data
-      - name: Run independent Codex snapshot review
-        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e
-        with:
-          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          codex-version: '0.159.2'
-          prompt-file: review-data/prompt.txt
-          output-schema-file: review-data/schema.json
-          output-file: review-data/codex-output.json
-          working-directory: /tmp/rightyo-review-empty
-          codex-home: /tmp/rightyo-codex-home
-          permission-profile: review-data-only
-          safety-strategy: drop-sudo
-          allow-bot-users: dependabot[bot]
-          codex-args: '["--ephemeral", "--skip-git-repo-check"]'
-      - name: Validate completed Codex result and exact revisions
-        env:
-          SNAPSHOT_SHA: ${{ needs.prepare.outputs.snapshot_sha }}
-        run: python3 scripts/ai_review.py codex --directory review-data
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: rightyo-review-codex
-          path: review-data/codex.json
-          if-no-files-found: error
-          retention-days: 1
-
-  claude:
-    name: Claude Code independent review
-    needs: prepare
-    if: ${{ needs.prepare.outputs.allowed == 'true' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions: {}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: rightyo-review-snapshot
-          path: review-data
-      - name: Install locked official review CLIs without lifecycle scripts
-        run: npm ci --ignore-scripts --no-audit --no-fund --prefix .github/reviews
-      - name: Run restricted Claude Code and validate completion
-        env:
-          SNAPSHOT_SHA: ${{ needs.prepare.outputs.snapshot_sha }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-        run: python3 scripts/ai_review.py claude --directory review-data
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: rightyo-review-claude
-          path: review-data/claude.json
-          if-no-files-found: error
-          retention-days: 1
-
-  publish:
-    name: Publish exact-head review checks
-    if: ${{ always() && ((github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request') && (github.event_name != 'pull_request_target' || github.actor != 'dependabot[bot]')) }}
-    needs: [prepare, codex, claude]
+  record:
+    name: Persist review request within serialized status pipeline
+    needs: resolve
+    if: ${{ needs.resolve.outputs.pr_number != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
+      actions: read
       contents: read
       pull-requests: read
-      checks: write
+      statuses: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: rightyo-review-*
-          path: review-data
-          merge-multiple: true
-      - name: Require both completed current-head reviews
-        if: ${{ always() }}
+      - name: Persist authorized review request as denial-only metadata
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          REVIEW_METADATA: ${{ needs.prepare.outputs.metadata }}
-          SNAPSHOT_SHA: ${{ needs.prepare.outputs.snapshot_sha }}
-          JOB_RESULTS: ${{ toJSON(needs) }}
-        run: python3 scripts/ai_review.py publish --directory review-data
+          GATE_PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+        run: python3 scripts/subscription_review.py record
+
+  gate:
+    name: Validate completed subscription review
+    needs: [resolve, record]
+    if: ${{ needs.resolve.outputs.pr_number != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Verify native Codex completion on the current head
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GATE_PR_NUMBER: ${{ needs.resolve.outputs.pr_number }}
+        run: python3 scripts/subscription_review.py

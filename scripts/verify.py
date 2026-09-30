@@ -11,6 +11,8 @@ from pathlib import Path
 
 import yaml
 from repository_checks import (
+    AI_REVIEW_WORKFLOW,
+    actionlint_source,
     artifact_errors,
     git_files,
     ignore_errors,
@@ -21,9 +23,11 @@ from repository_checks import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run(command, *, cwd=ROOT, env=None):
+def run(command, *, cwd=ROOT, env=None, input=None):
     print("Running: " + " ".join(map(str, command)), flush=True)
-    subprocess.run(command, cwd=cwd, env=env, check=True, timeout=180)
+    subprocess.run(
+        command, cwd=cwd, env=env, input=input, text=input is not None, check=True, timeout=180
+    )
 
 
 def repository_errors(root):
@@ -76,7 +80,18 @@ def main():
     if version != "1.7.7":
         raise SystemExit("actionlint must be the pinned version 1.7.7")
     # Disable optional host shellcheck/pyflakes discovery to keep local/CI parity.
-    run([args.actionlint, "-shellcheck=", "-pyflakes="])
+    lint_flags = [args.actionlint, "-shellcheck=", "-pyflakes="]
+    workflows = [
+        path
+        for path in git_files(ROOT)
+        if path.parts[:2] == (".github", "workflows") and path.suffix in (".yml", ".yaml")
+    ]
+    ordinary = [str(path) for path in workflows if str(path) != AI_REVIEW_WORKFLOW]
+    if ordinary:
+        run([*lint_flags, *ordinary])
+    if Path(AI_REVIEW_WORKFLOW) in workflows:
+        source = actionlint_source(AI_REVIEW_WORKFLOW, (ROOT / AI_REVIEW_WORKFLOW).read_text())
+        run([*lint_flags, "-stdin-filename", AI_REVIEW_WORKFLOW, "-"], input=source)
     python_paths = [name for name in ("scripts", "tests", "src") if (ROOT / name).is_dir()]
     run(
         [
