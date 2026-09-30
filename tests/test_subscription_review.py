@@ -15,6 +15,7 @@ from scripts.subscription_review import (
     comment_provenance,
     commit_status,
     event_pr,
+    inline_revision,
     main,
     pages,
     publish,
@@ -100,7 +101,14 @@ class CompletionTests(unittest.TestCase):
     def test_current_head_findings_block_even_with_clean_comment_or_dismissal(self):
         finding = {"user": completion()["user"], "commit_id": HEAD, "state": "DISMISSED"}
         self.assertIsNone(self.check([completion()], reviews=[finding]))
-        self.assertIsNone(self.check([completion()], inline=[finding]))
+        inline = {
+            **finding,
+            "original_commit_id": HEAD,
+            "pull_request_review_id": 100,
+        }
+        self.assertIsNone(
+            self.check([completion()], reviews=[{**finding, "id": 100}], inline=[inline])
+        )
         finding["commit_id"] = BASE
         self.assertIsNotNone(self.check([completion()], reviews=[finding]))
 
@@ -572,3 +580,71 @@ class PublisherRouteBindingTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 main()
             publish.assert_not_called()
+
+
+class InlineSourceBindingTests(unittest.TestCase):
+    def parent(self, revision=BASE):
+        return {
+            "id": 100,
+            "user": completion()["user"],
+            "commit_id": revision,
+            "state": "DISMISSED",
+        }
+
+    def inline(self, original=BASE):
+        return {
+            "user": completion()["user"],
+            "commit_id": HEAD,
+            "original_commit_id": original,
+            "pull_request_review_id": 100,
+        }
+
+    def test_forwarded_old_inline_uses_original_review_not_current_rendered_commit(self):
+        self.assertEqual(inline_revision(self.inline(), [self.parent()]), BASE)
+        result = clean_completion(
+            HEAD,
+            [summary(), completion()],
+            [self.parent()],
+            [self.inline()],
+            lambda short: HEAD,
+            lambda item, is_summary: True,
+            [],
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["kind"], "explicit")
+
+    def test_original_current_head_remains_blocking_despite_resolution_or_dismissal(self):
+        original = self.inline(HEAD)
+        original["commit_id"] = BASE
+        original["resolved"] = True
+        self.assertEqual(inline_revision(original, [self.parent(HEAD)]), HEAD)
+        self.assertIsNone(
+            clean_completion(
+                HEAD,
+                [summary(), completion()],
+                [self.parent(HEAD)],
+                [original],
+                lambda short: HEAD,
+                lambda item, is_summary: True,
+                [],
+            )
+        )
+
+    def test_missing_malformed_or_mismatched_inline_source_fails_closed(self):
+        for field, value in (
+            ("original_commit_id", None),
+            ("original_commit_id", "invalid"),
+            ("pull_request_review_id", None),
+            ("pull_request_review_id", True),
+        ):
+            item = {**self.inline(), field: value}
+            with self.assertRaises(GateError):
+                inline_revision(item, [self.parent()])
+        for parents in (
+            [],
+            [self.parent(), self.parent()],
+            [self.parent(HEAD)],
+            [{**self.parent(), "user": {"id": 3, "login": "other", "type": "User"}}],
+        ):
+            with self.assertRaises(GateError):
+                inline_revision(self.inline(), parents)

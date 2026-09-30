@@ -142,7 +142,12 @@ older clean evidence immediately. Current write/maintain/admin permission is che
 GitHub; quoted examples and unauthorized requests do not establish a review barrier. A
 current-head native Running, Queued or unknown activity summary also invalidates older
 verdicts. Fresh completion must postdate the barrier at whole-second precision.
-Current-head connector reviews or inline findings block
+Formal connector reviews bind to their immutable reviewed commit. Inline findings bind to
+`original_commit_id` and the matching authenticated parent review, because GitHub can move
+their rendered `commit_id` forward when an unchanged line survives later commits. Missing,
+malformed or inconsistent original/parent provenance fails closed. Old findings forwarded
+to a new head do not impersonate a review of that head.
+Current-head connector reviews or original inline findings block
 even after thread resolution or dismissal: fix on a new head and obtain a fresh review.
 
 Summary completion times include fractions of a second while reaction timestamps use

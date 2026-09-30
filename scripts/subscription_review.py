@@ -197,14 +197,31 @@ def freshness_barrier(comments, head, resolve, attest, authorize):
     return barrier, completed_cycle
 
 
+def inline_revision(comment, reviews):
+    """Bind a forwarded inline comment to its immutable original native review."""
+    original = comment.get("original_commit_id")
+    if not isinstance(original, str) or not SHA.fullmatch(original):
+        raise GateError("Native inline original revision is unavailable")
+    review_id = comment.get("pull_request_review_id")
+    if type(review_id) is not int or review_id < 1:
+        raise GateError("Native inline parent review identity is unavailable")
+    parents = [review for review in reviews if review.get("id") == review_id]
+    if len(parents) != 1 or not native(parents[0]) or parents[0].get("commit_id") != original:
+        raise GateError("Native inline parent review provenance is inconsistent")
+    return original
+
+
 def review_candidates(
     head, comments, reviews, inline_comments, resolve, attest, authorize=authorized_request
 ):
     """Require positive authenticated evidence, never absence of findings alone."""
     if not isinstance(head, str) or not SHA.fullmatch(head):
         raise GateError("Invalid immutable PR head")
-    for record in reviews + inline_comments:
+    for record in reviews:
         if native(record) and record.get("commit_id") == head:
+            return []
+    for record in inline_comments:
+        if native(record) and inline_revision(record, reviews) == head:
             return []
     barrier, completed_cycle = freshness_barrier(comments, head, resolve, attest, authorize)
     if not completed_cycle:
