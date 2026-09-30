@@ -1,0 +1,168 @@
+name: Independent AI reviews
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  workflow_run:
+    workflows: ['RightyO CI']
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Open PR number; dispatch authorizes this current head, including forks'
+        required: true
+        type: string
+      expected_head:
+        description: 'Full current PR head SHA; approval is bound to this revision'
+        required: true
+        type: string
+      expected_base:
+        description: 'Full current PR base SHA'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: rightyo-ai-${{ github.event.pull_request.number || inputs.pr_number || github.event.workflow_run.pull_requests[0].number }}-${{ github.event.pull_request.head.sha || inputs.expected_head || github.event.workflow_run.head_sha }}-${{ github.event_name == 'workflow_dispatch' && 'manual' || ((github.event_name == 'workflow_run' && github.event.workflow_run.event != 'pull_request') || (github.event_name == 'pull_request_target' && (github.actor == 'dependabot[bot]' || github.event.pull_request.head.repo.full_name != github.repository))) && 'ignored' || 'automatic' }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+
+jobs:
+  prepare:
+    name: Prepare immutable review snapshot
+    if: ${{ (github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request') && (github.event_name != 'pull_request_target' || github.actor != 'dependabot[bot]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    outputs:
+      allowed: ${{ steps.snapshot.outputs.allowed }}
+      metadata: ${{ steps.snapshot.outputs.metadata }}
+      snapshot_sha: ${{ steps.snapshot.outputs.snapshot_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Build source-only snapshot and start head checks
+        id: snapshot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: python3 scripts/ai_review.py prepare --directory review-data
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rightyo-review-snapshot
+          path: review-data/snapshot.json
+          if-no-files-found: error
+          retention-days: 1
+
+  codex:
+    name: Codex independent review
+    needs: prepare
+    if: ${{ needs.prepare.outputs.allowed == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rightyo-review-snapshot
+          path: review-data
+      - name: Install locked official review CLIs without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix .github/reviews
+      - name: Verify snapshot and Codex filesystem denial before credentials
+        env:
+          SNAPSHOT_SHA: ${{ needs.prepare.outputs.snapshot_sha }}
+        run: python3 scripts/ai_review.py sandbox-check --directory review-data
+      - name: Run independent Codex snapshot review
+        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          codex-version: '0.159.2'
+          prompt-file: review-data/prompt.txt
+          output-schema-file: review-data/schema.json
+          output-file: review-data/codex-output.json
+          working-directory: /tmp/rightyo-review-empty
+          codex-home: /tmp/rightyo-codex-home
+          permission-profile: review-data-only
+          safety-strategy: drop-sudo
+          allow-bot-users: dependabot[bot]
+          codex-args: '["--ephemeral", "--skip-git-repo-check"]'
+      - name: Validate completed Codex result and exact revisions
+        env:
+          SNAPSHOT_SHA: ${{ needs.prepare.outputs.snapshot_sha }}
+        run: python3 scripts/ai_review.py codex --directory review-data
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rightyo-review-codex
+          path: review-data/codex.json
+          if-no-files-found: error
+          retention-days: 1
+
+  claude:
+    name: Claude Code independent review
+    needs: prepare
+    if: ${{ needs.prepare.outputs.allowed == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rightyo-review-snapshot
+          path: review-data
+      - name: Install locked official review CLIs without lifecycle scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix .github/reviews
+      - name: Run restricted Claude Code and validate completion
+        env:
+          SNAPSHOT_SHA: ${{ needs.prepare.outputs.snapshot_sha }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: python3 scripts/ai_review.py claude --directory review-data
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rightyo-review-claude
+          path: review-data/claude.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish exact-head review checks
+    if: ${{ always() && ((github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request') && (github.event_name != 'pull_request_target' || github.actor != 'dependabot[bot]')) }}
+    needs: [prepare, codex, claude]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: rightyo-review-*
+          path: review-data
+          merge-multiple: true
+      - name: Require both completed current-head reviews
+        if: ${{ always() }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REVIEW_METADATA: ${{ needs.prepare.outputs.metadata }}
+          SNAPSHOT_SHA: ${{ needs.prepare.outputs.snapshot_sha }}
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: python3 scripts/ai_review.py publish --directory review-data

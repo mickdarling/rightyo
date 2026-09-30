@@ -6,7 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 from scripts.repository_checks import (
+    AI_REVIEW_WORKFLOW,
     MAX_FILE_BYTES,
     artifact_errors,
     artifact_reason,
@@ -135,9 +138,11 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(workflow_errors("ci.yml", self.document()), [])
 
     def test_privileged_event_fails(self):
-        doc = self.document()
-        doc["on"] = {"pull_request_target": {}}
-        self.assertTrue(workflow_errors("ci.yml", doc))
+        for event in ("pull_request_target", "workflow_run"):
+            with self.subTest(event=event):
+                doc = self.document()
+                doc["on"] = {event: {}}
+                self.assertTrue(workflow_errors("ci.yml", doc))
 
     def test_secret_references_fail_outside_steps(self):
         cases = (
@@ -196,6 +201,246 @@ class WorkflowPolicyTests(unittest.TestCase):
             {"run": "echo example", "env": {"TOKEN": "${{ secrets.EXAMPLE }}"}},
         ]
         self.assertGreaterEqual(len(workflow_errors("ci.yml", doc)), 5)
+
+
+class AIReviewPolicyTests(unittest.TestCase):
+    def document(self):
+        document = yaml.safe_load((ROOT / AI_REVIEW_WORKFLOW).read_text())
+        document["on"] = document.pop(True)
+        return document
+
+    def check(self, document):
+        return workflow_errors(AI_REVIEW_WORKFLOW, document)
+
+    def test_trusted_lane_passes_without_relaxing_other_workflows(self):
+        doc = self.document()
+        self.assertEqual(self.check(doc), [])
+        for path in ("ai-review.yml", ".github/workflows/another-review.yml"):
+            self.assertTrue(workflow_errors(path, doc))
+
+    def test_pr_checkout_or_persistent_credentials_are_rejected(self):
+        for key, value in (
+            ("ref", "${{ github.event.pull_request.head.sha }}"),
+            ("persist-credentials", True),
+            ("repository", "${{ github.event.pull_request.head.repo.full_name }}"),
+        ):
+            doc = self.document()
+            doc["jobs"]["prepare"]["steps"][0]["with"][key] = value
+            self.assertTrue(self.check(doc))
+
+    def test_extra_events_filters_or_unbounded_dispatch_are_rejected(self):
+        for change in ("push", "workflow_run", "paths", "dispatch"):
+            doc = self.document()
+            if change in ("push", "workflow_run"):
+                doc["on"][change] = {}
+            elif change == "paths":
+                doc["on"]["pull_request_target"]["paths"] = ["src/**"]
+            else:
+                doc["on"]["workflow_dispatch"]["inputs"]["shell"] = {"type": "string"}
+            self.assertTrue(self.check(doc))
+
+    def test_workflow_callback_scope_and_trusted_routing_cannot_be_broadened(self):
+        for change in ("workflow-name", "workflow-type", "prepare-route", "publish-route"):
+            with self.subTest(change=change):
+                doc = self.document()
+                if change == "workflow-name":
+                    doc["on"]["workflow_run"]["workflows"] = ["*"]
+                elif change == "workflow-type":
+                    doc["on"]["workflow_run"]["types"] = ["requested", "completed"]
+                elif change == "prepare-route":
+                    doc["jobs"]["prepare"].pop("if")
+                else:
+                    doc["jobs"]["publish"]["if"] = "${{ always() }}"
+                self.assertTrue(self.check(doc))
+
+    def test_callbacks_require_source_pull_request_event_at_both_writer_jobs(self):
+        fragment = "github.event.workflow_run.event == 'pull_request'"
+        for job in ("prepare", "publish"):
+            for replacement in (
+                "true",
+                "github.event.workflow_run.event == 'push'",
+                "github.event.workflow_run.actor.login == 'dependabot[bot]'",
+            ):
+                with self.subTest(job=job, replacement=replacement):
+                    doc = self.document()
+                    condition = doc["jobs"][job]["if"]
+                    self.assertIn(fragment, condition)
+                    doc["jobs"][job]["if"] = condition.replace(fragment, replacement, 1)
+                    self.assertTrue(self.check(doc))
+
+    def test_ignored_callbacks_and_fork_events_cannot_cancel_authorized_runs(self):
+        for change in ("no-partition", "cancel-everything", "missing-concurrency"):
+            with self.subTest(change=change):
+                doc = self.document()
+                if change == "no-partition":
+                    doc["concurrency"]["group"] = (
+                        "rightyo-ai-${{ github.event.pull_request.number }}"
+                    )
+                elif change == "cancel-everything":
+                    doc["concurrency"]["cancel-in-progress"] = True
+                else:
+                    doc.pop("concurrency")
+                self.assertTrue(self.check(doc))
+
+    def test_every_route_and_revision_partition_is_required(self):
+        fragments = {
+            "manual": "github.event_name == 'workflow_dispatch' && 'manual' || ",
+            "non-pr-callback": "github.event.workflow_run.event != 'pull_request'",
+            "bot-target": "github.actor == 'dependabot[bot]'",
+            "fork-target": "github.event.pull_request.head.repo.full_name != github.repository",
+            "pr-head": "github.event.pull_request.head.sha",
+            "dispatch-head": "inputs.expected_head",
+            "callback-head": "github.event.workflow_run.head_sha",
+        }
+        for route, fragment in fragments.items():
+            with self.subTest(route=route):
+                doc = self.document()
+                group = doc["concurrency"]["group"]
+                self.assertIn(fragment, group)
+                doc["concurrency"]["group"] = group.replace(fragment, "'removed'", 1)
+                self.assertTrue(self.check(doc))
+        doc = self.document()
+        doc["concurrency"]["cancel-in-progress"] = (
+            "${{ github.event_name == 'workflow_dispatch' || "
+            "github.event_name == 'pull_request_target' }}"
+        )
+        self.assertTrue(self.check(doc))
+
+    def test_dispatch_approval_requires_both_exact_revision_inputs(self):
+        for field in ("pr_number", "expected_head", "expected_base"):
+            for mutation in ("missing", "optional", "number", "default"):
+                with self.subTest(field=field, mutation=mutation):
+                    doc = self.document()
+                    inputs = doc["on"]["workflow_dispatch"]["inputs"]
+                    if mutation == "missing":
+                        del inputs[field]
+                    elif mutation == "optional":
+                        inputs[field]["required"] = False
+                    elif mutation == "number":
+                        inputs[field]["type"] = "number"
+                    else:
+                        inputs[field]["default"] = "current"
+                    self.assertTrue(self.check(doc))
+
+    def test_missing_review_job_skip_or_publisher_dependency_fails(self):
+        for change in ("missing", "skip", "needs", "publisher-if", "authorization-output"):
+            doc = self.document()
+            if change == "missing":
+                del doc["jobs"]["claude"]
+            elif change == "skip":
+                doc["jobs"]["codex"]["if"] = "false"
+            elif change == "needs":
+                doc["jobs"]["publish"]["needs"] = ["prepare"]
+            elif change == "publisher-if":
+                doc["jobs"]["publish"].pop("if")
+            else:
+                doc["jobs"]["prepare"]["outputs"]["allowed"] = "true"
+            self.assertTrue(self.check(doc))
+
+    def test_runner_or_permission_escalation_fails(self):
+        for field, value in (
+            ("runs-on", "self-hosted"),
+            ("permissions", {"contents": "write"}),
+            ("container", {"image": "example"}),
+            ("services", {"example": {}}),
+            ("timeout-minutes", 60),
+            ("environment", "production"),
+        ):
+            doc = self.document()
+            doc["jobs"]["codex"][field] = value
+            self.assertTrue(self.check(doc))
+
+    def test_provider_credentials_cannot_move_scopes_or_commands(self):
+        for location in ("root", "job", "other-step", "wrong-provider", "command"):
+            doc = self.document()
+            expression = "${{ secrets.OPENAI_API_KEY }}"
+            if location == "root":
+                doc["env"] = {"KEY": expression}
+            elif location == "job":
+                doc["jobs"]["codex"]["env"] = {"KEY": expression}
+            elif location == "other-step":
+                doc["jobs"]["prepare"]["steps"][0]["env"] = {"KEY": expression}
+            elif location == "wrong-provider":
+                doc["jobs"]["claude"]["steps"][3]["env"]["KEY"] = expression
+            else:
+                doc["jobs"]["claude"]["steps"][3]["run"] += "; echo unsafe"
+            self.assertTrue(self.check(doc))
+
+    def test_secret_fallback_bracket_access_or_extra_secret_fails(self):
+        for expression in (
+            "${{ secrets['OPENAI_API_KEY'] }}",
+            "${{ secrets.OPENAI_API_KEY || secrets.OTHER }}",
+            "${{ toJSON(secrets) }}",
+        ):
+            doc = self.document()
+            doc["jobs"]["codex"]["steps"][4]["with"]["openai-api-key"] = expression
+            self.assertTrue(self.check(doc))
+
+    def test_privileged_steps_and_codex_restrictions_cannot_be_extended(self):
+        for change in (
+            "extra-command",
+            "token-env",
+            "skip-validator",
+            "profile",
+            "unsafe-args",
+            "artifact-path",
+            "step-condition",
+            "install-scripts",
+        ):
+            with self.subTest(change=change):
+                doc = self.document()
+                if change == "extra-command":
+                    doc["jobs"]["publish"]["steps"].append({"run": "echo forge-checks"})
+                elif change == "token-env":
+                    doc["jobs"]["codex"]["steps"][2]["env"] = {
+                        "GITHUB_TOKEN": "${{ github.token }}",
+                    }
+                elif change == "skip-validator":
+                    doc["jobs"]["codex"]["steps"].pop(5)
+                elif change == "profile":
+                    doc["jobs"]["codex"]["steps"][4]["with"]["permission-profile"] = "danger"
+                elif change == "unsafe-args":
+                    doc["jobs"]["codex"]["steps"][4]["with"]["codex-args"] = '["--yolo"]'
+                elif change == "artifact-path":
+                    doc["jobs"]["claude"]["steps"][4]["with"]["path"] = "/tmp/**"
+                elif change == "step-condition":
+                    doc["jobs"]["publish"]["steps"][2]["if"] = "false"
+                else:
+                    doc["jobs"]["claude"]["steps"][2]["run"] = "npm ci --prefix .github/reviews"
+                self.assertTrue(self.check(doc))
+
+    def test_malformed_settings_fail_closed_instead_of_crashing(self):
+        for change in ("types", "inputs", "needs", "steps", "with", "env", "run"):
+            with self.subTest(change=change):
+                doc = self.document()
+                if change == "types":
+                    doc["on"]["pull_request_target"]["types"] = [{}]
+                elif change == "inputs":
+                    doc["on"]["workflow_dispatch"]["inputs"] = None
+                elif change == "needs":
+                    doc["jobs"]["codex"]["needs"] = [{}]
+                elif change == "steps":
+                    doc["jobs"]["codex"]["steps"] = None
+                else:
+                    doc["jobs"]["codex"]["steps"][1][change] = None
+                self.assertTrue(self.check(doc))
+
+    def test_local_mutable_or_unapproved_actions_and_shell_interpolation_fail(self):
+        for action in (
+            "./.github/actions/review",
+            "openai/codex-action@main",
+            "attacker/action@" + "a" * 40,
+        ):
+            doc = self.document()
+            doc["jobs"]["codex"]["steps"][4]["uses"] = action
+            self.assertTrue(self.check(doc))
+        doc = self.document()
+        doc["jobs"]["prepare"]["steps"].append(
+            {
+                "run": "echo '${{ github.event.pull_request.title }}'",
+            }
+        )
+        self.assertTrue(self.check(doc))
 
 
 if __name__ == "__main__":
