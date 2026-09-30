@@ -170,6 +170,8 @@ Do not add an OpenAI API key to use native Codex reviews. Reintroducing Claude r
 reviewed workflow change and verification of a completed exact-head subscription review.
 
 Roll out using an issue-linked, independently reviewed PR. Enable the reviewed workflow,
+after queued PR/comment/CI events have settled while the old lane remains disabled. Inspect
+and cancel legacy callbacks; never overwrite their failed reviews as successful. Then
 dispatch that immutable reviewed branch with the PR's full current revisions, verify its
 actual native completion and classic checks, and merge through ordinary protection. The
 workflow file alone does not configure the account's native review settings or branch
