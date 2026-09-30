@@ -362,7 +362,7 @@ def sandbox_check(directory, expected):
     # matching the Action's global CLI installation without exposing checkout.
     native = ROOT / (
         ".github/reviews/node_modules/@openai/codex-linux-x64/"
-        "vendor/x86_64-unknown-linux-musl/codex/codex"
+        "vendor/x86_64-unknown-linux-musl/bin/codex"
     )
     executable = Path("/usr/local/bin/rightyo-codex-preflight")
     subprocess.run(

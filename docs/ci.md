@@ -111,9 +111,14 @@ failed/inconclusive reviews never pass the gate.
 This source filter cannot prove that arbitrary public text lacks secrets or private content.
 
 Codex uses the official pinned Action and matching CLI/proxy 0.159.2. Its fresh configuration
-turns off command/image/app/plugin/MCP-related capabilities, denies reads outside minimal
-system runtime files, denies writes and command network access, and drops elevated privileges.
-A Linux control-command/canary-read probe runs before provider credentials are supplied.
+turns off command/image/app/plugin/MCP-related capabilities, uses a default-deny custom
+filesystem profile with minimal system reads and the empty working directory, and denies
+reads outside those paths. The Linux preflight copies only the locked native CLI into
+the minimal system runtime so bubblewrap can re-execute it without reading the checkout.
+It verifies a harmless command succeeds and an unrelated invented-secret canary remains
+unreadable before provider credentials are introduced. This avoids an explicit root deny
+mount masking required Linux runtime mounts. Writes and command network access remain
+denied, and the official Action drops elevated privileges.
 Codex retains its patch tool registration; filesystem denial is the boundary, not a claim
 that every tool is absent. Claude uses the official locked CLI 2.1.285, without the Action's
 GitHub MCP integration: restricted mode, no tools or MCP, no settings sources, no persistent

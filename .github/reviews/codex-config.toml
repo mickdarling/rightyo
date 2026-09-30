@@ -26,8 +26,8 @@ workspace_dependencies = false
 image_generation = false
 
 [permissions.review-data-only.filesystem]
-":root" = "deny"
 ":minimal" = "read"
+"/tmp/rightyo-review-empty" = "read"
 
 [permissions.review-data-only.network]
 enabled = false
