@@ -16,6 +16,36 @@ The lab starts idle and uses separately provisioned native runtimes and models.
 .venv/bin/rightyo prototype --config local/prototype.json --port 8766
 ```
 
+## Use RightyO as a local tool
+
+The website is a test/demo rig. A host application can instead consume the versioned
+JSONL event stream directly, without a browser. Install from this source checkout with
+Python 3.11+; no published package or bundled native models are assumed:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install .
+.venv/bin/rightyo tool-replay --input examples/synthetic-turns.json --provider mock
+```
+
+That first command path needs no microphone, model weights, API key, or hosted calls.
+It emits authored fixture decisions, not model-quality evidence. After separately
+provisioning the assets in [the prototype guide](docs/prototype.md), run the explicit
+foreground microphone tool:
+
+```sh
+.venv/bin/rightyo listen --config local/prototype.json --mode microphone \
+  --session-id local-session-001
+```
+
+Without hosted opt-in it emits transcript/session events only. Add both `--use-jev`
+and `--allow-hosted` to send bounded finalized transcript context to Jev and emit
+attention/request events. Stop with Ctrl-C; restart with a fresh session ID. The stream
+contains transcript text: pipe it to a local consumer and avoid logging real conversations.
+See [the tool guide](docs/tool-quickstart.md) for the event contract, Hailing Station handoff,
+limits, and contribution checks. Replies, acknowledgement voices, routing, and tool
+execution belong to the consuming application.
+
 ## Try the replay MVP
 
 Python 3.11 or newer is sufficient for synthetic replay; the runtime has no Python dependencies. See [the MVP guide](docs/mvp.md) for secure credentials, local audio and speaker imports, and the limits of the experiment.

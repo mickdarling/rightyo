@@ -1,0 +1,190 @@
+"""Synthetic producer contract tests; no native models, capture, or hosted calls."""
+
+import json
+import unittest
+
+from rightyo.contracts import ContractError, DecisionEvent, ProviderDecision, Turn
+from rightyo.tool_events import SpeechEvents
+
+
+def turn(name="request", start=1000, end=2000, text="Rightyo, check our discussion.", **extra):
+    return Turn(
+        session_id=extra.pop("session_id", "tool-demo"),
+        utterance_id=name,
+        revision=1,
+        start_ms=start,
+        end_ms=end,
+        text=text,
+        speaker_id="Speaker A",
+        finalized=True,
+        overlap=False,
+        recognizer_id="authored-fixture",
+        provenance="synthetic",
+        speaker_provenance="authored-fixture",
+        **extra,
+    )
+
+
+def decision(current, label="attend", recipient="system"):
+    return DecisionEvent(
+        current,
+        ProviderDecision(
+            label,
+            recipient,
+            1.0,
+            {k: float(k == label) for k in ("attend", "ignore", "uncertain")},
+            "mock-v1",
+            "mock",
+            1.0,
+        ),
+        current.revision,
+        0.0,
+        0.0,
+    )
+
+
+class SpeechEventsTests(unittest.TestCase):
+    def setUp(self):
+        self.events = SpeechEvents()
+        self.events.start("tool-demo")
+        self.started = self.events.drain()[0]
+
+    def test_capabilities_truthfully_advertise_finalized_activation(self):
+        self.assertEqual(self.started["schema_version"], 1)
+        self.assertEqual(self.started["capabilities"]["activation"], "finalized-turn")
+        self.assertFalse(self.started["capabilities"]["partials"])
+
+    def test_late_decision_freezes_prior_context_preserves_complete_trigger(self):
+        previous = turn("discussion", 0, 500, "The review is scheduled for Friday.")
+        request = turn()
+        future = turn("later", 2100, 3000, "Unrelated later conversation.")
+        self.events.transcript(previous, 500, expect_decision=False)
+        self.events.transcript(request, 2000)
+        self.events.transcript(future, 3000, expect_decision=False)
+        self.events.drain()
+        self.events.decision(decision(request), 3500)
+        attention, result = self.events.drain()
+        self.assertEqual(attention["request_id"], result["request_id"])
+        self.assertEqual(result["turn"], request.to_dict())
+        self.assertEqual(result["context"]["turns"], [previous.to_dict()])
+        self.assertEqual(result["decision_at_ms"], 3500)
+        self.assertEqual(result["emitted_at_ms"], 3500)
+        self.assertNotIn("target", result)
+
+    def test_ignore_uncertain_and_conflicting_recipient_never_emit_request(self):
+        for index, (label, recipient) in enumerate(
+            (("ignore", "other_human"), ("uncertain", "unknown"), ("attend", "other_human"))
+        ):
+            current = turn(str(index), index * 2000, index * 2000 + 1000)
+            self.events.transcript(current, current.end_ms)
+            self.events.decision(decision(current, label, recipient), current.end_ms)
+            self.assertEqual([e["type"] for e in self.events.drain()], ["transcript", "attention"])
+
+    def test_duplicates_emit_once_and_conflicting_final_rejected(self):
+        request = turn()
+        self.events.transcript(request, 2000)
+        self.events.transcript(request, 2000)
+        self.events.decision(decision(request), 2500)
+        self.events.decision(decision(request), 2500)
+        self.assertEqual(
+            [e["type"] for e in self.events.drain()], ["transcript", "attention", "request"]
+        )
+        with self.assertRaises(ContractError):
+            self.events.transcript(turn(text="Changed words"), 3000)
+
+    def test_cancel_drops_queued_requests_and_late_decisions(self):
+        request = turn()
+        self.events.transcript(request, 2000)
+        self.events.decision(decision(request), 2500)
+        self.events.end("cancelled", 2600)
+        self.events.decision(decision(request), 3000)
+        self.assertEqual([e["phase"] for e in self.events.drain()], ["cancelled"])
+        self.assertEqual(self.events._memory.snapshot(3000)["turns"], [])
+        self.assertEqual(self.events._pending, {})
+
+    def test_normal_end_preserves_order_then_is_idempotent(self):
+        request = turn()
+        self.events.transcript(request, 2000)
+        self.events.decision(decision(request), 2500)
+        self.events.end("stopped", 2600)
+        result = self.events.drain()
+        self.assertEqual(
+            [e["type"] for e in result], ["transcript", "attention", "request", "session"]
+        )
+        self.events.end("cancelled", 3000)
+        self.assertEqual(self.events.drain(), [])
+
+    def test_expiry_removes_stale_decisions_queued_text_and_prior_context(self):
+        previous = turn("previous", 0, 500, "Old conversation.")
+        request = turn()
+        self.events.transcript(previous, 500, expect_decision=False)
+        self.events.transcript(request, 2000)
+        self.events.decision(decision(request), 301000)
+        result = self.events.drain()[-1]
+        self.assertEqual(result["context"]["turns"], [])
+        self.events.expire(302000)
+        self.assertEqual(self.events.drain(), [])
+
+    def test_expired_undecided_turn_never_activates(self):
+        request = turn()
+        self.events.transcript(request, 2000)
+        self.events.expire(302000)
+        self.events.decision(decision(request), 302001)
+        self.assertEqual(self.events.drain(), [])
+
+    def test_queue_overflow_fails_closed_without_retained_request(self):
+        events = SpeechEvents(max_pending=2)
+        events.start("tool-demo")
+        events.drain()
+        request = turn()
+        events.transcript(request, 2000)
+        with self.assertRaises(ContractError):
+            events.decision(decision(request), 2500)
+        events.end("error", 2600, "consumer-backlog")
+        self.assertEqual([e["type"] for e in events.drain()], ["session"])
+        self.assertEqual(events._pending, {})
+
+    def test_transcript_only_sessions_do_not_hold_unused_decision_context(self):
+        for index in range(80):
+            current = turn(str(index), index * 1000, index * 1000 + 500)
+            self.events.transcript(current, current.end_ms, expect_decision=False)
+            self.events.drain()
+        self.assertEqual(self.events._pending, {})
+
+    def test_cross_session_partial_or_invalid_time_rejected(self):
+        with self.assertRaises(ContractError):
+            self.events.transcript(turn(session_id="another"), 2000)
+        with self.assertRaises(ContractError):
+            self.events.transcript(turn(), True)
+        with self.assertRaises(ContractError):
+            self.events.start("tool-demo")
+
+    def test_detached_drain_cannot_modify_frozen_context(self):
+        previous = turn("previous", 0, 500)
+        request = turn()
+        self.events.transcript(previous, 500, expect_decision=False)
+        self.events.transcript(request, 2000)
+        drained = self.events.drain()
+        drained[0]["turn"]["text"] = "Modified outside state"
+        self.events.decision(decision(request), 2500)
+        self.assertEqual(self.events.drain()[-1]["context"]["turns"][0]["text"], previous.text)
+
+    def test_shared_authored_fixture_matches_producer(self):
+        from pathlib import Path
+
+        events = SpeechEvents()
+        events.start("tool-demo")
+        previous = turn("discussion", 0, 500, "The review is scheduled for Friday.")
+        request = turn()
+        events.transcript(previous, 500)
+        events.decision(decision(previous, "ignore", "other_human"), 600)
+        events.transcript(request, 2000)
+        events.decision(decision(request), 2100)
+        events.end("stopped", 2200)
+        actual = events.drain()
+        fixture = Path(__file__).resolve().parents[1] / "examples/tool-events.jsonl"
+        self.assertEqual(actual, [json.loads(line) for line in fixture.read_text().splitlines()])
+
+
+if __name__ == "__main__":
+    unittest.main()
