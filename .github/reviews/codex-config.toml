@@ -1,0 +1,33 @@
+approval_policy = "never"
+project_doc_max_bytes = 0
+web_search = "disabled"
+
+[shell_environment_policy]
+inherit = "none"
+
+[features]
+shell_tool = false
+unified_exec = false
+shell_snapshot = false
+view_image = false
+apps = false
+plugins = false
+collab = false
+multi_agent = false
+js_repl = false
+code_mode = false
+hooks = false
+codex_hooks = false
+memory_tool = false
+memories = false
+search_tool = false
+skill_search = false
+workspace_dependencies = false
+image_generation = false
+
+[permissions.review-data-only.filesystem]
+":root" = "deny"
+":minimal" = "read"
+
+[permissions.review-data-only.network]
+enabled = false

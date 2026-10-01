@@ -1,0 +1,19 @@
+name: Native review activity relay
+
+on:
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+
+permissions: {}
+
+jobs:
+  notify:
+    name: Notify trusted review gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    permissions: {}
+    steps:
+      - name: Signal review activity without executing PR content
+        run: echo 'Review activity notification; the trusted publisher reads GitHub metadata independently'

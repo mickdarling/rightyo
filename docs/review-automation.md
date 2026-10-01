@@ -1,5 +1,9 @@
 # Codex and Claude Code review automation
 
+**Historical dual-provider design:** the active lane now uses subscription-backed native
+Codex reviews with a metadata-only gate. Claude is deferred until subscription credentials
+are configured. Follow [current CI setup](ci.md); this design is not an active API setup guide.
+
 This is the concrete implementation plan for
 [#17](https://github.com/mickdarling/rightyo/issues/17). No provider authentication or
 automated review result is established by this document. The baseline CI in
