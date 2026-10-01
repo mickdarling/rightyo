@@ -36,6 +36,8 @@ class SpeechEvents:
         self._sequence = self._now = 0
         self._active = False
         self._terminal = False
+        self._attention_enabled = True
+        self._sessions = set()
         self._queue = deque()
         self._queue_bytes = 0
         self._pending = {}
@@ -80,8 +82,13 @@ class SpeechEvents:
                 raise ContractError("invalid attention capability")
             if self._active or self._queue:
                 raise ContractError("finish and drain the previous event session")
-            if session_id == self._session:
+            session_key = hashlib.sha256(session_id.encode("utf-8")).digest()
+            if session_key in self._sessions:
                 raise ContractError("restart requires a new event session identity")
+            if len(self._sessions) >= 1000:
+                raise ContractError("event publisher session budget exceeded")
+            self._sessions.add(session_key)
+            self._attention_enabled = attention_enabled
             self._clear_content()
             self._seen.clear()
             self._decided.clear()
@@ -154,7 +161,7 @@ class SpeechEvents:
             self._seen[turn.utterance_id] = digest
             if turn.end_ms <= self._now - self.retention_ms:
                 return
-            if expect_decision:
+            if expect_decision and self._attention_enabled:
                 size = len(json.dumps(context, ensure_ascii=False).encode("utf-8"))
                 if len(self._pending) >= 32 or self._pending_bytes + size > MAX_PENDING_BYTES:
                     self._clear_content()
@@ -166,7 +173,7 @@ class SpeechEvents:
 
     def decision(self, event, now_ms):
         with self._lock:
-            if not self._active:
+            if not self._active or not self._attention_enabled:
                 return
             if not isinstance(event, DecisionEvent) or event.turn.session_id != self._session:
                 raise ContractError("decision event belongs to another session")

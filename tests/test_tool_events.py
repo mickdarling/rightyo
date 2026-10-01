@@ -151,6 +151,24 @@ class SpeechEventsTests(unittest.TestCase):
             self.events.drain()
         self.assertEqual(self.events._pending, {})
 
+    def test_disabled_attention_and_retired_session_identity_are_enforced(self):
+        events = SpeechEvents()
+        events.start("tool-demo", attention_enabled=False)
+        request = turn()
+        events.transcript(request, 2000)
+        events.decision(decision(request), 2500)
+        result = events.drain()
+        self.assertEqual(result[0]["capabilities"]["activation"], "disabled")
+        self.assertEqual([e["type"] for e in result], ["session", "transcript"])
+        self.assertEqual(events._pending, {})
+        events.end("stopped", 3000)
+        events.drain()
+        events.start("another-session")
+        events.end("stopped", 1000)
+        events.drain()
+        with self.assertRaises(ContractError):
+            events.start("tool-demo")
+
     def test_cross_session_partial_or_invalid_time_rejected(self):
         with self.assertRaises(ContractError):
             self.events.transcript(turn(session_id="another"), 2000)
