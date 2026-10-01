@@ -40,11 +40,12 @@ stage intended additions with `git add` before running it. It validates reposito
 the declared license, ignore rules with positive and negative examples, tracked artifact
 paths/extensions/size/binary content, simple Markdown whitespace/fences and local-link
 existence, YAML/JSON syntax, baseline workflow policy, actionlint, Ruff and discovered
-unittest cases. Optional host shellcheck/pyflakes integration is disabled for parity.
+unittest cases and prototype JavaScript syntax (Node.js 20+ required). Optional host shellcheck/pyflakes integration is disabled for parity.
 
 Once `pyproject.toml` and `src` exist, the same command builds a wheel with the pinned
 local backend, installs it without dependencies into temporary storage, and runs the
-explicit mock evaluation on `examples/synthetic-turns.json` from outside the source tree.
+explicit mock evaluation on `examples/synthetic-turns.json` from outside the source tree,
+plus a check that the installed prototype includes its browser assets.
 Before a package exists it states that package checks are inapplicable. Real-model accuracy,
 Mac/MPS behavior and hardware performance are not established by these checks.
 
@@ -103,6 +104,9 @@ for the trust boundaries and
 [actionlint documentation](https://github.com/rhysd/actionlint/blob/v1.7.7/docs/usage.md)
 for workflow validation.
 
+The microphone helper is additionally compiled and ad-hoc signed locally on macOS.
+A secretless Mac build lane is tracked in [#38](https://github.com/mickdarling/rightyo/issues/38);
+its workflow policy change needs review before adding it to the required aggregate.
 
 ## Subscription-backed Codex PR reviews
 

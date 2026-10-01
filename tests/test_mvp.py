@@ -158,6 +158,32 @@ class RunnerTests(unittest.TestCase):
 
 
 class JevTests(unittest.TestCase):
+    def test_cancellation_before_credentials_never_sends_text(self):
+        provider = JevProvider(allow_hosted=True, cancelled=lambda: True)
+        provider._opener = MagicMock()
+        with patch("rightyo.credentials.load_jev_api_key") as key:
+            with self.assertRaisesRegex(ProviderError, "cancelled"):
+                provider.decide({})
+        key.assert_not_called()
+        provider._opener.open.assert_not_called()
+
+    def test_cancellation_after_keychain_wait_never_sends_text(self):
+        stopped = False
+        provider = JevProvider(allow_hosted=True, cancelled=lambda: stopped)
+        provider._opener = MagicMock()
+
+        def credential():
+            nonlocal stopped
+            stopped = True
+            return "fictitious-test-key"
+
+        state = ReplayRunner(MockProvider())._state(turn())
+        with patch("rightyo.credentials.load_jev_api_key", side_effect=credential):
+            with self.assertRaisesRegex(ProviderError, "cancelled"):
+                provider.decide(state)
+        provider._opener.open.assert_not_called()
+        self.assertEqual(provider.requests, 0)
+
     def setUp(self):
         runner = ReplayRunner(MockProvider())
         self.state = runner._state(turn())
