@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import signal
 import sys
 import threading
@@ -14,14 +13,14 @@ from rightyo.contracts import ContractError
 from rightyo.pipeline import ReplayRunner
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
 from rightyo.providers import JevProvider, MockProvider, ProviderError
-from rightyo.tool_events import SpeechEvents
+from rightyo.tool_events import SpeechEvents, encode_json
 
 
 def _emit(events, output: TextIO):
     for event in events:
         # ASCII JSON escapes preserve every Unicode string even when a host's
         # text pipe is configured with a narrower encoding than UTF-8.
-        output.write(json.dumps(event, allow_nan=False, ensure_ascii=True) + "\n")
+        output.write(encode_json(event) + "\n")
         output.flush()
 
 

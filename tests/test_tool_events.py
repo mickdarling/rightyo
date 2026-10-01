@@ -126,7 +126,7 @@ class SpeechEventsTests(unittest.TestCase):
         self.assertEqual(self.events.drain(), [])
 
     def test_expiring_frozen_and_queued_context_reclaims_serialized_budget(self):
-        previous = turn("previous", 0, 500, "x" * 4000)
+        previous = turn("previous", 0, 500, "👋" * 4000)
         request = turn()
         self.events.transcript(previous, 500, expect_decision=False)
         self.events.transcript(request, 2000)
@@ -141,11 +141,46 @@ class SpeechEventsTests(unittest.TestCase):
         self.events.decision(decision(request), 300701)
         self.events.decision(decision(next_turn), 300701)
         actual_size = sum(
-            len(json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            len(json.dumps(payload, ensure_ascii=True, allow_nan=False)) + 1
             for payload, _ in self.events._queue
         )
         self.assertEqual(self.events._queue_bytes, actual_size)
         self.assertEqual(self.events._pending_bytes, 0)
+
+    def test_unicode_context_expansion_is_bounded_before_request_emission(self):
+        for index in range(64):
+            previous = turn(str(index), index * 1000, index * 1000 + 500, "👋" * 4000)
+            self.events.transcript(previous, previous.end_ms, expect_decision=False)
+            self.events.drain()
+        with self.assertRaisesRegex(ContractError, "pending attention context budget"):
+            self.events.transcript(turn(start=65000, end=66000), 66000)
+        self.events.end("error", 66000, "consumer-backlog")
+        self.assertEqual([e["type"] for e in self.events.drain()], ["session"])
+        self.assertEqual(self.events._pending_bytes, 0)
+
+    def test_unicode_wire_queue_and_single_event_limits_fail_closed(self):
+        from unittest.mock import patch
+
+        for limit in ("MAX_QUEUE_BYTES", "MAX_EVENT_BYTES"):
+            events = SpeechEvents()
+            events.start("tool-demo")
+            events.drain()
+            with patch("rightyo.tool_events." + limit, 60000):
+                previous = turn("first", 0, 500, "👋" * 4000)
+                events.transcript(previous, 500, expect_decision=False)
+                if limit == "MAX_EVENT_BYTES":
+                    events.drain()
+                    request = turn(start=1000, end=2000, text="👋" * 4000)
+                    events.transcript(request, 2000)
+                    events.drain()
+                    with self.assertRaisesRegex(ContractError, "consumer backlog"):
+                        events.decision(decision(request), 2100)
+                else:
+                    with self.assertRaisesRegex(ContractError, "consumer backlog"):
+                        events.transcript(turn(text="👋" * 4000), 2000, expect_decision=False)
+            events.end("error", 2100, "consumer-backlog")
+            self.assertEqual([e["type"] for e in events.drain()], ["session"])
+            self.assertEqual(events._pending, {})
 
     def test_expired_undecided_turn_never_activates(self):
         request = turn()

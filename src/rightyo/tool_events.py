@@ -16,6 +16,11 @@ MAX_QUEUE_BYTES = 4194304
 MAX_PENDING_BYTES = 1048576
 
 
+def encode_json(payload):
+    """The ASCII-safe JSON representation shared by wire output and byte budgets."""
+    return json.dumps(payload, ensure_ascii=True, allow_nan=False)
+
+
 class SpeechEvents:
     """Local v1 producer. Frozen request context never observes later turns.
 
@@ -55,7 +60,7 @@ class SpeechEvents:
             "emitted_at_ms": self._now,
             **fields,
         }
-        size = len(json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+        size = len(encode_json(payload)) + 1  # Include the JSONL newline.
         if (
             size > MAX_EVENT_BYTES
             or len(self._queue) >= self.max_pending
@@ -122,7 +127,7 @@ class SpeechEvents:
             self._pending_bytes = 0
             for key, (turn, context, _size) in list(self._pending.items()):
                 context["turns"] = [t for t in context["turns"] if t["end_ms"] > cutoff]
-                size = len(json.dumps(context, ensure_ascii=False).encode("utf-8"))
+                size = len(encode_json(context))
                 self._pending[key] = (turn, context, size)
                 self._pending_bytes += size
             kept = deque()
@@ -136,7 +141,7 @@ class SpeechEvents:
                         payload["context"]["turns"] = [
                             t for t in payload["context"]["turns"] if t["end_ms"] > cutoff
                         ]
-                size = len(json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+                size = len(encode_json(payload)) + 1
                 kept.append((payload, size))
                 self._queue_bytes += size
             self._queue = kept
@@ -168,7 +173,7 @@ class SpeechEvents:
             if turn.end_ms <= self._now - self.retention_ms:
                 return
             if expect_decision and self._attention_enabled:
-                size = len(json.dumps(context, ensure_ascii=False).encode("utf-8"))
+                size = len(encode_json(context))
                 if len(self._pending) >= 32 or self._pending_bytes + size > MAX_PENDING_BYTES:
                     self._clear_content()
                     self._active = False
