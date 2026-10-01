@@ -112,13 +112,19 @@ def counts(turns: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def timed_runs(
-    operation: Callable[[], list[dict[str, Any]]], *, reruns: int, duration: float
+    operation: Callable[[], list[dict[str, Any]]],
+    *,
+    reruns: int,
+    duration: float,
+    verify_artifacts: Callable[[], None],
 ) -> tuple[dict[str, Any], list[list[dict[str, Any]]]]:
     elapsed, results = [], []
     for _ in range(reruns + 1):
         start = time.perf_counter()
         result = operation()
         seconds = time.perf_counter() - start
+        # Integrity work is deliberately outside the reported inference timing.
+        verify_artifacts()
         if not math.isfinite(seconds) or seconds <= 0:
             raise AudioError("Invalid benchmark clock measurement")
         elapsed.append(seconds)
@@ -166,6 +172,23 @@ def benchmark(
         for path in (audio, whisper_executable, whisper_model, nemotron_executable, nemotron_model)
     ):
         raise AudioError("Explicit existing audio, runtimes and models are required")
+    paths = {
+        "audio": audio,
+        "whisper_executable": whisper_executable,
+        "whisper_model": whisper_model,
+        "nemotron_executable": nemotron_executable,
+        "nemotron_model": nemotron_model,
+    }
+    if speakerkit_rttm is not None:
+        paths["speakerkit_supplied_rttm"] = speakerkit_rttm
+    # Include validation/import in the protected interval, not only native inference.
+    provenance = {name: artifact(path) for name, path in paths.items()}
+
+    def verify_artifacts():
+        for name, path in paths.items():
+            if artifact(path) != provenance[name]:
+                raise AudioError("Supplied benchmark artifact changed during evaluation")
+
     duration = wav_duration(audio)
     baseline = None
     if speakerkit_rttm is not None:
@@ -177,16 +200,7 @@ def benchmark(
             baseline = parse_rttm(payload.decode("utf-8"), expected_file_id=audio.stem)
         except (OSError, UnicodeError):
             raise AudioError("Cannot read supplied RTTM") from None
-    # Hash before inference so a complete result records the exact supplied artifacts.
-    provenance = {
-        "audio": artifact(audio),
-        "whisper_executable": artifact(whisper_executable),
-        "whisper_model": artifact(whisper_model),
-        "nemotron_executable": artifact(nemotron_executable),
-        "nemotron_model": artifact(nemotron_model),
-    }
-    if speakerkit_rttm is not None:
-        provenance["speakerkit_supplied_rttm"] = artifact(speakerkit_rttm)
+    verify_artifacts()
     diarization_timing, timelines = timed_runs(
         lambda: diarize_nemotron_cpp(
             audio,
@@ -197,6 +211,7 @@ def benchmark(
         ),
         reruns=reruns,
         duration=duration,
+        verify_artifacts=verify_artifacts,
     )
     asr_timing, transcriptions = timed_runs(
         lambda: transcribe_whisper_cpp(
@@ -208,6 +223,7 @@ def benchmark(
         ),
         reruns=reruns,
         duration=duration,
+        verify_artifacts=verify_artifacts,
     )
 
     def joined(timeline):
@@ -256,6 +272,8 @@ def benchmark(
             "Initial invocation is not guaranteed cold: existing file caches are not flushed.",
             "Strict joins use the first ASR result; gaps and ambiguous segments stay unknown.",
             "No Jev call, audio capture, model download or hosted request is performed.",
+            "Artifact hashes are checked after validation and each invocation, outside timing.",
+            "Checks detect retained changes, not transient changes restored between checks.",
         ],
     }
     if baseline is not None:
@@ -267,6 +285,7 @@ def benchmark(
             ),
             "strict_join_counts": counts(joined(baseline)),
         }
+    verify_artifacts()
     return report
 
 

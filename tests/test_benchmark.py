@@ -164,6 +164,83 @@ class BenchmarkTests(unittest.TestCase):
             benchmark(**self.arguments, speakerkit_rttm=reference)
         inference.assert_not_called()
 
+    def test_changed_or_removed_inputs_reject_report_after_each_native_invocation(self):
+        reference = self.root / "comparison.rttm"
+        reference.write_text(
+            f"SPEAKER {self.audio.stem} 1 0 1 <NA> <NA> original-label <NA> <NA>\n"
+        )
+        paths = [*self.arguments.values(), reference]
+        for stage in ("diarize_nemotron_cpp", "transcribe_whisper_cpp"):
+            for path in paths:
+                for remove in (False, True):
+                    with self.subTest(stage=stage, artifact=path.name, remove=remove):
+                        original = path.read_bytes()
+
+                        def mutate(*args, **kwargs):
+                            if remove:
+                                path.unlink()
+                            else:
+                                # An atomic, same-sized replacement must also be detected.
+                                replacement = self.root / "replacement"
+                                replacement.write_bytes(b"x" * len(original))
+                                replacement.replace(path)
+                            return (
+                                self.timeline
+                                if stage == "diarize_nemotron_cpp"
+                                else self.transcription
+                            )
+
+                        output = self.root / "summary.json"
+                        stdout, stderr = io.StringIO(), io.StringIO()
+                        try:
+                            with (
+                                self.mocks(),
+                                patch(
+                                    "scripts.benchmark_stack." + stage, side_effect=mutate
+                                ) as inference,
+                                contextlib.redirect_stdout(stdout),
+                                contextlib.redirect_stderr(stderr),
+                            ):
+                                result = main(
+                                    self.argv(output=output, reruns=1, speakerkit_rttm=reference)
+                                )
+                            self.assertEqual(result, 1)
+                            self.assertEqual(inference.call_count, 1)
+                            self.assertEqual(stdout.getvalue(), "")
+                            self.assertEqual(
+                                stderr.getvalue(),
+                                "Benchmark failed; no complete result was produced\n",
+                            )
+                            self.assertFalse(output.exists())
+                        finally:
+                            path.write_bytes(original)
+
+    def test_mutation_during_audio_validation_fails_before_inference(self):
+        def validate_and_replace(path):
+            duration = wav_duration(path)
+            self.whisper_model.write_bytes(b"changed")
+            return duration
+
+        with (
+            patch("scripts.benchmark_stack.wav_duration", side_effect=validate_and_replace),
+            patch("scripts.benchmark_stack.diarize_nemotron_cpp") as inference,
+            self.assertRaises(AudioError),
+        ):
+            benchmark(**self.arguments)
+        inference.assert_not_called()
+
+    def test_mutation_during_report_construction_rejects_completion(self):
+        def hardware():
+            self.whisper_model.write_bytes(b"changed")
+            return {"os": "test"}
+
+        with (
+            self.mocks(),
+            patch("scripts.benchmark_stack.hardware", side_effect=hardware),
+            self.assertRaises(AudioError),
+        ):
+            benchmark(**self.arguments, reruns=0)
+
     def test_repeat_budget_timeout_and_missing_inputs_fail_before_inference(self):
         invalid = [
             {"reruns": -1},

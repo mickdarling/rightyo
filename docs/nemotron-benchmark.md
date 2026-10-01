@@ -153,6 +153,12 @@ The supplied baseline RTTM must use the WAV filename stem as its recording ID.
 per-invocation timeouts; it records hashes, hardware, stage times and attribution counts,
 with no transcript text, source labels or local input paths. A failed run does not produce
 a complete result. Metrics files must be new and existing files are never overwritten.
+The harness checks every supplied artifact's hash after validation, after each native
+invocation, and before returning a complete report. Replacements or missing files reject
+the run rather than attaching stale provenance to combined measurements. These checks
+are outside inference timing, but read the inputs and can warm OS caches. They detect
+changes present at a check; they are not immutable snapshots and cannot detect a transient
+change restored between checks. Keep the supplied files unchanged during evaluation.
 The harness makes no Jev calls; hosted replay is a separate explicit command in
 [the MVP guide](mvp.md). Offline CI exercises adapter/harness failure boundaries with
 synthetic stubs; it downloads no model and performs no hosted inference.
