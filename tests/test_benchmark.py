@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rightyo.audio import AudioError
-from scripts.benchmark_stack import benchmark, main, save_report, wav_duration
+from scripts.benchmark_stack import benchmark, main, save_report, source_paths, wav_duration
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -127,6 +127,42 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(report["configuration"]["nemotron_preset"], "v3-streaming")
         self.assertEqual(report["mode"], "offline-file-benchmark")
         self.assertTrue(report["completed"])
+        self.assertEqual(set(report["rightyo_source"]), {"benchmark_stack", "rightyo_audio"})
+        for name, path in source_paths().items():
+            self.assertEqual(
+                report["rightyo_source"][name]["sha256"],
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+
+    def test_changed_implementation_has_distinct_source_provenance_without_git(self):
+        source = self.root / "standalone-source.py"
+        with (
+            self.mocks(),
+            patch("scripts.benchmark_stack.source_paths", return_value={"benchmark_stack": source}),
+        ):
+            source.write_bytes(b"synthetic-source-version-one")
+            first = benchmark(**self.arguments, reruns=0)
+            source.write_bytes(b"synthetic-source-version-two")
+            second = benchmark(**self.arguments, reruns=0)
+        self.assertEqual(first["artifacts"], second["artifacts"])
+        self.assertNotEqual(first["rightyo_source"], second["rightyo_source"])
+        self.assertNotIn(str(source), json.dumps(second))
+
+    def test_source_changed_during_inference_rejects_complete_report(self):
+        source = self.root / "standalone-source.py"
+        source.write_bytes(b"synthetic-source-version-one")
+
+        def mutate(*args, **kwargs):
+            source.write_bytes(b"synthetic-source-version-two")
+            return self.timeline
+
+        with (
+            self.mocks(),
+            patch("scripts.benchmark_stack.source_paths", return_value={"benchmark_stack": source}),
+            patch("scripts.benchmark_stack.diarize_nemotron_cpp", side_effect=mutate),
+            self.assertRaises(AudioError),
+        ):
+            benchmark(**self.arguments, reruns=0)
 
     def test_overlap_counts_are_separate_from_unknown_counts(self):
         self.timeline.append(

@@ -159,6 +159,9 @@ the run rather than attaching stale provenance to combined measurements. These c
 are outside inference timing, but read the inputs and can warm OS caches. They detect
 changes present at a check; they are not immutable snapshots and cannot detect a transient
 change restored between checks. Keep the supplied files unchanged during evaluation.
+Reports also contain SHA-256 hashes of the benchmark harness and the actual imported
+RightyO audio adapter/join implementation. This source manifest distinguishes revisions
+and local edits even outside a Git checkout; the same integrity checks cover these files.
 The harness makes no Jev calls; hosted replay is a separate explicit command in
 [the MVP guide](mvp.md). Offline CI exercises adapter/harness failure boundaries with
 synthetic stubs; it downloads no model and performs no hosted inference.

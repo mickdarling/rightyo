@@ -22,6 +22,7 @@ import wave
 from pathlib import Path
 from typing import Any, Callable
 
+from rightyo import audio as audio_module
 from rightyo.audio import (
     MAX_BYTES,
     AudioError,
@@ -33,6 +34,14 @@ from rightyo.audio import (
 
 MAX_AUDIO_SECONDS = 3600
 MAX_AUDIO_BYTES = 128 * 1024 * 1024
+
+
+def source_paths() -> dict[str, Path]:
+    """Pin the actual imported implementation, including non-Git/dirty checkouts."""
+    return {
+        "benchmark_stack": Path(__file__),
+        "rightyo_audio": Path(audio_module.__file__),
+    }
 
 
 def artifact(path: Path) -> dict[str, Any]:
@@ -183,11 +192,14 @@ def benchmark(
         paths["speakerkit_supplied_rttm"] = speakerkit_rttm
     # Include validation/import in the protected interval, not only native inference.
     provenance = {name: artifact(path) for name, path in paths.items()}
+    sources = source_paths()
+    source_provenance = {name: artifact(path) for name, path in sources.items()}
 
     def verify_artifacts():
-        for name, path in paths.items():
-            if artifact(path) != provenance[name]:
-                raise AudioError("Supplied benchmark artifact changed during evaluation")
+        for manifest_paths, manifest in ((paths, provenance), (sources, source_provenance)):
+            for name, path in manifest_paths.items():
+                if artifact(path) != manifest[name]:
+                    raise AudioError("Benchmark source or input changed during evaluation")
 
     duration = wav_duration(audio)
     baseline = None
@@ -240,6 +252,7 @@ def benchmark(
         "completed": True,
         "hardware": hardware(),
         "artifacts": provenance,
+        "rightyo_source": source_provenance,
         "audio": {"duration_seconds": duration, "sample_rate_hz": 16000, "channels": 1},
         "configuration": {
             "reruns": reruns,
