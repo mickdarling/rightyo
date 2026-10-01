@@ -2,7 +2,7 @@
 
 GitHub issues are the execution records; [roadmap #1](https://github.com/mickdarling/rightyo/issues/1) tracks completion. This document establishes dependency order.
 
-1. **Fast CI and review setup.** Install the secretless PR lane and test its actual GitHub runs. Independent Codex and Claude Code reviews must bind to the current head; automated trusted review enforcement remains a separate setup task.
+1. **Fast CI and review setup.** Install the secretless PR lane and test its actual GitHub runs. Subscription-backed Codex reviews must bind to the current head; automated trusted review enforcement remains a separate setup task.
 2. **Transcript-first MVP.** Evaluate local Whisper file transcription plus Jev before training. Support anonymous speakers through a replaceable diarization boundary. Compare plain transcripts, inferred speakers and explicitly labeled oracle speakers; synthetic fixtures prove plumbing, not accuracy.
 3. **Consented evaluation manifest and metrics.** Establish held-out grouping, ambiguous labels, hard negatives, causal replay, privacy controls and the quality/compute break-even comparison. Raw data stays outside Git.
 4. **Conditional audio attention baseline and gated transcription.** Audit usable upstream models, weights and rights, then evaluate a compact audio model only if the MVP measurements justify it. Decide whether a shared encoder is justified from measured compute/latency.
@@ -20,4 +20,4 @@ GitHub issues are the execution records; [roadmap #1](https://github.com/mickdar
 | Evidence and optimization | [#9 calibration/held-out results](https://github.com/mickdarling/rightyo/issues/9), [#10 conditional distillation/export](https://github.com/mickdarling/rightyo/issues/10) |
 | Release and integration | [#11 model registry/cards/source/privacy](https://github.com/mickdarling/rightyo/issues/11), [#12 local Mac pilot/Hailing Station adapter](https://github.com/mickdarling/rightyo/issues/12) |
 
-Every issue includes acceptance criteria, dependencies, and verification requirements. The baseline workflow is described in [CI](ci.md); mechanical dual-review enforcement remains tracked in #17/#18. The MVP is documented in [the experiment guide](mvp.md). No TestFlight build change follows from this repository.
+Every issue includes acceptance criteria, dependencies, and verification requirements. The baseline workflow is described in [CI](ci.md); Claude rollout and stronger publisher enforcement remain tracked in #17/#18. The MVP is documented in [the experiment guide](mvp.md). No TestFlight build change follows from this repository.
