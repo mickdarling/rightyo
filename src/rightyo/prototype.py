@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from rightyo.capture import CaptureError, MacMicrophoneCapture
-from rightyo.contracts import ContractError, Turn
+from rightyo.contracts import ContractError, Turn, identifier
 from rightyo.credentials import CredentialError
 from rightyo.live_audio import LiveAudioError, LiveConfig, LiveProcessor
 from rightyo.memory import MemorySessionLimitError, TranscriptMemory
@@ -87,11 +87,15 @@ class PrototypeController:
         processor_factory=LiveProcessor,
         capture_factory=MacMicrophoneCapture,
         provider_factory=JevProvider,
+        event_publisher=None,
     ):
         self.config = config
         self.processor_factory = processor_factory
         self.capture_factory = capture_factory
         self.provider_factory = provider_factory
+        # Optional host-facing stream. The lab retains its browser lease and UI controls.
+        self._events = event_publisher
+        self._event_terminal = True
         self._lock = threading.RLock()
         self._generation = 0
         self._phase = "idle"
@@ -141,17 +145,31 @@ class PrototypeController:
                 if self._runner is not None:
                     self._runner.expire(self._now_ms())
                     self._prune_pending()
+                if self._events is not None:
+                    self._events.expire(self._now_ms())
             if expired:
                 self.stop()
 
     def start(self, options: dict[str, Any]) -> None:
-        if set(options) - {"mode", "use_jev", "retention_seconds", "confidence", "max_requests"}:
+        if set(options) - {
+            "mode",
+            "use_jev",
+            "retention_seconds",
+            "confidence",
+            "max_requests",
+            "session_id",
+        }:
             raise PrototypeError("Unrecognized prototype setting")
         mode = options.get("mode", "microphone")
         hosted = options.get("use_jev", False)
         retention = options.get("retention_seconds", 300)
         confidence = options.get("confidence", 0.7)
         budget = options.get("max_requests", 20)
+        session = options.get("session_id", "prototype-" + uuid.uuid4().hex)
+        try:
+            identifier(session, "session_id")
+        except ContractError:
+            raise PrototypeError("Invalid session identifier") from None
         if (
             not isinstance(mode, str)
             or mode not in {"microphone", "demo"}
@@ -194,7 +212,6 @@ class PrototypeController:
             except (ProviderError, CredentialError):
                 raise PrototypeError("Hosted decisions could not be initialized") from None
             runner = ReplayRunner(provider, memory=memory, cancelled=cancelled)
-            session = "prototype-" + uuid.uuid4().hex
             runner.restart(session)
             self._generation += 1
             generation = self._generation
@@ -214,6 +231,9 @@ class PrototypeController:
             self._decision_status = "ready" if hosted else "off"
             self._phase = "starting"
             self._started = self._last_browser = time.monotonic()
+            if self._events is not None:
+                self._events.start(session, now_ms=0, attention_enabled=hosted)
+                self._event_terminal = False
             threading.Thread(
                 target=self._decide,
                 args=(generation, stop, work, runner, hosted),
@@ -231,7 +251,9 @@ class PrototypeController:
             if generation != self._generation or self._stop.is_set():
                 return
             memory.append(turn)
-            if self._decision_cancel.is_set():
+            if self._events is not None:
+                self._publish("transcript", turn)
+            if self._decision_status == "off" or self._decision_cancel.is_set():
                 return
             try:
                 work.put_nowait(turn)
@@ -240,6 +262,7 @@ class PrototypeController:
                 if self._decision_status != "off":
                     self._decision_status = "unavailable"
                 self._discard_pending()
+                self._tool_attention_error("attention-backlog")
                 return
             self._pending += 1
 
@@ -317,6 +340,7 @@ class PrototypeController:
                     self._discard_pending()
                     if self._runner is not None:
                         self._runner.clear(clear_memory=False)
+                    self._event_end("error", "audio-unavailable")
         except Exception:
             with self._lock:
                 if generation == self._generation and not stop.is_set():
@@ -329,6 +353,7 @@ class PrototypeController:
                     self._discard_pending()
                     if self._runner is not None:
                         self._runner.clear(clear_memory=False)
+                    self._event_end("error", "audio-unavailable")
         finally:
             if capture is not None:
                 capture.stop()
@@ -381,6 +406,7 @@ class PrototypeController:
                     with self._lock:
                         if generation == self._generation:
                             self._decision_status = "budget-exhausted"
+                            self._tool_attention_error("attention-budget-exhausted")
                     enabled = False
                     continue
                 event = runner.process(turn)
@@ -396,12 +422,15 @@ class PrototypeController:
                             **event.public_dict(),
                             "recipient_speaker_id": event.decision.recipient_speaker_id,
                         }
+                        if self._events is not None:
+                            self._publish("decision", event)
             except Exception:
                 enabled = False
                 with self._lock:
                     if generation == self._generation and not stop.is_set():
                         self._decision_status = "unavailable"
                         self._requests = getattr(runner.provider, "requests", 0)
+                        self._tool_attention_error("attention-unavailable")
             finally:
                 event = None
                 work.task_done()
@@ -444,6 +473,8 @@ class PrototypeController:
             if heartbeat:
                 self._last_browser = time.monotonic()
             now = self._now_ms()
+            if self._events is not None:
+                self._events.expire(now)
             if self._runner is not None:
                 self._runner.expire(now)
                 self._prune_pending()
@@ -474,6 +505,7 @@ class PrototypeController:
         with self._lock:
             if self._phase == "stopping":
                 return
+            self._event_end("stopped" if self._phase == "complete" else "cancelled")
             self._generation += 1
             generation = self._generation
             self._stop.set()
@@ -515,6 +547,50 @@ class PrototypeController:
     def close(self):
         self._closed.set()
         self.stop()
+
+    def _publish(self, method, value):
+        """Run under the controller lock; a broken consumer cancels observation."""
+        try:
+            options = (
+                {"expect_decision": self._decision_status == "ready"}
+                if method == "transcript"
+                else {}
+            )
+            getattr(self._events, method)(value, now_ms=self._now_ms(), **options)
+        except Exception:
+            self._stop.set()
+            self._decision_cancel.set()
+            self._phase = "error"
+            self._error = "Tool event delivery failed; the session is incomplete."
+            self._memory.clear()
+            self._decisions.clear()
+            self._discard_pending()
+            self._event_end("error", "event-delivery-failed")
+            raise PrototypeError("Tool event delivery failed") from None
+
+    def _tool_attention_error(self, reason):
+        """A tool cannot silently continue after losing its promised attention service."""
+        if self._events is None or self._event_terminal:
+            return
+        self._stop.set()
+        self._decision_cancel.set()
+        self._phase = "error"
+        self._error = "Attention unavailable; the tool session is incomplete."
+        self._completed_at = time.monotonic()
+        self._memory.clear()
+        self._decisions.clear()
+        self._discard_pending()
+        self._event_end("error", reason)
+
+    def _event_end(self, phase, reason=None):
+        if self._events is not None and not self._event_terminal:
+            self._events.end(phase=phase, now_ms=self._now_ms(), reason=reason)
+            self._event_terminal = True
+
+    def drain_events(self):
+        """Drain only this explicit session's events, independently of the lab UI."""
+        with self._lock:
+            return [] if self._events is None else self._events.drain()
 
 
 class PrototypeServer(ThreadingHTTPServer):

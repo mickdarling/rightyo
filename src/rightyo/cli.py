@@ -188,8 +188,33 @@ def main(argv: list[str] | None = None) -> int:
     prototype = commands.add_parser("prototype", help="open an idle local Mac speech lab")
     prototype.add_argument("--config", type=Path, required=True, help="local asset configuration")
     prototype.add_argument("--port", type=int, default=8765)
+    listen = commands.add_parser("listen", help="explicit foreground speech JSONL tool")
+    listen.add_argument("--config", type=Path, required=True)
+    listen.add_argument("--mode", choices=("microphone", "demo"), required=True)
+    listen.add_argument("--session-id", help="host-selected session ID (otherwise generated)")
+    listen.add_argument("--use-jev", action="store_true")
+    listen.add_argument("--allow-hosted", action="store_true")
+    tool_replay = commands.add_parser("tool-replay", help="emit tool JSONL from supplied text")
+    tool_replay.add_argument("--input", type=Path, required=True)
+    tool_replay.add_argument("--provider", choices=("mock", "jev"), default="mock")
+    tool_replay.add_argument("--allow-hosted", action="store_true")
+    tool_replay.add_argument("--max-requests", type=int, default=20)
+    tool_replay.add_argument("--timeout", type=float, default=10)
+    tool_replay.add_argument("--min-confidence", type=float, default=0.7)
     args = parser.parse_args(argv)
     try:
+        if args.command in {"listen", "tool-replay"}:
+            from rightyo.prototype import PrototypeError
+            from rightyo.tool import listen, replay
+
+            try:
+                return listen(args) if args.command == "listen" else replay(args)
+            except PrototypeError as error:
+                print(f"rightyo: {error}", file=sys.stderr)
+                return 2
+            except (OSError, BrokenPipeError):
+                print("rightyo: tool input or output unavailable", file=sys.stderr)
+                return 2
         if args.command == "prototype":
             from rightyo.prototype import PrototypeError, serve
 

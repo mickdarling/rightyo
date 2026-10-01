@@ -168,6 +168,27 @@ def main():
                 cwd=temp,
                 env=dict(os.environ, PYTHONPATH=str(installed)),
             )
+            run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import json, subprocess, sys; "
+                    "result = subprocess.run([sys.executable, '-m', 'rightyo', 'tool-replay', "
+                    "'--input', sys.argv[1]], check=True, capture_output=True, text=True); "
+                    "events = [json.loads(line) for line in result.stdout.splitlines()]; "
+                    "assert events[0]['type'] == 'session' and "
+                    "events[0]['phase'] == 'started'; "
+                    "assert events[-1]['phase'] == 'stopped'; "
+                    "requests = [e for e in events if e['type'] == 'request']; "
+                    "assert len(requests) == 1 and requests[0]['turn']['finalized']; "
+                    "assert requests[0]['decision']['provider'] == 'mock'; "
+                    "assert all(e['schema_version'] == 1 for e in events); "
+                    "print('Installed headless tool contract smoke passed (authored mock)')",
+                    fixture,
+                ],
+                cwd=temp,
+                env=dict(os.environ, PYTHONPATH=str(installed)),
+            )
             if browser_script.is_file():
                 run(
                     [
