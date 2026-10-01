@@ -2,7 +2,7 @@
 
 A compact audio attention system: recognize when speech is addressed to the system, then transcribe that speech and emit the text.
 
-**Status:** a transcript-first experiment MVP, with local whisper.cpp file transcription, imported anonymous speaker timelines, mock decisions and opt-in Jev decisions. No trained attention model or live microphone capture is included. Project name: **RightyO**; repository/package spelling: **rightyo**.
+**Status:** a transcript-first experiment MVP, with local whisper.cpp file transcription, explicit local Nemotron 3 diarization or imported anonymous speaker timelines, mock decisions and opt-in Jev decisions. No trained attention model or live microphone capture is included. Project name: **RightyO**; repository/package spelling: **rightyo**.
 
 The first experiment transcribes locally and asks Jev whether the completed turn addresses the system and who its recipient is. Speaker A/B labels are sufficient initially; diarization alone cannot establish the addressee. This quickly tests whether existing models solve the product problem. A frozen audio encoder, compact attention head and gated decoder remain conditional research directions after quality and compute measurements justify them.
 

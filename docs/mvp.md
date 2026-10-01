@@ -68,12 +68,33 @@ rightyo evaluate --input /private/turns.json --provider mock
 ```
 
 Whisper alone does not supply stable speaker A/B identity. The importer accepts an actual
-Argmax-compatible RTTM timeline with `--diarization-input /private/conversation.rttm`.
+single-recording RTTM timeline with `--diarization-input /private/conversation.rttm`.
 Its recording ID must match the audio filename stem. A neutral JSON speaker timeline is
 also supported by `timeline-import`; see the authored example
 [synthetic-speakers.json](../examples/synthetic-speakers.json). Imported A/B/A labels remain
 stable within the session. Gaps, speaker changes within an ASR segment and overlaps retain
 unknown attribution; turn boundaries never fabricate speaker identities.
+
+Alternatively, run an explicitly provisioned NVIDIA Nemotron 3 native runtime alongside
+Whisper. The adapter pins the native `v3-streaming` preset, uses a private temporary RTTM
+file and preserves the same conservative attribution rules:
+
+```sh
+rightyo audio-import --audio /private/conversation.wav \
+  --whisper-executable /local/whisper-cli --model /local/ggml-base.en.bin \
+  --diarization-executable /local/nemo-speech \
+  --diarization-model /local/Nemotron-3-Diarization.q8_0.gguf \
+  --diarization-backend metal \
+  --session-id experiment-1 --output /private/nemotron-turns.json
+rightyo evaluate --input /private/nemotron-turns.json --provider jev --allow-hosted
+```
+
+The two diarization paths are mutually exclusive. Both native executable and model are
+required together; missing files fail before inference. The adapter supplies an absolute
+existing GGUF path, isolates native configuration and does not provision models or start
+capture. Upstream runtimes are executable code and must be trusted and separately provisioned.
+The configured timeout applies to each native stage. See the
+[stack benchmark](nemotron-benchmark.md) for exact versions, measurements and limitations.
 
 The repository does not bundle a diarization model. A local SpeakerKit test on generated
 two-voice speech is recorded in [the smoke record](mvp-smoke.md); it revealed gaps in ASR
