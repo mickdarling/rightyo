@@ -118,21 +118,27 @@ class SpeechEvents:
                 if turn.end_ms <= cutoff:
                     del self._pending[key]
                     self._pending_bytes -= size
-            # Pending frozen contexts must also obey elapsed retention at emission.
-            for _key, (_turn, context, _size) in self._pending.items():
+            # Reclaim accounting as well as plaintext when a frozen context shrinks.
+            self._pending_bytes = 0
+            for key, (turn, context, _size) in list(self._pending.items()):
                 context["turns"] = [t for t in context["turns"] if t["end_ms"] > cutoff]
+                size = len(json.dumps(context, ensure_ascii=False).encode("utf-8"))
+                self._pending[key] = (turn, context, size)
+                self._pending_bytes += size
             kept = deque()
-            for payload, size in self._queue:
+            self._queue_bytes = 0
+            for payload, _size in self._queue:
                 if payload["type"] in {"transcript", "request", "attention"}:
                     end = payload.get("turn", {}).get("end_ms", payload.get("speech_end_ms"))
                     if end is not None and end <= cutoff:
-                        self._queue_bytes -= size
                         continue
                     if payload["type"] == "request":
                         payload["context"]["turns"] = [
                             t for t in payload["context"]["turns"] if t["end_ms"] > cutoff
                         ]
+                size = len(json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8"))
                 kept.append((payload, size))
+                self._queue_bytes += size
             self._queue = kept
 
     def transcript(self, turn, now_ms, *, expect_decision=True):

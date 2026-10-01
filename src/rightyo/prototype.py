@@ -253,7 +253,7 @@ class PrototypeController:
             memory.append(turn)
             if self._events is not None:
                 self._publish("transcript", turn)
-            if self._decision_cancel.is_set():
+            if self._decision_status == "off" or self._decision_cancel.is_set():
                 return
             try:
                 work.put_nowait(turn)

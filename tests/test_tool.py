@@ -95,6 +95,24 @@ class ToolTests(unittest.TestCase):
             allow_hosted=False,
         )
 
+    def test_transcript_only_burst_never_uses_attention_queue_or_provider(self):
+        with wave.open(str(self.demo), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(16000)
+            audio.writeframes(bytes(40 * 6400))
+        output = io.StringIO()
+        with patch.object(
+            MockProvider, "decide", side_effect=AssertionError("unused provider")
+        ) as provider:
+            self.assertEqual(listen(self.args, output=output, controller_factory=self.factory), 0)
+        provider.assert_not_called()
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(events[0]["capabilities"]["activation"], "disabled")
+        self.assertEqual(events[-1]["phase"], "stopped")
+        self.assertEqual(sum(e["type"] == "transcript" for e in events), 40)
+        self.assertFalse(any(e["type"] in {"attention", "request"} for e in events))
+
     def factory(self, config, *, event_publisher):
         return PrototypeController(
             config,

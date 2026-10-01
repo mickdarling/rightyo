@@ -125,6 +125,28 @@ class SpeechEventsTests(unittest.TestCase):
         self.events.expire(302000)
         self.assertEqual(self.events.drain(), [])
 
+    def test_expiring_frozen_and_queued_context_reclaims_serialized_budget(self):
+        previous = turn("previous", 0, 500, "x" * 4000)
+        request = turn()
+        self.events.transcript(previous, 500, expect_decision=False)
+        self.events.transcript(request, 2000)
+        before = self.events._pending_bytes
+        self.events.expire(300600)
+        self.assertLess(self.events._pending_bytes, before - 3900)
+        next_turn = turn("next", 300601, 300700)
+        from unittest.mock import patch
+
+        with patch("rightyo.tool_events.MAX_PENDING_BYTES", before):
+            self.events.transcript(next_turn, 300700)
+        self.events.decision(decision(request), 300701)
+        self.events.decision(decision(next_turn), 300701)
+        actual_size = sum(
+            len(json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            for payload, _ in self.events._queue
+        )
+        self.assertEqual(self.events._queue_bytes, actual_size)
+        self.assertEqual(self.events._pending_bytes, 0)
+
     def test_expired_undecided_turn_never_activates(self):
         request = turn()
         self.events.transcript(request, 2000)
