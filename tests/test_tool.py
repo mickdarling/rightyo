@@ -184,6 +184,23 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(request["turn"]["revision"], 2)
         self.assertEqual(events[-1]["phase"], "stopped")
 
+    def test_unicode_replay_survives_ascii_stdout_and_preserves_request(self):
+        fixture = Path(__file__).resolve().parents[1] / "examples" / "synthetic-turns.json"
+        raw = json.loads(fixture.read_text())
+        text = "Rightyo, résume cette conversation — 你好 👋."
+        raw["turns"][1]["text"] = text
+        supplied = self.root / "unicode.json"
+        supplied.write_text(json.dumps(raw), encoding="utf-8")
+        encoded = io.BytesIO()
+        output = io.TextIOWrapper(encoded, encoding="ascii")
+        self.addCleanup(output.close)
+        with patch("sys.stdout", output):
+            self.assertEqual(main(["tool-replay", "--input", str(supplied)]), 0)
+        events = [json.loads(line) for line in encoded.getvalue().splitlines()]
+        request = next(event for event in events if event["type"] == "request")
+        self.assertEqual(request["turn"]["text"], text)
+        self.assertEqual(events[-1]["phase"], "stopped")
+
     def test_hosted_failure_and_budget_exhaustion_are_terminal_not_silent(self):
         for failure in (True, False):
             with self.subTest(failure=failure):

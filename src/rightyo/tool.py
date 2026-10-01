@@ -19,7 +19,9 @@ from rightyo.tool_events import SpeechEvents
 
 def _emit(events, output: TextIO):
     for event in events:
-        output.write(json.dumps(event, allow_nan=False, ensure_ascii=False) + "\n")
+        # ASCII JSON escapes preserve every Unicode string even when a host's
+        # text pipe is configured with a narrower encoding than UTF-8.
+        output.write(json.dumps(event, allow_nan=False, ensure_ascii=True) + "\n")
         output.flush()
 
 
