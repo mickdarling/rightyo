@@ -6,8 +6,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 from scripts.repository_checks import (
+    AI_REVIEW_WORKFLOW,
     MAX_FILE_BYTES,
+    REVIEW_RELAY_WORKFLOW,
+    actionlint_source,
     artifact_errors,
     artifact_reason,
     ignore_errors,
@@ -135,9 +140,11 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(workflow_errors("ci.yml", self.document()), [])
 
     def test_privileged_event_fails(self):
-        doc = self.document()
-        doc["on"] = {"pull_request_target": {}}
-        self.assertTrue(workflow_errors("ci.yml", doc))
+        for event in ("pull_request_target", "workflow_run"):
+            with self.subTest(event=event):
+                doc = self.document()
+                doc["on"] = {event: {}}
+                self.assertTrue(workflow_errors("ci.yml", doc))
 
     def test_secret_references_fail_outside_steps(self):
         cases = (
@@ -198,5 +205,239 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertGreaterEqual(len(workflow_errors("ci.yml", doc)), 5)
 
 
+class AIReviewPolicyTests(unittest.TestCase):
+    def document(self):
+        document = yaml.safe_load((ROOT / AI_REVIEW_WORKFLOW).read_text())
+        document["on"] = document.pop(True)
+        return document
+
+    def check(self, document):
+        return workflow_errors(AI_REVIEW_WORKFLOW, document)
+
+    def test_trusted_lane_passes_without_relaxing_other_workflows(self):
+        doc = self.document()
+        self.assertEqual(self.check(doc), [])
+        for path in ("ai-review.yml", ".github/workflows/another-review.yml"):
+            self.assertTrue(workflow_errors(path, doc))
+
+    def test_trusted_checkout_and_token_boundary_are_frozen(self):
+        for mutation in ("checkout-head", "persistent", "extra-command", "model-key", "job-token"):
+            with self.subTest(mutation=mutation):
+                doc = self.document()
+                job = doc["jobs"]["gate"]
+                if mutation == "checkout-head":
+                    job["steps"][0]["with"]["ref"] = "${{ github.event.pull_request.head.sha }}"
+                elif mutation == "persistent":
+                    job["steps"][0]["with"]["persist-credentials"] = True
+                elif mutation == "extra-command":
+                    job["steps"].append({"run": "echo forged-check"})
+                elif mutation == "model-key":
+                    job["steps"][1]["env"]["KEY"] = "${{ secrets.OPENAI_API_KEY }}"
+                else:
+                    job["env"] = {"GITHUB_TOKEN": "${{ github.token }}"}
+                self.assertTrue(self.check(doc))
+
+    def test_event_routes_revision_input_and_publisher_permissions_are_frozen(self):
+        for mutation in (
+            "event",
+            "dispatch",
+            "permission",
+            "checks-permission",
+            "runner",
+            "concurrency",
+            "condition",
+        ):
+            with self.subTest(mutation=mutation):
+                doc = self.document()
+                if mutation == "event":
+                    doc["on"]["push"] = {}
+                elif mutation == "dispatch":
+                    del doc["on"]["workflow_dispatch"]["inputs"]["expected_head"]
+                elif mutation == "concurrency":
+                    doc["concurrency"]["cancel-in-progress"] = True
+                else:
+                    field, value = {
+                        "permission": ("permissions", {"contents": "write"}),
+                        "checks-permission": (
+                            "permissions",
+                            {"contents": "read", "pull-requests": "read", "checks": "write"},
+                        ),
+                        "runner": ("runs-on", "self-hosted"),
+                        "condition": ("if", "false"),
+                    }[mutation]
+                    doc["jobs"]["gate"][field] = value
+                self.assertTrue(self.check(doc))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewRelayPolicyTests(unittest.TestCase):
+    def test_only_fixed_unprivileged_notification_is_allowed(self):
+        doc = yaml.safe_load((ROOT / REVIEW_RELAY_WORKFLOW).read_text())
+        self.assertEqual(workflow_errors(REVIEW_RELAY_WORKFLOW, doc), [])
+        for mutation in ("permissions", "checkout", "secret", "event-code", "wrong-trigger"):
+            changed = yaml.safe_load((ROOT / REVIEW_RELAY_WORKFLOW).read_text())
+            if mutation == "permissions":
+                changed["jobs"]["notify"]["permissions"] = {"statuses": "write"}
+            elif mutation == "checkout":
+                changed["jobs"]["notify"]["steps"].append({"uses": "actions/checkout@" + "a" * 40})
+            elif mutation == "secret":
+                changed["env"] = {"KEY": "${{ secrets.OPENAI_API_KEY }}"}
+            elif mutation == "event-code":
+                changed["jobs"]["notify"]["steps"][0]["run"] = "${{ github.event.review.body }}"
+            else:
+                changed[True]["pull_request_target"] = {}
+            self.assertTrue(workflow_errors(REVIEW_RELAY_WORKFLOW, changed))
+
+
+class ResolverPolicyTests(unittest.TestCase):
+    def test_resolver_cannot_publish_and_workflow_mutex_requires_authoritative_route(self):
+        for mutation in ("resolver-write", "global-mutex", "wrong-job-mutex", "unchecked-route"):
+            doc = yaml.safe_load((ROOT / AI_REVIEW_WORKFLOW).read_text())
+            if mutation == "resolver-write":
+                doc["jobs"]["resolve"]["permissions"]["statuses"] = "write"
+            elif mutation == "global-mutex":
+                doc["concurrency"] = {"group": "all", "cancel-in-progress": False}
+            elif mutation == "wrong-job-mutex":
+                doc["jobs"]["gate"]["concurrency"] = {"group": "${{ github.run_id }}"}
+            else:
+                del doc["jobs"]["gate"]["steps"][1]["env"]["GATE_PR_NUMBER"]
+            self.assertTrue(workflow_errors(AI_REVIEW_WORKFLOW, doc))
+
+
+class RequestRecorderPolicyTests(unittest.TestCase):
+    def test_marker_is_required_before_publisher_without_independent_job_mutex(self):
+        for mutation in ("skip-recorder", "recorder-mutex", "gate-without-recorder"):
+            doc = yaml.safe_load((ROOT / AI_REVIEW_WORKFLOW).read_text())
+            if mutation == "skip-recorder":
+                doc["jobs"]["record"]["if"] = "false"
+            elif mutation == "recorder-mutex":
+                doc["jobs"]["record"]["concurrency"] = {"group": "all", "cancel-in-progress": True}
+            else:
+                doc["jobs"]["gate"]["needs"] = ["resolve"]
+            self.assertTrue(workflow_errors(AI_REVIEW_WORKFLOW, doc))
+
+
+class ReviewInvalidationPolicyTests(unittest.TestCase):
+    def test_denial_precedes_routing_and_cannot_checkout_or_approve(self):
+        for mutation in (
+            "skip-denial",
+            "checkout",
+            "write-more",
+            "no-head-read",
+            "approve",
+            "skip-dependency",
+        ):
+            doc = yaml.safe_load((ROOT / AI_REVIEW_WORKFLOW).read_text())
+            job = doc["jobs"]["invalidate"]
+            if mutation == "skip-denial":
+                job["if"] = "false"
+            elif mutation == "checkout":
+                job["steps"].insert(0, {"uses": "actions/checkout@v4"})
+            elif mutation == "write-more":
+                job["permissions"]["contents"] = "write"
+            elif mutation == "no-head-read":
+                del job["permissions"]["pull-requests"]
+            elif mutation == "approve":
+                job["steps"][0]["run"] = job["steps"][0]["run"].replace('"pending"', '"success"')
+            else:
+                del doc["jobs"]["resolve"]["needs"]
+            self.assertTrue(workflow_errors(AI_REVIEW_WORKFLOW, doc))
+
+
+class WorkflowSerializationPolicyTests(unittest.TestCase):
+    def test_all_status_writers_share_fixed_workflow_mutex_and_retain_pending_callbacks(self):
+        doc = yaml.safe_load((ROOT / AI_REVIEW_WORKFLOW).read_text())
+        self.assertEqual(
+            doc["concurrency"],
+            {"group": "rightyo-subscription-status", "queue": "max", "cancel-in-progress": False},
+        )
+        writers = {
+            name
+            for name, job in doc["jobs"].items()
+            if job.get("permissions", {}).get("statuses") == "write"
+        }
+        self.assertEqual(writers, {"invalidate", "record", "gate"})
+        self.assertTrue(all("concurrency" not in job for job in doc["jobs"].values()))
+        for mutation in ("no-lock", "job-only", "no-queue", "queue-one", "dynamic", "cancel"):
+            changed = yaml.safe_load((ROOT / AI_REVIEW_WORKFLOW).read_text())
+            if mutation == "no-lock":
+                del changed["concurrency"]
+            elif mutation == "job-only":
+                changed["jobs"]["gate"]["concurrency"] = changed.pop("concurrency")
+            elif mutation == "no-queue":
+                del changed["concurrency"]["queue"]
+            elif mutation == "queue-one":
+                changed["concurrency"]["queue"] = "single"
+            elif mutation == "dynamic":
+                changed["concurrency"]["group"] = "${{ github.run_id }}"
+            else:
+                changed["concurrency"]["cancel-in-progress"] = True
+            self.assertTrue(workflow_errors(AI_REVIEW_WORKFLOW, changed))
+
+    def test_new_denial_cannot_be_overwritten_between_old_read_and_success(self):
+        # Enumerate schedules for an in-flight publisher and a later callback.
+        # The former job-only mutex allowed old-read/new-denial/old-success.
+        from itertools import permutations
+
+        doc = yaml.safe_load((ROOT / AI_REVIEW_WORKFLOW).read_text())
+        self.assertEqual(workflow_errors(AI_REVIEW_WORKFLOW, doc), [])
+        schedules = [
+            order
+            for order in permutations(("old-read", "old-success", "new-denial"))
+            if order.index("old-read") < order.index("old-success")
+        ]
+        unsafe = ("old-read", "new-denial", "old-success")
+        self.assertIn(unsafe, schedules)
+        # Workflow scope forbids another run's bootstrap inside a running pipeline.
+        shared = doc["concurrency"]["group"] == "rightyo-subscription-status"
+        serialized = [
+            order
+            for order in schedules
+            if not shared
+            or not order.index("old-read") < order.index("new-denial") < order.index("old-success")
+        ]
+        self.assertNotIn(unsafe, serialized)
+        for order in serialized:
+            if order[0] == "old-read":
+                latest = None
+                for event in order:
+                    if event == "old-success":
+                        latest = "success"
+                    elif event == "new-denial":
+                        latest = "pending"
+                self.assertEqual(latest, "pending")
+
+
+class ActionlintQueueCompatibilityTests(unittest.TestCase):
+    def source(self):
+        return (ROOT / AI_REVIEW_WORKFLOW).read_text()
+
+    def test_only_literal_validated_queue_line_is_removed(self):
+        source = self.source()
+        result = actionlint_source(AI_REVIEW_WORKFLOW, source)
+        self.assertEqual(result, source.replace("  queue: max\n", "", 1))
+        self.assertIn("on:\n", result)
+        self.assertIn("${{ github.workflow_sha }}", result)
+        self.assertIn("python3 - <<'PY'", result)
+
+    def test_invalid_or_mis_scoped_queue_cannot_be_normalized(self):
+        for source in (
+            self.source().replace("  queue: max", "  queue: single"),
+            self.source().replace("  cancel-in-progress: false", "  cancel-in-progress: true"),
+            self.source().replace("  group: rightyo-subscription-status", "  group: other"),
+            self.source().replace("  queue: max\n", ""),
+            self.source().replace("  queue: max\n", "  queue: max\n  queue: max\n"),
+            self.source().replace("    needs: invalidate", "    needs: []"),
+        ):
+            with self.assertRaises(ValueError):
+                actionlint_source(AI_REVIEW_WORKFLOW, source)
+
+    def test_other_workflows_are_byte_unchanged_including_unknown_queue(self):
+        source = "on: push\nconcurrency:\n  queue: invalid\n"
+        self.assertEqual(actionlint_source(".github/workflows/other.yml", source), source)
+        for name in (".github/workflows/ci.yml", REVIEW_RELAY_WORKFLOW):
+            source = (ROOT / name).read_text()
+            self.assertEqual(actionlint_source(name, source), source)
