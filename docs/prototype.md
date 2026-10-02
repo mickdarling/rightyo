@@ -36,7 +36,18 @@ Create the ignored `local/prototype.json` with absolute paths to your existing a
 
 `demo_audio` is optional, as is `"addressing": {"names": ["Hailing Station", "computer"]}`,
 the runtime forms of address described in [the tool API](tool-api.md); `--name` flags on
-the command line replace the file's names. An optional `"session_budget_seconds": 7200`
+the command line replace the file's names. An optional `"speakers"` object declares
+hard-coded speaker roles for the headless tool, for example
+`"speakers": {"owner": ["Speaker A"], "trusted": [], "owner_only": false}`; it may also
+set `"stop_phrases"`. Session speaker labels such as `Speaker A` are anonymous and are
+assigned per session by the diarizer, so a configured label names whichever voice
+receives it; roles are precedence data for the host, not a verified identity.
+`"source": "model"` is refused by the lab and by `listen`, in both microphone and demo
+modes, with a clear error before any capture starts: a hosted role question would run on
+the audio path under the controller lock, where Stop and lease expiry cannot reach it.
+Model-sourced roles remain available to `tool-replay`, which has no audio thread; the
+live path is tracked in [#55](https://github.com/mickdarling/rightyo/issues/55).
+An optional `"session_budget_seconds": 7200`
 ends a session after that many seconds; `--session-budget SECONDS` on the command line
 replaces the file's value. The budget is a positive whole number of seconds; omitting it
 means there is no session ceiling, which is the default. In microphone mode the budget is

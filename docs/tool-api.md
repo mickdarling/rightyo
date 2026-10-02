@@ -32,10 +32,12 @@ The events are:
 | `transcript` | `turn` | One immutable finalized transcript turn |
 | `attention` | `utterance_id`, `speech_end_ms`, `decision`, optional `request_id` | `attend`, `ignore`, or `uncertain` evidence |
 | `request` | `request_id`, `turn`, `decision`, `context`, `decision_at_ms` | Complete attended input available for host handling |
+| `override` | `superseded_request_id`, `by_utterance_id`, `role` | An owner's turn supersedes an earlier open non-owner request |
 
 Initial capabilities declare `activation: "finalized-turn"` when decisions are
 available, or `"disabled"` for transcription-only listening, `partials: false`,
-`speakers: "anonymous"`, and `context: true`. Mock replay decisions are identified
+`speakers: "anonymous"` (or `"enrolled"` when [speaker roles](#speaker-roles-and-owner-override)
+are configured), and `context: true`. Mock replay decisions are identified
 by `provider: "mock"` and `model: "mock-v1"`; they are fixture rules. A local
 listener without Jev opt-in emits no invented attention decisions.
 
@@ -113,14 +115,88 @@ and so is reached by very long sessions with frequent speaker changes (a windowe
 is tracked in [#49](https://github.com/mickdarling/rightyo/issues/49)).
 The default history is five minutes, with 1,000 unique turns and 1 MiB of retained
 transcript data. There are additional independent bounds: at most 32 frozen pending
-contexts totalling 1 MiB, 128 queued events totalling 4 MiB, and 1,200,000 bytes per
-event. Exceeding a delivery bound fails closed; it does not silently drop an attended
+contexts totalling 1 MiB, 128 queued events (configurable from 5 to 128) totalling
+4 MiB, and 1,200,000 bytes per event. Exceeding a delivery bound fails closed; it does not silently drop an attended
 request. Drain continuously and start a new bounded session when necessary.
 
 [The authored shared fixture](../examples/tool-events.jsonl) demonstrates ordinary
 discussion, ignored attention, an attended retrospective request with prior context,
 and normal termination. Producer tests generate and compare this exact fixture;
 the Hailing Station consumer uses the same authored contract fixture.
+
+## Speaker roles and owner override
+
+Without configuration the tool behaves exactly as above: `speakers` is `"anonymous"`
+and no `role` field exists. When speaker roles are configured, through the prototype
+configuration's `speakers` object or the `--owner`, `--trusted`, `--owner-only` and
+`--role-source` options of `tool-replay`, the started event declares
+`speakers: "enrolled"` and every turn object (in `transcript`, the `request` turn and
+`context.turns`) and every decision object carries `role`, one of the literals `owner`,
+`trusted`, `participant` or `unknown`. A role is fixed the first time a speaker is
+emitted in a session and never changes afterwards; a turn without a speaker label is
+`unknown`. Roles are descriptive data from configuration or a model answer. They are
+not authentication, they do not verify who is speaking, and they never unlock anything
+on the host: the host's own policy and confirmation flow decide what any request may do.
+
+Owners and trusted speakers are configured by session speaker label or enrolled
+identifier. With `"source": "configured"` (the default) every other speaker is a
+`participant`. With `"source": "model"` the opted-in Jev provider is asked once per
+newly observed unconfigured speaker, from the bounded recent conversation, whether that
+speaker is `trusted`, `participant` or `unknown`; low confidence is `unknown`. The model
+is never offered `owner`, and configured roles replace its answer, so an owner cannot be
+downgraded by a transcript that claims otherwise. Each role question shares the hosted
+request budget and consent; without hosted opt-in only the configured roles apply.
+
+Precedence is applied by the producer before emission. An owner's attended turn, or an
+owner turn that is only a stop phrase (default `stop`, `cancel`, `ignore that`, `never
+mind`; matched case-insensitively against the whole utterance after punctuation is
+removed), emits one `override` event per earlier non-owner request that is still open:
+`superseded_request_id` names the request, `by_utterance_id` names the owner's turn and
+`role` is `owner`. Overrides follow the owner's `attention` event and precede the owner's
+own `request`; a stop phrase produces no request even when the decision was `attend`, and
+its attention evidence is emitted unchanged without a `request_id`. A non-owner request
+stays open until an override, retention expiry or a terminal event. Open requests are
+bounded to the event queue capacity minus four (124 by default) so that one owner
+decision's burst of overrides always fits the queue; a request that would exceed the
+bound fails closed with an error, never a silent drop. An
+owner override also supersedes every earlier non-owner turn whose decision is still
+pending: when that late decision arrives, its `attention` evidence is emitted without a
+`request_id`, an `override` names the request id the turn would have carried, and no
+`request` follows. Hosts therefore treat an `override` whose `superseded_request_id`
+they never received as already handled. A stop phrase with nothing open or pending
+emits no override. With
+`owner_only: true`, a non-owner `attend` decision is emitted as `ignore` and no request
+is delivered; non-owner turns remain ordinary context. The producer adds no free-text
+markers: interpreting non-owner context as information rather than instructions is the
+host's responsibility, informed by the `role` on every context turn.
+
+A host that accepts `speakers: "enrolled"` must also accept the `override` event; it is
+part of the enrolled contract. An `override` is never emitted on an anonymous session.
+An owner stop phrase supersedes open requests regardless of the decision label on the
+owner's turn (`attend`, `ignore` or `uncertain`): the configured phrase, not the
+attention decision, is the signal, as chosen in
+[#50](https://github.com/mickdarling/rightyo/issues/50). If a hosted role question
+fails (timeout, unavailability, budget exhaustion or cancellation), the session keeps
+listening: that speaker receives the configured role if any, otherwise `unknown`, fixed
+as usual, and no further model questions are asked in that session; the producer
+records this as `role_status: "unavailable"`. A provider answer that names an
+unconfigured speaker as `owner` is rejected the same way (`role_status: "rejected"`):
+owners come only from configuration. Model-sourced roles are available to `tool-replay`
+only; `listen` and the lab refuse `"source": "model"` before capture starts (see
+[the lab notes](prototype.md)). The degradation is also visible on the stream: when a
+priority provider is configured, the terminal `session` event carries an optional
+`role_status` of `ready`, `unavailable` or `rejected`, and the decision evidence of the
+turn where degradation occurred carries the same key, so a consumer can distinguish a
+disabled model lookup from a legitimate `unknown` or `participant`. The key is absent on
+anonymous sessions, and hosts tolerate it as an unknown optional key elsewhere. Because
+decisions can arrive out of order, an
+owner override supersedes only turns earlier than the owner's turn, compared by turn
+time (a turn whose `end_ms` is at or before the owner turn's `end_ms`), never by
+emission order; a later non-owner request that happened to be decided first stays open.
+
+[The enrolled fixture](../examples/enrolled-override.jsonl) shows a participant's
+attended request followed by the owner's "Ignore that." override; the shared anonymous
+fixture above is byte-identical to before.
 
 ## Python extension boundaries
 

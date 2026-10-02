@@ -10,7 +10,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from rightyo.contracts import Addressing, ContractError, Turn
+from rightyo.contracts import Addressing, ContractError, SpeakerPriority, Turn
 from rightyo.credentials import CredentialError
 from rightyo.pipeline import ReplayRunner
 from rightyo.providers import JevProvider, MockProvider, ProviderError
@@ -137,6 +137,49 @@ def addressing_from_args(args: argparse.Namespace) -> Addressing | None:
     return None if not names else Addressing.from_names(names)
 
 
+def priority_from_args(args: argparse.Namespace) -> SpeakerPriority | None:
+    """Validated speaker roles from --owner/--trusted/--owner-only/--role-source, or none."""
+    owners = getattr(args, "owners", None) or []
+    trusted = getattr(args, "trusted", None) or []
+    owner_only = bool(getattr(args, "owner_only", False))
+    source = getattr(args, "role_source", None)
+    if not owners and not trusted and not owner_only and source is None:
+        return None
+    return SpeakerPriority.from_dict(
+        {
+            "owner": owners,
+            "trusted": trusted,
+            "owner_only": owner_only,
+            **({} if source is None else {"source": source}),
+        }
+    )
+
+
+def _add_speaker_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--owner",
+        dest="owners",
+        action="append",
+        metavar="SPEAKER",
+        help="a speaker label whose turns take precedence (repeatable; none by default)",
+    )
+    parser.add_argument(
+        "--trusted",
+        dest="trusted",
+        action="append",
+        metavar="SPEAKER",
+        help="a speaker label with trusted standing (repeatable)",
+    )
+    parser.add_argument(
+        "--owner-only", action="store_true", help="deliver requests from owners only"
+    )
+    parser.add_argument(
+        "--role-source",
+        choices=("configured", "model"),
+        help="assign unconfigured speakers by configuration (default) or the Jev provider",
+    )
+
+
 def _session_budget(text: str) -> int:
     try:
         value = int(text)
@@ -241,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     tool_replay.add_argument("--timeout", type=float, default=10)
     tool_replay.add_argument("--min-confidence", type=float, default=0.7)
     _add_name_option(tool_replay)
+    _add_speaker_options(tool_replay)
     args = parser.parse_args(argv)
     try:
         if args.command in {"listen", "tool-replay"}:

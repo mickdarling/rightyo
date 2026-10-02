@@ -14,6 +14,17 @@ MAX_TEXT_CHARS = 4000
 MAX_ADDRESS_NAMES = 8
 MAX_ADDRESS_NAME_CHARS = 48
 _ADDRESS_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,%d}" % (MAX_ADDRESS_NAME_CHARS - 1))
+# Speaker roles are allowlisted literals that describe precedence inside RightyO. They
+# are configuration or model output, never authentication, and unlock nothing downstream.
+SPEAKER_ROLES = frozenset({"owner", "trusted", "participant", "unknown"})
+MODEL_SPEAKER_ROLES = frozenset({"trusted", "participant", "unknown"})
+ROLE_SOURCES = frozenset({"configured", "model"})
+DEFAULT_STOP_PHRASES = ("stop", "cancel", "ignore that", "never mind")
+MAX_OWNER_SPEAKERS = 8
+MAX_TRUSTED_SPEAKERS = 32
+MAX_STOP_PHRASES = 16
+_STOP_PHRASE = re.compile(r"[A-Za-z0-9' ]{1,48}")
+_PHRASE_SEPARATORS = re.compile(r"[^\w]+")
 
 
 class ContractError(ValueError):
@@ -39,6 +50,27 @@ def address_name(value: Any) -> str:
         # and the mock prefix never becomes "name.," or "name-:".
         raise ContractError("invalid address name")
     return value
+
+
+def speaker_role(value: Any) -> str:
+    # Type first: an unhashable value must raise the sanitized error, not a TypeError.
+    if not isinstance(value, str) or value not in SPEAKER_ROLES:
+        raise ContractError("invalid speaker role")
+    return value
+
+
+def normalize_phrase(text: str) -> str:
+    """Casefolded words only: apostrophes removed, punctuation and whitespace collapsed."""
+    stripped = text.replace("'", "").replace("’", "")
+    return " ".join(_PHRASE_SEPARATORS.sub(" ", stripped).casefold().split())
+
+
+def _speaker_list(values: Any, name: str, limit: int) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple)):
+        raise ContractError(f"{name} speakers must be a list")
+    if len(values) > limit:
+        raise ContractError(f"too many {name} speakers")
+    return tuple(identifier(value, f"{name} speaker") for value in values)
 
 
 def integer(value: Any, name: str, minimum: int = 0) -> int:
@@ -87,6 +119,89 @@ class Addressing:
 
     def to_dict(self) -> dict[str, Any]:
         return {"names": list(self.names)}
+
+
+@dataclass(frozen=True)
+class SpeakerPriority:
+    """Hard-coded speaker roles and the owner's precedence rules.
+
+    Owners and trusted speakers are anonymous session labels or enrolled identifiers
+    supplied by configuration. A role is descriptive data for precedence and routing
+    inside RightyO; it is not an authenticated identity and never unlocks a host gate.
+    """
+
+    owners: tuple[str, ...] = ()
+    trusted: tuple[str, ...] = ()
+    owner_only: bool = False
+    stop_phrases: tuple[str, ...] = DEFAULT_STOP_PHRASES
+    source: str = "configured"
+
+    def __post_init__(self) -> None:
+        if type(self.owners) is not tuple or type(self.trusted) is not tuple:
+            raise ContractError("speaker lists must be tuples")
+        _speaker_list(self.owners, "owner", MAX_OWNER_SPEAKERS)
+        _speaker_list(self.trusted, "trusted", MAX_TRUSTED_SPEAKERS)
+        listed = [*self.owners, *self.trusted]
+        if len(set(listed)) != len(listed):
+            raise ContractError("a speaker may hold only one configured role")
+        if type(self.owner_only) is not bool:
+            raise ContractError("invalid owner_only flag")
+        if type(self.stop_phrases) is not tuple or not 1 <= len(self.stop_phrases) <= (
+            MAX_STOP_PHRASES
+        ):
+            raise ContractError(f"stop phrases require between 1 and {MAX_STOP_PHRASES} entries")
+        normalized = set()
+        for phrase in self.stop_phrases:
+            if not isinstance(phrase, str) or not _STOP_PHRASE.fullmatch(phrase):
+                raise ContractError("invalid stop phrase")
+            words = normalize_phrase(phrase)
+            if not words or words in normalized:
+                raise ContractError("empty or duplicate stop phrase")
+            normalized.add(words)
+        if self.source not in ROLE_SOURCES:
+            raise ContractError("invalid speaker role source")
+
+    def configured_role(self, speaker_id: str | None) -> str | None:
+        if speaker_id in self.owners:
+            return "owner"
+        if speaker_id in self.trusted:
+            return "trusted"
+        return None
+
+    def is_stop_phrase(self, text: str) -> bool:
+        """Whole-utterance match after casefolding and punctuation removal."""
+        words = normalize_phrase(text)
+        return any(words == normalize_phrase(phrase) for phrase in self.stop_phrases)
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> SpeakerPriority:
+        allowed = {"owner", "trusted", "owner_only", "stop_phrases", "source"}
+        if not isinstance(raw, dict) or set(raw) - allowed:
+            raise ContractError("speakers must be an object with known keys only")
+        values: dict[str, Any] = {}
+        if "owner" in raw:
+            values["owners"] = _speaker_list(raw["owner"], "owner", MAX_OWNER_SPEAKERS)
+        if "trusted" in raw:
+            values["trusted"] = _speaker_list(raw["trusted"], "trusted", MAX_TRUSTED_SPEAKERS)
+        if "owner_only" in raw:
+            values["owner_only"] = raw["owner_only"]
+        if "stop_phrases" in raw:
+            phrases = raw["stop_phrases"]
+            if isinstance(phrases, (str, bytes)) or not isinstance(phrases, (list, tuple)):
+                raise ContractError("stop phrases must be a list")
+            values["stop_phrases"] = tuple(phrases)
+        if "source" in raw:
+            values["source"] = raw["source"]
+        return cls(**values)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "owner": list(self.owners),
+            "trusted": list(self.trusted),
+            "owner_only": self.owner_only,
+            "stop_phrases": list(self.stop_phrases),
+            "source": self.source,
+        }
 
 
 @dataclass(frozen=True)

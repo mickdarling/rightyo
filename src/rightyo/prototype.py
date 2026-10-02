@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from rightyo.capture import CaptureError, MacMicrophoneCapture
-from rightyo.contracts import Addressing, ContractError, Turn, identifier
+from rightyo.contracts import Addressing, ContractError, SpeakerPriority, Turn, identifier
 from rightyo.credentials import CredentialError
 from rightyo.live_audio import (
     DiarizerTimelineLimitError,
@@ -27,7 +27,7 @@ from rightyo.live_audio import (
 )
 from rightyo.memory import MemorySessionLimitError, TranscriptMemory
 from rightyo.pipeline import ReplayRunner
-from rightyo.providers import JevProvider, MockProvider, ProviderError
+from rightyo.providers import ConfiguredPriorityProvider, JevProvider, MockProvider, ProviderError
 
 BROWSER_LEASE_SECONDS = 15
 PCM_BYTES_PER_MS = 32
@@ -59,6 +59,7 @@ class PrototypeConfig:
     microphone_helper: Path
     demo_audio: Path | None = None
     addressing: Addressing | None = None
+    speakers: SpeakerPriority | None = None
     session_budget_seconds: int | None = None
 
     @classmethod
@@ -78,18 +79,35 @@ class PrototypeConfig:
             }
             if not isinstance(raw, dict) or not required <= raw.keys():
                 raise ValueError
-            if raw.keys() - required - {"demo_audio", "addressing", "session_budget_seconds"}:
+            if (
+                raw.keys()
+                - required
+                - {
+                    "demo_audio",
+                    "addressing",
+                    "speakers",
+                    "session_budget_seconds",
+                }
+            ):
                 raise ValueError
             addressing = raw.pop("addressing", None)
             if addressing is not None:
                 addressing = Addressing.from_dict(addressing)
+            speakers = raw.pop("speakers", None)
+            if speakers is not None:
+                speakers = SpeakerPriority.from_dict(speakers)
             budget = validate_session_budget(raw.pop("session_budget_seconds", None))
             values = {}
             for name, value in raw.items():
                 if not isinstance(value, str) or not value or not Path(value).is_absolute():
                     raise ValueError
                 values[name] = Path(value)
-            config = cls(**values, addressing=addressing, session_budget_seconds=budget)
+            config = cls(
+                **values,
+                addressing=addressing,
+                speakers=speakers,
+                session_budget_seconds=budget,
+            )
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
             return config
@@ -122,6 +140,9 @@ class PrototypeController:
         self._mode = "microphone"
         self._error = None
         self._decision_status = "off"
+        # Speaker role source for the tool stream: off, or configured. Model-sourced
+        # roles are refused here and available to tool-replay only (tracked in #55).
+        self._role_status = "off"
         self._memory = TranscriptMemory()
         self._runner: ReplayRunner | None = None
         self._capture = None
@@ -214,6 +235,14 @@ class PrototypeController:
             raise PrototypeError("Invalid prototype setting")
         if mode == "demo" and self.config.demo_audio is None:
             raise PrototypeError("No generated audio demo is configured")
+        if self.config.speakers is not None and self.config.speakers.source == "model":
+            # A hosted role question would run on the audio path under the controller
+            # lock, where Stop and lease expiry cannot reach it; tool-replay has no such
+            # path and keeps model-sourced roles.
+            raise PrototypeError(
+                "Model-sourced speaker roles are not available in live microphone or demo "
+                "mode yet; use configured roles, or tool-replay (tracked in #55)"
+            )
         budget_seconds = validate_session_budget(self.config.session_budget_seconds)
         with self._lock:
             if self._phase in {"starting", "listening", "replaying", "finishing", "stopping"}:
@@ -244,6 +273,13 @@ class PrototypeController:
             runner = ReplayRunner(
                 provider, memory=memory, cancelled=cancelled, addressing=self.config.addressing
             )
+            # Only configured roles run here: no hosted role question ever executes
+            # under the controller lock (model-sourced roles are refused above).
+            priority = (
+                None
+                if self.config.speakers is None
+                else ConfiguredPriorityProvider(self.config.speakers)
+            )
             runner.restart(session)
             self._generation += 1
             generation = self._generation
@@ -263,6 +299,7 @@ class PrototypeController:
             self._mode = mode
             self._error = None
             self._decision_status = "ready" if hosted else "off"
+            self._role_status = "off" if priority is None else "configured"
             self._phase = "starting"
             self._started = self._last_browser = time.monotonic()
             if self._events is not None:
@@ -271,6 +308,7 @@ class PrototypeController:
                     now_ms=0,
                     attention_enabled=hosted,
                     addressing=self.config.addressing,
+                    priority=priority,
                 )
                 self._event_terminal = False
             threading.Thread(
@@ -555,6 +593,7 @@ class PrototypeController:
                 "mode": self._mode,
                 "error": self._error,
                 "decision_status": self._decision_status,
+                "role_status": self._role_status,
                 "decisions": dict(self._decisions),
                 "pending_decisions": self._pending,
                 "jev_requests": self._requests,
@@ -591,6 +630,7 @@ class PrototypeController:
             self._audio_started = None
             self._completed_at = None
             self._decision_status = "off"
+            self._role_status = "off"
             while not self._decision_queue.empty():
                 try:
                     self._decision_queue.get_nowait()
