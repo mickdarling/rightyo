@@ -12,7 +12,12 @@ from typing import TextIO
 from rightyo.cli import addressing_from_args, load_turns
 from rightyo.contracts import ContractError
 from rightyo.pipeline import ReplayRunner
-from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
+from rightyo.prototype import (
+    PrototypeConfig,
+    PrototypeController,
+    PrototypeError,
+    validate_session_budget,
+)
 from rightyo.providers import JevProvider, MockProvider, ProviderError
 from rightyo.tool_events import SpeechEvents, encode_json
 
@@ -81,6 +86,10 @@ def listen(args, *, output=None, controller_factory=PrototypeController) -> int:
     if addressing is not None:
         # Command-line names take precedence over the configuration file's names.
         config = replace(config, addressing=addressing)
+    budget = getattr(args, "session_budget", None)
+    if budget is not None:
+        # The command line's budget likewise replaces the configuration file's.
+        config = replace(config, session_budget_seconds=validate_session_budget(budget))
     events = SpeechEvents()
     controller = controller_factory(config, event_publisher=events)
     # Signal handlers are installed only by this explicit foreground operation.

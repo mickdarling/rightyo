@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 from rightyo.contracts import Turn
 from rightyo.credentials import CredentialError
-from rightyo.live_audio import LiveAudioError
+from rightyo.live_audio import DiarizerTimelineLimitError, LiveAudioError
 from rightyo.memory import MemorySessionLimitError
 from rightyo.prototype import (
     PrototypeConfig,
@@ -25,6 +25,9 @@ from rightyo.prototype import (
     PrototypeServer,
 )
 from rightyo.providers import MockProvider, ProviderError
+from rightyo.tool_events import SpeechEvents
+
+THREE_HOURS_MS = 3 * 60 * 60 * 1000
 
 
 def await_condition(condition):
@@ -235,7 +238,12 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn("synthetic-private-provider-detail", json.dumps(snapshot))
 
     def test_audio_failure_preserves_valid_history_cancels_queue_and_ages(self):
-        for failure in (LiveAudioError, RuntimeError, MemorySessionLimitError):
+        for failure in (
+            LiveAudioError,
+            RuntimeError,
+            MemorySessionLimitError,
+            DiarizerTimelineLimitError,
+        ):
             with self.subTest(failure=failure):
                 provider = FakeHosted()
                 provider.release.clear()
@@ -246,6 +254,8 @@ class ControllerTests(unittest.TestCase):
                 class FailingProcessor(FakeProcessor):
                     def push_pcm16(self, pcm):
                         if self.index == 2:
+                            if failure is DiarizerTimelineLimitError:
+                                raise failure()
                             raise failure("synthetic-private-audio-detail")
                         super().push_pcm16(pcm)
                         if self.index == 1 and not provider.entered.wait(1):
@@ -273,6 +283,13 @@ class ControllerTests(unittest.TestCase):
                         snapshot["error"],
                         "Session reached its 1,000-turn limit; start a new session.",
                     )
+                elif failure is DiarizerTimelineLimitError:
+                    self.assertEqual(
+                        snapshot["error"],
+                        "Session reached the speaker timeline limit; start a new session.",
+                    )
+                else:
+                    self.assertNotIn("limit", snapshot["error"])
                 provider.release.set()
                 await_condition(lambda: old_work.unfinished_tasks == 0)
                 self.assertEqual(provider.requests, 1)
@@ -505,19 +522,208 @@ class ControllerTests(unittest.TestCase):
         self.hosted.assert_not_called()
         self.controller.stop()
 
-    def test_browser_lease_and_session_limit_stop_observation(self):
+    def test_browser_lease_and_configured_wall_clock_budget_stop_observation(self):
         for expiry in ("browser", "session"):
             with self.subTest(expiry=expiry):
+                if expiry == "session":
+                    self.controller.config = replace(self.config, session_budget_seconds=600)
                 self.controller.start({"mode": "microphone"})
                 with self.controller._lock:
                     if expiry == "browser":
                         self.controller._last_browser -= 20
                     else:
-                        self.controller._started -= 901
+                        self.controller._started -= 601
                 await_condition(
                     lambda: self.controller.snapshot(heartbeat=False)["phase"] == "idle"
                 )
                 self.assertEqual(self.controller.snapshot()["turns"], [])
+
+    def test_default_has_no_session_ceiling_and_accepts_three_hours_of_audio(self):
+        class HourlyProcessor(FakeProcessor):
+            def push_pcm16(self, pcm):
+                start = self.received_ms
+                self.received_ms += len(pcm) // 32
+                if self.received_ms % (60 * 60 * 1000):
+                    return
+                self.index += 1
+                self.on_turn(
+                    Turn(
+                        self.config.session_id,
+                        f"hourly-{self.index}",
+                        1,
+                        start,
+                        self.received_ms,
+                        "Speaker B, still here.",
+                        "Speaker A",
+                        True,
+                        False,
+                        "fake-local-recognizer",
+                        self.config.provenance,
+                        "diarization-timeline",
+                    )
+                )
+
+        self.processor.side_effect = HourlyProcessor
+        events = SpeechEvents()
+        controller = PrototypeController(
+            self.config,
+            processor_factory=self.processor,
+            capture_factory=self.capture,
+            provider_factory=self.hosted,
+            event_publisher=events,
+        )
+        self.addCleanup(controller.close)
+        self.assertIsNone(controller.snapshot()["session_limit_seconds"])
+        controller.start({"mode": "microphone"})
+        await_condition(lambda: bool(FakeCapture.instances and FakeCapture.instances[0].started))
+        processor = FakeProcessor.instances[0]
+        self.assertIsNone(processor.config.session_budget_ms)
+        second = bytes(32000)
+        for _ in range(THREE_HOURS_MS // 1000):
+            FakeCapture.instances[0].pcm.put(second)
+        deadline = time.monotonic() + 20
+        while processor.received_ms < THREE_HOURS_MS and time.monotonic() < deadline:
+            threading.Event().wait(0.01)
+        self.assertEqual(processor.received_ms, THREE_HOURS_MS)
+        snapshot = controller.snapshot()
+        self.assertEqual(snapshot["phase"], "listening")
+        self.assertIsNone(snapshot["error"])
+        self.assertEqual([t["utterance_id"] for t in snapshot["turns"]], ["hourly-3"])
+        self.assertEqual(snapshot["turns"][0]["end_ms"], THREE_HOURS_MS)
+        self.assertEqual(snapshot["retention"]["expired_turns"], 2)
+        self.assertEqual(snapshot["retention"]["session_turn_count"], 3)
+        # Undrained queued events expire with their turns; the current one is delivered.
+        transcripts = [e for e in controller.drain_events() if e["type"] == "transcript"]
+        self.assertEqual([t["turn"]["utterance_id"] for t in transcripts], ["hourly-3"])
+        self.assertEqual(transcripts[-1]["emitted_at_ms"], THREE_HOURS_MS)
+        self.assertFalse(processor.closed)
+        controller.stop()
+        self.assertEqual(controller.drain_events()[-1]["phase"], "cancelled")
+
+    def test_configured_budget_stops_at_the_audio_boundary_as_cancelled(self):
+        events = SpeechEvents()
+        controller = PrototypeController(
+            replace(self.config, session_budget_seconds=2),
+            processor_factory=self.processor,
+            capture_factory=self.capture,
+            provider_factory=self.hosted,
+            event_publisher=events,
+        )
+        self.addCleanup(controller.close)
+        self.assertEqual(controller.snapshot()["session_limit_seconds"], 2)
+        controller.start({"mode": "microphone"})
+        await_condition(lambda: bool(FakeCapture.instances and FakeCapture.instances[0].started))
+        processor = FakeProcessor.instances[0]
+        self.assertEqual(processor.config.session_budget_ms, 2000)
+        for _ in range(15):
+            FakeCapture.instances[0].pcm.put(bytes(6400))
+        # Drain like a foreground consumer: cancellation discards undrained events.
+        emitted = []
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            emitted.extend(controller.drain_events())
+            if controller.snapshot(heartbeat=False)["phase"] == "idle":
+                break
+            threading.Event().wait(0.005)
+        emitted.extend(controller.drain_events())
+        self.assertEqual(controller.snapshot()["phase"], "idle")
+        self.assertEqual(processor.received_ms, 2000)
+        self.assertTrue(processor.closed)
+        self.assertTrue(FakeCapture.instances[0].stopped)
+        self.assertEqual(emitted[0]["phase"], "started")
+        self.assertEqual(sum(e["type"] == "transcript" for e in emitted), 10)
+        self.assertEqual(emitted[-1]["phase"], "cancelled")
+        self.assertNotIn("reason", emitted[-1])
+        self.assertEqual(controller.drain_events(), [])
+        self.assertEqual(controller.snapshot()["turns"], [])
+        self.assertIsNone(controller.snapshot()["error"])
+
+    def test_demo_budget_truncates_replay_without_flushing_the_tail(self):
+        demo = Path(self.directory.name) / "generated-two-second.wav"
+        with wave.open(str(demo), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(16000)
+            audio.writeframes(bytes(2 * 32000))
+        events = SpeechEvents()
+        controller = PrototypeController(
+            replace(self.config, demo_audio=demo, session_budget_seconds=1),
+            processor_factory=self.processor,
+            capture_factory=self.capture,
+            provider_factory=self.hosted,
+            event_publisher=events,
+        )
+        self.addCleanup(controller.close)
+        controller.start({"mode": "demo"})
+        await_condition(lambda: controller.snapshot(heartbeat=False)["phase"] == "idle")
+        processor = FakeProcessor.instances[0]
+        self.assertEqual(processor.received_ms, 1000)
+        self.assertFalse(processor.finished)
+        self.assertTrue(processor.closed)
+        self.assertEqual(controller.drain_events()[-1]["phase"], "cancelled")
+        self.capture.assert_not_called()
+
+    def test_slow_replay_still_receives_the_whole_budget_before_cancellation(self):
+        class SlowProcessor(FakeProcessor):
+            pushing = False
+            closed_mid_push = False
+
+            def push_pcm16(self, pcm):
+                self.pushing = True
+                # Slower than real time: 200 ms of audio takes 300 ms of wall clock.
+                threading.Event().wait(0.3)
+                super().push_pcm16(pcm)
+                self.pushing = False
+
+            def close(self):
+                self.closed_mid_push |= self.pushing
+                super().close()
+
+        demo = Path(self.directory.name) / "generated-two-second.wav"
+        with wave.open(str(demo), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(16000)
+            audio.writeframes(bytes(2 * 32000))
+        self.processor.side_effect = SlowProcessor
+        events = SpeechEvents()
+        controller = PrototypeController(
+            replace(self.config, demo_audio=demo, session_budget_seconds=1),
+            processor_factory=self.processor,
+            capture_factory=self.capture,
+            provider_factory=self.hosted,
+            event_publisher=events,
+        )
+        self.addCleanup(controller.close)
+        controller.start({"mode": "demo"})
+        with controller._lock:
+            # Even a long-expired wall clock must not end a replay before its boundary.
+            controller._started -= 3600
+        emitted = []
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            emitted.extend(controller.drain_events())
+            if controller.snapshot(heartbeat=False)["phase"] == "idle":
+                break
+            threading.Event().wait(0.01)
+        emitted.extend(controller.drain_events())
+        processor = FakeProcessor.instances[0]
+        self.assertEqual(controller.snapshot()["phase"], "idle")
+        self.assertEqual(processor.received_ms, 1000)
+        self.assertEqual(processor.index, 5)
+        self.assertFalse(processor.closed_mid_push)
+        self.assertFalse(processor.finished)
+        self.assertEqual(sum(e["type"] == "transcript" for e in emitted), 5)
+        self.assertEqual(emitted[-1]["phase"], "cancelled")
+
+    def test_invalid_session_budget_is_rejected_before_any_capture(self):
+        for invalid in (0, -1, True, 1.5, "60"):
+            self.controller.config = replace(self.config, session_budget_seconds=invalid)
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(PrototypeError, "budget"):
+                self.controller.start({"mode": "microphone"})
+        self.processor.assert_not_called()
+        self.capture.assert_not_called()
+        self.assertEqual(self.controller.snapshot()["phase"], "idle")
 
     def test_idle_expiry_discards_decision_records_with_transcript(self):
         self.controller.start({"mode": "demo", "use_jev": True})
@@ -555,10 +761,18 @@ class ConfigTests(unittest.TestCase):
             }
             config.write_text(json.dumps(valid))
             self.assertEqual(PrototypeConfig.load(config).whisper_model, asset)
+            self.assertIsNone(PrototypeConfig.load(config).session_budget_seconds)
+            config.write_text(json.dumps(valid | {"session_budget_seconds": 4 * 3600}))
+            self.assertEqual(PrototypeConfig.load(config).session_budget_seconds, 14400)
             for invalid in (
                 {},
                 [],
                 valid | {"unknown": str(asset)},
+                valid | {"session_budget_seconds": 0},
+                valid | {"session_budget_seconds": -1},
+                valid | {"session_budget_seconds": True},
+                valid | {"session_budget_seconds": 1.5},
+                valid | {"session_budget_seconds": "60"},
                 valid | {"whisper_model": "relative"},
                 valid | {"whisper_model": str(asset / "missing")},
                 valid | {"whisper_model": {}},

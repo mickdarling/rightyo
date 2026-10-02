@@ -45,7 +45,8 @@ Repeatable `--name` flags (for example `--name "Hailing Station" --name computer
 the forms of address the system answers to for `listen`, `tool-replay` and `prototype`. They
 are advertised in the started session event and given to the decision provider as evidence,
 not as a required wake word; see [the API reference](tool-api.md). Nothing is configured by
-default.
+default. Sessions have no default duration ceiling; `--session-budget SECONDS` on `listen`
+and `prototype` ends a session after that many seconds with the ordinary `cancelled` event.
 
 No attention is fabricated in these commands: local-only audio emits transcript and session
 events. Optional Jev inference requires both `--use-jev --allow-hosted`, with the existing

@@ -336,6 +336,52 @@ class ToolTests(unittest.TestCase):
         self.assertTrue(controllers[0]._closed.is_set())
         self.assertEqual(controllers[0]._memory.retained_ids, set())
 
+    def test_session_budget_flag_parses_validates_and_overrides_configuration(self):
+        for command in (
+            ["listen", "--config", str(self.config), "--mode", "demo"],
+            ["prototype", "--config", str(self.config)],
+        ):
+            for invalid in ("0", "-5", "abc", "1.5"):
+                with self.subTest(command=command[0], invalid=invalid):
+                    with patch("sys.stderr", io.StringIO()) as error:
+                        with self.assertRaises(SystemExit) as exit:
+                            main([*command, "--session-budget", invalid])
+                    self.assertEqual(exit.exception.code, 2)
+                    self.assertIn("positive number of seconds", error.getvalue())
+        Processor.instances.clear()
+        with patch("rightyo.prototype.serve") as serve:
+            self.assertEqual(
+                main(["prototype", "--config", str(self.config), "--session-budget", "30"]), 0
+            )
+            serve.assert_called_once_with(
+                self.config, 8765, addressing=None, session_budget_seconds=30
+            )
+            serve.reset_mock()
+            self.assertEqual(main(["prototype", "--config", str(self.config)]), 0)
+            serve.assert_called_once_with(
+                self.config, 8765, addressing=None, session_budget_seconds=None
+            )
+        self.assertEqual(Processor.instances, [])
+        raw = json.loads(self.config.read_text())
+        self.config.write_text(json.dumps({**raw, "session_budget_seconds": 60}))
+        loaded = []
+
+        def factory(config, *, event_publisher):
+            loaded.append(config.session_budget_seconds)
+            return self.factory(config, event_publisher=event_publisher)
+
+        for flag in (None, 5):
+            args = Namespace(**vars(self.args), session_budget=flag)
+            with self.subTest(flag=flag):
+                self.assertEqual(listen(args, output=io.StringIO(), controller_factory=factory), 0)
+        self.assertEqual(listen(self.args, output=io.StringIO(), controller_factory=factory), 0)
+        self.assertEqual(loaded, [60, 5, 60])
+        self.assertTrue(
+            all(p.config.session_budget_ms == s * 1000 for p, s in zip(Processor.instances, loaded))
+        )
+        with self.assertRaisesRegex(PrototypeError, "budget"):
+            listen(Namespace(**vars(self.args), session_budget=0), controller_factory=factory)
+
     def test_replay_rejects_late_invalid_input_before_emission_or_provider(self):
         fixture = Path(__file__).resolve().parents[1] / "examples" / "synthetic-turns.json"
         raw = json.loads(fixture.read_text())
