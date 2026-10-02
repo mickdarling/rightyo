@@ -248,6 +248,36 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaises(ProviderError):
             JevProvider(allow_hosted=True).answer(body, b"x" * 32769)
 
+    def test_hosted_budget_slot_is_reserved_atomically_and_refunded_when_unsent(self):
+        provider = JevProvider(allow_hosted=True, max_requests=1)
+        provider._opener = MagicMock()
+        stream = provider._opener.open.return_value.__enter__.return_value
+        stream.read.return_value = b'{"model": "jev-1.13.0", "answers": {}}'
+        body = {"model": JEV_MODEL, "questions": {}}
+        with self.assertRaisesRegex(ProviderError, "payload budget"):
+            provider.answer(body, b"x" * 32769)
+        self.assertEqual(provider.requests, 0)
+        entered, release = threading.Event(), threading.Event()
+
+        def key():
+            entered.set()
+            release.wait(3)
+            return "fictitious-test-key"
+
+        results = []
+        with patch("rightyo.credentials.load_jev_api_key", side_effect=key):
+            worker = threading.Thread(target=lambda: results.append(provider.answer(body, b"{}")))
+            worker.start()
+            self.assertTrue(entered.wait(3))
+            # The slot is held while the first caller waits for its credential.
+            with self.assertRaisesRegex(ProviderError, "budget exhausted"):
+                provider.decide({})
+            release.set()
+            worker.join(3)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(provider.requests, 1)
+        self.assertEqual(provider._opener.open.call_count, 1)
+
 
 class EnrolledEventTests(unittest.TestCase):
     def start(self, priority=OWNER, provider=None):
@@ -518,6 +548,58 @@ class EnrolledEventTests(unittest.TestCase):
         self.assertEqual(
             [e["by_utterance_id"] for e in drained if e["type"] == "override"], ["own", "own"]
         )
+
+    def test_open_request_bound_delivers_full_burst_and_fails_closed_beyond_it(self):
+        self.start()
+        limit = self.events.max_open
+        self.assertEqual(limit, 124)
+        for index in range(limit):
+            current = turn(f"r{index}", index * 1000, index * 1000 + 500, "Rightyo, task.")
+            self.events.transcript(current, current.end_ms)
+            self.events.decision(decision(current), current.end_ms + 100)
+            self.events.drain()
+        stop = turn("stop", 200000, 200500, "stop", "Speaker A")
+        self.events.transcript(stop, 200500)
+        self.events.decision(decision(stop, "uncertain", "unknown"), 200600)
+        drained = self.events.drain()
+        self.assertEqual(len(drained), limit + 2)
+        self.assertEqual(
+            [e["superseded_request_id"] for e in drained[2:]],
+            [f"enrolled-demo:r{index}" for index in range(limit)],
+        )
+        events = SpeechEvents()
+        events.start("enrolled-demo", priority=ConfiguredPriorityProvider(OWNER))
+        events.drain()
+        for index in range(200):
+            current = turn(f"r{index}", index * 1000, index * 1000 + 500, "Rightyo, task.")
+            events.transcript(current, current.end_ms)
+            if index < limit:
+                events.decision(decision(current), current.end_ms + 100)
+                events.drain()
+                continue
+            with self.assertRaisesRegex(ContractError, "open request budget"):
+                events.decision(decision(current), current.end_ms + 100)
+            break
+        self.assertEqual(index, limit)
+        self.assertEqual(events._open, {})
+        self.assertFalse(events._active)
+
+    def test_configured_owner_is_never_downgraded_by_a_provider_answer(self):
+        self.start()
+        self.provider.assign = lambda state: {"Speaker A": "participant", "Speaker B": "trusted"}
+        request = turn("request", 0, 500, "Rightyo, delete the project.")
+        stop = turn("stop", 1000, 1500, "Stop.", "Speaker A")
+        for current in (request, stop):
+            self.events.transcript(current, current.end_ms)
+            self.events.decision(decision(current), current.end_ms + 100)
+        drained = self.events.drain()
+        self.assertEqual(self.events.role_status, "ready")
+        self.assertEqual(
+            [e["type"] for e in drained],
+            ["transcript", "attention", "request", "transcript", "attention", "override"],
+        )
+        self.assertEqual([e["turn"]["role"] for e in drained[::3]], ["trusted", "owner"])
+        self.assertEqual(self.events._roles, {"Speaker B": "trusted", "Speaker A": "owner"})
 
     def test_invalid_providers_and_assignments_fail_closed_without_echo(self):
         events = SpeechEvents()

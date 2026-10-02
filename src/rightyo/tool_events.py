@@ -62,6 +62,10 @@ class SpeechEvents:
             raise ContractError("invalid event queue budget")
         self.retention_ms = retention_ms
         self.max_pending = max_pending
+        # Open non-owner requests are bounded below the queue capacity, with headroom for
+        # the owner's transcript, attention and request, so one owner decision's burst of
+        # overrides can never overflow the queue; exceeding the bound fails closed.
+        self.max_open = max(1, max_pending - 4)
         self._lock = RLock()
         self._memory = TranscriptMemory(retention_ms=retention_ms)
         self._session = None
@@ -276,6 +280,12 @@ class SpeechEvents:
             if any(v == "owner" and s not in rules.owners for s, v in validated.items()):
                 # Owners come only from configuration; a provider naming one is rejected.
                 degraded = "rejected"
+            # The configured overlay always wins: a configured owner or trusted speaker
+            # keeps that role whatever the provider answered or omitted.
+            validated = {s: rules.configured_role(s) or v for s, v in validated.items()}
+            configured = rules.configured_role(turn.speaker_id)
+            if configured is not None:
+                validated[turn.speaker_id] = configured
         except ProviderError:
             # A hosted role question failed (timeout, unavailability, budget, cancellation).
             degraded = "unavailable"
@@ -373,7 +383,12 @@ class SpeechEvents:
                     decision_at_ms=self._now,
                 )
                 if role is not None and role != "owner":
-                    # Bounded by the session's turn budget; nothing is silently dropped.
+                    if len(self._open) >= self.max_open:
+                        # Fail closed before an owner's override burst could overflow the
+                        # queue; nothing is silently dropped.
+                        self._clear_content()
+                        self._active = False
+                        raise ContractError("open request budget exceeded")
                     self._open[request_id] = turn.end_ms
 
     def end(self, phase="cancelled", now_ms=0, reason=None):

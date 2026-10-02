@@ -139,8 +139,10 @@ removed), emits one `override` event per earlier non-owner request that is still
 `role` is `owner`. Overrides follow the owner's `attention` event and precede the owner's
 own `request`; a stop phrase produces no request even when the decision was `attend`, and
 its attention evidence is emitted unchanged without a `request_id`. A non-owner request
-stays open until an override, retention expiry or a terminal event; every open request
-within the session's existing turn budget is tracked, none is silently dropped. An
+stays open until an override, retention expiry or a terminal event. Open requests are
+bounded to the event queue capacity minus four (124 by default) so that one owner
+decision's burst of overrides always fits the queue; a request that would exceed the
+bound fails closed with an error, never a silent drop. An
 owner override also supersedes every earlier non-owner turn whose decision is still
 pending: when that late decision arrives, its `attention` evidence is emitted without a
 `request_id`, an `override` names the request id the turn would have carried, and no

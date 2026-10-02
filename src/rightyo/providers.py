@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import socket
+import threading
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Protocol
@@ -335,16 +336,29 @@ class JevProvider:
         self.requests = 0
         # No environment proxies: destination and credentials remain tied to the official endpoint.
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        # Attention decisions and role questions share one budget from different threads:
+        # a slot is reserved atomically before any work and refunded if nothing is sent.
+        self._budget = threading.Lock()
 
-    def _guard(self) -> None:
-        if self.cancelled():
-            raise ProviderError("Jev processing was cancelled")
-        if self.requests >= self.max_requests:
-            raise ProviderError("Jev request budget exhausted")
+    def _reserve(self) -> None:
+        with self._budget:
+            if self.cancelled():
+                raise ProviderError("Jev processing was cancelled")
+            if self.requests >= self.max_requests:
+                raise ProviderError("Jev request budget exhausted")
+            self.requests += 1
+
+    def _refund(self) -> None:
+        with self._budget:
+            self.requests -= 1
 
     def decide(self, state: dict[str, Any]) -> ProviderDecision:
-        self._guard()
-        request_body, payload = bounded_request(state)
+        self._reserve()
+        try:
+            request_body, payload = bounded_request(state)
+        except ProviderError:
+            self._refund()
+            raise
         raw = self._send(payload)
         decision = None
         try:
@@ -359,8 +373,9 @@ class JevProvider:
         """Send an already bounded Jev request under the same consent, budget and limits."""
         if not isinstance(request_body, dict) or not isinstance(payload, bytes):
             raise ProviderError("Jev request must be a bounded encoded body")
-        self._guard()
+        self._reserve()
         if len(payload) > MAX_REQUEST_BYTES:
+            self._refund()
             raise ProviderError("Jev request exceeds payload budget")
         return self._send(payload)
 
@@ -368,9 +383,15 @@ class JevProvider:
         # Load only at the point of use; never log/serialize the key or a Request object.
         from rightyo.credentials import load_jev_api_key
 
-        api_key = load_jev_api_key()
+        # The slot was reserved by the caller; refund it if nothing is sent.
+        try:
+            api_key = load_jev_api_key()
+        except Exception:
+            self._refund()
+            raise
         if self.cancelled():
             del api_key
+            self._refund()
             raise ProviderError("Jev processing was cancelled")
         request = urllib.request.Request(
             JEV_ENDPOINT,
@@ -379,7 +400,6 @@ class JevProvider:
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         )
         del api_key
-        self.requests += 1
         failure = None
         content = b""
         try:
