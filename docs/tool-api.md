@@ -234,9 +234,11 @@ The whole string is at most 16,000 characters (four times the turn text limit). 
 context does not fit, the oldest context turns are dropped first and
 `Older context was omitted to fit.` is inserted after the request; the request turn is
 never truncated. The string is validated like turn text (valid UTF-8, bounded, non-empty)
-and counts toward the per-event byte budget. The string is frozen at decision time: later
-retention expiry can shrink a queued request's `context.turns` but does not rewrite its
-`formed_request`.
+and counts toward the per-event byte budget. It follows the retention window like the
+rest of the queued content: when expiry prunes a context turn from a queued request's
+`context.turns`, the producer re-renders that request's `formed_request` from the pruned
+context through the same former, so no expired text outlives the window inside the
+string; a queued request whose context was not pruned keeps its string byte-identical.
 
 A former that raises, or that returns a value that is not a string, is empty or exceeds
 the bound, fails closed: the producer raises `ContractError`, the session ends with

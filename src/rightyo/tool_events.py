@@ -236,10 +236,22 @@ class SpeechEvents:
                     if end is not None and end <= cutoff:
                         continue
                     if payload["type"] == "request":
-                        payload["context"]["turns"] = [
-                            t for t in payload["context"]["turns"] if t["end_ms"] > cutoff
-                        ]
+                        turns = [t for t in payload["context"]["turns"] if t["end_ms"] > cutoff]
+                        if len(turns) != len(payload["context"]["turns"]):
+                            payload["context"]["turns"] = turns
+                            if "formed_request" in payload:
+                                # The convenience string must not outlive the retention
+                                # window either: re-render it from the pruned context,
+                                # failing closed exactly as at emission. An unpruned
+                                # request keeps its string byte-identical.
+                                payload["formed_request"] = self._render_request(
+                                    payload["turn"], turns
+                                )
                 size = len(encode_json(payload)) + 1
+                if size > MAX_EVENT_BYTES:
+                    self._clear_content()
+                    self._active = False
+                    raise ContractError("speech event consumer backlog exceeded")
                 kept.append((payload, size))
                 self._queue_bytes += size
             self._queue = kept
@@ -513,9 +525,13 @@ class SpeechEvents:
         """
         if self._former is None:
             return {}
+        return {"formed_request": self._render_request(_with_role(turn, role), context["turns"])}
+
+    def _render_request(self, record, context_turns):
+        """Run the former on the bounded state for one request record and its context."""
         state = {
-            "current_turn": _with_role(turn, role),
-            "context_turns": copy.deepcopy(context["turns"]),
+            "current_turn": copy.deepcopy(record),
+            "context_turns": copy.deepcopy(context_turns),
             "addressing": None if self._addressing is None else self._addressing.to_dict(),
             "speakers": "anonymous" if self._priority is None else "enrolled",
         }
@@ -528,7 +544,7 @@ class SpeechEvents:
             self._clear_content()
             self._active = False
             raise ContractError("request forming failed")
-        return {"formed_request": formed}
+        return formed
 
     def end(self, phase="cancelled", now_ms=0, reason=None):
         with self._lock:

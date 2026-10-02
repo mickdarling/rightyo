@@ -9,6 +9,7 @@ import tempfile
 import unittest
 import wave
 from argparse import Namespace
+from collections import deque
 from pathlib import Path
 from unittest.mock import patch
 
@@ -337,6 +338,75 @@ class SpeechEventsFormingTests(unittest.TestCase):
         for former in (NoForm(), BadKind(), object()):
             with self.subTest(former=type(former).__name__), self.assertRaises(ContractError):
                 SpeechEvents().start("formed-demo", former=former)
+
+    def queue_request(self, former):
+        """An enrolled session with one formed request left queued, context turn included."""
+        events = SpeechEvents()
+        owner = ConfiguredPriorityProvider(SpeakerPriority(owners=("Speaker A",)))
+        events.start("formed-demo", priority=owner, former=former)
+        context = turn("discussion", 0, 500, "Speaker A, the project is finished.", "Speaker B")
+        request = turn("request", 1000, 2000, "Rightyo, archive the project.")
+        events.transcript(context, 500)
+        events.decision(decision(context, "ignore", "other_human"), 500)
+        events.transcript(request, 2000)
+        events.decision(decision(request), 2000)
+        return events
+
+    def queued_request(self, events):
+        return next(p for p, _size in events._queue if p["type"] == "request")
+
+    def test_expiry_re_renders_a_queued_formed_request_without_the_expired_text(self):
+        class Counting(TemplateRequestFormer):
+            calls = 0
+
+            def form(self, state):
+                Counting.calls += 1
+                return super().form(state)
+
+        events = self.queue_request(Counting())
+        before = events._queue_bytes
+        self.assertEqual(self.queued_request(events)["formed_request"], FIXTURE_FORMED)
+        # Cutoff 600 ms: the context turn (ending at 500) expires; the request stays.
+        events.expire(300600)
+        request = self.queued_request(events)
+        self.assertEqual(request["context"]["turns"], [])
+        self.assertEqual(
+            request["formed_request"], 'Owner (Speaker A) asked: "Rightyo, archive the project.".'
+        )
+        self.assertNotIn("project is finished", encode_json(request))
+        self.assertLess(events._queue_bytes, before)
+        self.assertEqual(
+            events._queue_bytes, sum(len(encode_json(p)) + 1 for p, _size in events._queue)
+        )
+        self.assertEqual(Counting.calls, 2)
+        self.assertTrue(events._active)
+        drained = events.drain()
+        self.assertEqual([e["type"] for e in drained][-1], "request")
+        self.assertNotIn("project is finished", json.dumps(drained))
+
+    def test_expiry_leaves_an_unpruned_queued_formed_request_byte_identical(self):
+        recorder = _Recorder()
+        events = self.queue_request(recorder)
+        before = (encode_json(self.queued_request(events)), events._queue_bytes)
+        # Cutoff 0 ms prunes nothing: the former is not consulted again.
+        events.expire(300000)
+        self.assertEqual((encode_json(self.queued_request(events)), events._queue_bytes), before)
+        self.assertEqual(len(recorder.states), 1)
+
+    def test_former_failing_during_expiry_fails_closed(self):
+        for failure in (RuntimeError("boom"), 7, ""):
+            with self.subTest(failure=type(failure).__name__):
+                recorder = _Recorder()
+                events = self.queue_request(recorder)
+                recorder.result = failure
+                with self.assertRaisesRegex(ContractError, "request forming failed"):
+                    events.expire(300600)
+                self.assertEqual(events._queue, deque())
+                self.assertEqual(events._queue_bytes, 0)
+                self.assertEqual(events._pending, {})
+                self.assertFalse(events._active)
+                events.end("error", 300700, "replay-failed")
+                self.assertEqual([e["type"] for e in events.drain()], ["session"])
 
     def test_formed_request_counts_toward_the_event_byte_budget(self):
         _events, without = self.run_session()
