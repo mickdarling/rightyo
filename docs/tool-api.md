@@ -45,8 +45,9 @@ separate top-level `addressing` object, for example
 are supplied at runtime through repeatable `--name` flags on `listen`,
 `tool-replay` and `prototype`, or through the prototype configuration's
 `addressing.names`; the command line takes precedence over the file. Each name is
-one to 48 characters of letters, digits, spaces, dots, underscores or hyphens,
-starting with a letter or digit, with at most eight distinct names. The names
+one to 48 ASCII letters, digits, single spaces, dots, underscores or hyphens,
+starting with an ASCII letter or digit, not ending in a dot or hyphen, with at
+most eight distinct names; non-ASCII names are rejected. The names
 are passed to the decision provider as evidence that speech using one of them is
 addressed to the system; a name alone is neither required nor a transcript
 filter, and the complete turn is still judged from context. The mock fixture rule

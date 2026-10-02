@@ -28,7 +28,15 @@ def identifier(value: Any, name: str) -> str:
 
 def address_name(value: Any) -> str:
     """One runtime form of address: a sanitized display name, not a wake-word grammar."""
-    if not isinstance(value, str) or not _ADDRESS_NAME.fullmatch(value) or value != value.strip():
+    if (
+        not isinstance(value, str)
+        or not _ADDRESS_NAME.fullmatch(value)
+        or value != value.strip()
+        or "  " in value
+        or value.endswith((".", "-"))
+    ):
+        # Single spaces and no trailing punctuation: a name never reads as prompt prose
+        # and the mock prefix never becomes "name.," or "name-:".
         raise ContractError("invalid address name")
     return value
 
