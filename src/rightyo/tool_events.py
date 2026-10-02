@@ -384,6 +384,10 @@ class SpeechEvents:
             would_attend = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
             attended = would_attend and not stop and superseded_by is None
             overriding = role == "owner" and (attended or stop)
+            # Form before any reservation or emission so the burst reserve below counts
+            # the exact request bytes, formed string included, and a failing former
+            # fails closed before anything of this decision is queued.
+            formed = self._form_request(turn, role, context) if attended else {}
             to_supersede = []
             if overriding:
                 # Earlier is decided by turn time (end_ms at or before the owner's), not by
@@ -436,6 +440,7 @@ class SpeechEvents:
                                 "decision": evidence,
                                 "context": context,
                                 "decision_at_ms": self._now,
+                                **formed,
                             },
                         )
                     )
@@ -482,7 +487,6 @@ class SpeechEvents:
                     if other_role != "owner" and earlier.end_ms <= turn.end_ms:
                         self._superseded.setdefault(other, key)
             if attended:
-                formed = self._form_request(turn, role, context)
                 self._emit(
                     "request",
                     request_id=request_id,
