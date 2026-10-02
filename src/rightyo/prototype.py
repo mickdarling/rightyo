@@ -43,6 +43,7 @@ from rightyo.providers import (
 )
 from rightyo.speech_backends import (
     HostedSpeechError,
+    describe,
     diarizer_factory,
     diarizer_spec,
     is_hosted,
@@ -654,9 +655,13 @@ class PrototypeController:
                 "jev_requests": self._requests,
                 "jev_request_limit": self._request_limit,
                 "demo_available": self.config.demo_audio is not None,
+                # Stage identities come from the selected backends, never from a fixed
+                # local label; hosted selections are reported as hosted, without endpoints.
+                "transcriber": describe(self.config.transcriber),
+                "diarizer": describe(self.config.diarizer),
                 "models": {
-                    "diarization": "Nemotron 3 (configured GGUF)",
-                    "asr": "Whisper (configured model)",
+                    "diarization": describe(self.config.diarizer)["service"],
+                    "asr": describe(self.config.transcriber)["service"],
                     "decision": "Jev 1.13.0 (opt-in)",
                 },
                 "session_limit_seconds": self.config.session_budget_seconds,

@@ -696,6 +696,50 @@ class ConfigurationSelectionTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(PrototypeError):
                 self.load(self.local | {"diarizer": invalid})
 
+    def test_snapshot_reports_selected_backends_without_endpoints_or_credentials(self):
+        local = PrototypeController(self.load(self.local), capture_factory=Mock())
+        self.addCleanup(local.close)
+        snapshot = local.snapshot()
+        self.assertEqual(
+            snapshot["transcriber"],
+            {"kind": "whisper.cpp", "hosted": False, "service": "Whisper (configured model)"},
+        )
+        self.assertEqual(
+            snapshot["diarizer"],
+            {"kind": "nemotron.cpp", "hosted": False, "service": "Nemotron 3 (configured GGUF)"},
+        )
+        self.assertEqual(snapshot["models"]["asr"], "Whisper (configured model)")
+        hosted = PrototypeController(
+            self.load(
+                {
+                    "microphone_helper": str(self.asset),
+                    "transcriber": self.hosted_transcriber | {"language": "en"},
+                    "diarizer": self.hosted_diarizer,
+                }
+            ),
+            capture_factory=Mock(),
+            allow_hosted_speech=True,
+        )
+        self.addCleanup(hosted.close)
+        snapshot = hosted.snapshot()
+        self.assertEqual(
+            snapshot["transcriber"],
+            {
+                "kind": "hosted-openai-compatible",
+                "hosted": True,
+                "service": "OpenAI-compatible hosted",
+            },
+        )
+        self.assertEqual(
+            snapshot["diarizer"],
+            {"kind": "hosted-deepgram", "hosted": True, "service": "Deepgram hosted"},
+        )
+        self.assertEqual(snapshot["models"]["diarization"], "Deepgram hosted")
+        with patch.dict(os.environ, {"RIGHTYO_TRANSCRIBER_API_KEY": KEY}):
+            encoded = json.dumps(hosted.snapshot())
+        for secret in (ENDPOINT, DEEPGRAM_ENDPOINT, "whisper-1", "nova-3", KEY, "api.deepgram"):
+            self.assertNotIn(secret, encoded)
+
     def test_controller_and_listen_require_explicit_hosted_consent(self):
         config = self.load(self.local | {"transcriber": self.hosted_transcriber})
         processors = []

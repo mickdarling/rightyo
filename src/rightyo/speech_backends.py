@@ -521,6 +521,23 @@ def is_hosted(spec: dict[str, Any]) -> bool:
     return spec["kind"].startswith("hosted-")
 
 
+SERVICE_NAMES = {
+    "whisper.cpp": "Whisper (configured model)",
+    "nemotron.cpp": "Nemotron 3 (configured GGUF)",
+    "hosted-openai-compatible": "OpenAI-compatible hosted",
+    "hosted-deepgram": "Deepgram hosted",
+}
+
+
+def describe(spec: dict[str, Any]) -> dict[str, Any]:
+    """A display-safe summary of a validated spec: kind, hosted flag and service name.
+
+    Never includes the endpoint, model name, language or any credential, so it can be
+    shown to a page or written to a snapshot.
+    """
+    return {"kind": spec["kind"], "hosted": is_hosted(spec), "service": SERVICE_NAMES[spec["kind"]]}
+
+
 def transcriber_factory(
     spec: dict[str, Any], *, allow_hosted: bool = False
 ) -> Callable[[LiveConfig], Transcriber] | None:

@@ -125,6 +125,13 @@ labels persist for the session. The 18,000-segment timeline cap does not apply t
 A stop during an in-flight hosted request waits for that request's `timeout_seconds`
 at most; the endpoint must not carry its own query string or fragment.
 
+The lab page labels the two speech stages from the loaded configuration: `LOCAL` with the
+local runtime name, or `HOSTED` with the service family ("OpenAI-compatible hosted",
+"Deepgram hosted"); the masthead then reads "Audio leaves this Mac" and the Start status
+says "Connecting to hosted speech service" instead of "Loading local models". The
+controller snapshot carries the same `transcriber`/`diarizer` summaries (`kind`, `hosted`,
+`service`) and never the endpoint, model name or credential.
+
 Hosted calls use the standard library only, send no environment proxy, refuse redirects,
 cap responses at 2 MiB, and report failures as "Hosted speech backend failed" without
 audio, transcript, URL or credential content; a failure stops the session like a local
