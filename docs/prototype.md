@@ -37,9 +37,14 @@ Create the ignored `local/prototype.json` with absolute paths to your existing a
 `demo_audio` is optional, as is `"addressing": {"names": ["Hailing Station", "computer"]}`,
 the runtime forms of address described in [the tool API](tool-api.md); `--name` flags on
 the command line replace the file's names. An optional `"session_budget_seconds": 7200`
-stops a session after that much audio; `--session-budget SECONDS` on the command line
+ends a session after that many seconds; `--session-budget SECONDS` on the command line
 replaces the file's value. The budget is a positive whole number of seconds; omitting it
-means there is no session ceiling, which is the default. Replay accepts mono PCM16 WAV at
+means there is no session ceiling, which is the default. A live microphone session ends
+when the wall clock since Start reaches the budget, which includes diarizer start-up, so
+somewhat less than the budget's worth of audio is processed. Faster-than-real-time
+feeders such as replay are trimmed at the exact audio boundary instead. Demo audio whose
+length equals the budget exactly ends `cancelled` (budget reached) rather than `complete`.
+Replay accepts mono PCM16 WAV at
 16 kHz, at most three minutes; it feeds real PCM in causal order as quickly as processing
 permits. It is not a wall-clock streaming latency measurement. Playback through speakers is
 a separate physical test.
@@ -72,6 +77,10 @@ including turns already expired or evicted. Hash-only duplicate bookkeeping keep
 session bound; word-timed ASR fragments each count as a turn, so fragmented speech can
 reach it well within a long ambient session. Reaching 1,000 turns stops processing with
 an explicit message to start a new session, preserving valid history until expiry or Stop.
+The native diarizer separately keeps one whole-session speaker timeline capped at 18,000
+segments, returned in full at every utterance; very long sessions with frequent speaker
+changes reach it, stop with a distinct timeline-limit message, and likewise need a new
+session. A windowed timeline is tracked in [#49](https://github.com/mickdarling/rightyo/issues/49).
 The whole turn overlapping the time boundary is retained and its overlap is reported. Ignore and uncertain decisions remain in local context: a later
 request can refer to the preceding discussion. Copy context produces speaker-labelled text
 for manual use downstream, including unknown-speaker and overlap indications.
@@ -95,9 +104,8 @@ stops an active session after 15 seconds. Browser background timer throttling ca
 trigger this lease, so keep the lab visible while listening. This is a prototype limitation,
 including when switching tabs to a downstream application. There is no default session
 duration ceiling: a session listens until Stop, a lease loss, an error, or the configured
-session budget. A configured budget ends the session at the audio boundary the same way
-Stop does, discarding the unfinished utterance and emitting the ordinary `cancelled` tool
-event. A completed replay's text ages out too. Refreshing loses the browser token; use the
+session budget. A configured budget ends the session the same way Stop does, discarding
+the unfinished utterance and emitting the ordinary `cancelled` tool event. A completed replay's text ages out too. Refreshing loses the browser token; use the
 launch URL again. Only one session runs at a time.
 
 Capture reads are aggregated into 200 ms PCM blocks. The pending capture queue holds

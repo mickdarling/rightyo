@@ -40,6 +40,17 @@ class LiveAudioError(ValueError):
     """Sanitized failure: never embeds paths, PCM, transcripts, or native logs."""
 
 
+class DiarizerTimelineLimitError(LiveAudioError):
+    """The native stream's whole-session timeline reached its fixed segment cap.
+
+    The full timeline is returned per utterance, so very long sessions with frequent
+    speaker changes reach it; a windowed timeline is tracked in #49.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("Local diarizer timeline limit reached; restart the session")
+
+
 @dataclass(frozen=True)
 class LiveConfig:
     session_id: str
@@ -213,7 +224,7 @@ class _NativeStream:
         fn = self.lib.nemo_speech_diar_segments
         self.check(fn(self.stream, None, None, 0, ctypes.byref(count)))
         if count.value > 18000:
-            raise LiveAudioError("Local diarizer exceeded segment limit")
+            raise DiarizerTimelineLimitError()
         output = (_Segment * count.value)()
         self.check(fn(self.stream, None, output, count.value, ctypes.byref(count)))
         # Segment times must lie within audio actually pushed (plus one second of
@@ -280,6 +291,10 @@ def _native_worker(library: str, model: str) -> int:
                 raise LiveAudioError("Invalid native command")
             protocol.write(json.dumps(response, separators=(",", ":")) + "\n")
         return 0
+    except DiarizerTimelineLimitError:
+        # A value-free reason code only; no native detail crosses the protocol.
+        protocol.write('{"ok":false,"reason":"timeline-limit"}\n')
+        return 1
     except Exception:
         protocol.write('{"ok":false}\n')
         return 1
@@ -345,8 +360,14 @@ class _Diarizer:
         self.buffer = bytearray(rest)
         try:
             result = json.loads(line)
-            if not isinstance(result, dict) or result.get("ok") is not True:
+            if not isinstance(result, dict):
                 raise ValueError
+            if result.get("ok") is not True:
+                if result.get("reason") == "timeline-limit":
+                    raise DiarizerTimelineLimitError()
+                raise ValueError
+        except DiarizerTimelineLimitError:
+            raise
         except (ValueError, RecursionError):
             raise LiveAudioError("Local diarizer failed") from None
         return result

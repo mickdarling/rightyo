@@ -72,12 +72,14 @@ uncertain application action.
 
 A session has no default duration ceiling; it listens until the host stops it or a
 terminal condition occurs. `--session-budget SECONDS` on `listen` and `prototype`, or
-`session_budget_seconds` in the prototype configuration, ends a session at that audio
-boundary with the ordinary `cancelled` event, the same as a host-initiated stop. The
-budget is a positive whole number of seconds; the command line replaces the file's value.
-Timestamps are plain integers in stream milliseconds and do not wrap. Memory is bounded
-independently of session length by the rolling retention limits below, the per-utterance
-audio window, and the per-session unique-turn count.
+`session_budget_seconds` in the prototype configuration, ends a session with the ordinary
+`cancelled` event, the same as a host-initiated stop. A live microphone session ends when
+the wall clock since start reaches the budget, including diarizer start-up, so somewhat
+less audio than the budget is processed; faster-than-real-time feeders are trimmed at the
+exact audio boundary. The budget is a positive whole number of seconds; the command line
+replaces the file's value. Timestamps are plain integers in stream milliseconds and do not
+wrap. Memory is bounded independently of session length by the rolling retention limits
+below, the per-utterance audio window, and the per-session unique-turn count.
 
 ## Turn and request fields
 
@@ -104,6 +106,11 @@ requests. Expiry also removes stale context while awaiting a decision.
 cutoff, capacity/expiry counts and whole-turn boundary policy. It is not a claim
 that every retained turn is included: overlap filtering or subsequent expiry can
 reduce the handoff. Compare the supplied turns themselves for actual coverage.
+Two per-session counts end a native session with a distinct error and require a new
+session identity: 1,000 unique finalized turns, and the native diarizer's whole-session
+speaker timeline of at most 18,000 segments, which is returned in full at every utterance
+and so is reached by very long sessions with frequent speaker changes (a windowed timeline
+is tracked in [#49](https://github.com/mickdarling/rightyo/issues/49)).
 The default history is five minutes, with 1,000 unique turns and 1 MiB of retained
 transcript data. There are additional independent bounds: at most 32 frozen pending
 contexts totalling 1 MiB, 128 queued events totalling 4 MiB, and 1,200,000 bytes per

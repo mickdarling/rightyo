@@ -152,7 +152,7 @@ def _add_session_budget_option(parser: argparse.ArgumentParser) -> None:
         "--session-budget",
         type=_session_budget,
         metavar="SECONDS",
-        help="stop the session after this much audio (default: no session ceiling)",
+        help="end the session after this many seconds (default: no session ceiling)",
     )
 
 

@@ -3,6 +3,7 @@
 import array
 import ctypes
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,7 @@ from unittest.mock import Mock, patch
 from rightyo.live_audio import (
     BYTES_PER_MS,
     FRAME_BYTES,
+    DiarizerTimelineLimitError,
     LiveAudioError,
     LiveConfig,
     LiveProcessor,
@@ -406,6 +408,37 @@ class NativeSegmentBoundTests(unittest.TestCase):
                     stream.segments()
         stream, _ = _native_stream([(0.5, 5.0, 1)], 5 * 1000 * BYTES_PER_MS)
         self.assertEqual(stream.segments(), [{"start_ms": 500, "end_ms": 5000, "speaker": 1}])
+
+    def test_timeline_segment_cap_is_a_distinct_value_free_failure(self):
+        stream, _ = _native_stream([(0.0, 0.5, 1)] * 18001, 10 * 1000 * BYTES_PER_MS)
+        with self.assertRaises(DiarizerTimelineLimitError) as error:
+            stream.segments()
+        self.assertIsInstance(error.exception, LiveAudioError)
+        self.assertEqual(
+            str(error.exception), "Local diarizer timeline limit reached; restart the session"
+        )
+        # The parent reconstructs the same distinct error from the worker's reason code only.
+        for line, expected in (
+            (b'{"ok":false,"reason":"timeline-limit"}\n', DiarizerTimelineLimitError),
+            (b'{"ok":false,"reason":"private-detail"}\n', LiveAudioError),
+            (b'{"ok":false}\n', LiveAudioError),
+        ):
+            with self.subTest(line=line):
+                reader, writer = os.pipe()
+                diarizer = _Diarizer.__new__(_Diarizer)
+                diarizer.timeout = 1
+                diarizer.cancelled = lambda: False
+                diarizer.process = Mock(stdout=os.fdopen(reader, "rb", buffering=0))
+                diarizer.buffer = bytearray()
+                os.write(writer, line)
+                os.close(writer)
+                try:
+                    with self.assertRaises(expected) as error:
+                        diarizer._receive()
+                    self.assertIs(type(error.exception), expected)
+                    self.assertNotIn("private-detail", str(error.exception))
+                finally:
+                    diarizer.process.stdout.close()
 
     def test_push_advances_the_bound_by_the_audio_actually_pushed(self):
         stream, pushed = _native_stream([(0.0, 1.5, 1)], 0)
