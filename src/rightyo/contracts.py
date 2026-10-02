@@ -53,7 +53,8 @@ def address_name(value: Any) -> str:
 
 
 def speaker_role(value: Any) -> str:
-    if value not in SPEAKER_ROLES:
+    # Type first: an unhashable value must raise the sanitized error, not a TypeError.
+    if not isinstance(value, str) or value not in SPEAKER_ROLES:
         raise ContractError("invalid speaker role")
     return value
 

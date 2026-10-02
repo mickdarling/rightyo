@@ -21,6 +21,7 @@ from rightyo.contracts import (
     SpeakerPriority,
     Turn,
     normalize_phrase,
+    speaker_role,
 )
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
 from rightyo.providers import (
@@ -586,7 +587,10 @@ class EnrolledEventTests(unittest.TestCase):
 
     def test_configured_owner_is_never_downgraded_by_a_provider_answer(self):
         self.start()
-        self.provider.assign = lambda state: {"Speaker A": "participant", "Speaker B": "trusted"}
+        self.provider.assign = lambda state: {
+            speaker: "trusted" if speaker == "Speaker B" else "participant"
+            for speaker in state["known_participants"]
+        }
         request = turn("request", 0, 500, "Rightyo, delete the project.")
         stop = turn("stop", 1000, 1500, "Stop.", "Speaker A")
         for current in (request, stop):
@@ -634,6 +638,54 @@ class EnrolledEventTests(unittest.TestCase):
                     [e["superseded_request_id"] for e in overrides],
                     [f"enrolled-demo:r{index}" for index in range(open_count)],
                 )
+
+    def test_minimum_queue_capacity_supersedes_exactly_one_open_request(self):
+        with self.assertRaises(ContractError):
+            SpeechEvents(max_pending=4)
+        events = SpeechEvents(max_pending=5)
+        events.start("enrolled-demo", priority=ConfiguredPriorityProvider(OWNER))
+        events.drain()
+        self.assertEqual(events.max_open, 1)
+        request = turn("request", 0, 500, "Rightyo, delete the project.")
+        events.transcript(request, 500)
+        events.decision(decision(request), 600)
+        events.drain()
+        stop = turn("stop", 1000, 1500, "stop", "Speaker A")
+        events.transcript(stop, 1500)
+        events.decision(decision(stop, "uncertain", "unknown"), 1600)
+        drained = events.drain()
+        self.assertEqual([e["type"] for e in drained], ["transcript", "attention", "override"])
+        self.assertEqual(drained[2]["superseded_request_id"], "enrolled-demo:request")
+        for index in range(2):
+            current = turn(f"more{index}", 2000 + index * 1000, 2500 + index * 1000, "Rightyo, go.")
+            events.transcript(current, current.end_ms)
+            if index == 0:
+                events.decision(decision(current), current.end_ms + 100)
+                events.drain()
+                continue
+            with self.assertRaisesRegex(ContractError, "open request budget"):
+                events.decision(decision(current), current.end_ms + 100)
+
+    def test_roles_for_unseen_speakers_are_never_cached(self):
+        self.start()
+        assign = MagicMock(return_value={"Speaker B": "participant", "Speaker Z": "trusted"})
+        self.provider.assign = assign
+        first = turn("first", 0, 500, "Hello there.")
+        self.events.transcript(first, 500)
+        self.assertEqual(self.events.role_status, "rejected")
+        self.assertEqual(self.events._roles, {"Speaker B": "unknown"})
+        self.assertEqual(assign.call_args.args[0]["known_participants"], ["Speaker B"])
+        later = turn("later", 1000, 1500, "Rightyo, lights.", "Speaker Z")
+        self.events.transcript(later, 1500)
+        drained = self.events.drain()
+        self.assertEqual([e["turn"]["role"] for e in drained], ["unknown", "participant"])
+        self.assertEqual(assign.call_count, 1)
+
+    def test_unhashable_provider_roles_raise_the_sanitized_error(self):
+        for invalid in (["owner"], {"role": "owner"}, None, 1):
+            with self.subTest(invalid=invalid), self.assertRaises(ContractError) as error:
+                speaker_role(invalid)
+            self.assertNotIn("owner", str(error.exception))
 
     def test_invalid_providers_and_assignments_fail_closed_without_echo(self):
         events = SpeechEvents()
@@ -903,6 +955,38 @@ class CommandLineAndPrototypeTests(unittest.TestCase):
         # The fixture's speaker-less turn is unknown without consulting the provider.
         self.assertEqual(roles, {"Speaker A": "owner", "Speaker B": "unknown", None: "unknown"})
         self.assertEqual(oracles[0].requests, 1)
+
+    def test_tool_replay_terminates_cleanly_when_a_provider_returns_a_bad_role(self):
+        class BadProvider:
+            def __init__(self, priority):
+                self.priority = priority
+
+            def assign(self, state):
+                return {speaker: ["owner"] for speaker in state["known_participants"]}
+
+        args = Namespace(
+            input=FIXTURE,
+            provider="mock",
+            allow_hosted=False,
+            max_requests=20,
+            timeout=10,
+            min_confidence=0.7,
+            names=None,
+            owners=["Speaker A"],
+            trusted=None,
+            owner_only=False,
+            role_source=None,
+        )
+        output = io.StringIO()
+        with patch("rightyo.tool.ConfiguredPriorityProvider", BadProvider):
+            with self.assertRaises(ContractError) as error:
+                replay(args, output=output)
+        self.assertNotIn("owner", str(error.exception))
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(events[0]["phase"], "started")
+        self.assertEqual(events[-1]["phase"], "error")
+        self.assertEqual(events[-1]["reason"], "replay-failed")
+        self.assertFalse(any("turn" in e for e in events))
 
 
 if __name__ == "__main__":

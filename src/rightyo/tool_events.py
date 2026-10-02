@@ -57,7 +57,9 @@ class SpeechEvents:
     """
 
     def __init__(self, *, retention_ms=300000, max_pending=128):
-        integer(max_pending, "max_pending", 2)
+        # At least five: one open request plus the owner's transcript, attention and
+        # request, with a terminal slot, so the static and dynamic override bounds agree.
+        integer(max_pending, "max_pending", 5)
         if max_pending > 128:
             raise ContractError("invalid event queue budget")
         self.retention_ms = retention_ms
@@ -65,7 +67,7 @@ class SpeechEvents:
         # Open non-owner requests are bounded below the queue capacity, with headroom for
         # the owner's transcript, attention and request, so one owner decision's burst of
         # overrides can never overflow the queue; exceeding the bound fails closed.
-        self.max_open = max(1, max_pending - 4)
+        self.max_open = max_pending - 4
         self._lock = RLock()
         self._memory = TranscriptMemory(retention_ms=retention_ms)
         self._session = None
@@ -279,6 +281,10 @@ class SpeechEvents:
             }
             if any(v == "owner" and s not in rules.owners for s, v in validated.items()):
                 # Owners come only from configuration; a provider naming one is rejected.
+                degraded = "rejected"
+            if not set(validated) <= set(state["known_participants"]):
+                # A role for a speaker not yet observed would let that speaker's first
+                # real turn skip the provider; treat it as a contract violation.
                 degraded = "rejected"
             # The configured overlay always wins: a configured owner or trusted speaker
             # keeps that role whatever the provider answered or omitted.

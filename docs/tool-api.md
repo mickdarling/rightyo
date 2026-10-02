@@ -99,8 +99,8 @@ that every retained turn is included: overlap filtering or subsequent expiry can
 reduce the handoff. Compare the supplied turns themselves for actual coverage.
 The default history is five minutes, with 1,000 unique turns and 1 MiB of retained
 transcript data. There are additional independent bounds: at most 32 frozen pending
-contexts totalling 1 MiB, 128 queued events totalling 4 MiB, and 1,200,000 bytes per
-event. Exceeding a delivery bound fails closed; it does not silently drop an attended
+contexts totalling 1 MiB, 128 queued events (configurable from 5 to 128) totalling
+4 MiB, and 1,200,000 bytes per event. Exceeding a delivery bound fails closed; it does not silently drop an attended
 request. Drain continuously and start a new bounded session when necessary.
 
 [The authored shared fixture](../examples/tool-events.jsonl) demonstrates ordinary

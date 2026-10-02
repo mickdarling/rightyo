@@ -152,8 +152,14 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(Processor.instances, [])
 
     def test_slow_consumer_backlog_cancels_and_emits_only_safe_terminal(self):
+        with wave.open(str(self.demo), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(16000)
+            audio.writeframes(bytes(10 * 6400))
+
         def factory(config, *, event_publisher):
-            controller = self.factory(config, event_publisher=SpeechEvents(max_pending=2))
+            controller = self.factory(config, event_publisher=SpeechEvents(max_pending=5))
             original_start = controller.start
 
             def start(options):

@@ -190,9 +190,14 @@ class SpeechEventsTests(unittest.TestCase):
         self.assertEqual(self.events.drain(), [])
 
     def test_queue_overflow_fails_closed_without_retained_request(self):
-        events = SpeechEvents(max_pending=2)
+        with self.assertRaises(ContractError):
+            SpeechEvents(max_pending=4)
+        events = SpeechEvents(max_pending=5)
         events.start("tool-demo")
         events.drain()
+        for index in range(3):
+            previous = turn(f"chat-{index}", index * 200, index * 200 + 100, "Hello.")
+            events.transcript(previous, previous.end_ms, expect_decision=False)
         request = turn()
         events.transcript(request, 2000)
         with self.assertRaises(ContractError):
