@@ -4,7 +4,6 @@ import array
 import io
 import json
 import os
-import subprocess
 import tempfile
 import unittest
 import urllib.error
@@ -47,8 +46,32 @@ ENDPOINT = "https://transcribe.example.test/v1/audio/transcriptions"
 VOICE = array.array("h", [5000] * 320).tobytes()
 
 
-def load_key():
+def load_key(**_options):
     return KEY
+
+
+class FakeProcess:
+    """A `security` stand-in that hangs until terminated; never a real Keychain."""
+
+    def __init__(self, args, **_options):
+        self.args = args
+        self.stdout = io.BytesIO(b"")
+        self.terminated = False
+        self.returncode = None
+
+    def poll(self):
+        if not self.terminated:
+            return None
+        self.returncode = -15
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+
+    kill = terminate
+
+    def wait(self, timeout=None):
+        return self.poll()
 
 
 class FakeResponse:
@@ -86,7 +109,7 @@ def http_error(code, body=PRIVATE.encode()):
 
 
 class StubDiarizer:
-    def __init__(self):
+    def __init__(self, config=None):
         self.frames = []
         self.closed = False
 
@@ -106,7 +129,7 @@ class StubDiarizer:
 class StubTranscriber:
     recognizer_id = "stub-recognizer"
 
-    def __init__(self):
+    def __init__(self, config=None):
         self.calls = []
 
     def transcribe(self, pcm, register=None):
@@ -218,6 +241,31 @@ class ProtocolAndSelectionTests(unittest.TestCase):
                 getattr(processor._diarizer, "speaker_provenance", "diarization-timeline"),
                 "diarization-timeline",
             )
+
+    def test_backend_classes_lambdas_and_instances_are_all_accepted(self):
+        turns = []
+        for transcriber, diarizer in (
+            (StubTranscriber, StubDiarizer),
+            (lambda config: StubTranscriber(), lambda config: StubDiarizer()),
+            (StubTranscriber(), StubDiarizer()),
+        ):
+            with self.subTest(transcriber=transcriber):
+                turns.clear()
+                processor = LiveProcessor(
+                    LiveConfig(
+                        "factory-test",
+                        provenance="causal-replay",
+                        transcriber=transcriber,
+                        diarizer=diarizer,
+                    ),
+                    turns.append,
+                )
+                self.assertIsInstance(processor._transcriber, StubTranscriber)
+                self.assertIsInstance(processor._diarizer, StubDiarizer)
+                for _ in range(10):
+                    processor.push_pcm16(VOICE)
+                processor.finish()
+                self.assertEqual(len(turns), 1)
 
     def test_local_assets_are_required_only_by_the_local_defaults(self):
         with self.assertRaisesRegex(LiveAudioError, "existing"):
@@ -389,7 +437,7 @@ class HostedTranscriberTests(unittest.TestCase):
                 self.assertNotIn(PRIVATE, str(caught.exception))
 
     def test_missing_credential_or_cancellation_sends_nothing(self):
-        def missing():
+        def missing(**_options):
             raise CredentialError("Synthetic missing credential")
 
         opener, requests = patched_opener(b"{}")
@@ -406,20 +454,30 @@ class HostedTranscriberTests(unittest.TestCase):
     def test_recognizer_id_names_the_configured_model_safely(self):
         first = self.transcriber(model="whisper-1").recognizer_id
         second = self.transcriber(model="gpt-4o-transcribe").recognizer_id
-        self.assertEqual(first, "hosted-openai-compatible whisper-1")
+        self.assertRegex(first, r"^hosted-openai-compatible whisper-1 [0-9a-f]{12}$")
         self.assertNotEqual(first, second)
         odd = self.transcriber(model="org/model:v1.2").recognizer_id
-        self.assertEqual(odd, "hosted-openai-compatible org-model-v1.2")
+        self.assertRegex(odd, r"^hosted-openai-compatible org-model-v1.2 [0-9a-f]{12}$")
+        # Sanitization alone would collide; the hash of the original name keeps them apart.
+        self.assertNotEqual(
+            self.transcriber(model="org/model:v1").recognizer_id,
+            self.transcriber(model="org-model-v1").recognizer_id,
+        )
         long = self.transcriber(model="m" * 128).recognizer_id
         self.assertEqual(len(long), 96)
+        self.assertNotEqual(
+            provenance_id("p", "a" * 199 + "b"), provenance_id("p", "a" * 199 + "c")
+        )
+        self.assertLessEqual(len(provenance_id("p", "a" * 200)), 96)
         for value in (first, second, odd, long):
             identifier(value, "recognizer_id")
             self.assertNotIn("example.test", value)
-        self.assertEqual(
-            provenance_id("hosted-deepgram", "nova-3", "latest"), "hosted-deepgram nova-3 latest"
+        self.assertRegex(
+            provenance_id("hosted-deepgram", "nova-3", "latest"),
+            r"^hosted-deepgram nova-3 latest [0-9a-f]{12}$",
         )
         diarizer = DeepgramDiarizer(allow_hosted=True, model="nova-2", diarize_model="v2")
-        self.assertEqual(diarizer.diarizer_id, "hosted-deepgram nova-2 v2")
+        self.assertRegex(diarizer.diarizer_id, r"^hosted-deepgram nova-2 v2 [0-9a-f]{12}$")
         self.assertEqual(diarizer.speaker_provenance, "diarization-utterance")
         turns = []
         document = {"text": "Hi.", "words": [{"word": "Hi", "start": 0.0, "end": 0.1}]}
@@ -474,6 +532,43 @@ class HostedTranscriberTests(unittest.TestCase):
         self.assertEqual(len(reads), 3)
         self.assertTrue(response.closed)
 
+    def test_keychain_lookup_is_cancelled_or_bounded_by_the_hosted_deadline(self):
+        polls = []
+        spawned = []
+
+        def popen(args, **options):
+            spawned.append(FakeProcess(args, **options))
+            return spawned[-1]
+
+        opener, requests = patched_opener(b"{}")
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("rightyo.credentials.sys.platform", "darwin"),
+            patch("rightyo.credentials.subprocess.Popen", side_effect=popen),
+            patch("rightyo.credentials.time.sleep", lambda _s: polls.append(1)),
+            opener,
+        ):
+            transcriber = self.transcriber(
+                load_key=load_transcriber_api_key, cancelled=lambda: len(polls) >= 2
+            )
+            with self.assertRaisesRegex(HostedSpeechError, "cancelled") as caught:
+                transcriber.transcribe(bytes(640))
+            self.assertIsNone(caught.exception.__context__)
+            self.assertTrue(spawned[0].terminated)
+            clock = [0.0]
+
+            def monotonic():
+                clock[0] += 20.0
+                return clock[0]
+
+            with patch("rightyo.credentials.time.monotonic", monotonic):
+                slow = self.transcriber(load_key=load_transcriber_api_key, timeout_seconds=30)
+                with self.assertRaisesRegex(HostedSpeechError, "credential is unavailable"):
+                    slow.transcribe(bytes(640))
+            self.assertTrue(spawned[1].terminated)
+        self.assertEqual(requests, [])
+        self.assertNotIn(KEY, "".join(str(process.args) for process in spawned))
+
     def test_redirects_are_refused_before_forwarding_credentials(self):
         source = Mock()
         with self.assertRaisesRegex(HostedSpeechError, "redirect refused"):
@@ -489,15 +584,34 @@ class HostedTranscriberTests(unittest.TestCase):
             [u["text"] for u in openai_units({"text": '"I\'m here!"', "words": words}, 600)],
             [" \"I'm", ' here!"'],
         )
-        # Misaligned text keeps bare words rather than guessing punctuation.
+        # Words that do not reproduce the text in order are never used as the transcript:
+        # complete, consistent segments are used instead, or the response is rejected.
+        complete = [
+            {"text": "I'm here.", "start": 0, "end": 0.4},
+            {"text": "Are you?", "start": 0.4, "end": 0.6},
+        ]
+        incomplete = [{"word": "I'm", "start": 0.1, "end": 0.3}]
+        misordered = [
+            {"word": "here", "start": 0.3, "end": 0.5},
+            {"word": "I'm", "start": 0.1, "end": 0.3},
+        ]
+        for bad_words in (incomplete, misordered, words):
+            with self.subTest(words=bad_words):
+                units = openai_units(
+                    {"text": "I'm here. Are you?", "words": bad_words, "segments": complete},
+                    600,
+                )
+                self.assertEqual([u["text"] for u in units], [" I'm here.", " Are you?"])
+                with self.assertRaisesRegex(HostedSpeechError, "inconsistent word timing"):
+                    openai_units({"text": "I'm here. Are you?", "words": bad_words}, 600)
+        segments = {"text": "A. B.", "segments": [{"text": "A. B.", "start": 0, "end": 0.4}]}
         self.assertEqual(
-            [u["text"] for u in openai_units({"text": "I am here.", "words": words}, 600)],
-            [" I'm", " here"],
+            openai_units(segments, 300), [{"text": " A. B.", "start_ms": 0, "end_ms": 300}]
         )
-        segments = {"text": "A. B.", "segments": [{"text": "A.", "start": 0, "end": 0.4}]}
-        self.assertEqual(
-            openai_units(segments, 300), [{"text": " A.", "start_ms": 0, "end_ms": 300}]
-        )
+        with self.assertRaisesRegex(HostedSpeechError, "inconsistent segments"):
+            openai_units(
+                {"text": "A. B.", "segments": [{"text": "A.", "start": 0, "end": 0.4}]}, 300
+            )
         for bad in (
             {"text": "x"},
             {"text": "x", "words": [{"word": "x", "start": 0.7, "end": 0.8}]},
@@ -856,26 +970,47 @@ class ConfigurationSelectionTests(unittest.TestCase):
 class SpeechCredentialTests(unittest.TestCase):
     def test_each_backend_has_its_own_environment_variable_and_keychain_item(self):
         with patch.dict(os.environ, {"RIGHTYO_TRANSCRIBER_API_KEY": KEY}, clear=True):
-            with patch("rightyo.credentials.subprocess.run") as runner:
+            with patch("rightyo.credentials.subprocess.Popen") as runner:
                 self.assertEqual(load_transcriber_api_key(), KEY)
                 runner.assert_not_called()
             with self.assertRaises(CredentialError) as error:
                 with patch("rightyo.credentials.sys.platform", "linux"):
                     load_diarizer_api_key()
             self.assertIn("RIGHTYO_DIARIZER_API_KEY", str(error.exception))
-        response = subprocess.CompletedProcess([], 0, (KEY + "\n").encode(), b"")
+
+        class Completed(FakeProcess):
+            def __init__(self, args, status, output, **options):
+                super().__init__(args, **options)
+                self.stdout = io.BytesIO(output)
+                self.status = status
+
+            def poll(self):
+                self.returncode = self.status
+                return self.returncode
+
+        spawned = []
+
+        def completed(status, output):
+            def popen(args, **options):
+                spawned.append(Completed(args, status, output, **options))
+                return spawned[-1]
+
+            return popen
+
         with (
             patch.dict(os.environ, {"TYPESAFE_API_KEY": "unrelated-jev-key"}, clear=True),
             patch("rightyo.credentials.sys.platform", "darwin"),
-            patch("rightyo.credentials.subprocess.run", return_value=response) as runner,
+            patch(
+                "rightyo.credentials.subprocess.Popen",
+                side_effect=completed(0, (KEY + "\n").encode()),
+            ),
         ):
             self.assertEqual(load_diarizer_api_key(), KEY)
-            self.assertIn("rightyo.diarizer", runner.call_args.args[0])
-        failed = subprocess.CompletedProcess([], 1, KEY.encode(), KEY.encode())
+            self.assertIn("rightyo.diarizer", spawned[-1].args)
         with (
             patch.dict(os.environ, {}, clear=True),
             patch("rightyo.credentials.sys.platform", "darwin"),
-            patch("rightyo.credentials.subprocess.run", return_value=failed),
+            patch("rightyo.credentials.subprocess.Popen", side_effect=completed(1, KEY.encode())),
         ):
             with self.assertRaises(CredentialError) as error:
                 load_transcriber_api_key()

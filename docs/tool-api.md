@@ -296,15 +296,18 @@ also provides the hosted implementations and the factories that section maps to.
 Word-to-speaker attribution, grouping and the `Turn` contract are the same for every
 backend. Hosted backends refuse to send audio without explicit consent (`--allow-hosted`),
 and no hosted backend has been accuracy-tested here. Turns from the hosted transcriber
-carry `recognizer_id` `hosted-openai-compatible <model>`, the configured model name with
-characters outside the identifier charset replaced by `-` and the whole truncated to 96
-characters, so transcripts from different models stay distinguishable in exported events;
-the endpoint never appears. `DeepgramDiarizer.diarizer_id` names that backend the same way
-(`hosted-deepgram <model> <diarize_model>`) while `speaker_provenance` keeps its
+carry `recognizer_id` `hosted-openai-compatible <model> <hash>`: the configured model name
+with characters outside the identifier charset replaced by `-`, followed by the first 12
+hex digits of the SHA-256 of the original name so sanitized or truncated names cannot
+collide, the whole within 96 characters; transcripts from different models therefore stay
+distinguishable in exported events, and the endpoint never appears.
+`DeepgramDiarizer.diarizer_id` names that backend the same way
+(`hosted-deepgram <model> <diarize_model> <hash>`) while `speaker_provenance` keeps its
 allowlisted value. The hosted transcriber ignores the `register` cancellation hook: the
-`cancelled` guard is checked before each request and between body chunks, and the body is
-read against one wall-clock deadline of `timeout_seconds` (default 30, at most 120) from
-the start of the request. Connection, TLS and response-header waits each use the same
+`cancelled` guard is checked before each request, during a login Keychain credential
+lookup and between body chunks, and the credential lookup plus the body read share one
+wall-clock deadline of `timeout_seconds` (default 30, at most 120) from the start of the
+request; a Keychain lookup that is cancelled or outlives the deadline is terminated. Connection, TLS and response-header waits each use the same
 value as an inactivity timeout, so an unresponsive endpoint is abandoned within a small
 multiple of `timeout_seconds`, and a stop during hosted recognition waits at most for the
 current chunk.

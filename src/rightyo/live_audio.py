@@ -13,6 +13,7 @@ from __future__ import annotations
 import array
 import base64
 import ctypes
+import inspect
 import json
 import math
 import os
@@ -52,9 +53,14 @@ class DiarizerTimelineLimitError(LiveAudioError):
         super().__init__("Local diarizer timeline limit reached; restart the session")
 
 
+def _is_backend_instance(value: Any, method: str) -> bool:
+    # A class exposes the method too, but as an unbound function: treat it as a factory.
+    return hasattr(value, method) and not inspect.isclass(value)
+
+
 def _check_backend(value: Any, method: str, label: str) -> None:
-    """Accept None, an instance exposing `method`, or a factory called with the config."""
-    if not (value is None or hasattr(value, method) or callable(value)):
+    """Accept None, an instance exposing `method`, or a factory (class or callable)."""
+    if not (value is None or _is_backend_instance(value, method) or callable(value)):
         raise LiveAudioError(f"Invalid {label} backend")
 
 
@@ -618,7 +624,7 @@ class WhisperCppTranscriber:
 def _select(value: Any, default: Callable[[LiveConfig], Any], config: LiveConfig, method: str):
     if value is None:
         return default(config)
-    return value if hasattr(value, method) else value(config)
+    return value if _is_backend_instance(value, method) else value(config)
 
 
 class LiveProcessor:

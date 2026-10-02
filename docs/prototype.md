@@ -122,8 +122,9 @@ person as Speaker A in the next; its turns carry `speaker_provenance:
 "diarization-utterance"` with utterance-namespaced labels such as `u7 Speaker A`, and
 the native Nemotron stream is the only backend whose
 labels persist for the session. The 18,000-segment timeline cap does not apply to it.
-A hosted response body is read against a wall-clock deadline of `timeout_seconds`, and a
-stop is honoured between body chunks; the endpoint must not carry its own query string or
+A hosted request's Keychain credential lookup and response body share a wall-clock
+deadline of `timeout_seconds`, and a stop is honoured during the lookup and between body
+chunks; the endpoint must not carry its own query string or
 fragment.
 
 The lab page labels the two speech stages from the loaded configuration: `LOCAL` with the

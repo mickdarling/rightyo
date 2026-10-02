@@ -9,6 +9,7 @@ class. Nothing here is an accuracy claim for any hosted model.
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import io
 import json
@@ -54,10 +55,15 @@ class _ReadCancelled(Exception):
 def provenance_id(prefix: str, *parts: str) -> str:
     """A `contracts.identifier`-safe label naming the backend family and its model.
 
-    Characters outside the identifier charset become `-`; the result is truncated to 96.
-    Only the configured model/version names are included, never an endpoint or key.
+    Characters outside the identifier charset become `-`, and a 12-hex SHA-256 prefix of
+    the original names is appended so sanitized or truncated names cannot collide; the
+    whole stays within 96 characters. Only the configured model/version names are
+    included, never an endpoint or key.
     """
-    return " ".join([prefix, *(_UNSAFE.sub("-", part) for part in parts)])[:96].strip()
+    digest = hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:12]
+    safe = " ".join(_UNSAFE.sub("-", part) for part in parts)
+    budget = 96 - len(prefix) - len(digest) - 2
+    return f"{prefix} {safe[:budget].strip()} {digest}"
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -136,7 +142,7 @@ class _HostedClient:
         allow_hosted: bool,
         timeout_seconds: float,
         cancelled: Callable[[], bool] | None,
-        load_key: Callable[[], str],
+        load_key: Callable[..., str],
     ) -> None:
         if allow_hosted is not True:
             raise HostedSpeechError(f"{label} requires explicit hosted consent to send audio")
@@ -149,12 +155,16 @@ class _HostedClient:
     def post(self, url: str, body: bytes, headers: dict[str, str], scheme: str) -> dict[str, Any]:
         if self.cancelled():
             raise HostedSpeechError(f"{self.label} request was cancelled")
+        # One wall-clock deadline covers the credential lookup and the whole exchange.
+        deadline = time.monotonic() + self.timeout
         key = None
         try:
-            key = self.load_key()
+            key = self.load_key(cancelled=self.cancelled, timeout_seconds=self.timeout)
         except CredentialError:
             pass
         if key is None:
+            if self.cancelled():
+                raise HostedSpeechError(f"{self.label} request was cancelled")
             raise HostedSpeechError(f"{self.label} credential is unavailable")
         if self.cancelled():
             del key
@@ -166,8 +176,7 @@ class _HostedClient:
         failure = None
         content = b""
         # urllib's timeout is per operation, so a slowly dripping body could outlive it;
-        # the body is read in bounded chunks against one wall-clock deadline instead.
-        deadline = time.monotonic() + self.timeout
+        # the body is read in bounded chunks against the same deadline instead.
         try:
             with self._opener.open(request, timeout=self.timeout) as response:
                 chunks: list[bytes] = []
@@ -287,7 +296,11 @@ def openai_units(document: dict[str, Any], duration_ms: int) -> list[dict[str, A
         if punctuated is not None:
             for unit, value in zip(units, punctuated):
                 unit["text"] = " " + value
-        return units
+            return units
+        # Words that do not cover `text` in order would truncate or reorder the
+        # transcript; use the complete segments instead, or fail closed.
+        if not isinstance(document.get("segments"), list) or not document.get("segments"):
+            raise HostedSpeechError(f"{label} returned inconsistent word timing")
     segments = document.get("segments")
     if isinstance(segments, list) and segments:
         if len(segments) > 1000:
@@ -303,6 +316,9 @@ def openai_units(document: dict[str, Any], duration_ms: int) -> list[dict[str, A
             if not value[:1].isspace():
                 value = " " + value
             units.append({"text": value, "start_ms": start, "end_ms": end})
+        # Segments must reproduce the transcript; otherwise the response is inconsistent.
+        if " ".join("".join(unit["text"] for unit in units).split()) != " ".join(text.split()):
+            raise HostedSpeechError(f"{label} returned inconsistent segments")
         return units
     raise HostedSpeechError(f"{label} returned no timed units")
 
@@ -338,7 +354,7 @@ class OpenAICompatibleTranscriber:
         language: str | None = None,
         timeout_seconds: float = 30,
         cancelled: Callable[[], bool] | None = None,
-        load_key: Callable[[], str] = load_transcriber_api_key,
+        load_key: Callable[..., str] = load_transcriber_api_key,
     ) -> None:
         self.endpoint = _https_endpoint(endpoint, "Hosted transcriber")
         self.model = _name(model, "hosted transcriber model")
@@ -450,7 +466,7 @@ class DeepgramDiarizer:
         window_ms: int = MAX_AUDIO_MS,
         timeout_seconds: float = 30,
         cancelled: Callable[[], bool] | None = None,
-        load_key: Callable[[], str] = load_diarizer_api_key,
+        load_key: Callable[..., str] = load_diarizer_api_key,
     ) -> None:
         self.endpoint = _https_endpoint(endpoint, "Hosted diarizer")
         self.model = _name(model, "hosted diarizer model")

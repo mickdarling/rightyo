@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import Callable
 
 KEYCHAIN_SERVICE = "rightyo.jev"
 KEYCHAIN_ACCOUNT = "api-key"
@@ -28,15 +30,18 @@ def _validate_key(value: str, label: str) -> str:
     return key
 
 
-def _load_api_key(environment: str, service: str, label: str, hint: str) -> str:
-    configured = os.environ.get(environment)
-    if configured is not None:
-        return _validate_key(configured, label)
-    if sys.platform != "darwin":
-        raise CredentialError(f"Configure {environment} through your secret manager.")
-    result = None
+def _keychain_lookup(
+    service: str, cancelled: Callable[[], bool] | None, timeout_seconds: float
+) -> tuple[int, bytes] | str:
+    """Run `security` under a wall-clock deadline that cancellation can cut short.
+
+    Returns (exit status, stdout) or a reason word; never raises with process output.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    process = None
+    reason = None
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             [
                 "/usr/bin/security",
                 "find-generic-password",
@@ -47,20 +52,60 @@ def _load_api_key(environment: str, service: str, label: str, hint: str) -> str:
                 "-w",
                 str(Path.home() / "Library" / "Keychains" / "login.keychain-db"),
             ],
-            capture_output=True,
-            timeout=120,
-            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        # Raise outside the handler: timeout exceptions can carry partial stdout.
-        pass
-    if result is None:
+        while process.poll() is None:
+            if cancelled is not None and cancelled():
+                reason = "cancelled"
+                break
+            if time.monotonic() >= deadline:
+                reason = "timeout"
+                break
+            time.sleep(0.05)
+        if reason is not None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+            return reason
+        assert process.stdout is not None
+        return process.returncode, process.stdout.read()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return "inaccessible"
+    finally:
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
+
+
+def _load_api_key(
+    environment: str,
+    service: str,
+    label: str,
+    hint: str,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+    timeout_seconds: float = 120,
+) -> str:
+    configured = os.environ.get(environment)
+    if configured is not None:
+        return _validate_key(configured, label)
+    if sys.platform != "darwin":
+        raise CredentialError(f"Configure {environment} through your secret manager.")
+    result = _keychain_lookup(service, cancelled, timeout_seconds)
+    if result == "cancelled":
+        raise CredentialError(f"The {label} credential lookup was cancelled.")
+    if isinstance(result, str):
         raise CredentialError(f"The {label} login Keychain item could not be accessed.")
-    if result.returncode != 0:
+    status, output = result
+    if status != 0:
         raise CredentialError(hint)
     decoded = None
     try:
-        decoded = result.stdout.decode("utf-8")
+        decoded = output.decode("utf-8")
     except UnicodeDecodeError:
         pass
     if decoded is None:
@@ -68,22 +113,29 @@ def _load_api_key(environment: str, service: str, label: str, hint: str) -> str:
     return _validate_key(decoded, label)
 
 
-def load_jev_api_key() -> str:
+def load_jev_api_key(
+    *, cancelled: Callable[[], bool] | None = None, timeout_seconds: float = 120
+) -> str:
     """Return the key to the calling process; never print or persist it.
 
     On macOS the native secure dialog stores the item in the login Keychain.
     An explicit environment variable also supports user-managed deployments.
     Neither path loads .env files, and the key is never passed in process argv.
+    A Keychain lookup ends early when `cancelled` reports true or `timeout_seconds` pass.
     """
     return _load_api_key(
         "TYPESAFE_API_KEY",
         KEYCHAIN_SERVICE,
         "Jev",
         "Save a Jev API key with the native RightyO credential dialog.",
+        cancelled=cancelled,
+        timeout_seconds=timeout_seconds,
     )
 
 
-def load_transcriber_api_key() -> str:
+def load_transcriber_api_key(
+    *, cancelled: Callable[[], bool] | None = None, timeout_seconds: float = 120
+) -> str:
     """The hosted transcriber key: `RIGHTYO_TRANSCRIBER_API_KEY` or login Keychain item
     service `rightyo.transcriber`, account `api-key`. Same rules as the Jev key."""
     return _load_api_key(
@@ -92,10 +144,14 @@ def load_transcriber_api_key() -> str:
         "hosted transcriber",
         "Save a hosted transcriber API key in the login Keychain "
         f"(service {TRANSCRIBER_KEYCHAIN_SERVICE}, account {KEYCHAIN_ACCOUNT}).",
+        cancelled=cancelled,
+        timeout_seconds=timeout_seconds,
     )
 
 
-def load_diarizer_api_key() -> str:
+def load_diarizer_api_key(
+    *, cancelled: Callable[[], bool] | None = None, timeout_seconds: float = 120
+) -> str:
     """The hosted diarizer key: `RIGHTYO_DIARIZER_API_KEY` or login Keychain item
     service `rightyo.diarizer`, account `api-key`. Same rules as the Jev key."""
     return _load_api_key(
@@ -104,4 +160,6 @@ def load_diarizer_api_key() -> str:
         "hosted diarizer",
         "Save a hosted diarizer API key in the login Keychain "
         f"(service {DIARIZER_KEYCHAIN_SERVICE}, account {KEYCHAIN_ACCOUNT}).",
+        cancelled=cancelled,
+        timeout_seconds=timeout_seconds,
     )
