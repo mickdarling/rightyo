@@ -91,8 +91,10 @@ class SpeechEvents:
         # mapped to the owner's utterance: their late decisions never emit a request.
         self._superseded = {}
         # "off" without a provider, "ready" with one, "unavailable" after a hosted role
-        # question failed and roles degraded to configured/unknown for the session.
+        # question failed, or "rejected" after a provider contract violation; either
+        # degrades roles to configured/unknown for the rest of the session.
         self.role_status = "off"
+        self._degraded_turn = None
 
     def _emit(self, kind, **fields):
         self._sequence += 1
@@ -155,6 +157,7 @@ class SpeechEvents:
             self._roles.clear()
             self._priority = priority
             self.role_status = "off" if priority is None else "ready"
+            self._degraded_turn = None
             self._session = session_id
             self._sequence = 0
             self._now = now_ms
@@ -261,13 +264,16 @@ class SpeechEvents:
             return role
         recent = [_role_state(record) for record in past[-ROLE_CONTEXT_TURNS:]]
         current = _role_state(turn.to_dict())
+        participants = sorted(
+            {r["speaker_id"] for r in [*recent, current] if r["speaker_id"] is not None}
+        )
         state = {
             "past_turns": recent,
             "current_turn": current,
-            "known_participants": sorted(
-                {r["speaker_id"] for r in [*recent, current] if r["speaker_id"] is not None}
-            ),
-            "roles": dict(self._roles),
+            "known_participants": participants,
+            # Only the retained participants' roles travel with the request: the whole
+            # session's role map could exceed the payload budget, which prunes turns only.
+            "roles": {s: self._roles[s] for s in participants if s in self._roles},
         }
         rules = self._priority.priority
         degraded = None
@@ -300,6 +306,8 @@ class SpeechEvents:
             # later speakers use configured roles only, and the session keeps listening.
             self._priority = ConfiguredPriorityProvider(rules)
             self.role_status = degraded
+            # The turn whose decision evidence will carry the degradation on the stream.
+            self._degraded_turn = turn.utterance_id
             validated = {turn.speaker_id: rules.configured_role(turn.speaker_id) or "unknown"}
         for speaker, value in validated.items():
             # An earlier fixed role is never revised by a later answer.
@@ -335,6 +343,9 @@ class SpeechEvents:
             stop = False
             if role is not None:
                 evidence["role"] = role
+                if key == self._degraded_turn:
+                    # The stream shows where model lookups degraded, not only the object.
+                    evidence["role_status"] = self.role_status
                 rules = self._priority.priority
                 if rules.owner_only and role != "owner" and evidence["label"] == "attend":
                     # Owner-only mode: other speakers remain context, never a request.
@@ -426,7 +437,13 @@ class SpeechEvents:
             self._open.clear()
             self._active = False
             self._terminal = True
-            self._emit("session", phase=phase, **({"reason": reason} if reason else {}))
+            self._emit(
+                "session",
+                phase=phase,
+                **({"reason": reason} if reason else {}),
+                # Only enrolled sessions report role health; anonymous output is unchanged.
+                **({"role_status": self.role_status} if self._priority is not None else {}),
+            )
 
     def drain(self):
         with self._lock:

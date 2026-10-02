@@ -183,7 +183,13 @@ records this as `role_status: "unavailable"`. A provider answer that names an
 unconfigured speaker as `owner` is rejected the same way (`role_status: "rejected"`):
 owners come only from configuration. Model-sourced roles are available to `tool-replay`
 only; `listen` and the lab refuse `"source": "model"` before capture starts (see
-[the lab notes](prototype.md)). Because decisions can arrive out of order, an
+[the lab notes](prototype.md)). The degradation is also visible on the stream: when a
+priority provider is configured, the terminal `session` event carries an optional
+`role_status` of `ready`, `unavailable` or `rejected`, and the decision evidence of the
+turn where degradation occurred carries the same key, so a consumer can distinguish a
+disabled model lookup from a legitimate `unknown` or `participant`. The key is absent on
+anonymous sessions, and hosts tolerate it as an unknown optional key elsewhere. Because
+decisions can arrive out of order, an
 owner override supersedes only turns earlier than the owner's turn, compared by turn
 time (a turn whose `end_ms` is at or before the owner turn's `end_ms`), never by
 emission order; a later non-owner request that happened to be decided first stays open.

@@ -687,6 +687,50 @@ class EnrolledEventTests(unittest.TestCase):
                 speaker_role(invalid)
             self.assertNotIn("owner", str(error.exception))
 
+    def test_role_request_carries_only_retained_participants_roles(self):
+        oracle = Oracle("participant")
+        self.start(provider=ModelPriorityProvider(oracle, OWNER))
+        for index in range(400):
+            speaker = f"speaker-{index:03d}-" + "x" * 80
+            current = turn(f"t{index}", index * 1000, index * 1000 + 500, "Hello.", speaker)
+            self.events.transcript(current, current.end_ms, expect_decision=False)
+            self.events.drain()
+        self.assertEqual(len(self.events._roles), 400)
+        last = turn("last", 400000, 400500, "Rightyo, lights.", "Speaker B")
+        self.events.transcript(last, 400500)
+        self.assertEqual(self.events.role_status, "ready")
+        self.assertEqual(oracle.requests, 401)
+        body = oracle.bodies[-1]
+        index = body["state"]["known_participants"].index("Speaker B")
+        self.assertEqual(set(body["questions"]), {f"role_{index}"})
+        self.assertTrue(set(body["state"]["roles"]) <= set(body["state"]["known_participants"]))
+        self.assertLessEqual(len(body["state"]["roles"]), 8)
+        self.assertEqual(self.events.drain()[0]["turn"]["role"], "participant")
+
+    def test_terminal_event_and_degrading_turn_carry_role_status_only_when_enrolled(self):
+        self.start(provider=ModelPriorityProvider(Oracle(), OWNER))
+        self.provider.assign = MagicMock(side_effect=ProviderError("Jev temporarily unavailable"))
+        first = turn("first", 0, 500, "Rightyo, lights.")
+        second = turn("second", 1000, 1500, "Rightyo, more.", "Speaker C")
+        for current in (first, second):
+            self.events.transcript(current, current.end_ms)
+            self.events.decision(decision(current), current.end_ms + 100)
+        self.events.end("stopped", 2000)
+        drained = self.events.drain()
+        self.assertEqual(drained[1]["decision"]["role_status"], "unavailable")
+        self.assertEqual(drained[2]["decision"], drained[1]["decision"])
+        self.assertNotIn("role_status", drained[4]["decision"])
+        self.assertEqual(drained[-1]["phase"], "stopped")
+        self.assertEqual(drained[-1]["role_status"], "unavailable")
+        healthy = SpeechEvents()
+        healthy.start("enrolled-demo", priority=ConfiguredPriorityProvider(OWNER))
+        healthy.end("cancelled", 100)
+        self.assertEqual(healthy.drain()[-1]["role_status"], "ready")
+        anonymous = SpeechEvents()
+        anonymous.start("enrolled-demo")
+        anonymous.end("stopped", 100)
+        self.assertNotIn("role_status", anonymous.drain()[-1])
+
     def test_invalid_providers_and_assignments_fail_closed_without_echo(self):
         events = SpeechEvents()
         for invalid in (OWNER, object(), {"assign": lambda state: {}}):
@@ -715,6 +759,8 @@ class EnrolledEventTests(unittest.TestCase):
         self.assertNotIn("role", drained[2]["decision"])
         self.assertNotIn("role", drained[3]["turn"])
         self.assertEqual(events._open, {})
+        events.end("stopped", 1700)
+        self.assertNotIn("role_status", events.drain()[-1])
 
     def test_authored_override_fixture_matches_producer(self):
         self.start()
@@ -736,6 +782,7 @@ class EnrolledEventTests(unittest.TestCase):
             [e["type"] for e in expected][5:9], ["request", "transcript", "attention", "override"]
         )
         self.assertEqual(expected[8]["type"], "override")
+        self.assertEqual(expected[9]["role_status"], "ready")
         self.assertEqual(expected[5]["context"]["turns"][0]["role"], "owner")
 
     def events_started(self):
