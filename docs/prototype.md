@@ -49,7 +49,10 @@ is published, once per speaker per session and bounded by the hosted `timeout_se
 (10 seconds), so capture can stall for up to that long per new speaker; a failed question
 degrades that speaker to the configured role or `unknown` and disables further role
 questions for the session (`role_status: "unavailable"`) rather than stopping the
-session. Moving the question off the audio thread is tracked in
+session. Stop, lease expiry and Ctrl-C set the provider's cancellation before waiting
+for the controller, so a lookup that has not yet sent its request returns at once; an
+HTTP exchange already in flight still ends only at its timeout. Moving the question off
+the audio thread is tracked in
 [#49](https://github.com/mickdarling/rightyo/issues/49). Replay accepts mono PCM16 WAV at 16 kHz, at most
 three minutes; it feeds real PCM in causal order as quickly as processing permits. It is not
 a wall-clock streaming latency measurement. Playback through speakers is a separate physical

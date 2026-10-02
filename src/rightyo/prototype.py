@@ -548,6 +548,11 @@ class PrototypeController:
             }
 
     def stop(self) -> None:
+        # Cancel before taking the controller lock: a hosted role lookup inside _accept
+        # runs under that lock and polls these events, so Stop is not held until the
+        # lookup's own timeout. Setting an already set or superseded event is harmless.
+        self._stop.set()
+        self._decision_cancel.set()
         with self._lock:
             if self._phase == "stopping":
                 return

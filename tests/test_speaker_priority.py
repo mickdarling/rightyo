@@ -5,6 +5,8 @@ from __future__ import annotations
 import io
 import json
 import tempfile
+import threading
+import time
 import unittest
 import wave
 from argparse import Namespace
@@ -425,6 +427,59 @@ class EnrolledEventTests(unittest.TestCase):
         self.assertEqual([e["type"] for e in drained].count("request"), 3)
         self.assertEqual(self.events._roles["Speaker B"], "unknown")
 
+    def test_owner_override_supersedes_pending_non_owner_turns_before_their_decisions(self):
+        self.start()
+        early = turn("early", 0, 500, "Rightyo, delete the project.")
+        stop = turn("stop", 1000, 1500, "Stop.", "Speaker A")
+        self.events.transcript(early, 500)
+        self.events.transcript(stop, 1500)
+        self.events.decision(decision(stop, "uncertain", "unknown"), 1600)
+        self.events.decision(decision(early), 1700)
+        drained = self.events.drain()
+        self.assertEqual(
+            [e["type"] for e in drained],
+            ["transcript", "transcript", "attention", "attention", "override"],
+        )
+        self.assertEqual(drained[3]["utterance_id"], "early")
+        self.assertEqual(drained[3]["decision"]["label"], "attend")
+        self.assertNotIn("request_id", drained[3])
+        self.assertEqual(drained[4]["superseded_request_id"], "enrolled-demo:early")
+        self.assertEqual(drained[4]["by_utterance_id"], "stop")
+        self.assertEqual(self.events._open, {})
+        self.assertEqual(self.events._superseded, {})
+        # An owner's attended turn supersedes a pending turn the same way, after its own request.
+        pending = turn("pending", 2000, 2500, "Rightyo, empty the trash.", "Speaker C")
+        own = turn("own", 3000, 3500, "Rightyo, status.", "Speaker A")
+        self.events.transcript(pending, 2500)
+        self.events.transcript(own, 3500)
+        self.events.decision(decision(own), 3600)
+        self.events.decision(decision(pending), 3700)
+        drained = self.events.drain()
+        self.assertEqual(
+            [e["type"] for e in drained],
+            ["transcript", "transcript", "attention", "request", "attention", "override"],
+        )
+        self.assertEqual(drained[3]["request_id"], "enrolled-demo:own")
+        self.assertEqual(drained[5]["superseded_request_id"], "enrolled-demo:pending")
+        self.assertEqual(drained[5]["by_utterance_id"], "own")
+
+    def test_every_open_request_is_superseded_without_a_silent_cap(self):
+        self.start()
+        for index in range(33):
+            current = turn(f"r{index}", index * 1000, index * 1000 + 500, "Rightyo, task.")
+            self.events.transcript(current, current.end_ms)
+            self.events.decision(decision(current), current.end_ms + 100)
+            self.events.drain()
+        stop = turn("stop", 40000, 40500, "stop", "Speaker A")
+        self.events.transcript(stop, 40500)
+        self.events.decision(decision(stop, "uncertain", "unknown"), 40600)
+        overrides = [e for e in self.events.drain() if e["type"] == "override"]
+        self.assertEqual(
+            [e["superseded_request_id"] for e in overrides],
+            [f"enrolled-demo:r{index}" for index in range(33)],
+        )
+        self.assertEqual(self.events._open, {})
+
     def test_invalid_providers_and_assignments_fail_closed_without_echo(self):
         events = SpeechEvents()
         for invalid in (OWNER, object(), {"assign": lambda state: {}}):
@@ -678,6 +733,49 @@ class CommandLineAndPrototypeTests(unittest.TestCase):
         self.assertEqual(sum(e["type"] == "transcript" for e in events), 2)
         self.assertIn("unavailable", statuses)
         self.assertEqual(oracle.requests, 1)
+
+    def test_stop_cancels_a_slow_live_role_lookup_promptly(self):
+        config = self.write_config({"speakers": {"owner": ["Speaker A"], "source": "model"}})
+        oracles = []
+
+        class SlowOracle:
+            def __init__(self, *, cancelled, **_options):
+                self.cancelled = cancelled
+                self.requests = 0
+                self.min_confidence = 0.7
+                self.entered = threading.Event()
+                self.released = threading.Event()
+                oracles.append(self)
+
+            def decide(self, state):
+                return MockProvider().decide(state)
+
+            def answer(self, _body, _payload):
+                self.requests += 1
+                self.entered.set()
+                deadline = time.monotonic() + 3
+                while not self.cancelled() and time.monotonic() < deadline:
+                    threading.Event().wait(0.005)
+                self.released.set()
+                raise ProviderError("Jev processing was cancelled")
+
+        controller = PrototypeController(
+            PrototypeConfig.load(config),
+            event_publisher=SpeechEvents(),
+            processor_factory=_Processor,
+            capture_factory=_refuse,
+            provider_factory=SlowOracle,
+        )
+        self.addCleanup(controller.close)
+        controller.start({"mode": "demo", "use_jev": True, "session_id": "slow-roles"})
+        self.assertTrue(oracles[0].entered.wait(3))
+        started = time.monotonic()
+        controller.stop()
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertTrue(oracles[0].released.is_set())
+        self.assertTrue(oracles[0].cancelled())
+        self.assertEqual(controller.snapshot()["phase"], "idle")
+        self.assertEqual(oracles[0].requests, 1)
 
 
 if __name__ == "__main__":

@@ -139,8 +139,14 @@ removed), emits one `override` event per earlier non-owner request that is still
 `role` is `owner`. Overrides follow the owner's `attention` event and precede the owner's
 own `request`; a stop phrase produces no request even when the decision was `attend`, and
 its attention evidence is emitted unchanged without a `request_id`. A non-owner request
-stays open until an override, retention expiry or a terminal event; at most 32 are
-tracked, oldest first. A stop phrase with nothing open emits no override. With
+stays open until an override, retention expiry or a terminal event; every open request
+within the session's existing turn budget is tracked, none is silently dropped. An
+owner override also supersedes every earlier non-owner turn whose decision is still
+pending: when that late decision arrives, its `attention` evidence is emitted without a
+`request_id`, an `override` names the request id the turn would have carried, and no
+`request` follows. Hosts therefore treat an `override` whose `superseded_request_id`
+they never received as already handled. A stop phrase with nothing open or pending
+emits no override. With
 `owner_only: true`, a non-owner `attend` decision is emitted as `ignore` and no request
 is delivered; non-owner turns remain ordinary context. The producer adds no free-text
 markers: interpreting non-owner context as information rather than instructions is the

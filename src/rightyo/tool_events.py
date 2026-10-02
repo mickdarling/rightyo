@@ -24,9 +24,7 @@ from rightyo.providers import ConfiguredPriorityProvider, ProviderError
 MAX_EVENT_BYTES = 1200000
 MAX_QUEUE_BYTES = 4194304
 MAX_PENDING_BYTES = 1048576
-# Emitted non-owner requests an owner can still supersede, and the context a role
-# provider sees when a speaker first appears.
-MAX_OPEN_REQUESTS = 32
+# The context a role provider sees when a speaker first appears.
 ROLE_CONTEXT_TURNS = 8
 
 
@@ -83,6 +81,9 @@ class SpeechEvents:
         self._priority = None
         self._roles = {}
         self._open = {}
+        # Pending non-owner turns an owner superseded before their decisions arrived,
+        # mapped to the owner's utterance: their late decisions never emit a request.
+        self._superseded = {}
         # "off" without a provider, "ready" with one, "unavailable" after a hosted role
         # question failed and roles degraded to configured/unknown for the session.
         self.role_status = "off"
@@ -116,6 +117,7 @@ class SpeechEvents:
         self._queue.clear()
         self._queue_bytes = 0
         self._open.clear()
+        self._superseded.clear()
 
     def start(
         self, session_id, now_ms=0, *, attention_enabled=True, addressing=None, priority=None
@@ -186,6 +188,9 @@ class SpeechEvents:
             for request_id, end_ms in list(self._open.items()):
                 if end_ms <= cutoff:
                     del self._open[request_id]
+            for key in list(self._superseded):
+                if key not in self._pending:
+                    del self._superseded[key]
             kept = deque()
             self._queue_bytes = 0
             for payload, _size in self._queue:
@@ -314,11 +319,9 @@ class SpeechEvents:
                     evidence["label"] = "ignore"
                 stop = role == "owner" and rules.is_stop_phrase(turn.text)
             request_id = self._session + ":" + key
-            attended = (
-                evidence["label"] == "attend"
-                and evidence["recipient_kind"] == "system"
-                and not stop
-            )
+            superseded_by = self._superseded.pop(key, None)
+            would_attend = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
+            attended = would_attend and not stop and superseded_by is None
             self._emit(
                 "attention",
                 utterance_id=key,
@@ -326,9 +329,19 @@ class SpeechEvents:
                 decision=evidence,
                 **({"request_id": request_id} if attended else {}),
             )
+            if superseded_by is not None and would_attend:
+                # The owner superseded this turn before its decision arrived: keep the
+                # evidence trail, name the request it would have carried, deliver nothing.
+                self._emit(
+                    "override",
+                    superseded_request_id=request_id,
+                    by_utterance_id=superseded_by,
+                    role="owner",
+                )
             if role == "owner" and (attended or stop):
                 # The owner's own attended turn or a stop phrase supersedes every open
-                # non-owner request before any new request of the owner's is delivered.
+                # non-owner request before any new request of the owner's is delivered,
+                # and every earlier non-owner turn still awaiting its decision.
                 for superseded in list(self._open):
                     self._emit(
                         "override",
@@ -337,6 +350,9 @@ class SpeechEvents:
                         role="owner",
                     )
                 self._open.clear()
+                for other, (earlier, _context, _size, other_role) in self._pending.items():
+                    if other_role != "owner" and earlier.end_ms <= turn.end_ms:
+                        self._superseded.setdefault(other, key)
             if attended:
                 self._emit(
                     "request",
@@ -347,9 +363,8 @@ class SpeechEvents:
                     decision_at_ms=self._now,
                 )
                 if role is not None and role != "owner":
+                    # Bounded by the session's turn budget; nothing is silently dropped.
                     self._open[request_id] = turn.end_ms
-                    while len(self._open) > MAX_OPEN_REQUESTS:
-                        del self._open[next(iter(self._open))]
 
     def end(self, phase="cancelled", now_ms=0, reason=None):
         with self._lock:
