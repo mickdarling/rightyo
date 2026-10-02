@@ -248,7 +248,14 @@ class SpeechEvents:
                                     payload["turn"], turns
                                 )
                 size = len(encode_json(payload)) + 1
-                if size > MAX_EVENT_BYTES:
+                # A re-rendered string may grow, so the rebuilt queue is held to the
+                # same per-event, count and aggregate bounds as emission, failing closed
+                # the same way rather than letting the backlog exceed its budget.
+                if (
+                    size > MAX_EVENT_BYTES
+                    or len(kept) >= self.max_pending
+                    or self._queue_bytes + size > MAX_QUEUE_BYTES
+                ):
                     self._clear_content()
                     self._active = False
                     raise ContractError("speech event consumer backlog exceeded")

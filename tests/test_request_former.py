@@ -393,6 +393,46 @@ class SpeechEventsFormingTests(unittest.TestCase):
         self.assertEqual((encode_json(self.queued_request(events)), events._queue_bytes), before)
         self.assertEqual(len(recorder.states), 1)
 
+    def test_growing_re_render_is_held_to_the_aggregate_queue_bound(self):
+        class Growing:
+            """A stub former whose re-render after pruning is far longer than its first."""
+
+            kind = "template"
+
+            def __init__(self):
+                self.calls = 0
+
+            def form(self, _state):
+                self.calls += 1
+                return "g" * (16 if self.calls == 1 else MAX_FORMED_REQUEST_CHARS)
+
+        for slack, trips in (
+            (MAX_FORMED_REQUEST_CHARS // 2, True),
+            (MAX_FORMED_REQUEST_CHARS + 64, False),
+        ):
+            with self.subTest(trips=trips):
+                former = Growing()
+                events = self.queue_request(former)
+                before = events._queue_bytes
+                with patch("rightyo.tool_events.MAX_QUEUE_BYTES", before + slack):
+                    if trips:
+                        with self.assertRaisesRegex(ContractError, "consumer backlog"):
+                            events.expire(300600)
+                        self.assertEqual(events._queue, deque())
+                        self.assertEqual(events._queue_bytes, 0)
+                        self.assertFalse(events._active)
+                        continue
+                    events.expire(300600)
+                self.assertEqual(former.calls, 2)
+                self.assertTrue(events._active)
+                self.assertGreater(events._queue_bytes, before)
+                self.assertLessEqual(events._queue_bytes, before + slack)
+                self.assertEqual(
+                    events._queue_bytes, sum(len(encode_json(p)) + 1 for p, _size in events._queue)
+                )
+                request = self.queued_request(events)
+                self.assertEqual(len(request["formed_request"]), MAX_FORMED_REQUEST_CHARS)
+
     def test_former_failing_during_expiry_fails_closed(self):
         for failure in (RuntimeError("boom"), 7, ""):
             with self.subTest(failure=type(failure).__name__):
