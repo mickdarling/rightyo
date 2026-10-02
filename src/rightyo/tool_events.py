@@ -49,6 +49,22 @@ def encode_json(payload):
     return json.dumps(payload, ensure_ascii=True, allow_nan=False)
 
 
+def _speech_summary(value):
+    """A validated, detached copy of the advertised speech backends, or None."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"transcriber", "diarizer"}:
+        raise ContractError("invalid speech backend summary")
+    summary = {}
+    for stage, entry in value.items():
+        if not isinstance(entry, dict) or set(entry) != {"kind", "id"}:
+            raise ContractError("invalid speech backend summary")
+        identifier(entry["kind"], f"{stage} kind")
+        identifier(entry["id"], f"{stage} id")
+        summary[stage] = {"kind": entry["kind"], "id": entry["id"]}
+    return summary
+
+
 class SpeechEvents:
     """Local v1 producer. Frozen request context never observes later turns.
 
@@ -148,9 +164,11 @@ class SpeechEvents:
         addressing=None,
         priority=None,
         former=None,
+        speech=None,
     ):
         with self._lock:
             identifier(session_id, "session_id")
+            speech = _speech_summary(speech)
             integer(now_ms, "now_ms")
             if type(attention_enabled) is not bool:
                 raise ContractError("invalid attention capability")
@@ -203,6 +221,8 @@ class SpeechEvents:
                 # Likewise for request forming: a separate top-level object, never a key
                 # inside the strictly validated capability set.
                 **({} if former is None else {"request_forming": {"kind": former.kind}}),
+                # And for the selected speech backends: kinds and display-safe ids only.
+                **({} if speech is None else {"speech": speech}),
             )
 
     def expire(self, now_ms):

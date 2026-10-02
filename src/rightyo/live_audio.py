@@ -336,6 +336,8 @@ class NemotronCppDiarizer:
     windowing tracked in #54).
     """
 
+    diarizer_id = "nemotron.cpp v3-streaming"
+
     def __init__(self, config: LiveConfig):
         if config.diarization_library is None or config.diarization_model is None:
             raise LiveAudioError("Explicit existing runtimes and models are required")

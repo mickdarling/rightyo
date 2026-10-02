@@ -47,6 +47,7 @@ from rightyo.speech_backends import (
     diarizer_factory,
     diarizer_spec,
     is_hosted,
+    speech_summary,
     transcriber_factory,
     transcriber_spec,
 )
@@ -357,6 +358,7 @@ class PrototypeController:
                     addressing=self.config.addressing,
                     priority=priority,
                     former=request_former_for(self.config.request_former),
+                    speech=speech_summary(self.config.transcriber, self.config.diarizer),
                 )
                 self._event_terminal = False
             threading.Thread(

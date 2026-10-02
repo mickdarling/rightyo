@@ -12,7 +12,7 @@ from argparse import Namespace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from rightyo.contracts import identifier
+from rightyo.contracts import ContractError, identifier
 from rightyo.credentials import CredentialError, load_diarizer_api_key, load_transcriber_api_key
 from rightyo.live_audio import (
     BYTES_PER_MS,
@@ -36,9 +36,11 @@ from rightyo.speech_backends import (
     diarizer_factory,
     openai_units,
     provenance_id,
+    speech_summary,
     transcriber_factory,
 )
 from rightyo.tool import listen
+from rightyo.tool_events import SpeechEvents
 
 KEY = "synthetic-test-key-do-not-use"
 PRIVATE = "private utterance text"
@@ -516,6 +518,28 @@ class HostedTranscriberTests(unittest.TestCase):
         self.assertIsNone(caught.exception.__context__)
         self.assertNotIn(ENDPOINT, str(caught.exception))
 
+    def test_dripping_body_is_read_with_read1_so_the_deadline_can_fire(self):
+        clock = [0.0]
+
+        def monotonic():
+            clock[0] += 10.0
+            return clock[0]
+
+        class Dripping(FakeResponse):
+            def read(self, limit):
+                raise AssertionError("a blocking full-chunk read must not be used")
+
+            def read1(self, limit):
+                return FakeResponse.read(self, 1)
+
+        response = Dripping(b"{" * 10)
+        with patch("urllib.request.build_opener", return_value=Mock(open=lambda *a, **k: response)):
+            with patch("rightyo.speech_backends.time.monotonic", monotonic):
+                with self.assertRaisesRegex(HostedSpeechError, "deadline"):
+                    self.transcriber(timeout_seconds=30).transcribe(bytes(640))
+        self.assertTrue(response.closed)
+        self.assertGreater(len(response.payload), 0)
+
     def test_cancellation_mid_read_stops_the_request_and_closes_it(self):
         reads = []
         response = FakeResponse(b"{" * 10)
@@ -678,7 +702,12 @@ class HostedDiarizerTests(unittest.TestCase):
             finished = diarizer.finish()
         self.assertEqual(len(seen), 2)
         request = seen[0]
-        self.assertEqual(request.full_url, DEEPGRAM_ENDPOINT + "?model=nova-3&diarize_model=latest")
+        self.assertEqual(
+            request.full_url,
+            DEEPGRAM_ENDPOINT + "?model=nova-3&diarize_model=latest&mip_opt_out=true",
+        )
+        # Consented audio is excluded from the provider's model improvement program.
+        self.assertIn("mip_opt_out=true", request.full_url)
         self.assertEqual(request.get_header("Content-type"), "audio/wav")
         self.assertFalse(request.has_header("Authorization"))
         with wave.open(io.BytesIO(request.data), "rb") as audio:
@@ -927,6 +956,58 @@ class ConfigurationSelectionTests(unittest.TestCase):
             encoded = json.dumps(hosted.snapshot())
         for secret in (ENDPOINT, DEEPGRAM_ENDPOINT, "whisper-1", "nova-3", KEY, "api.deepgram"):
             self.assertNotIn(secret, encoded)
+
+    def test_started_event_advertises_selected_backends_with_display_safe_ids(self):
+        # Authored replay publishers advertise nothing, so shared fixtures are unchanged.
+        plain = SpeechEvents()
+        plain.start("fixture-session")
+        self.assertNotIn("speech", plain.drain()[0])
+        local = speech_summary({"kind": "whisper.cpp"}, {"kind": "nemotron.cpp"})
+        self.assertEqual(
+            local,
+            {
+                "transcriber": {"kind": "whisper.cpp", "id": "whisper.cpp-live-window"},
+                "diarizer": {"kind": "nemotron.cpp", "id": "nemotron.cpp v3-streaming"},
+            },
+        )
+        config = self.load(
+            {
+                "microphone_helper": str(self.asset),
+                "transcriber": self.hosted_transcriber,
+                "diarizer": self.hosted_diarizer | {"diarize_model": "v2"},
+            }
+        )
+        hosted = speech_summary(config.transcriber, config.diarizer)
+        self.assertEqual(hosted["transcriber"]["kind"], "hosted-openai-compatible")
+        self.assertEqual(hosted["diarizer"]["kind"], "hosted-deepgram")
+        self.assertEqual(
+            hosted["transcriber"]["id"],
+            OpenAICompatibleTranscriber(
+                endpoint=ENDPOINT, model="whisper-1", allow_hosted=True
+            ).recognizer_id,
+        )
+        self.assertEqual(
+            hosted["diarizer"]["id"],
+            DeepgramDiarizer(allow_hosted=True, diarize_model="v2").diarizer_id,
+        )
+        for secret in (ENDPOINT, "example.test", "api.deepgram", str(self.asset), KEY):
+            self.assertNotIn(secret, json.dumps(hosted))
+        events = SpeechEvents()
+        controller = PrototypeController(
+            config,
+            processor_factory=Mock(side_effect=LiveAudioError("stop before audio")),
+            capture_factory=Mock(),
+            event_publisher=events,
+            allow_hosted_speech=True,
+        )
+        self.addCleanup(controller.close)
+        controller.start({"mode": "microphone"})
+        started = controller.drain_events()[0]
+        self.assertEqual(started["phase"], "started")
+        self.assertEqual(started["speech"], hosted)
+        self.assertNotIn("speech", started["capabilities"])
+        with self.assertRaises(ContractError):
+            SpeechEvents().start("bad", speech={"transcriber": {"kind": "x"}})
 
     def test_controller_and_listen_require_explicit_hosted_consent(self):
         config = self.load(self.local | {"transcriber": self.hosted_transcriber})

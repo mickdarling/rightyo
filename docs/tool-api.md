@@ -217,6 +217,17 @@ selected through the prototype configuration's `request_former` object, for exam
 Only the `kind` key is accepted and `template` is the only kind; an unknown kind or an extra
 key is rejected before any session starts.
 
+A live session (`listen` or the lab) also advertises its selected speech backends on the
+`started` event as a separate top-level `speech` object beside the capability set, for
+example `"speech": {"transcriber": {"kind": "whisper.cpp", "id":
+"whisper.cpp-live-window"}, "diarizer": {"kind": "nemotron.cpp", "id": "nemotron.cpp
+v3-streaming"}}`. The transcriber `id` is the `recognizer_id` its turns carry; the
+diarizer `id` names the backend and, for the hosted diarizer, the configured model and
+diarizer version (`hosted-deepgram <model> <diarize_model> <hash>`), so exported sessions
+record which diarizer labelled them without changing the `Turn` contract. Ids are display
+safe: never an endpoint, local path, model file or credential. Authored replay
+(`tool-replay`) does not advertise `speech`, so the shared fixtures are unchanged.
+
 When a former is configured, the `started` event advertises it as a separate top-level
 object beside the capability set, `"request_forming": {"kind": "template"}`, in the same
 way `addressing` is advertised: the existing `capabilities` set is unchanged, so consumers
@@ -295,7 +306,13 @@ configuration select an implementation by name, described in
 also provides the hosted implementations and the factories that section maps to.
 Word-to-speaker attribution, grouping and the `Turn` contract are the same for every
 backend. Hosted backends refuse to send audio without explicit consent (`--allow-hosted`),
-and no hosted backend has been accuracy-tested here. Turns from the hosted transcriber
+and no hosted backend has been accuracy-tested here. Every Deepgram request carries
+`mip_opt_out=true`, which per Deepgram's documentation excludes it from the Model
+Improvement Program (participation is otherwise the default) and gives it zero data
+retention after the response. The OpenAI-compatible transcription request has no
+request-level training or retention control in the cited schema: the operator must
+configure data-use and retention controls on the provider account, and confirm the
+provider's policy, before pointing this backend at it. Turns from the hosted transcriber
 carry `recognizer_id` `hosted-openai-compatible <model> <hash>`: the configured model name
 with characters outside the identifier charset replaced by `-`, followed by the first 12
 hex digits of the SHA-256 of the original name so sanitized or truncated names cannot

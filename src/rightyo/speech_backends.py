@@ -25,7 +25,14 @@ import wave
 from typing import Any, Callable
 
 from rightyo.credentials import CredentialError, load_diarizer_api_key, load_transcriber_api_key
-from rightyo.live_audio import BYTES_PER_MS, SAMPLE_RATE, LiveAudioError, LiveConfig
+from rightyo.live_audio import (
+    BYTES_PER_MS,
+    SAMPLE_RATE,
+    LiveAudioError,
+    LiveConfig,
+    NemotronCppDiarizer,
+    WhisperCppTranscriber,
+)
 from rightyo.providers import Diarizer, Transcriber
 
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -186,7 +193,10 @@ class _HostedClient:
                         raise _ReadCancelled
                     if time.monotonic() >= deadline:
                         raise _ReadDeadline
-                    chunk = response.read(min(READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - size))
+                    # `read1` returns as soon as any body bytes arrive, so a dripping
+                    # endpoint cannot hold a full-chunk `read` past the deadline checks.
+                    reader = getattr(response, "read1", None) or response.read
+                    chunk = reader(min(READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - size))
                     if not chunk:
                         break
                     chunks.append(chunk)
@@ -358,7 +368,7 @@ class OpenAICompatibleTranscriber:
     ) -> None:
         self.endpoint = _https_endpoint(endpoint, "Hosted transcriber")
         self.model = _name(model, "hosted transcriber model")
-        self.recognizer_id = provenance_id("hosted-openai-compatible", self.model)
+        self.recognizer_id = transcriber_id({"kind": "hosted-openai-compatible", "model": model})
         if language is not None and (
             not isinstance(language, str) or not _LANGUAGE.fullmatch(language)
         ):
@@ -440,7 +450,13 @@ class DeepgramDiarizer:
     developers.deepgram.com/docs/diarization: the raw audio is the request body with
     `Content-Type: audio/wav` and `Authorization: Token <key>`; query `model` selects
     the model and `diarize_model` (`latest`, `v1`, `v2`) enables diarization ("The
-    `diarize` parameter is deprecated. Use `diarize_model` instead"). The response's
+    `diarize` parameter is deprecated. Use `diarize_model` instead"). Participation in
+    Deepgram's Model Improvement Program "is the default"; per
+    developers.deepgram.com/docs/the-deepgram-model-improvement-partnership-program and
+    developers.deepgram.com/trust-security/your-data (read 2026-10-02), "Add
+    `mip_opt_out=true` as a query parameter of all API requests that you want to be
+    excluded from the Model Improvement Program", and "Opting out gives you zero data
+    retention". Every request here carries `mip_opt_out=true`. The response's
     `results.channels[0].alternatives[0].words[]` carries `word`, `start`, `end`
     (seconds), `speaker` (zero-based integer) and `speaker_confidence`.
 
@@ -474,7 +490,9 @@ class DeepgramDiarizer:
             raise LiveAudioError("Invalid hosted diarizer version")
         self.diarize_model = diarize_model
         # `speaker_provenance` stays the allowlisted contract value; this names the backend.
-        self.diarizer_id = provenance_id("hosted-deepgram", self.model, diarize_model)
+        self.diarizer_id = diarizer_id(
+            {"kind": "hosted-deepgram", "model": model, "diarize_model": diarize_model}
+        )
         if type(window_ms) is not int or not 1000 <= window_ms <= MAX_AUDIO_MS:
             raise LiveAudioError("Invalid hosted diarizer window")
         self.window_bytes = window_ms * BYTES_PER_MS
@@ -505,7 +523,11 @@ class DeepgramDiarizer:
         if not self._buffer:
             return []
         window = bytes(self._buffer)
-        query = urllib.parse.urlencode({"model": self.model, "diarize_model": self.diarize_model})
+        # Every request opts out of Deepgram's Model Improvement Program (see the class
+        # docstring): consented audio is for this session's labels only.
+        query = urllib.parse.urlencode(
+            {"model": self.model, "diarize_model": self.diarize_model, "mip_opt_out": "true"}
+        )
         document = self._client.post(
             self.endpoint + "?" + query, _wav(window), {"Content-Type": "audio/wav"}, "Token "
         )
@@ -577,6 +599,41 @@ def diarizer_spec(value: Any) -> dict[str, Any]:
 
 def is_hosted(spec: dict[str, Any]) -> bool:
     return spec["kind"].startswith("hosted-")
+
+
+def transcriber_id(spec: dict[str, Any]) -> str:
+    """The `recognizer_id` the selected transcriber stamps on turns (display-safe)."""
+    if spec["kind"] == "hosted-openai-compatible":
+        return provenance_id("hosted-openai-compatible", _name(spec["model"], "model"))
+    return WhisperCppTranscriber.recognizer_id
+
+
+def diarizer_id(spec: dict[str, Any]) -> str:
+    """A display-safe id naming the selected diarizer and its version.
+
+    The hosted id names the configured model and diarizer version; Deepgram's response
+    metadata may name a more specific resolved model, which is not surfaced here because
+    the id is advertised when the session starts, before any request.
+    """
+    if spec["kind"] == "hosted-deepgram":
+        model = _name(spec["model"], "model")
+        version = spec["diarize_model"]
+        if version not in DEEPGRAM_DIARIZE_MODELS:
+            raise LiveAudioError("Invalid hosted diarizer version")
+        return provenance_id("hosted-deepgram", model, version)
+    return NemotronCppDiarizer.diarizer_id
+
+
+def speech_summary(transcriber: dict[str, Any], diarizer: dict[str, Any]) -> dict[str, Any]:
+    """The `speech` object advertised on a live session's `started` event.
+
+    Kinds and ids only: never an endpoint, local path, model file or credential.
+    """
+    transcriber, diarizer = transcriber_spec(transcriber), diarizer_spec(diarizer)
+    return {
+        "transcriber": {"kind": transcriber["kind"], "id": transcriber_id(transcriber)},
+        "diarizer": {"kind": diarizer["kind"], "id": diarizer_id(diarizer)},
+    }
 
 
 SERVICE_NAMES = {

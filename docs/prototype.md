@@ -106,12 +106,16 @@ per the API reference read on 2026-10-02, that is what `whisper-1` accepts, whil
 `gpt-4o-transcribe` and `gpt-4o-mini-transcribe` return only `json` and
 `gpt-4o-transcribe-diarize` does not offer timestamp granularities. `endpoint` and
 `model` are required; `language` (ISO 639-1) and `timeout_seconds` (at most 120) are
-optional. The credential is read from `RIGHTYO_TRANSCRIBER_API_KEY` or the login
+optional. The request has no training or retention opt-out parameter in the cited schema;
+configure data-use controls on the provider account and confirm its policy before use. The credential is read from `RIGHTYO_TRANSCRIBER_API_KEY` or the login
 Keychain item with service `rightyo.transcriber` and account `api-key`.
 
 `hosted-deepgram` posts the trailing utterance window to Deepgram's pre-recorded
-`https://api.deepgram.com/v1/listen` with `model` (default `nova-3`) and `diarize_model`
-(`latest`, `v1` or `v2`; default `latest`) and reads the word-level `speaker` labels,
+`https://api.deepgram.com/v1/listen` with `model` (default `nova-3`), `diarize_model`
+(`latest`, `v1` or `v2`; default `latest`) and always `mip_opt_out=true`, which Deepgram
+documents as excluding the request from its Model Improvement Program (participation is
+otherwise the default) with zero data retention after the response; it reads the
+word-level `speaker` labels,
 merging consecutive words of one speaker into timeline segments. `endpoint` may be
 overridden with another `https` URL. The credential is read from
 `RIGHTYO_DIARIZER_API_KEY` or the login Keychain item with service `rightyo.diarizer`
