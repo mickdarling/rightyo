@@ -137,6 +137,25 @@ def addressing_from_args(args: argparse.Namespace) -> Addressing | None:
     return None if not names else Addressing.from_names(names)
 
 
+def _session_budget(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise argparse.ArgumentTypeError("session budget must be a positive number of seconds")
+    return value
+
+
+def _add_session_budget_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--session-budget",
+        type=_session_budget,
+        metavar="SECONDS",
+        help="stop the session after this much audio (default: no session ceiling)",
+    )
+
+
 def _add_name_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--name",
@@ -205,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     prototype.add_argument("--config", type=Path, required=True, help="local asset configuration")
     prototype.add_argument("--port", type=int, default=8765)
     _add_name_option(prototype)
+    _add_session_budget_option(prototype)
     listen = commands.add_parser("listen", help="explicit foreground speech JSONL tool")
     listen.add_argument("--config", type=Path, required=True)
     listen.add_argument("--mode", choices=("microphone", "demo"), required=True)
@@ -212,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     listen.add_argument("--use-jev", action="store_true")
     listen.add_argument("--allow-hosted", action="store_true")
     _add_name_option(listen)
+    _add_session_budget_option(listen)
     tool_replay = commands.add_parser("tool-replay", help="emit tool JSONL from supplied text")
     tool_replay.add_argument("--input", type=Path, required=True)
     tool_replay.add_argument("--provider", choices=("mock", "jev"), default="mock")
@@ -238,7 +259,12 @@ def main(argv: list[str] | None = None) -> int:
             from rightyo.prototype import PrototypeError, serve
 
             try:
-                serve(args.config, args.port, addressing=addressing_from_args(args))
+                serve(
+                    args.config,
+                    args.port,
+                    addressing=addressing_from_args(args),
+                    session_budget_seconds=args.session_budget,
+                )
             except (PrototypeError, OSError):
                 print(
                     "rightyo: prototype setup failed; check local assets and port", file=sys.stderr

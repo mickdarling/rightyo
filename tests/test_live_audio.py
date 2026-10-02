@@ -1,6 +1,7 @@
 """Offline tests: no capture, hosted calls, downloaded models or native inference."""
 
 import array
+import ctypes
 import json
 import subprocess
 import sys
@@ -12,17 +13,20 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from rightyo.live_audio import (
+    BYTES_PER_MS,
     FRAME_BYTES,
     LiveAudioError,
     LiveConfig,
     LiveProcessor,
     _attribute,
     _Diarizer,
+    _NativeStream,
     _units,
 )
 
 SILENCE = bytes(FRAME_BYTES)
 VOICE = array.array("h", [5000] * 320).tobytes()
+THREE_HOURS_MS = 3 * 60 * 60 * 1000
 
 
 class FakeDiarizer:
@@ -208,6 +212,53 @@ class LiveProcessorTests(unittest.TestCase):
             self.assertTrue(processor.failed)
             self.assertTrue(processor.closed)
 
+    def test_unbounded_default_accepts_an_utterance_three_hours_into_the_stream(self):
+        self.assertIsNone(self.config.session_budget_ms)
+        self.feed(SILENCE, 100)
+        # Advance the stream clock instead of computing 540,000 synthetic RMS frames;
+        # every later offset is derived from this clock exactly as in a real session.
+        self.processor._received_ms = THREE_HOURS_MS
+        diarizer = self.processor._diarizer
+        diarizer.segments = lambda: [{"start_ms": 0, "end_ms": THREE_HOURS_MS * 2, "speaker": 1}]
+        self.feed(VOICE, 10)
+        self.feed(SILENCE, 72)
+        self.assertEqual(len(self.turns), 1)
+        self.assertEqual(self.turns[0].start_ms, THREE_HOURS_MS - 240)
+        self.assertEqual(self.turns[0].end_ms, THREE_HOURS_MS - 240 + 200)
+        self.assertEqual(self.turns[0].speaker_id, "Speaker A")
+        self.assertEqual(self.processor.received_ms, THREE_HOURS_MS + 82 * 20)
+        self.assertFalse(self.processor.failed)
+        self.assertLessEqual(self.processor.buffered_audio_bytes, 240 * BYTES_PER_MS)
+
+    def test_configured_budget_ends_at_the_stream_boundary(self):
+        config = LiveConfig(**(vars(self.config) | {"session_budget_ms": 2000}))
+        processor = LiveProcessor(config, self.turns.append)
+        self.addCleanup(processor.close)
+        for _ in range(100):
+            processor.push_pcm16(SILENCE)
+        self.assertEqual(processor.received_ms, 2000)
+        self.assertFalse(processor.failed)
+        with self.assertRaisesRegex(LiveAudioError, "duration limit"):
+            processor.push_pcm16(SILENCE)
+        self.assertTrue(processor.failed)
+        self.assertTrue(processor.closed)
+        # Unframed partial bytes count toward the budget before they form a frame.
+        partial = LiveProcessor(config, self.turns.append)
+        self.addCleanup(partial.close)
+        for _ in range(99):
+            partial.push_pcm16(SILENCE)
+        partial.push_pcm16(SILENCE[:320])
+        with self.assertRaisesRegex(LiveAudioError, "duration limit"):
+            partial.push_pcm16(SILENCE)
+        self.assertEqual(self.turns, [])
+
+    def test_session_budget_must_be_a_positive_integer_or_absent(self):
+        for invalid in (0, -1, True, 1.5, "60", 2000.0):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(LiveAudioError, "budget"):
+                LiveConfig(**(vars(self.config) | {"session_budget_ms": invalid}))
+        config = LiveConfig(**(vars(self.config) | {"session_budget_ms": THREE_HOURS_MS * 8}))
+        self.assertEqual(config.session_budget_ms, THREE_HOURS_MS * 8)
+
     def test_configuration_requires_explicit_local_assets_and_limits(self):
         with self.assertRaisesRegex(LiveAudioError, "existing"):
             LiveConfig("test", "/missing", "/missing", "/missing", "/missing")
@@ -309,6 +360,61 @@ class NativeStartupCancellationTests(unittest.TestCase):
     def test_cancel_guard_must_be_callable(self):
         with self.assertRaisesRegex(LiveAudioError, "cancellation guard"):
             LiveConfig(**(vars(self.config) | {"cancelled": True}))
+
+
+def _native_stream(segments, pushed_bytes):
+    """A ctypes-free stand-in: no library is loaded and no model is provisioned."""
+    stream = _NativeStream.__new__(_NativeStream)
+    stream.model = ctypes.c_void_p(1)
+    stream.stream = ctypes.c_void_p(1)
+    stream.pushed_bytes = pushed_bytes
+    pushed = []
+
+    def list_segments(_stream, _model, output, _capacity, count):
+        count._obj.value = len(segments)
+        if output is not None:
+            for slot, (start, end, speaker) in zip(output, segments):
+                slot.start_time, slot.end_time, slot.speaker = start, end, speaker
+        return 0
+
+    def push(_stream, _floats, samples, _rate):
+        pushed.append(samples)
+        return 0
+
+    stream.lib = Mock(
+        nemo_speech_diar_segments=list_segments, nemo_speech_diar_stream_push_f32=push
+    )
+    return stream, pushed
+
+
+class NativeSegmentBoundTests(unittest.TestCase):
+    def test_segment_times_are_bounded_by_pushed_audio_not_a_fixed_ceiling(self):
+        three_hours = THREE_HOURS_MS * BYTES_PER_MS
+        stream, _ = _native_stream([(10799.0, 10800.9, 1)], three_hours)
+        self.assertEqual(
+            stream.segments(), [{"start_ms": 10799000, "end_ms": 10800900, "speaker": 1}]
+        )
+        for segments, pushed in (
+            ([(10799.0, 10801.5, 1)], three_hours),
+            ([(0.5, 5.0, 1)], 0),
+            ([(0.5, 5.0, 1)], 3 * 1000 * BYTES_PER_MS),
+            ([(0.5, 5.0, 9)], 10 * 1000 * BYTES_PER_MS),
+        ):
+            stream, _ = _native_stream(segments, pushed)
+            with self.subTest(segments=segments, pushed=pushed):
+                with self.assertRaisesRegex(LiveAudioError, "Invalid local diarizer result"):
+                    stream.segments()
+        stream, _ = _native_stream([(0.5, 5.0, 1)], 5 * 1000 * BYTES_PER_MS)
+        self.assertEqual(stream.segments(), [{"start_ms": 500, "end_ms": 5000, "speaker": 1}])
+
+    def test_push_advances_the_bound_by_the_audio_actually_pushed(self):
+        stream, pushed = _native_stream([(0.0, 1.5, 1)], 0)
+        with self.assertRaises(LiveAudioError):
+            stream.segments()
+        stream.push(bytes(1000 * BYTES_PER_MS))
+        self.assertEqual(pushed, [16000])
+        self.assertEqual(stream.pushed_bytes, 1000 * BYTES_PER_MS)
+        self.assertEqual(stream.segments(), [{"start_ms": 0, "end_ms": 1500, "speaker": 1}])
 
 
 class ConservativeAlignmentTests(unittest.TestCase):

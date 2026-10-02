@@ -56,6 +56,37 @@ class TranscriptMemoryTests(unittest.TestCase):
         self.assertEqual(memory.snapshot(0)["turns"], [])
         self.assertEqual(memory.snapshot(0)["retention"]["now_ms"], 310000)
 
+    def test_three_hour_stream_stays_within_retention_turn_and_byte_bounds(self):
+        # 900 twelve-second turns span three hours without any session time ceiling.
+        stream = [turn(i, start_ms=i * 12000, end_ms=(i + 1) * 12000) for i in range(900)]
+        memory = TranscriptMemory()
+        for item in stream:
+            memory.append(item)
+            self.assertLessEqual(len(memory.retained_ids), 26)
+        snapshot = memory.snapshot(3 * 60 * 60 * 1000)
+        retention = snapshot["retention"]
+        self.assertEqual(retention["session_turn_count"], 900)
+        self.assertEqual(retention["turn_count"], 25)
+        self.assertEqual(retention["expired_turns"], 875)
+        self.assertEqual(retention["capacity_evicted_turns"], 0)
+        self.assertEqual(snapshot["turns"][0]["utterance_id"], "turn-875")
+        self.assertEqual(snapshot["turns"][-1]["end_ms"], 3 * 60 * 60 * 1000)
+        self.assertLessEqual(retention["retained_bytes"], retention["max_bytes"])
+        capped = TranscriptMemory(retention_ms=900000, max_turns=10, max_bytes=4000)
+        for item in stream:
+            capped.append(item)
+            self.assertLessEqual(len(capped.retained_ids), 10)
+        retention = capped.snapshot(3 * 60 * 60 * 1000)["retention"]
+        self.assertLessEqual(retention["turn_count"], 10)
+        self.assertLessEqual(retention["retained_bytes"], 4000)
+        self.assertGreater(retention["capacity_evicted_turns"], 0)
+        self.assertEqual(
+            retention["turn_count"]
+            + retention["expired_turns"]
+            + retention["capacity_evicted_turns"],
+            900,
+        )
+
     def test_capacity_accounts_for_utf8_and_reports_early_eviction(self):
         memory = TranscriptMemory(max_bytes=17000)
         memory.append(turn(0, text="😀" * 4000))

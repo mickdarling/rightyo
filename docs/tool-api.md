@@ -70,6 +70,15 @@ local transcription. If a pipe closes, the producer cancels. Consumers treat EOF
 without a normal terminal event as incomplete and never automatically retry an
 uncertain application action.
 
+A session has no default duration ceiling; it listens until the host stops it or a
+terminal condition occurs. `--session-budget SECONDS` on `listen` and `prototype`, or
+`session_budget_seconds` in the prototype configuration, ends a session at that audio
+boundary with the ordinary `cancelled` event, the same as a host-initiated stop. The
+budget is a positive whole number of seconds; the command line replaces the file's value.
+Timestamps are plain integers in stream milliseconds and do not wrap. Memory is bounded
+independently of session length by the rolling retention limits below, the per-utterance
+audio window, and the per-session unique-turn count.
+
 ## Turn and request fields
 
 `turn` uses the existing validated `Turn` contract: `session_id`, `utterance_id`,
@@ -116,7 +125,9 @@ from internal state. This API produces input events; it performs no application
 actions.
 
 `LiveProcessor(LiveConfig(...), on_turn)` accepts explicit PCM16 mono 16 kHz through
-`push_pcm16`, followed by `finish` or cancellation/`close`. Native paths are explicit,
+`push_pcm16`, followed by `finish` or cancellation/`close`. Each push is at most one
+second of audio; `LiveConfig.session_budget_ms` (default `None`, no ceiling) fails the
+processor closed once more audio than the budget arrives. Native paths are explicit,
 separately provisioned trusted assets. The controller connects its finalized turns
 to the replaceable `DecisionProvider` and event publisher. Alternative backends can
 produce the same validated `Turn`/`DecisionEvent` values without changing consumers.

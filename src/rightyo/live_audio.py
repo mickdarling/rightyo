@@ -31,7 +31,8 @@ from .contracts import PROVENANCE, Turn, identifier
 
 SAMPLE_RATE = 16000
 FRAME_BYTES = 640  # 20 ms of mono signed little-endian PCM16
-MAX_SESSION_MS = 900_000
+BYTES_PER_MS = 32  # mono PCM16 at 16 kHz
+MAX_CHUNK_BYTES = 32000  # one second of audio per push
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
@@ -53,9 +54,16 @@ class LiveConfig:
     max_utterance_ms: int = 12000
     timeout_seconds: float = 30
     cancelled: Callable[[], bool] | None = None
+    # Total audio accepted per session, in stream milliseconds. None means no ceiling:
+    # memory stays bounded by the utterance window and downstream retention limits.
+    session_budget_ms: int | None = None
 
     def __post_init__(self) -> None:
         identifier(self.session_id, "session_id")
+        if self.session_budget_ms is not None and (
+            type(self.session_budget_ms) is not int or self.session_budget_ms < 1
+        ):
+            raise LiveAudioError("Invalid session budget")
         if self.cancelled is not None and not callable(self.cancelled):
             raise LiveAudioError("Invalid cancellation guard")
         if self.provenance not in PROVENANCE:
@@ -127,6 +135,7 @@ class _NativeStream:
         self.lib = ctypes.CDLL(library)
         self.model = ctypes.c_void_p()
         self.stream = ctypes.c_void_p()
+        self.pushed_bytes = 0
         signatures = {
             "create": (
                 [ctypes.POINTER(_ModelConfig), ctypes.POINTER(ctypes.c_void_p)],
@@ -194,6 +203,7 @@ class _NativeStream:
         self.check(
             self.lib.nemo_speech_diar_stream_push_f32(self.stream, floats, len(values), SAMPLE_RATE)
         )
+        self.pushed_bytes += len(pcm)
 
     def finish(self) -> None:
         self.check(self.lib.nemo_speech_diar_stream_finish(self.stream))
@@ -206,13 +216,16 @@ class _NativeStream:
             raise LiveAudioError("Local diarizer exceeded segment limit")
         output = (_Segment * count.value)()
         self.check(fn(self.stream, None, output, count.value, ctypes.byref(count)))
+        # Segment times must lie within audio actually pushed (plus one second of
+        # native lookahead/rounding); the bound follows the stream, not a fixed ceiling.
+        horizon = self.pushed_bytes / (BYTES_PER_MS * 1000) + 1
         result = []
         for segment in output[: count.value]:
             start, end = segment.start_time, segment.end_time
             if (
                 not math.isfinite(start)
                 or not math.isfinite(end)
-                or not 0 <= start < end <= MAX_SESSION_MS / 1000 + 1
+                or not 0 <= start < end <= horizon
                 or not 1 <= segment.speaker <= 8
             ):
                 raise LiveAudioError("Invalid local diarizer result")
@@ -244,7 +257,6 @@ def _native_worker(library: str, model: str) -> int:
     try:
         native = _NativeStream(library, model)
         protocol.write('{"ok":true}\n')
-        received = 0
         while True:
             line = sys.stdin.buffer.readline(64000)
             if not line or not line.endswith(b"\n"):
@@ -253,8 +265,7 @@ def _native_worker(library: str, model: str) -> int:
             command = request.get("command")
             if command == "push":
                 pcm = base64.b64decode(request["pcm"], validate=True)
-                received += len(pcm)
-                if len(pcm) > 32000 or len(pcm) % 2 or received > MAX_SESSION_MS * 32:
+                if len(pcm) > MAX_CHUNK_BYTES or len(pcm) % 2:
                     raise LiveAudioError("Invalid audio frame")
                 native.push(pcm)
                 response = {"ok": True}
@@ -570,9 +581,13 @@ class LiveProcessor:
         if self.closed or self.failed:
             raise LiveAudioError("Audio session is closed")
         try:
-            if not isinstance(pcm, bytes) or len(pcm) > 32000 or len(pcm) % 2:
+            if not isinstance(pcm, bytes) or len(pcm) > MAX_CHUNK_BYTES or len(pcm) % 2:
                 raise LiveAudioError("Invalid mono PCM16 frame")
-            if self._received_ms + (len(self._partial) + len(pcm)) // 32 > MAX_SESSION_MS:
+            budget = self.config.session_budget_ms
+            if (
+                budget is not None
+                and self._received_ms + (len(self._partial) + len(pcm)) // BYTES_PER_MS > budget
+            ):
                 raise LiveAudioError("Audio session exceeded duration limit")
             self._partial.extend(pcm)
             while len(self._partial) >= FRAME_BYTES:
@@ -621,7 +636,7 @@ class LiveProcessor:
         if self.closed:
             raise LiveAudioError("Audio session was stopped")
         groups: list[dict[str, Any]] = []
-        for unit in _units(document, len(pcm) // 32):
+        for unit in _units(document, len(pcm) // BYTES_PER_MS):
             start, end = unit["start_ms"] + offset, unit["end_ms"] + offset
             speaker, overlap = _attribute(start, end, timeline)
             if groups and (groups[-1]["speaker"], groups[-1]["overlap"]) == (speaker, overlap):
