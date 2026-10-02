@@ -43,7 +43,14 @@ set `"stop_phrases"` and `"source": "model"`, which asks Jev about unconfigured 
 only when the session has opted into hosted decisions. Session speaker labels such as
 `Speaker A` are anonymous and are assigned per session by the diarizer, so a configured
 label names whichever voice receives it; roles are precedence data for the host, not a
-verified identity. Replay accepts mono PCM16 WAV at 16 kHz, at most
+verified identity. With `"source": "model"`, the role question for a newly observed
+speaker currently runs synchronously on the audio path when that speaker's first turn
+is published, once per speaker per session and bounded by the hosted `timeout_seconds`
+(10 seconds), so capture can stall for up to that long per new speaker; a failed question
+degrades that speaker to the configured role or `unknown` and disables further role
+questions for the session (`role_status: "unavailable"`) rather than stopping the
+session. Moving the question off the audio thread is tracked in
+[#49](https://github.com/mickdarling/rightyo/issues/49). Replay accepts mono PCM16 WAV at 16 kHz, at most
 three minutes; it feeds real PCM in causal order as quickly as processing permits. It is not
 a wall-clock streaming latency measurement. Playback through speakers is a separate physical
 test.

@@ -116,6 +116,9 @@ class PrototypeController:
         self._mode = "microphone"
         self._error = None
         self._decision_status = "off"
+        # Speaker role source for the tool stream: off, configured, model, or unavailable
+        # once a hosted role question failed and roles degraded to configured/unknown.
+        self._role_status = "off"
         self._memory = TranscriptMemory()
         self._runner: ReplayRunner | None = None
         self._capture = None
@@ -255,6 +258,13 @@ class PrototypeController:
             self._mode = mode
             self._error = None
             self._decision_status = "ready" if hosted else "off"
+            self._role_status = (
+                "off"
+                if priority is None
+                else "model"
+                if isinstance(priority, ModelPriorityProvider)
+                else "configured"
+            )
             self._phase = "starting"
             self._started = self._last_browser = time.monotonic()
             if self._events is not None:
@@ -285,6 +295,9 @@ class PrototypeController:
             memory.append(turn)
             if self._events is not None:
                 self._publish("transcript", turn)
+                if self._events.role_status == "unavailable":
+                    # A failed hosted role question degraded roles; listening continues.
+                    self._role_status = "unavailable"
             if self._decision_status == "off" or self._decision_cancel.is_set():
                 return
             try:
@@ -520,6 +533,7 @@ class PrototypeController:
                 "mode": self._mode,
                 "error": self._error,
                 "decision_status": self._decision_status,
+                "role_status": self._role_status,
                 "decisions": dict(self._decisions),
                 "pending_decisions": self._pending,
                 "jev_requests": self._requests,
@@ -554,6 +568,7 @@ class PrototypeController:
             self._audio_started = None
             self._completed_at = None
             self._decision_status = "off"
+            self._role_status = "off"
             while not self._decision_queue.empty():
                 try:
                     self._decision_queue.get_nowait()

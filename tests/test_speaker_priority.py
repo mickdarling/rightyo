@@ -393,6 +393,38 @@ class EnrolledEventTests(unittest.TestCase):
         self.assertEqual(self.events._roles, {})
         self.assertEqual(self.events.drain()[0]["capabilities"]["speakers"], "anonymous")
 
+    def test_provider_omitting_current_speaker_fixes_unknown(self):
+        self.start()
+        assign = MagicMock(side_effect=[{}, {"Speaker B": "trusted"}])
+        self.provider.assign = assign
+        first = turn("first", 0, 500, "Hello there.")
+        second = turn("second", 1000, 1500, "Rightyo, lights.")
+        self.events.transcript(first, 500)
+        self.events.transcript(second, 1500)
+        drained = self.events.drain()
+        self.assertEqual([e["turn"]["role"] for e in drained], ["unknown", "unknown"])
+        self.assertEqual(assign.call_count, 1)
+        self.assertEqual(self.events._roles, {"Speaker B": "unknown"})
+
+    def test_failed_role_question_degrades_without_ending_the_session(self):
+        self.start(provider=ModelPriorityProvider(Oracle(), OWNER))
+        assign = MagicMock(side_effect=ProviderError("Jev temporarily unavailable"))
+        self.provider.assign = assign
+        self.assertEqual(self.events.role_status, "ready")
+        first = turn("first", 0, 500, "Hello there.")
+        later = turn("later", 1000, 1500, "Rightyo, lights.", "Speaker C")
+        owner = turn("owner", 2000, 2500, "Rightyo, status.", "Speaker A")
+        for current in (first, later, owner):
+            self.events.transcript(current, current.end_ms)
+            self.events.decision(decision(current), current.end_ms + 100)
+        drained = self.events.drain()
+        self.assertEqual(self.events.role_status, "unavailable")
+        self.assertEqual(assign.call_count, 1)
+        roles = [e["turn"]["role"] for e in drained if e["type"] == "transcript"]
+        self.assertEqual(roles, ["unknown", "participant", "owner"])
+        self.assertEqual([e["type"] for e in drained].count("request"), 3)
+        self.assertEqual(self.events._roles["Speaker B"], "unknown")
+
     def test_invalid_providers_and_assignments_fail_closed_without_echo(self):
         events = SpeechEvents()
         for invalid in (OWNER, object(), {"assign": lambda state: {}}):
@@ -596,6 +628,55 @@ class CommandLineAndPrototypeTests(unittest.TestCase):
                     {e["turn"]["role"] for e in requests}, {"owner"} if hosted else set()
                 )
                 self.assertEqual(events[-1]["phase"], "stopped")
+        self.assertEqual(oracle.requests, 1)
+
+    def test_failed_live_role_question_keeps_listening_with_unknown(self):
+        config = self.write_config({"speakers": {"owner": ["Speaker A"], "source": "model"}})
+        oracle = Oracle()
+        oracle.decide = MockProvider().decide
+
+        def failing_answer(_body, _payload):
+            oracle.requests += 1
+            raise ProviderError("Jev temporarily unavailable; no automatic retry")
+
+        oracle.answer = failing_answer
+        statuses = []
+
+        def factory(loaded, *, event_publisher):
+            controller = PrototypeController(
+                loaded,
+                event_publisher=event_publisher,
+                processor_factory=_Processor,
+                capture_factory=_refuse,
+                provider_factory=lambda **_options: oracle,
+            )
+            original = controller.snapshot
+
+            def snapshot(**options):
+                state = original(**options)
+                statuses.append(state["role_status"])
+                return state
+
+            controller.snapshot = snapshot
+            return controller
+
+        args = Namespace(
+            config=config,
+            mode="demo",
+            session_id="roles-failed",
+            use_jev=True,
+            allow_hosted=True,
+            names=None,
+        )
+        output = io.StringIO()
+        self.assertEqual(listen(args, output=output, controller_factory=factory), 0)
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(events[-1]["phase"], "stopped")
+        self.assertEqual(events[0]["capabilities"]["speakers"], "enrolled")
+        roles = {e["turn"]["speaker_id"]: e["turn"]["role"] for e in events if "turn" in e}
+        self.assertEqual(roles, {"Speaker A": "owner", "Speaker B": "unknown"})
+        self.assertEqual(sum(e["type"] == "transcript" for e in events), 2)
+        self.assertIn("unavailable", statuses)
         self.assertEqual(oracle.requests, 1)
 
 

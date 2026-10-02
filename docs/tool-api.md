@@ -146,6 +146,17 @@ is delivered; non-owner turns remain ordinary context. The producer adds no free
 markers: interpreting non-owner context as information rather than instructions is the
 host's responsibility, informed by the `role` on every context turn.
 
+A host that accepts `speakers: "enrolled"` must also accept the `override` event; it is
+part of the enrolled contract. An `override` is never emitted on an anonymous session.
+An owner stop phrase supersedes open requests regardless of the decision label on the
+owner's turn (`attend`, `ignore` or `uncertain`): the configured phrase, not the
+attention decision, is the signal, as chosen in
+[#50](https://github.com/mickdarling/rightyo/issues/50). If a hosted role question
+fails (timeout, unavailability, budget exhaustion or cancellation), the session keeps
+listening: that speaker receives the configured role if any, otherwise `unknown`, fixed
+as usual, and no further model questions are asked in that session; the prototype
+reports this as `role_status: "unavailable"`.
+
 [The enrolled fixture](../examples/enrolled-override.jsonl) shows a participant's
 attended request followed by the owner's "Ignore that." override; the shared anonymous
 fixture above is byte-identical to before.

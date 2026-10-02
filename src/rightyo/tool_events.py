@@ -19,6 +19,7 @@ from rightyo.contracts import (
     speaker_role,
 )
 from rightyo.memory import TranscriptMemory
+from rightyo.providers import ConfiguredPriorityProvider, ProviderError
 
 MAX_EVENT_BYTES = 1200000
 MAX_QUEUE_BYTES = 4194304
@@ -82,6 +83,9 @@ class SpeechEvents:
         self._priority = None
         self._roles = {}
         self._open = {}
+        # "off" without a provider, "ready" with one, "unavailable" after a hosted role
+        # question failed and roles degraded to configured/unknown for the session.
+        self.role_status = "off"
 
     def _emit(self, kind, **fields):
         self._sequence += 1
@@ -142,6 +146,7 @@ class SpeechEvents:
             self._decided.clear()
             self._roles.clear()
             self._priority = priority
+            self.role_status = "off" if priority is None else "ready"
             self._session = session_id
             self._sequence = 0
             self._now = now_ms
@@ -253,7 +258,16 @@ class SpeechEvents:
             ),
             "roles": dict(self._roles),
         }
-        assigned = self._priority.assign(state)
+        try:
+            assigned = self._priority.assign(state)
+        except ProviderError:
+            # A hosted role question failed (timeout, unavailability, budget, cancellation).
+            # Degrade rather than abort: this speaker takes the configured role or unknown,
+            # later speakers use configured roles only, and the session keeps listening.
+            rules = self._priority.priority
+            self._priority = ConfiguredPriorityProvider(rules)
+            self.role_status = "unavailable"
+            assigned = {turn.speaker_id: rules.configured_role(turn.speaker_id) or "unknown"}
         if not isinstance(assigned, dict):
             raise ContractError("invalid speaker role assignment")
         validated = {
@@ -263,7 +277,8 @@ class SpeechEvents:
         for speaker, value in validated.items():
             # An earlier fixed role is never revised by a later answer.
             self._roles.setdefault(speaker, value)
-        return self._roles.get(turn.speaker_id, "unknown")
+        # A provider that omits the current speaker still fixes that speaker's role.
+        return self._roles.setdefault(turn.speaker_id, "unknown")
 
     def decision(self, event, now_ms):
         with self._lock:
