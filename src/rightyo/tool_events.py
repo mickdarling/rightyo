@@ -338,6 +338,20 @@ class SpeechEvents:
             superseded_by = self._superseded.pop(key, None)
             would_attend = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
             attended = would_attend and not stop and superseded_by is None
+            overriding = role == "owner" and (attended or stop)
+            to_supersede = []
+            if overriding:
+                # Earlier is decided by turn time (end_ms at or before the owner's), not by
+                # emission order: decisions arrive out of order, and a request spoken after
+                # the owner's turn is not what the owner was superseding.
+                to_supersede = [r for r, end in self._open.items() if end <= turn.end_ms]
+                # The whole burst plus the owner's own attention/request/terminal must fit
+                # the undrained queue; otherwise fail closed before emitting any override,
+                # never a partial batch.
+                if len(to_supersede) + 3 > self.max_pending - len(self._queue):
+                    self._clear_content()
+                    self._active = False
+                    raise ContractError("speech event consumer backlog exceeded")
             self._emit(
                 "attention",
                 utterance_id=key,
@@ -354,22 +368,18 @@ class SpeechEvents:
                     by_utterance_id=superseded_by,
                     role="owner",
                 )
-            if role == "owner" and (attended or stop):
+            if overriding:
                 # The owner's own attended turn or a stop phrase supersedes every earlier
                 # open non-owner request before any new request of the owner's is
                 # delivered, and every earlier non-owner turn still awaiting its decision.
-                # Earlier is decided by turn time (end_ms at or before the owner's), not by
-                # emission order: decisions arrive out of order, and a request spoken after
-                # the owner's turn is not what the owner was superseding.
-                for superseded, end_ms in list(self._open.items()):
-                    if end_ms <= turn.end_ms:
-                        self._emit(
-                            "override",
-                            superseded_request_id=superseded,
-                            by_utterance_id=key,
-                            role="owner",
-                        )
-                        del self._open[superseded]
+                for superseded in to_supersede:
+                    self._emit(
+                        "override",
+                        superseded_request_id=superseded,
+                        by_utterance_id=key,
+                        role="owner",
+                    )
+                    del self._open[superseded]
                 for other, (earlier, _context, _size, other_role) in self._pending.items():
                     if other_role != "owner" and earlier.end_ms <= turn.end_ms:
                         self._superseded.setdefault(other, key)

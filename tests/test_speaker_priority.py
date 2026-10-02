@@ -6,10 +6,10 @@ import io
 import json
 import tempfile
 import threading
-import time
 import unittest
 import wave
 from argparse import Namespace
+from collections import deque
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -33,7 +33,7 @@ from rightyo.providers import (
     build_role_request,
     parse_role_response,
 )
-from rightyo.tool import listen
+from rightyo.tool import listen, replay
 from rightyo.tool_events import SpeechEvents
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -601,6 +601,40 @@ class EnrolledEventTests(unittest.TestCase):
         self.assertEqual([e["turn"]["role"] for e in drained[::3]], ["trusted", "owner"])
         self.assertEqual(self.events._roles, {"Speaker B": "trusted", "Speaker A": "owner"})
 
+    def test_override_burst_checks_dynamic_queue_headroom_before_emitting(self):
+        for open_count, undrained, expect_failure in ((124, 2, True), (100, 2, False)):
+            with self.subTest(open_count=open_count):
+                self.start()
+                for index in range(open_count):
+                    current = turn(f"r{index}", index * 1000, index * 1000 + 500, "Rightyo, task.")
+                    self.events.transcript(current, current.end_ms)
+                    self.events.decision(decision(current), current.end_ms + 100)
+                    self.events.drain()
+                for index in range(undrained):
+                    current = turn(
+                        f"chat{index}", 150000 + index * 1000, 150500 + index * 1000, "Hi."
+                    )
+                    self.events.transcript(current, current.end_ms)
+                    self.events.decision(decision(current, "ignore", "other_human"), current.end_ms)
+                stop = turn("stop", 200000, 200500, "stop", "Speaker A")
+                self.events.transcript(stop, 200500)
+                before = self.events._sequence
+                if expect_failure:
+                    with self.assertRaisesRegex(ContractError, "consumer backlog"):
+                        self.events.decision(decision(stop, "uncertain", "unknown"), 200600)
+                    self.assertEqual(self.events._sequence, before)
+                    self.assertEqual(self.events._queue, deque())
+                    self.assertFalse(self.events._active)
+                    continue
+                self.events.decision(decision(stop, "uncertain", "unknown"), 200600)
+                drained = self.events.drain()
+                overrides = [e for e in drained if e["type"] == "override"]
+                self.assertEqual(len(drained), undrained * 2 + 2 + open_count)
+                self.assertEqual(
+                    [e["superseded_request_id"] for e in overrides],
+                    [f"enrolled-demo:r{index}" for index in range(open_count)],
+                )
+
     def test_invalid_providers_and_assignments_fail_closed_without_echo(self):
         events = SpeechEvents()
         for invalid in (OWNER, object(), {"assign": lambda state: {}}):
@@ -767,23 +801,41 @@ class CommandLineAndPrototypeTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(PrototypeError):
                 PrototypeConfig.load(self.write_config({"speakers": invalid}))
 
-    def test_listen_applies_configured_roles_and_model_roles_only_with_opt_in(self):
-        config = self.write_config(
-            {"speakers": {"owner": ["Speaker A"], "source": "model", "owner_only": True}}
-        )
-        oracle = Oracle("trusted")
-        oracle.decide = MockProvider().decide
+    def test_live_refuses_model_sourced_roles_before_capture_and_applies_configured(self):
+        started = []
 
         def factory(loaded, *, event_publisher):
+            def processor(config, callback):
+                started.append(config.session_id)
+                return _Processor(config, callback)
+
+            oracle = Oracle("trusted")
+            oracle.decide = MockProvider().decide
             return PrototypeController(
                 loaded,
                 event_publisher=event_publisher,
-                processor_factory=_Processor,
+                processor_factory=processor,
                 capture_factory=_refuse,
                 provider_factory=lambda **_options: oracle,
             )
 
-        for hosted, expected in ((False, "participant"), (True, "trusted")):
+        refused = self.write_config({"speakers": {"owner": ["Speaker A"], "source": "model"}})
+        for hosted in (False, True):
+            args = Namespace(
+                config=refused,
+                mode="demo",
+                session_id=f"refused-{int(hosted)}",
+                use_jev=hosted,
+                allow_hosted=hosted,
+                names=None,
+            )
+            with self.subTest(hosted=hosted), self.assertRaises(PrototypeError) as error:
+                listen(args, output=io.StringIO(), controller_factory=factory)
+            self.assertIn("configured roles", str(error.exception))
+            self.assertNotIn("Speaker", str(error.exception))
+        self.assertEqual(started, [])
+        config = self.write_config({"speakers": {"owner": ["Speaker A"], "owner_only": True}})
+        for hosted in (False, True):
             with self.subTest(hosted=hosted):
                 args = Namespace(
                     config=config,
@@ -798,104 +850,58 @@ class CommandLineAndPrototypeTests(unittest.TestCase):
                 events = [json.loads(line) for line in output.getvalue().splitlines()]
                 self.assertEqual(events[0]["capabilities"]["speakers"], "enrolled")
                 roles = {e["turn"]["speaker_id"]: e["turn"]["role"] for e in events if "turn" in e}
-                self.assertEqual(roles, {"Speaker A": "owner", "Speaker B": expected})
+                self.assertEqual(roles, {"Speaker A": "owner", "Speaker B": "participant"})
                 requests = [e for e in events if e["type"] == "request"]
                 self.assertEqual(
                     {e["turn"]["role"] for e in requests}, {"owner"} if hosted else set()
                 )
                 self.assertEqual(events[-1]["phase"], "stopped")
-        self.assertEqual(oracle.requests, 1)
 
-    def test_failed_live_role_question_keeps_listening_with_unknown(self):
-        config = self.write_config({"speakers": {"owner": ["Speaker A"], "source": "model"}})
-        oracle = Oracle()
-        oracle.decide = MockProvider().decide
+    def test_replay_degrades_a_failed_model_role_question_and_keeps_going(self):
+        raw = json.loads(FIXTURE.read_text())
+        raw["turns"][0]["speaker_id"] = "Speaker B"
+        supplied = self.root / "two-speakers.json"
+        supplied.write_text(json.dumps(raw), encoding="utf-8")
 
-        def failing_answer(_body, _payload):
-            oracle.requests += 1
-            raise ProviderError("Jev temporarily unavailable; no automatic retry")
-
-        oracle.answer = failing_answer
-        statuses = []
-
-        def factory(loaded, *, event_publisher):
-            controller = PrototypeController(
-                loaded,
-                event_publisher=event_publisher,
-                processor_factory=_Processor,
-                capture_factory=_refuse,
-                provider_factory=lambda **_options: oracle,
-            )
-            original = controller.snapshot
-
-            def snapshot(**options):
-                state = original(**options)
-                statuses.append(state["role_status"])
-                return state
-
-            controller.snapshot = snapshot
-            return controller
-
-        args = Namespace(
-            config=config,
-            mode="demo",
-            session_id="roles-failed",
-            use_jev=True,
-            allow_hosted=True,
-            names=None,
-        )
-        output = io.StringIO()
-        self.assertEqual(listen(args, output=output, controller_factory=factory), 0)
-        events = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual(events[-1]["phase"], "stopped")
-        self.assertEqual(events[0]["capabilities"]["speakers"], "enrolled")
-        roles = {e["turn"]["speaker_id"]: e["turn"]["role"] for e in events if "turn" in e}
-        self.assertEqual(roles, {"Speaker A": "owner", "Speaker B": "unknown"})
-        self.assertEqual(sum(e["type"] == "transcript" for e in events), 2)
-        self.assertIn("unavailable", statuses)
-        self.assertEqual(oracle.requests, 1)
-
-    def test_stop_cancels_a_slow_live_role_lookup_promptly(self):
-        config = self.write_config({"speakers": {"owner": ["Speaker A"], "source": "model"}})
-        oracles = []
-
-        class SlowOracle:
-            def __init__(self, *, cancelled, **_options):
-                self.cancelled = cancelled
+        class FailingOracle:
+            def __init__(self, **_options):
                 self.requests = 0
                 self.min_confidence = 0.7
-                self.entered = threading.Event()
-                self.released = threading.Event()
-                oracles.append(self)
 
             def decide(self, state):
                 return MockProvider().decide(state)
 
             def answer(self, _body, _payload):
                 self.requests += 1
-                self.entered.set()
-                deadline = time.monotonic() + 3
-                while not self.cancelled() and time.monotonic() < deadline:
-                    threading.Event().wait(0.005)
-                self.released.set()
-                raise ProviderError("Jev processing was cancelled")
+                raise ProviderError("Jev temporarily unavailable; no automatic retry")
 
-        controller = PrototypeController(
-            PrototypeConfig.load(config),
-            event_publisher=SpeechEvents(),
-            processor_factory=_Processor,
-            capture_factory=_refuse,
-            provider_factory=SlowOracle,
+        oracles = []
+
+        def factory(**options):
+            oracles.append(FailingOracle(**options))
+            return oracles[-1]
+
+        args = Namespace(
+            input=supplied,
+            provider="jev",
+            allow_hosted=True,
+            max_requests=20,
+            timeout=10,
+            min_confidence=0.7,
+            names=None,
+            owners=["Speaker A"],
+            trusted=None,
+            owner_only=False,
+            role_source="model",
         )
-        self.addCleanup(controller.close)
-        controller.start({"mode": "demo", "use_jev": True, "session_id": "slow-roles"})
-        self.assertTrue(oracles[0].entered.wait(3))
-        started = time.monotonic()
-        controller.stop()
-        self.assertLess(time.monotonic() - started, 2)
-        self.assertTrue(oracles[0].released.is_set())
-        self.assertTrue(oracles[0].cancelled())
-        self.assertEqual(controller.snapshot()["phase"], "idle")
+        output = io.StringIO()
+        with patch("rightyo.tool.JevProvider", side_effect=factory):
+            self.assertEqual(replay(args, output=output), 0)
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(events[-1]["phase"], "stopped")
+        roles = {e["turn"]["speaker_id"]: e["turn"]["role"] for e in events if "turn" in e}
+        # The fixture's speaker-less turn is unknown without consulting the provider.
+        self.assertEqual(roles, {"Speaker A": "owner", "Speaker B": "unknown", None: "unknown"})
         self.assertEqual(oracles[0].requests, 1)
 
 

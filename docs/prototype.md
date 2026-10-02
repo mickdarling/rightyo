@@ -39,21 +39,15 @@ the runtime forms of address described in [the tool API](tool-api.md); `--name` 
 the command line replace the file's names. An optional `"speakers"` object declares
 hard-coded speaker roles for the headless tool, for example
 `"speakers": {"owner": ["Speaker A"], "trusted": [], "owner_only": false}`; it may also
-set `"stop_phrases"` and `"source": "model"`, which asks Jev about unconfigured speakers
-only when the session has opted into hosted decisions. Session speaker labels such as
-`Speaker A` are anonymous and are assigned per session by the diarizer, so a configured
-label names whichever voice receives it; roles are precedence data for the host, not a
-verified identity. With `"source": "model"`, the role question for a newly observed
-speaker currently runs synchronously on the audio path when that speaker's first turn
-is published, once per speaker per session and bounded by the hosted `timeout_seconds`
-(10 seconds), so capture can stall for up to that long per new speaker; a failed question
-degrades that speaker to the configured role or `unknown` and disables further role
-questions for the session (`role_status: "unavailable"`) rather than stopping the
-session. Stop, lease expiry and Ctrl-C set the provider's cancellation before waiting
-for the controller, so a lookup that has not yet sent its request returns at once; an
-HTTP exchange already in flight still ends only at its timeout. Moving the question off
-the audio thread is tracked in
-[#49](https://github.com/mickdarling/rightyo/issues/49). Replay accepts mono PCM16 WAV at 16 kHz, at most
+set `"stop_phrases"`. Session speaker labels such as `Speaker A` are anonymous and are
+assigned per session by the diarizer, so a configured label names whichever voice
+receives it; roles are precedence data for the host, not a verified identity.
+`"source": "model"` is refused by the lab and by `listen`, in both microphone and demo
+modes, with a clear error before any capture starts: a hosted role question would run on
+the audio path under the controller lock, where Stop and lease expiry cannot reach it.
+Model-sourced roles remain available to `tool-replay`, which has no audio thread; the
+live path is tracked in [#55](https://github.com/mickdarling/rightyo/issues/55). Replay
+accepts mono PCM16 WAV at 16 kHz, at most
 three minutes; it feeds real PCM in causal order as quickly as processing permits. It is not
 a wall-clock streaming latency measurement. Playback through speakers is a separate physical
 test.

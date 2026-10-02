@@ -22,13 +22,7 @@ from rightyo.credentials import CredentialError
 from rightyo.live_audio import LiveAudioError, LiveConfig, LiveProcessor
 from rightyo.memory import MemorySessionLimitError, TranscriptMemory
 from rightyo.pipeline import ReplayRunner
-from rightyo.providers import (
-    ConfiguredPriorityProvider,
-    JevProvider,
-    MockProvider,
-    ModelPriorityProvider,
-    ProviderError,
-)
+from rightyo.providers import ConfiguredPriorityProvider, JevProvider, MockProvider, ProviderError
 
 SESSION_SECONDS = 900
 BROWSER_LEASE_SECONDS = 15
@@ -116,8 +110,8 @@ class PrototypeController:
         self._mode = "microphone"
         self._error = None
         self._decision_status = "off"
-        # Speaker role source for the tool stream: off, configured, model, or unavailable
-        # once a hosted role question failed and roles degraded to configured/unknown.
+        # Speaker role source for the tool stream: off, or configured. Model-sourced
+        # roles are refused here and available to tool-replay only (tracked in #55).
         self._role_status = "off"
         self._memory = TranscriptMemory()
         self._runner: ReplayRunner | None = None
@@ -202,6 +196,14 @@ class PrototypeController:
             raise PrototypeError("Invalid prototype setting")
         if mode == "demo" and self.config.demo_audio is None:
             raise PrototypeError("No generated audio demo is configured")
+        if self.config.speakers is not None and self.config.speakers.source == "model":
+            # A hosted role question would run on the audio path under the controller
+            # lock, where Stop and lease expiry cannot reach it; tool-replay has no such
+            # path and keeps model-sourced roles.
+            raise PrototypeError(
+                "Model-sourced speaker roles are not available in live microphone or demo "
+                "mode yet; use configured roles, or tool-replay (tracked in #55)"
+            )
         with self._lock:
             if self._phase in {"starting", "listening", "replaying", "finishing", "stopping"}:
                 raise PrototypeError("Stop the active session before starting another")
@@ -231,16 +233,13 @@ class PrototypeController:
             runner = ReplayRunner(
                 provider, memory=memory, cancelled=cancelled, addressing=self.config.addressing
             )
-            speakers = self.config.speakers
-            priority = None
-            if speakers is not None:
-                # Model-assigned roles need the hosted opt-in; otherwise only the
-                # configured roles apply and nothing leaves the machine.
-                priority = (
-                    ModelPriorityProvider(provider, speakers)
-                    if hosted and speakers.source == "model"
-                    else ConfiguredPriorityProvider(speakers)
-                )
+            # Only configured roles run here: no hosted role question ever executes
+            # under the controller lock (model-sourced roles are refused above).
+            priority = (
+                None
+                if self.config.speakers is None
+                else ConfiguredPriorityProvider(self.config.speakers)
+            )
             runner.restart(session)
             self._generation += 1
             generation = self._generation
@@ -258,13 +257,7 @@ class PrototypeController:
             self._mode = mode
             self._error = None
             self._decision_status = "ready" if hosted else "off"
-            self._role_status = (
-                "off"
-                if priority is None
-                else "model"
-                if isinstance(priority, ModelPriorityProvider)
-                else "configured"
-            )
+            self._role_status = "off" if priority is None else "configured"
             self._phase = "starting"
             self._started = self._last_browser = time.monotonic()
             if self._events is not None:
@@ -295,9 +288,6 @@ class PrototypeController:
             memory.append(turn)
             if self._events is not None:
                 self._publish("transcript", turn)
-                if self._events.role_status in {"unavailable", "rejected"}:
-                    # A failed or rejected role answer degraded roles; listening continues.
-                    self._role_status = self._events.role_status
             if self._decision_status == "off" or self._decision_cancel.is_set():
                 return
             try:
@@ -548,11 +538,6 @@ class PrototypeController:
             }
 
     def stop(self) -> None:
-        # Cancel before taking the controller lock: a hosted role lookup inside _accept
-        # runs under that lock and polls these events, so Stop is not held until the
-        # lookup's own timeout. Setting an already set or superseded event is harmless.
-        self._stop.set()
-        self._decision_cancel.set()
         with self._lock:
             if self._phase == "stopping":
                 return

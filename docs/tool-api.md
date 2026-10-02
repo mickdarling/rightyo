@@ -162,10 +162,12 @@ attention decision, is the signal, as chosen in
 [#50](https://github.com/mickdarling/rightyo/issues/50). If a hosted role question
 fails (timeout, unavailability, budget exhaustion or cancellation), the session keeps
 listening: that speaker receives the configured role if any, otherwise `unknown`, fixed
-as usual, and no further model questions are asked in that session; the prototype
-reports this as `role_status: "unavailable"`. A provider answer that names an
+as usual, and no further model questions are asked in that session; the producer
+records this as `role_status: "unavailable"`. A provider answer that names an
 unconfigured speaker as `owner` is rejected the same way (`role_status: "rejected"`):
-owners come only from configuration. Because decisions can arrive out of order, an
+owners come only from configuration. Model-sourced roles are available to `tool-replay`
+only; `listen` and the lab refuse `"source": "model"` before capture starts (see
+[the lab notes](prototype.md)). Because decisions can arrive out of order, an
 owner override supersedes only turns earlier than the owner's turn, compared by turn
 time (a turn whose `end_ms` is at or before the owner turn's `end_ms`), never by
 emission order; a later non-owner request that happened to be decided first stays open.
