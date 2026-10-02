@@ -716,6 +716,7 @@ class LiveProcessor:
             self._asr_process = None
         if self.closed:
             raise LiveAudioError("Audio session was stopped")
+        provenance = getattr(self._diarizer, "speaker_provenance", "diarization-timeline")
         groups: list[dict[str, Any]] = []
         for unit in units:
             start, end = unit["start_ms"] + offset, unit["end_ms"] + offset
@@ -750,7 +751,7 @@ class LiveProcessor:
                 overlap=group["overlap"],
                 recognizer_id=self._transcriber.recognizer_id,
                 provenance=self.config.provenance,
-                speaker_provenance="diarization-timeline" if timeline else "unknown",
+                speaker_provenance=provenance if timeline else "unknown",
             )
             self.on_turn(turn)
 
@@ -765,7 +766,10 @@ class LiveProcessor:
                 self._diarizer.push(pcm)
                 if self._utterance:
                     self._utterance.extend(pcm)
-            self._finalize(self._diarizer.finish())
+            # Flush only for a pending utterance: nothing else is emitted, and a hosted
+            # diarizer must not send audio that no turn will use.
+            if self._utterance:
+                self._finalize(self._diarizer.finish())
         except Exception:
             self.failed = True
             raise

@@ -175,7 +175,40 @@ class ProtocolAndSelectionTests(unittest.TestCase):
         self.assertEqual(turns[0].recognizer_id, "stub-recognizer")
         self.assertEqual(turns[0].speaker_id, "Speaker B")
         self.assertEqual(turns[0].text, "Hi.")
+        self.assertEqual(turns[0].speaker_provenance, "diarization-timeline")
         self.assertTrue(diarizer.closed)
+
+    def test_per_utterance_labels_are_declared_while_the_native_path_is_unchanged(self):
+        turns = []
+        per_utterance = StubDiarizer()
+        per_utterance.speaker_provenance = "diarization-utterance"
+        for diarizer, expected in (
+            (per_utterance, "diarization-utterance"),
+            (StubDiarizer(), "diarization-timeline"),
+        ):
+            with self.subTest(expected=expected):
+                turns.clear()
+                processor = LiveProcessor(
+                    LiveConfig(
+                        "selection-test",
+                        provenance="causal-replay",
+                        transcriber=StubTranscriber(),
+                        diarizer=diarizer,
+                    ),
+                    turns.append,
+                )
+                for _ in range(10):
+                    processor.push_pcm16(VOICE)
+                processor.finish()
+                self.assertEqual([turn.speaker_provenance for turn in turns], [expected])
+        self.assertEqual(DeepgramDiarizer.speaker_provenance, "diarization-utterance")
+        with patch("rightyo.live_audio._transcribe", return_value={"transcription": []}):
+            processor = LiveProcessor(self.local_config(diarizer=StubDiarizer()), turns.append)
+            self.addCleanup(processor.close)
+            self.assertEqual(
+                getattr(processor._diarizer, "speaker_provenance", "diarization-timeline"),
+                "diarization-timeline",
+            )
 
     def test_local_assets_are_required_only_by_the_local_defaults(self):
         with self.assertRaisesRegex(LiveAudioError, "existing"):
@@ -206,7 +239,13 @@ class HostedTranscriberTests(unittest.TestCase):
             OpenAICompatibleTranscriber(endpoint=ENDPOINT, model="whisper-1")
         with self.assertRaisesRegex(HostedSpeechError, "consent"):
             OpenAICompatibleTranscriber(endpoint=ENDPOINT, model="whisper-1", allow_hosted=1)
-        for endpoint in ("http://transcribe.example.test/v1", "https://u:p@x.test/v1", 5):
+        for endpoint in (
+            "http://transcribe.example.test/v1",
+            "https://u:p@x.test/v1",
+            ENDPOINT + "?model=x",
+            ENDPOINT + "#fragment",
+            5,
+        ):
             with self.subTest(endpoint=endpoint), self.assertRaisesRegex(LiveAudioError, "https"):
                 self.transcriber(endpoint=endpoint)
         with self.assertRaises(LiveAudioError):
@@ -362,8 +401,9 @@ class HostedDiarizerTests(unittest.TestCase):
     def test_hosted_use_requires_explicit_consent_and_valid_settings(self):
         with self.assertRaisesRegex(HostedSpeechError, "consent"):
             DeepgramDiarizer()
-        with self.assertRaisesRegex(LiveAudioError, "https"):
-            self.diarizer(endpoint="http://api.deepgram.com/v1/listen")
+        for endpoint in ("http://api.deepgram.com/v1/listen", DEEPGRAM_ENDPOINT + "?diarize=true"):
+            with self.subTest(endpoint=endpoint), self.assertRaisesRegex(LiveAudioError, "https"):
+                self.diarizer(endpoint=endpoint)
         with self.assertRaises(LiveAudioError):
             self.diarizer(diarize_model="v9")
         with self.assertRaises(LiveAudioError):
@@ -441,6 +481,41 @@ class HostedDiarizerTests(unittest.TestCase):
             diarizer.push(bytes(640))
             self.assertEqual(diarizer.segments(), [])
         self.assertEqual(seen, ["Token " + KEY])
+
+    def test_finish_without_a_pending_utterance_sends_no_audio(self):
+        opener, requests = patched_opener(
+            b'{"results":{"channels":[{"alternatives":[{"words":[]}]}]}}'
+        )
+        turns = []
+        with opener:
+            silent = LiveProcessor(
+                LiveConfig(
+                    "silent-finish",
+                    provenance="causal-replay",
+                    transcriber=StubTranscriber(),
+                    diarizer=lambda config: self.diarizer(cancelled=config.cancelled),
+                ),
+                turns.append,
+            )
+            for _ in range(100):
+                silent.push_pcm16(bytes(640))
+            silent.finish()
+            self.assertEqual(requests, [])
+            voiced = LiveProcessor(
+                LiveConfig(
+                    "voiced-finish",
+                    provenance="causal-replay",
+                    transcriber=StubTranscriber(),
+                    diarizer=lambda config: self.diarizer(cancelled=config.cancelled),
+                ),
+                turns.append,
+            )
+            for _ in range(10):
+                voiced.push_pcm16(VOICE)
+            voiced.finish()
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].speaker_provenance, "unknown")
 
     def test_silence_without_pushed_audio_and_failures_send_or_reveal_nothing(self):
         opener, requests = patched_opener(b"{}")

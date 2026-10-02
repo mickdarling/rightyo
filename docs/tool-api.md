@@ -91,6 +91,12 @@ below, the per-utterance audio window, and the per-session unique-turn count.
 turns are final. Labels are anonymous within a session, not verified identities;
 overlap and unknown speakers retain their explicit meaning. Provenance distinguishes
 `synthetic`, `recorded-file`, `causal-replay`, and `live-microphone`.
+`speaker_provenance` says how far a label reaches: `diarization-timeline` labels come
+from one session-long speaker timeline (the native stream), so the same label across
+turns is the same anonymous voice for the session; `diarization-utterance` labels
+(the hosted per-request diarizer) are stable only within one utterance, and a label in
+one utterance does not identify the same voice in another; `authored-fixture` and
+`unknown` keep their meanings. None is an identity.
 
 Decision evidence contains `label`, `recipient_kind`, `confidence`, `provider`, and
 `model`. A probability is not demonstrated accuracy or authority. A request is
@@ -287,7 +293,11 @@ configuration select an implementation by name, described in
 also provides the hosted implementations and the factories that section maps to.
 Word-to-speaker attribution, grouping and the `Turn` contract are the same for every
 backend. Hosted backends refuse to send audio without explicit consent (`--allow-hosted`),
-and no hosted backend has been accuracy-tested here.
+and no hosted backend has been accuracy-tested here. The hosted transcriber ignores the
+`register` cancellation hook: the `cancelled` guard is checked before each request, but a
+request already in flight is bounded only by its `timeout_seconds` (default 30, at most
+120), so a stop during hosted recognition can block for up to that long before the
+session reports stopped.
 
 The current native implementation still uses conservative endpointing and completed
 Whisper windows. Persistent ASR, early attention, lower endpoint latency and other

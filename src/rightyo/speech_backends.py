@@ -60,8 +60,10 @@ def _https_endpoint(value: Any, label: str) -> str:
         or not parts.hostname
         or parts.username is not None
         or parts.password is not None
+        or parts.query
         or parts.fragment
     ):
+        # Query and fragment are refused: the backend appends its own query string.
         raise LiveAudioError(f"{label} requires an https endpoint")
     return value
 
@@ -391,10 +393,12 @@ class DeepgramDiarizer:
     that window's timeline in stream milliseconds with consecutive words of one
     speaker merged into a segment. "Speaker A" in one utterance is therefore not
     known to be the same person as "Speaker A" in the next: the service documents no
-    cross-request label stability and none is invented here. Audio outside the window
-    is not retained, and the whole-session timeline cap of the native backend does not
-    apply.
+    cross-request label stability and none is invented here, so turns carry
+    `speaker_provenance="diarization-utterance"`. Audio outside the window is not
+    retained, and the whole-session timeline cap of the native backend does not apply.
     """
+
+    speaker_provenance = "diarization-utterance"
 
     def __init__(
         self,

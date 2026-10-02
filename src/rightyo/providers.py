@@ -88,7 +88,10 @@ class Diarizer(Protocol):
 
     `segments` and `finish` return `{"speaker": int >= 1, "start_ms", "end_ms"}` entries
     in stream milliseconds; `finish` flushes any lookahead first. Whether labels stay
-    stable across utterances is a property of the implementation, not of this surface.
+    stable across utterances is a property of the implementation: an implementation
+    whose labels hold only within one utterance declares `speaker_provenance =
+    "diarization-utterance"`; without the attribute, turns carry the session-stable
+    `"diarization-timeline"`.
     """
 
     def push(self, pcm: bytes) -> None: ...

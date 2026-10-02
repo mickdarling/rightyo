@@ -9,7 +9,9 @@ from typing import Any
 
 LABELS = frozenset({"attend", "ignore", "uncertain"})
 PROVENANCE = frozenset({"synthetic", "recorded-file", "causal-replay", "live-microphone"})
-SPEAKER_PROVENANCE = frozenset({"authored-fixture", "diarization-timeline", "unknown"})
+SPEAKER_PROVENANCE = frozenset(
+    {"authored-fixture", "diarization-timeline", "diarization-utterance", "unknown"}
+)
 MAX_TEXT_CHARS = 4000
 MAX_ADDRESS_NAMES = 8
 MAX_ADDRESS_NAME_CHARS = 48
