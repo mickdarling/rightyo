@@ -96,17 +96,24 @@ class SpeechEvents:
         self.role_status = "off"
         self._degraded_turn = None
 
-    def _emit(self, kind, **fields):
-        self._sequence += 1
-        payload = {
+    def _payload(self, kind, sequence, fields):
+        return {
             "schema_version": 1,
             "type": kind,
             "session_id": self._session,
-            "sequence": self._sequence,
+            "sequence": sequence,
             "emitted_at_ms": self._now,
             **fields,
         }
-        size = len(encode_json(payload)) + 1  # Include the JSONL newline.
+
+    @staticmethod
+    def _size(payload):
+        return len(encode_json(payload)) + 1  # Include the JSONL newline.
+
+    def _emit(self, kind, **fields):
+        self._sequence += 1
+        payload = self._payload(kind, self._sequence, fields)
+        size = self._size(payload)
         if (
             size > MAX_EVENT_BYTES
             or len(self._queue) >= self.max_pending
@@ -366,6 +373,59 @@ class SpeechEvents:
                 # the undrained queue; otherwise fail closed before emitting any override,
                 # never a partial batch.
                 if len(to_supersede) + 3 > self.max_pending - len(self._queue):
+                    self._clear_content()
+                    self._active = False
+                    raise ContractError("speech event consumer backlog exceeded")
+                # Byte accounting with the exact payloads about to be emitted, in the
+                # sequence order they will receive, plus a terminal event upper bound
+                # (longest identifier reason, sequence digit growth), so the burst can
+                # never trip the queue byte bound part way through.
+                first = self._sequence + 1
+                burst = sum(
+                    self._size(
+                        self._payload(
+                            "override",
+                            first + 1 + offset,
+                            {"superseded_request_id": r, "by_utterance_id": key, "role": "owner"},
+                        )
+                    )
+                    for offset, r in enumerate(to_supersede)
+                )
+                reserve = self._size(
+                    self._payload(
+                        "attention",
+                        first,
+                        {
+                            "utterance_id": key,
+                            "speech_end_ms": turn.end_ms,
+                            "decision": evidence,
+                            **({"request_id": request_id} if attended else {}),
+                        },
+                    )
+                )
+                after = first + 1 + len(to_supersede)
+                if attended:
+                    reserve += self._size(
+                        self._payload(
+                            "request",
+                            after,
+                            {
+                                "request_id": request_id,
+                                "turn": _with_role(turn, role),
+                                "decision": evidence,
+                                "context": context,
+                                "decision_at_ms": self._now,
+                            },
+                        )
+                    )
+                reserve += 32 + self._size(
+                    self._payload(
+                        "session",
+                        after + 1,
+                        {"phase": "cancelled", "reason": "x" * 96, "role_status": "unavailable"},
+                    )
+                )
+                if self._queue_bytes + burst + reserve > MAX_QUEUE_BYTES:
                     self._clear_content()
                     self._active = False
                     raise ContractError("speech event consumer backlog exceeded")

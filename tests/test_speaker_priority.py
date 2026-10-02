@@ -731,6 +731,39 @@ class EnrolledEventTests(unittest.TestCase):
         anonymous.end("stopped", 100)
         self.assertNotIn("role_status", anonymous.drain()[-1])
 
+    def test_override_burst_checks_queue_bytes_before_emitting(self):
+        from unittest.mock import patch
+
+        for slack, expect_failure in ((500, True), (20000, False)):
+            with self.subTest(slack=slack):
+                self.start()
+                for index in range(3):
+                    current = turn(f"r{index}", index * 1000, index * 1000 + 500, "Rightyo, task.")
+                    self.events.transcript(current, current.end_ms)
+                    self.events.decision(decision(current), current.end_ms + 100)
+                    self.events.drain()
+                for index in range(4):
+                    start = 10000 + index * 1000
+                    big = turn(f"big{index}", start, start + 500, "x" * 4000)
+                    self.events.transcript(big, big.end_ms, expect_decision=False)
+                stop = turn("stop", 20000, 20500, "stop", "Speaker A")
+                self.events.transcript(stop, 20500)
+                limit = self.events._queue_bytes + slack
+                before = self.events._sequence
+                with patch("rightyo.tool_events.MAX_QUEUE_BYTES", limit):
+                    if expect_failure:
+                        with self.assertRaisesRegex(ContractError, "consumer backlog"):
+                            self.events.decision(decision(stop, "uncertain", "unknown"), 20600)
+                        self.assertEqual(self.events._sequence, before)
+                        self.assertEqual(self.events._queue, deque())
+                        self.assertFalse(self.events._active)
+                        continue
+                    self.events.decision(decision(stop, "uncertain", "unknown"), 20600)
+                drained = self.events.drain()
+                kinds = [e["type"] for e in drained][-4:]
+                self.assertEqual(kinds, ["attention"] + ["override"] * 3)
+                self.assertLessEqual(sum(len(json.dumps(e)) for e in drained), limit)
+
     def test_invalid_providers_and_assignments_fail_closed_without_echo(self):
         events = SpeechEvents()
         for invalid in (OWNER, object(), {"assign": lambda state: {}}):
