@@ -70,6 +70,64 @@ a separate physical test.
 .venv/bin/rightyo prototype --config local/prototype.json --port 8766
 ```
 
+## Speech backends
+
+Recognition and speaker labelling are selected by two optional sections. Omitting them,
+as every existing configuration does, keeps the local runtimes above:
+
+```json
+{
+  "transcriber": {"kind": "whisper.cpp"},
+  "diarizer": {"kind": "nemotron.cpp"}
+}
+```
+
+The hosted alternatives are opt-in. Selecting one makes that side's local asset paths
+optional, and the lab or `listen` then refuses to start without `--allow-hosted`, which
+authorizes sending session audio to the named service for that run:
+
+```json
+{
+  "transcriber": {
+    "kind": "hosted-openai-compatible",
+    "endpoint": "https://api.openai.com/v1/audio/transcriptions",
+    "model": "whisper-1",
+    "language": "en",
+    "timeout_seconds": 30
+  },
+  "diarizer": {"kind": "hosted-deepgram", "model": "nova-3", "diarize_model": "latest"}
+}
+```
+
+`hosted-openai-compatible` posts each finalized utterance as a WAV file to the given
+`https` endpoint in the OpenAI `POST /v1/audio/transcriptions` schema with
+`response_format=verbose_json` and `timestamp_granularities[]` `word` and `segment`;
+per the API reference read on 2026-10-02, that is what `whisper-1` accepts, while
+`gpt-4o-transcribe` and `gpt-4o-mini-transcribe` return only `json` and
+`gpt-4o-transcribe-diarize` does not offer timestamp granularities. `endpoint` and
+`model` are required; `language` (ISO 639-1) and `timeout_seconds` (at most 120) are
+optional. The credential is read from `RIGHTYO_TRANSCRIBER_API_KEY` or the login
+Keychain item with service `rightyo.transcriber` and account `api-key`.
+
+`hosted-deepgram` posts the trailing utterance window to Deepgram's pre-recorded
+`https://api.deepgram.com/v1/listen` with `model` (default `nova-3`) and `diarize_model`
+(`latest`, `v1` or `v2`; default `latest`) and reads the word-level `speaker` labels,
+merging consecutive words of one speaker into timeline segments. `endpoint` may be
+overridden with another `https` URL. The credential is read from
+`RIGHTYO_DIARIZER_API_KEY` or the login Keychain item with service `rightyo.diarizer`
+and account `api-key`; create it with `security add-generic-password -s rightyo.diarizer
+-a api-key -w` (prompted, never on the command line). Deepgram labels speakers per
+request, so with this backend Speaker A in one utterance is not known to be the same
+person as Speaker A in the next; the native Nemotron stream is the only backend whose
+labels persist for the session. The 18,000-segment timeline cap does not apply to it.
+
+Hosted calls use the standard library only, send no environment proxy, refuse redirects,
+cap responses at 2 MiB, and report failures as "Hosted speech backend failed" without
+audio, transcript, URL or credential content; a failure stops the session like a local
+one. Unknown kinds, unknown keys and non-`https` endpoints are rejected when the file is
+loaded. No hosted backend has been accuracy-tested in this repository; the local smoke
+evidence below is for the local runtimes only.
+
 Open the printed local URL, including its one-time session fragment. The dashboard initially
 sits idle. **Start microphone** explicitly enables the default input and may prompt for
 macOS permission. A pending permission prompt can be cancelled with Stop. The capture helper
@@ -97,7 +155,7 @@ an explicit message to start a new session, preserving valid history until expir
 The native diarizer separately keeps one whole-session speaker timeline capped at 18,000
 segments, returned in full at every utterance; very long sessions with frequent speaker
 changes reach it, stop with a distinct timeline-limit message, and likewise need a new
-session. A windowed timeline is tracked in [#49](https://github.com/mickdarling/rightyo/issues/49).
+session. A windowed timeline is tracked in [#54](https://github.com/mickdarling/rightyo/issues/54).
 The whole turn overlapping the time boundary is retained and its overlap is reported. Ignore and uncertain decisions remain in local context: a later
 request can refer to the preceding discussion. Copy context produces speaker-labelled text
 for manual use downstream, including unknown-speaker and overlap indications.

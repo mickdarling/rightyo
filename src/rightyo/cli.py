@@ -281,6 +281,11 @@ def main(argv: list[str] | None = None) -> int:
     prototype = commands.add_parser("prototype", help="open an idle local Mac speech lab")
     prototype.add_argument("--config", type=Path, required=True, help="local asset configuration")
     prototype.add_argument("--port", type=int, default=8765)
+    prototype.add_argument(
+        "--allow-hosted",
+        action="store_true",
+        help="send session audio to the hosted speech backends named in the configuration",
+    )
     _add_name_option(prototype)
     _add_session_budget_option(prototype)
     listen = commands.add_parser("listen", help="explicit foreground speech JSONL tool")
@@ -325,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.port,
                     addressing=addressing_from_args(args),
                     session_budget_seconds=args.session_budget,
+                    allow_hosted=args.allow_hosted,
                 )
             except (PrototypeError, OSError):
                 print(

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .contracts import PROVENANCE, Turn, identifier
+from .providers import Diarizer, Transcriber
 
 SAMPLE_RATE = 16000
 FRAME_BYTES = 640  # 20 ms of mono signed little-endian PCM16
@@ -44,20 +45,27 @@ class DiarizerTimelineLimitError(LiveAudioError):
     """The native stream's whole-session timeline reached its fixed segment cap.
 
     The full timeline is returned per utterance, so very long sessions with frequent
-    speaker changes reach it; a windowed timeline is tracked in #49.
+    speaker changes reach it; a windowed timeline is tracked in #54.
     """
 
     def __init__(self) -> None:
         super().__init__("Local diarizer timeline limit reached; restart the session")
 
 
+def _check_backend(value: Any, method: str, label: str) -> None:
+    """Accept None, an instance exposing `method`, or a factory called with the config."""
+    if not (value is None or hasattr(value, method) or callable(value)):
+        raise LiveAudioError(f"Invalid {label} backend")
+
+
 @dataclass(frozen=True)
 class LiveConfig:
     session_id: str
-    whisper_executable: str | Path
-    whisper_model: str | Path
-    diarization_library: str | Path
-    diarization_model: str | Path
+    # Local runtime assets; required only by the default local backends below.
+    whisper_executable: str | Path | None = None
+    whisper_model: str | Path | None = None
+    diarization_library: str | Path | None = None
+    diarization_model: str | Path | None = None
     provenance: str = "live-microphone"
     energy_threshold: float = 0.008
     hangover_ms: int = 1440
@@ -68,9 +76,15 @@ class LiveConfig:
     # Total audio accepted per session, in stream milliseconds. None means no ceiling:
     # memory stays bounded by the utterance window and downstream retention limits.
     session_budget_ms: int | None = None
+    # A `Transcriber`/`Diarizer` instance, or a factory called with this config. None
+    # selects the local whisper.cpp recognizer and Nemotron native stream.
+    transcriber: Transcriber | Callable[[LiveConfig], Transcriber] | None = None
+    diarizer: Diarizer | Callable[[LiveConfig], Diarizer] | None = None
 
     def __post_init__(self) -> None:
         identifier(self.session_id, "session_id")
+        _check_backend(self.transcriber, "transcribe", "transcriber")
+        _check_backend(self.diarizer, "push", "diarizer")
         if self.session_budget_ms is not None and (
             type(self.session_budget_ms) is not int or self.session_budget_ms < 1
         ):
@@ -98,14 +112,18 @@ class LiveConfig:
             or not 0 < self.timeout_seconds <= 120
         ):
             raise LiveAudioError("Invalid local processing timeout")
-        for value in (
+        assets = (
             self.whisper_executable,
             self.whisper_model,
             self.diarization_library,
             self.diarization_model,
+        )
+        required = assets[:2] if self.transcriber is None else ()
+        required += assets[2:] if self.diarizer is None else ()
+        if any(value is None for value in required) or any(
+            value is not None and not Path(value).is_file() for value in assets
         ):
-            if not Path(value).is_file():
-                raise LiveAudioError("Explicit existing runtimes and models are required")
+            raise LiveAudioError("Explicit existing runtimes and models are required")
 
 
 def _pcm_samples(pcm: bytes) -> array.array:
@@ -304,8 +322,17 @@ def _native_worker(library: str, model: str) -> int:
         protocol.close()
 
 
-class _Diarizer:
+class NemotronCppDiarizer:
+    """The default `Diarizer`: one persistent native stream in a private subprocess.
+
+    Speaker channels are arrival-ordered and stable for the whole session. The
+    whole-session timeline is capped at 18,000 segments (`DiarizerTimelineLimitError`,
+    windowing tracked in #54).
+    """
+
     def __init__(self, config: LiveConfig):
+        if config.diarization_library is None or config.diarization_model is None:
+            raise LiveAudioError("Explicit existing runtimes and models are required")
         self.timeout = config.timeout_seconds
         self.cancelled = config.cancelled if config.cancelled is not None else (lambda: False)
         self._check_cancelled()
@@ -407,6 +434,10 @@ class _Diarizer:
             if stream is not None:
                 stream.close()
         self.buffer.clear()
+
+
+# Compatibility name; the default selection below resolves it at call time.
+_Diarizer = NemotronCppDiarizer
 
 
 def _attribute(start: int, end: int, timeline: list[dict[str, Any]]) -> tuple[str | None, bool]:
@@ -567,6 +598,29 @@ def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]]:
     return result
 
 
+class WhisperCppTranscriber:
+    """The default `Transcriber`: the pinned whisper.cpp CLI on a temporary WAV file."""
+
+    recognizer_id = "whisper.cpp-live-window"
+
+    def __init__(self, config: LiveConfig):
+        if config.whisper_executable is None or config.whisper_model is None:
+            raise LiveAudioError("Explicit existing runtimes and models are required")
+        self.config = config
+
+    def transcribe(
+        self, pcm: bytes, register: Callable[[subprocess.Popen], None] | None = None
+    ) -> list[dict[str, Any]]:
+        document = _transcribe(self.config, pcm, register)
+        return _units(document, len(pcm) // BYTES_PER_MS)
+
+
+def _select(value: Any, default: Callable[[LiveConfig], Any], config: LiveConfig, method: str):
+    if value is None:
+        return default(config)
+    return value if hasattr(value, method) else value(config)
+
+
 class LiveProcessor:
     """Single-owner synchronous processor; feed only explicitly consented audio.
 
@@ -580,7 +634,13 @@ class LiveProcessor:
         self.on_turn = on_turn
         self.failed = False
         self.closed = False
-        self._diarizer = _Diarizer(config)
+        self._transcriber: Transcriber = _select(
+            config.transcriber, WhisperCppTranscriber, config, "transcribe"
+        )
+        # Resolved through the module at call time so the default stays patchable.
+        self._diarizer: Diarizer = _select(
+            config.diarizer, lambda value: _Diarizer(value), config, "push"
+        )
         self._partial = bytearray()
         self._pre_roll: deque[bytes] = deque(maxlen=config.pre_roll_ms // 20)
         self._utterance = bytearray()
@@ -651,13 +711,13 @@ class LiveProcessor:
         self._utterance.clear()
         self._pre_roll.clear()
         try:
-            document = _transcribe(self.config, pcm, self._register_asr)
+            units = self._transcriber.transcribe(pcm, self._register_asr)
         finally:
             self._asr_process = None
         if self.closed:
             raise LiveAudioError("Audio session was stopped")
         groups: list[dict[str, Any]] = []
-        for unit in _units(document, len(pcm) // BYTES_PER_MS):
+        for unit in units:
             start, end = unit["start_ms"] + offset, unit["end_ms"] + offset
             speaker, overlap = _attribute(start, end, timeline)
             if groups and (groups[-1]["speaker"], groups[-1]["overlap"]) == (speaker, overlap):
@@ -688,7 +748,7 @@ class LiveProcessor:
                 speaker_id=group["speaker"],
                 finalized=True,
                 overlap=group["overlap"],
-                recognizer_id="whisper.cpp-live-window",
+                recognizer_id=self._transcriber.recognizer_id,
                 provenance=self.config.provenance,
                 speaker_provenance="diarization-timeline" if timeline else "unknown",
             )

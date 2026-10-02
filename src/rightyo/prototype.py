@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 import wave
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -41,9 +41,18 @@ from rightyo.providers import (
     ProviderError,
     request_former_for,
 )
+from rightyo.speech_backends import (
+    HostedSpeechError,
+    diarizer_factory,
+    diarizer_spec,
+    is_hosted,
+    transcriber_factory,
+    transcriber_spec,
+)
 
 BROWSER_LEASE_SECONDS = 15
 PCM_BYTES_PER_MS = 32
+LOCAL_ASSETS = ("whisper_executable", "whisper_model", "diarization_library", "diarization_model")
 
 
 class PrototypeError(ValueError):
@@ -65,16 +74,25 @@ def validate_session_budget(value: Any) -> int | None:
 
 @dataclass(frozen=True)
 class PrototypeConfig:
-    whisper_executable: Path
-    whisper_model: Path
-    diarization_library: Path
-    diarization_model: Path
+    # Local assets are required by the local backends only; a hosted selection may omit them.
+    whisper_executable: Path | None
+    whisper_model: Path | None
+    diarization_library: Path | None
+    diarization_model: Path | None
     microphone_helper: Path
     demo_audio: Path | None = None
     addressing: Addressing | None = None
     speakers: SpeakerPriority | None = None
     session_budget_seconds: int | None = None
     request_former: RequestForming | None = None
+    # Validated `transcriber`/`diarizer` sections; the defaults are the local backends.
+    transcriber: dict[str, Any] = field(default_factory=lambda: transcriber_spec(None))
+    diarizer: dict[str, Any] = field(default_factory=lambda: diarizer_spec(None))
+
+    @property
+    def hosted_speech(self) -> bool:
+        """Whether a selected speech backend would send audio to a hosted service."""
+        return is_hosted(self.transcriber) or is_hosted(self.diarizer)
 
     @classmethod
     def load(cls, path: Path) -> PrototypeConfig:
@@ -84,26 +102,26 @@ class PrototypeConfig:
             if len(content) > 65536:
                 raise ValueError
             raw = json.loads(content, parse_constant=_reject_constant)
-            required = {
-                "whisper_executable",
-                "whisper_model",
-                "diarization_library",
-                "diarization_model",
-                "microphone_helper",
-            }
-            if not isinstance(raw, dict) or not required <= raw.keys():
+            if not isinstance(raw, dict):
                 raise ValueError
-            if (
-                raw.keys()
-                - required
-                - {
-                    "demo_audio",
-                    "addressing",
-                    "speakers",
-                    "session_budget_seconds",
-                    "request_former",
-                }
-            ):
+            transcriber = transcriber_spec(raw.pop("transcriber", None))
+            diarizer = diarizer_spec(raw.pop("diarizer", None))
+            required = {"microphone_helper"}
+            if not is_hosted(transcriber):
+                required |= {"whisper_executable", "whisper_model"}
+            if not is_hosted(diarizer):
+                required |= {"diarization_library", "diarization_model"}
+            if not required <= raw.keys():
+                raise ValueError
+            optional = {
+                "demo_audio",
+                "addressing",
+                "speakers",
+                "session_budget_seconds",
+                "request_former",
+                *LOCAL_ASSETS,
+            }
+            if raw.keys() - required - optional:
                 raise ValueError
             addressing = raw.pop("addressing", None)
             if addressing is not None:
@@ -121,11 +139,15 @@ class PrototypeConfig:
                     raise ValueError
                 values[name] = Path(value)
             config = cls(
-                **values,
+                **{name: values.get(name) for name in LOCAL_ASSETS},
+                microphone_helper=values["microphone_helper"],
+                demo_audio=values.get("demo_audio"),
                 addressing=addressing,
                 speakers=speakers,
                 session_budget_seconds=budget,
                 request_former=forming,
+                transcriber=transcriber,
+                diarizer=diarizer,
             )
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
@@ -145,11 +167,14 @@ class PrototypeController:
         capture_factory=MacMicrophoneCapture,
         provider_factory=JevProvider,
         event_publisher=None,
+        allow_hosted_speech=False,
     ):
         self.config = config
         self.processor_factory = processor_factory
         self.capture_factory = capture_factory
         self.provider_factory = provider_factory
+        # Explicit consent for configured hosted speech backends to receive audio.
+        self.allow_hosted_speech = allow_hosted_speech is True
         # Optional host-facing stream. The lab retains its browser lease and UI controls.
         self._events = event_publisher
         self._event_terminal = True
@@ -262,6 +287,8 @@ class PrototypeController:
                 "Model-sourced speaker roles are not available in live microphone or demo "
                 "mode yet; use configured roles, or tool-replay (tracked in #55)"
             )
+        if self.config.hosted_speech and not self.allow_hosted_speech:
+            raise PrototypeError("Hosted speech backends require explicit hosted consent")
         budget_seconds = validate_session_budget(self.config.session_budget_seconds)
         with self._lock:
             if self._phase in {"starting", "listening", "replaying", "finishing", "stopping"}:
@@ -376,6 +403,12 @@ class PrototypeController:
                     provenance="live-microphone" if mode == "microphone" else "causal-replay",
                     cancelled=stop.is_set,
                     session_budget_ms=self._budget_ms,
+                    transcriber=transcriber_factory(
+                        self.config.transcriber, allow_hosted=self.allow_hosted_speech
+                    ),
+                    diarizer=diarizer_factory(
+                        self.config.diarizer, allow_hosted=self.allow_hosted_speech
+                    ),
                 ),
                 lambda turn: self._accept(generation, work, memory, turn),
             )
@@ -437,6 +470,8 @@ class PrototypeController:
                         self._error = (
                             "Session reached the speaker timeline limit; start a new session."
                         )
+                    elif isinstance(error, HostedSpeechError):
+                        self._error = "Hosted speech backend failed; the session is incomplete."
                     else:
                         self._error = (
                             "Audio stopped. Check microphone permission and local model setup."
@@ -831,10 +866,13 @@ def serve(
     *,
     addressing: Addressing | None = None,
     session_budget_seconds: int | None = None,
+    allow_hosted: bool = False,
 ) -> None:
     if type(port) is not int or not 0 <= port <= 65535:
         raise PrototypeError("Invalid local port")
     config = PrototypeConfig.load(config_path)
+    if config.hosted_speech and not allow_hosted:
+        raise PrototypeError("Hosted speech backends require --allow-hosted")
     if addressing is not None:
         # Command-line names take precedence over the configuration file's names.
         config = replace(config, addressing=addressing)
@@ -842,7 +880,7 @@ def serve(
         config = replace(
             config, session_budget_seconds=validate_session_budget(session_budget_seconds)
         )
-    controller = PrototypeController(config)
+    controller = PrototypeController(config, allow_hosted_speech=allow_hosted)
     server = None
     try:
         server = PrototypeServer(controller, port)

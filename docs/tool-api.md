@@ -112,7 +112,7 @@ Two per-session counts end a native session with a distinct error and require a 
 session identity: 1,000 unique finalized turns, and the native diarizer's whole-session
 speaker timeline of at most 18,000 segments, which is returned in full at every utterance
 and so is reached by very long sessions with frequent speaker changes (a windowed timeline
-is tracked in [#49](https://github.com/mickdarling/rightyo/issues/49)).
+is tracked in [#54](https://github.com/mickdarling/rightyo/issues/54)).
 The default history is five minutes, with 1,000 unique turns and 1 MiB of retained
 transcript data. There are additional independent bounds: at most 32 frozen pending
 contexts totalling 1 MiB, 128 queued events (configurable from 5 to 128) totalling
@@ -272,6 +272,22 @@ processor closed once more audio than the budget arrives. Native paths are expli
 separately provisioned trusted assets. The controller connects its finalized turns
 to the replaceable `DecisionProvider` and event publisher. Alternative backends can
 produce the same validated `Turn`/`DecisionEvent` values without changing consumers.
+
+Speech recognition and speaker labelling are replaceable at the same kind of boundary.
+`rightyo.providers.Transcriber` turns one finalized utterance of PCM16 mono 16 kHz bytes
+into utterance-relative `{"text", "start_ms", "end_ms"}` units and names the
+`recognizer_id` of emitted turns; `rightyo.providers.Diarizer` receives every pushed
+frame (`push`) and returns a stream-relative `{"speaker", "start_ms", "end_ms"}` timeline
+(`segments`, `finish`, `close`). `LiveConfig.transcriber` and `LiveConfig.diarizer` take
+an instance or a factory called with the config; `None` keeps the local defaults,
+`WhisperCppTranscriber` and `NemotronCppDiarizer` in `rightyo.live_audio`, whose
+behaviour is unchanged. The `transcriber`/`diarizer` sections of the prototype
+configuration select an implementation by name, described in
+[the prototype document](prototype.md#speech-backends); `rightyo.speech_backends`
+also provides the hosted implementations and the factories that section maps to.
+Word-to-speaker attribution, grouping and the `Turn` contract are the same for every
+backend. Hosted backends refuse to send audio without explicit consent (`--allow-hosted`),
+and no hosted backend has been accuracy-tested here.
 
 The current native implementation still uses conservative endpointing and completed
 Whisper windows. Persistent ASR, early attention, lower endpoint latency and other

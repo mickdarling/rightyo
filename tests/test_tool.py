@@ -360,12 +360,12 @@ class ToolTests(unittest.TestCase):
                 main(["prototype", "--config", str(self.config), "--session-budget", "30"]), 0
             )
             serve.assert_called_once_with(
-                self.config, 8765, addressing=None, session_budget_seconds=30
+                self.config, 8765, addressing=None, session_budget_seconds=30, allow_hosted=False
             )
             serve.reset_mock()
             self.assertEqual(main(["prototype", "--config", str(self.config)]), 0)
             serve.assert_called_once_with(
-                self.config, 8765, addressing=None, session_budget_seconds=None
+                self.config, 8765, addressing=None, session_budget_seconds=None, allow_hosted=False
             )
         self.assertEqual(Processor.instances, [])
         raw = json.loads(self.config.read_text())

@@ -174,14 +174,12 @@ class LiveProcessorTests(unittest.TestCase):
         executable = Path(self.directory.name) / "slow-recognizer"
         executable.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n")
         executable.chmod(0o700)
-        self.processor.config = LiveConfig(
-            **(
-                vars(self.config)
-                | {
-                    "whisper_executable": executable,
-                }
-            )
+        self.processor.close()
+        self.processor = LiveProcessor(
+            LiveConfig(**(vars(self.config) | {"whisper_executable": executable})),
+            self.turns.append,
         )
+        self.addCleanup(self.processor.close)
         self.feed(VOICE, 10)
         failures = []
 
