@@ -14,6 +14,7 @@ from rightyo.contracts import (
     DecisionEvent,
     SpeakerPriority,
     Turn,
+    formed_request_text,
     identifier,
     integer,
     speaker_role,
@@ -95,6 +96,10 @@ class SpeechEvents:
         # degrades roles to configured/unknown for the rest of the session.
         self.role_status = "off"
         self._degraded_turn = None
+        # Optional request forming renders a convenience string beside the raw turns;
+        # off by default, and the raw turn/context are unchanged either way.
+        self._former = None
+        self._addressing = None
 
     def _payload(self, kind, sequence, fields):
         return {
@@ -135,7 +140,14 @@ class SpeechEvents:
         self._superseded.clear()
 
     def start(
-        self, session_id, now_ms=0, *, attention_enabled=True, addressing=None, priority=None
+        self,
+        session_id,
+        now_ms=0,
+        *,
+        attention_enabled=True,
+        addressing=None,
+        priority=None,
+        former=None,
     ):
         with self._lock:
             identifier(session_id, "session_id")
@@ -149,6 +161,10 @@ class SpeechEvents:
                 or not isinstance(getattr(priority, "priority", None), SpeakerPriority)
             ):
                 raise ContractError("invalid speaker priority provider")
+            if former is not None and not callable(getattr(former, "form", None)):
+                raise ContractError("invalid request former")
+            if former is not None:
+                identifier(getattr(former, "kind", None), "request former kind")
             if self._active or self._queue:
                 raise ContractError("finish and drain the previous event session")
             session_key = hashlib.sha256(session_id.encode("utf-8")).digest()
@@ -163,6 +179,8 @@ class SpeechEvents:
             self._decided.clear()
             self._roles.clear()
             self._priority = priority
+            self._former = former
+            self._addressing = addressing
             self.role_status = "off" if priority is None else "ready"
             self._degraded_turn = None
             self._session = session_id
@@ -182,6 +200,9 @@ class SpeechEvents:
                 # Configured forms of address are advertised beside, not inside, the
                 # existing capability set so strict consumers of that set are unchanged.
                 **({} if addressing is None else {"addressing": addressing.to_dict()}),
+                # Likewise for request forming: a separate top-level object, never a key
+                # inside the strictly validated capability set.
+                **({} if former is None else {"request_forming": {"kind": former.kind}}),
             )
 
     def expire(self, now_ms):
@@ -461,6 +482,7 @@ class SpeechEvents:
                     if other_role != "owner" and earlier.end_ms <= turn.end_ms:
                         self._superseded.setdefault(other, key)
             if attended:
+                formed = self._form_request(turn, role, context)
                 self._emit(
                     "request",
                     request_id=request_id,
@@ -468,6 +490,7 @@ class SpeechEvents:
                     decision=evidence,
                     context=context,
                     decision_at_ms=self._now,
+                    **formed,
                 )
                 if role is not None and role != "owner":
                     if len(self._open) >= self.max_open:
@@ -477,6 +500,31 @@ class SpeechEvents:
                         self._active = False
                         raise ContractError("open request budget exceeded")
                     self._open[request_id] = turn.end_ms
+
+    def _form_request(self, turn, role, context):
+        """The optional ``formed_request`` field, present only when a former is configured.
+
+        A former that raises or returns an invalid value fails closed: the session's
+        content is released and the error ends the session, never a silently dropped field.
+        """
+        if self._former is None:
+            return {}
+        state = {
+            "current_turn": _with_role(turn, role),
+            "context_turns": copy.deepcopy(context["turns"]),
+            "addressing": None if self._addressing is None else self._addressing.to_dict(),
+            "speakers": "anonymous" if self._priority is None else "enrolled",
+        }
+        formed = None
+        try:
+            formed = formed_request_text(self._former.form(state))
+        except Exception:
+            pass
+        if formed is None:
+            self._clear_content()
+            self._active = False
+            raise ContractError("request forming failed")
+        return {"formed_request": formed}
 
     def end(self, phase="cancelled", now_ms=0, reason=None):
         with self._lock:

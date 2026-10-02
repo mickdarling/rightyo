@@ -121,6 +121,43 @@ class Addressing:
         return {"names": list(self.names)}
 
 
+# A formed request is a convenience rendering of the raw turns for hosts that cannot
+# reason over them; it is bounded like turn text and carries no authority of its own.
+REQUEST_FORMER_KINDS = frozenset({"template"})
+MAX_FORMED_REQUEST_CHARS = 4 * MAX_TEXT_CHARS
+
+
+def formed_request_text(value: Any) -> str:
+    """The same text validation as turn text, plus a non-empty, bounded length."""
+    if not isinstance(value, str) or not 1 <= len(value) <= MAX_FORMED_REQUEST_CHARS:
+        raise ContractError("invalid formed request length")
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        raise ContractError("formed request must be valid UTF-8") from None
+    return value
+
+
+@dataclass(frozen=True)
+class RequestForming:
+    """Which optional request former renders ``formed_request``; absent means off."""
+
+    kind: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, str) or self.kind not in REQUEST_FORMER_KINDS:
+            raise ContractError("invalid request former kind")
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> RequestForming:
+        if not isinstance(raw, dict) or set(raw) != {"kind"}:
+            raise ContractError("request_former must be an object with only kind")
+        return cls(raw["kind"])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind}
+
+
 @dataclass(frozen=True)
 class SpeakerPriority:
     """Hard-coded speaker roles and the owner's precedence rules.

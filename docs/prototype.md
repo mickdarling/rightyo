@@ -47,6 +47,11 @@ modes, with a clear error before any capture starts: a hosted role question woul
 the audio path under the controller lock, where Stop and lease expiry cannot reach it.
 Model-sourced roles remain available to `tool-replay`, which has no audio thread; the
 live path is tracked in [#55](https://github.com/mickdarling/rightyo/issues/55).
+An optional `"request_former": {"kind": "template"}` turns on
+[request forming](tool-api.md#request-forming) for the headless tool: each `request`
+event then also carries a `formed_request` string beside the unchanged raw turns, and the
+started event advertises `request_forming`. It is off when the key is absent; `template`
+is the only kind, and `--request-former template` on `listen` replaces the file's value.
 An optional `"session_budget_seconds": 7200`
 ends a session after that many seconds; `--session-budget SECONDS` on the command line
 replaces the file's value. The budget is a positive whole number of seconds; omitting it

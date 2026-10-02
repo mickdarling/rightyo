@@ -17,7 +17,14 @@ from pathlib import Path
 from typing import Any
 
 from rightyo.capture import CaptureError, MacMicrophoneCapture
-from rightyo.contracts import Addressing, ContractError, SpeakerPriority, Turn, identifier
+from rightyo.contracts import (
+    Addressing,
+    ContractError,
+    RequestForming,
+    SpeakerPriority,
+    Turn,
+    identifier,
+)
 from rightyo.credentials import CredentialError
 from rightyo.live_audio import (
     DiarizerTimelineLimitError,
@@ -27,7 +34,13 @@ from rightyo.live_audio import (
 )
 from rightyo.memory import MemorySessionLimitError, TranscriptMemory
 from rightyo.pipeline import ReplayRunner
-from rightyo.providers import ConfiguredPriorityProvider, JevProvider, MockProvider, ProviderError
+from rightyo.providers import (
+    ConfiguredPriorityProvider,
+    JevProvider,
+    MockProvider,
+    ProviderError,
+    request_former_for,
+)
 
 BROWSER_LEASE_SECONDS = 15
 PCM_BYTES_PER_MS = 32
@@ -61,6 +74,7 @@ class PrototypeConfig:
     addressing: Addressing | None = None
     speakers: SpeakerPriority | None = None
     session_budget_seconds: int | None = None
+    request_former: RequestForming | None = None
 
     @classmethod
     def load(cls, path: Path) -> PrototypeConfig:
@@ -87,6 +101,7 @@ class PrototypeConfig:
                     "addressing",
                     "speakers",
                     "session_budget_seconds",
+                    "request_former",
                 }
             ):
                 raise ValueError
@@ -97,6 +112,9 @@ class PrototypeConfig:
             if speakers is not None:
                 speakers = SpeakerPriority.from_dict(speakers)
             budget = validate_session_budget(raw.pop("session_budget_seconds", None))
+            forming = raw.pop("request_former", None)
+            if forming is not None:
+                forming = RequestForming.from_dict(forming)
             values = {}
             for name, value in raw.items():
                 if not isinstance(value, str) or not value or not Path(value).is_absolute():
@@ -107,6 +125,7 @@ class PrototypeConfig:
                 addressing=addressing,
                 speakers=speakers,
                 session_budget_seconds=budget,
+                request_former=forming,
             )
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
@@ -309,6 +328,7 @@ class PrototypeController:
                     attention_enabled=hosted,
                     addressing=self.config.addressing,
                     priority=priority,
+                    former=request_former_for(self.config.request_former),
                 )
                 self._event_terminal = False
             threading.Thread(

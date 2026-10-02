@@ -47,6 +47,9 @@ are advertised in the started session event and given to the decision provider a
 not as a required wake word; see [the API reference](tool-api.md). Nothing is configured by
 default. Sessions have no default duration ceiling; `--session-budget SECONDS` on `listen`
 and `prototype` ends a session after that many seconds with the ordinary `cancelled` event.
+`--request-former template` on `listen` and `tool-replay` adds a `formed_request` string to
+each request beside the unchanged raw turns; it is off by default (see
+[request forming](tool-api.md#request-forming)).
 
 No attention is fabricated in these commands: local-only audio emits transcript and session
 events. Optional Jev inference requires both `--use-jev --allow-hosted`, with the existing
