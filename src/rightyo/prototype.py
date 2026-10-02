@@ -11,13 +11,13 @@ import threading
 import time
 import uuid
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 from rightyo.capture import CaptureError, MacMicrophoneCapture
-from rightyo.contracts import ContractError, Turn, identifier
+from rightyo.contracts import Addressing, ContractError, Turn, identifier
 from rightyo.credentials import CredentialError
 from rightyo.live_audio import LiveAudioError, LiveConfig, LiveProcessor
 from rightyo.memory import MemorySessionLimitError, TranscriptMemory
@@ -44,6 +44,7 @@ class PrototypeConfig:
     diarization_model: Path
     microphone_helper: Path
     demo_audio: Path | None = None
+    addressing: Addressing | None = None
 
     @classmethod
     def load(cls, path: Path) -> PrototypeConfig:
@@ -62,14 +63,17 @@ class PrototypeConfig:
             }
             if not isinstance(raw, dict) or not required <= raw.keys():
                 raise ValueError
-            if raw.keys() - required - {"demo_audio"}:
+            if raw.keys() - required - {"demo_audio", "addressing"}:
                 raise ValueError
+            addressing = raw.pop("addressing", None)
+            if addressing is not None:
+                addressing = Addressing.from_dict(addressing)
             values = {}
             for name, value in raw.items():
                 if not isinstance(value, str) or not value or not Path(value).is_absolute():
                     raise ValueError
                 values[name] = Path(value)
-            config = cls(**values)
+            config = cls(**values, addressing=addressing)
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
             return config
@@ -211,7 +215,9 @@ class PrototypeController:
                 )
             except (ProviderError, CredentialError):
                 raise PrototypeError("Hosted decisions could not be initialized") from None
-            runner = ReplayRunner(provider, memory=memory, cancelled=cancelled)
+            runner = ReplayRunner(
+                provider, memory=memory, cancelled=cancelled, addressing=self.config.addressing
+            )
             runner.restart(session)
             self._generation += 1
             generation = self._generation
@@ -232,7 +238,12 @@ class PrototypeController:
             self._phase = "starting"
             self._started = self._last_browser = time.monotonic()
             if self._events is not None:
-                self._events.start(session, now_ms=0, attention_enabled=hosted)
+                self._events.start(
+                    session,
+                    now_ms=0,
+                    attention_enabled=hosted,
+                    addressing=self.config.addressing,
+                )
                 self._event_terminal = False
             threading.Thread(
                 target=self._decide,
@@ -696,10 +707,14 @@ class PrototypeHandler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True})
 
 
-def serve(config_path: Path, port: int = 8765) -> None:
+def serve(config_path: Path, port: int = 8765, *, addressing: Addressing | None = None) -> None:
     if type(port) is not int or not 0 <= port <= 65535:
         raise PrototypeError("Invalid local port")
-    controller = PrototypeController(PrototypeConfig.load(config_path))
+    config = PrototypeConfig.load(config_path)
+    if addressing is not None:
+        # Command-line names take precedence over the configuration file's names.
+        config = replace(config, addressing=addressing)
+    controller = PrototypeController(config)
     server = None
     try:
         server = PrototypeServer(controller, port)

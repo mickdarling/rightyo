@@ -10,7 +10,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from rightyo.contracts import ContractError, Turn
+from rightyo.contracts import Addressing, ContractError, Turn
 from rightyo.credentials import CredentialError
 from rightyo.pipeline import ReplayRunner
 from rightyo.providers import JevProvider, MockProvider, ProviderError
@@ -131,6 +131,22 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def addressing_from_args(args: argparse.Namespace) -> Addressing | None:
+    """Validated runtime forms of address from repeatable --name flags, or none."""
+    names = getattr(args, "names", None)
+    return None if not names else Addressing.from_names(names)
+
+
+def _add_name_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--name",
+        dest="names",
+        action="append",
+        metavar="NAME",
+        help="a form of address the system answers to (repeatable; none configured by default)",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="RightyO explicit transcript-first experiments")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -188,12 +204,14 @@ def main(argv: list[str] | None = None) -> int:
     prototype = commands.add_parser("prototype", help="open an idle local Mac speech lab")
     prototype.add_argument("--config", type=Path, required=True, help="local asset configuration")
     prototype.add_argument("--port", type=int, default=8765)
+    _add_name_option(prototype)
     listen = commands.add_parser("listen", help="explicit foreground speech JSONL tool")
     listen.add_argument("--config", type=Path, required=True)
     listen.add_argument("--mode", choices=("microphone", "demo"), required=True)
     listen.add_argument("--session-id", help="host-selected session ID (otherwise generated)")
     listen.add_argument("--use-jev", action="store_true")
     listen.add_argument("--allow-hosted", action="store_true")
+    _add_name_option(listen)
     tool_replay = commands.add_parser("tool-replay", help="emit tool JSONL from supplied text")
     tool_replay.add_argument("--input", type=Path, required=True)
     tool_replay.add_argument("--provider", choices=("mock", "jev"), default="mock")
@@ -201,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     tool_replay.add_argument("--max-requests", type=int, default=20)
     tool_replay.add_argument("--timeout", type=float, default=10)
     tool_replay.add_argument("--min-confidence", type=float, default=0.7)
+    _add_name_option(tool_replay)
     args = parser.parse_args(argv)
     try:
         if args.command in {"listen", "tool-replay"}:
@@ -219,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
             from rightyo.prototype import PrototypeError, serve
 
             try:
-                serve(args.config, args.port)
+                serve(args.config, args.port, addressing=addressing_from_args(args))
             except (PrototypeError, OSError):
                 print(
                     "rightyo: prototype setup failed; check local assets and port", file=sys.stderr

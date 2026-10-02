@@ -11,7 +11,7 @@ from functools import wraps
 from threading import RLock
 from typing import Any, Callable
 
-from rightyo.contracts import ContractError, DecisionEvent, Turn, identifier
+from rightyo.contracts import Addressing, ContractError, DecisionEvent, Turn, identifier
 from rightyo.memory import TranscriptMemory
 from rightyo.providers import DecisionProvider
 
@@ -59,6 +59,7 @@ class ReplayRunner:
         expected_reply: str | None = None,
         memory: TranscriptMemory | None = None,
         cancelled: Callable[[], bool] | None = None,
+        addressing: Addressing | None = None,
     ) -> None:
         if not 1 <= max_context_turns <= 32 or not 4000 <= max_context_chars <= 16000:
             raise ContractError("invalid context budget")
@@ -71,6 +72,9 @@ class ReplayRunner:
         self._lock = RLock()
         if cancelled is not None and not callable(cancelled):
             raise ContractError("invalid cancellation guard")
+        if addressing is not None and not isinstance(addressing, Addressing):
+            raise ContractError("invalid addressing")
+        self.addressing = addressing
         self.cancelled = cancelled or (lambda: False)
         self.provider = provider
         self.memory = memory
@@ -185,6 +189,8 @@ class ReplayRunner:
             "known_participants": participants,
             "expected_reply": self.expected_reply,
             "playback_active": self.playback_active,
+            # Runtime forms of address are configuration, never a transcript-derived value.
+            "addressing": None if self.addressing is None else self.addressing.to_dict(),
         }
 
     def process(self, turn: Turn) -> DecisionEvent | None:

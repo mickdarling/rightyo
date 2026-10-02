@@ -11,6 +11,9 @@ LABELS = frozenset({"attend", "ignore", "uncertain"})
 PROVENANCE = frozenset({"synthetic", "recorded-file", "causal-replay", "live-microphone"})
 SPEAKER_PROVENANCE = frozenset({"authored-fixture", "diarization-timeline", "unknown"})
 MAX_TEXT_CHARS = 4000
+MAX_ADDRESS_NAMES = 8
+MAX_ADDRESS_NAME_CHARS = 48
+_ADDRESS_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,%d}" % (MAX_ADDRESS_NAME_CHARS - 1))
 
 
 class ContractError(ValueError):
@@ -20,6 +23,21 @@ class ContractError(ValueError):
 def identifier(value: Any, name: str) -> str:
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_. -]{1,96}", value):
         raise ContractError(f"invalid {name}")
+    return value
+
+
+def address_name(value: Any) -> str:
+    """One runtime form of address: a sanitized display name, not a wake-word grammar."""
+    if (
+        not isinstance(value, str)
+        or not _ADDRESS_NAME.fullmatch(value)
+        or value != value.strip()
+        or "  " in value
+        or value.endswith((".", "-"))
+    ):
+        # Single spaces and no trailing punctuation: a name never reads as prompt prose
+        # and the mock prefix never becomes "name.," or "name-:".
+        raise ContractError("invalid address name")
     return value
 
 
@@ -33,6 +51,42 @@ def probability(value: Any) -> float:
     if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
         raise ContractError("invalid provider probability")
     return float(value)
+
+
+@dataclass(frozen=True)
+class Addressing:
+    """Names the system answers to, supplied at runtime and never hard-coded.
+
+    A name is evidence of addressing, not a requirement or a transcript filter; the
+    decision provider still judges the addressee from the complete turn and context.
+    """
+
+    names: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.names) is not tuple or not 1 <= len(self.names) <= MAX_ADDRESS_NAMES:
+            raise ContractError(f"addressing requires between 1 and {MAX_ADDRESS_NAMES} names")
+        seen = set()
+        for name in self.names:
+            folded = address_name(name).casefold()
+            if folded in seen:
+                raise ContractError("duplicate address name")
+            seen.add(folded)
+
+    @classmethod
+    def from_names(cls, names: Any) -> Addressing:
+        if isinstance(names, (str, bytes)) or not isinstance(names, (list, tuple)):
+            raise ContractError("addressing names must be a list")
+        return cls(tuple(names))
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> Addressing:
+        if not isinstance(raw, dict) or set(raw) != {"names"}:
+            raise ContractError("addressing must be an object with only names")
+        return cls.from_names(raw["names"])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"names": list(self.names)}
 
 
 @dataclass(frozen=True)

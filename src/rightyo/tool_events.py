@@ -8,7 +8,7 @@ import json
 from collections import deque
 from threading import RLock
 
-from rightyo.contracts import ContractError, DecisionEvent, Turn, identifier, integer
+from rightyo.contracts import Addressing, ContractError, DecisionEvent, Turn, identifier, integer
 from rightyo.memory import TranscriptMemory
 
 MAX_EVENT_BYTES = 1200000
@@ -79,12 +79,14 @@ class SpeechEvents:
         self._queue.clear()
         self._queue_bytes = 0
 
-    def start(self, session_id, now_ms=0, *, attention_enabled=True):
+    def start(self, session_id, now_ms=0, *, attention_enabled=True, addressing=None):
         with self._lock:
             identifier(session_id, "session_id")
             integer(now_ms, "now_ms")
             if type(attention_enabled) is not bool:
                 raise ContractError("invalid attention capability")
+            if addressing is not None and not isinstance(addressing, Addressing):
+                raise ContractError("invalid addressing")
             if self._active or self._queue:
                 raise ContractError("finish and drain the previous event session")
             session_key = hashlib.sha256(session_id.encode("utf-8")).digest()
@@ -111,6 +113,9 @@ class SpeechEvents:
                     "speakers": "anonymous",
                     "context": True,
                 },
+                # Configured forms of address are advertised beside, not inside, the
+                # existing capability set so strict consumers of that set are unchanged.
+                **({} if addressing is None else {"addressing": addressing.to_dict()}),
             )
 
     def expire(self, now_ms):

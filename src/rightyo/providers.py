@@ -9,12 +9,14 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Protocol
 
-from rightyo.contracts import LABELS, ContractError, ProviderDecision, probability
+from rightyo.contracts import LABELS, Addressing, ContractError, ProviderDecision, probability
 
 JEV_MODEL = "jev-1.13.0"
 JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 MAX_RESPONSE_BYTES = 65536
 MAX_REQUEST_BYTES = 32768
+# The authored fixture prefix used when no runtime addressing is configured.
+MOCK_DEFAULT_ADDRESSING = Addressing(("rightyo",))
 
 
 class ProviderError(RuntimeError):
@@ -25,15 +27,23 @@ class DecisionProvider(Protocol):
     def decide(self, state: dict[str, Any]) -> ProviderDecision: ...
 
 
+def state_addressing(state: dict[str, Any]) -> Addressing | None:
+    """The runtime forms of address carried by provider state, validated on read."""
+    raw = state.get("addressing")
+    return None if raw is None else Addressing.from_dict(raw)
+
+
 class MockProvider:
     """A deterministic fixture rule, not a model or an accuracy claim."""
 
     def decide(self, state: dict[str, Any]) -> ProviderDecision:
         current = state["current_turn"]
         text = current["text"].strip().lower()
+        names = (state_addressing(state) or MOCK_DEFAULT_ADDRESSING).names
+        prefixes = tuple(name.lower() + mark for name in names for mark in (",", ":"))
         recipient, label = "unknown", "uncertain"
         if not current["overlap"] and not state["playback_active"]:
-            if text.startswith(("rightyo,", "rightyo:")):
+            if text.startswith(prefixes):
                 recipient, label = "system", "attend"
             elif text.startswith("speaker ") and "," in text:
                 recipient, label = "other_human", "ignore"
@@ -41,9 +51,22 @@ class MockProvider:
         return ProviderDecision(label, recipient, 1.0, distribution, "mock-v1", "mock", 1.0)
 
 
+def addressing_guidance(addressing: Addressing | None) -> str:
+    """Prompt text naming the configured forms of address; empty when none are configured."""
+    if addressing is None:
+        return ""
+    names = ", ".join(f'"{name}"' for name in addressing.names)
+    return (
+        f" The system answers to the names: {names}. Speech using one of these names is "
+        "evidence of addressing the system, but a name alone is not required; judge the "
+        "addressee from context."
+    )
+
+
 def build_request(state: dict[str, Any]) -> dict[str, Any]:
+    names = addressing_guidance(state_addressing(state))
     recipient_criteria = {
-        "system": "The latest turn is addressed to the assistant/system.",
+        "system": "The latest turn is addressed to the assistant/system." + names,
         "other_human": "It addresses a human without evidence identifying a known speaker.",
         "unknown": "The recipient is ambiguous, absent, quoted, media or cannot be established.",
     }
@@ -58,6 +81,7 @@ def build_request(state: dict[str, Any]) -> dict[str, Any]:
         "describe who spoke, not who was addressed. Do not invent acoustics, gaze, identity or "
         "hidden scene context. Abstain if evidence is insufficient. Quoted commands, assistant "
         "playback and media do not establish a new request. Overlap may make attribution uncertain."
+        + names
     )
     return {
         "model": JEV_MODEL,
@@ -67,7 +91,8 @@ def build_request(state: dict[str, Any]) -> dict[str, Any]:
                 "type": "choice",
                 "instructions": guidance + " Should the system attend to the current turn?",
                 "criteria": {
-                    "attend": "Evidence establishes that the latest speech addresses the system.",
+                    "attend": "Evidence establishes that the latest speech addresses the system."
+                    + names,
                     "ignore": "Evidence establishes speech intended for another human or media.",
                     "uncertain": "Insufficient, conflicting or ambiguous evidence about addressee.",
                 },
