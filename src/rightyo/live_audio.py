@@ -648,6 +648,7 @@ class LiveProcessor:
         self._last_voice_ms = 0
         self._received_ms = 0
         self._counter = 0
+        self._utterances = 0
         self._asr_process: subprocess.Popen | None = None
 
     @property
@@ -717,10 +718,15 @@ class LiveProcessor:
         if self.closed:
             raise LiveAudioError("Audio session was stopped")
         provenance = getattr(self._diarizer, "speaker_provenance", "diarization-timeline")
+        self._utterances += 1
         groups: list[dict[str, Any]] = []
         for unit in units:
             start, end = unit["start_ms"] + offset, unit["end_ms"] + offset
             speaker, overlap = _attribute(start, end, timeline)
+            if speaker is not None and provenance == "diarization-utterance":
+                # Per-request labels are namespaced by utterance so that equal labels
+                # from independent requests can never be merged into one participant.
+                speaker = f"u{self._utterances} {speaker}"
             if groups and (groups[-1]["speaker"], groups[-1]["overlap"]) == (speaker, overlap):
                 groups[-1]["text"] += unit["text"]
                 groups[-1]["end_ms"] = max(groups[-1]["end_ms"], end)

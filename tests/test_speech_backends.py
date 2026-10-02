@@ -13,6 +13,7 @@ from argparse import Namespace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from rightyo.contracts import identifier
 from rightyo.credentials import CredentialError, load_diarizer_api_key, load_transcriber_api_key
 from rightyo.live_audio import (
     BYTES_PER_MS,
@@ -22,8 +23,9 @@ from rightyo.live_audio import (
     NemotronCppDiarizer,
     WhisperCppTranscriber,
 )
+from rightyo.pipeline import ReplayRunner
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
-from rightyo.providers import Diarizer, Transcriber
+from rightyo.providers import Diarizer, MockProvider, Transcriber
 from rightyo.speech_backends import (
     DEEPGRAM_ENDPOINT,
     MAX_RESPONSE_BYTES,
@@ -201,6 +203,10 @@ class ProtocolAndSelectionTests(unittest.TestCase):
                     processor.push_pcm16(VOICE)
                 processor.finish()
                 self.assertEqual([turn.speaker_provenance for turn in turns], [expected])
+                self.assertEqual(
+                    turns[0].speaker_id,
+                    "u1 Speaker B" if expected == "diarization-utterance" else "Speaker B",
+                )
         self.assertEqual(DeepgramDiarizer.speaker_provenance, "diarization-utterance")
         with patch("rightyo.live_audio._transcribe", return_value={"transcription": []}):
             processor = LiveProcessor(self.local_config(diarizer=StubDiarizer()), turns.append)
@@ -227,6 +233,43 @@ class ProtocolAndSelectionTests(unittest.TestCase):
         for name in ("transcriber", "diarizer"):
             with self.assertRaisesRegex(LiveAudioError, name):
                 self.local_config(**{name: object()})
+
+    def test_per_utterance_labels_never_merge_into_one_participant(self):
+        turns = []
+        per_utterance = StubDiarizer()
+        per_utterance.speaker_provenance = "diarization-utterance"
+        per_utterance.segments = lambda: [{"start_ms": 0, "end_ms": 900000, "speaker": 1}]
+        processor = LiveProcessor(
+            LiveConfig(
+                "namespace-test",
+                provenance="causal-replay",
+                transcriber=StubTranscriber(),
+                diarizer=per_utterance,
+            ),
+            turns.append,
+        )
+        self.addCleanup(processor.close)
+        for _ in range(2):
+            for _ in range(10):
+                processor.push_pcm16(VOICE)
+            for _ in range(72):
+                processor.push_pcm16(bytes(640))
+        # The service labelled both utterances "Speaker A"; the turns must not match.
+        self.assertEqual([turn.speaker_id for turn in turns], ["u1 Speaker A", "u2 Speaker A"])
+        for turn in turns:
+            identifier(turn.speaker_id, "speaker_id")
+        states = []
+
+        class Recorder:
+            def decide(self, state):
+                states.append(state)
+                return MockProvider().decide(state)
+
+        runner = ReplayRunner(Recorder())
+        for turn in turns:
+            runner.process(turn)
+        self.assertEqual(states[-1]["known_participants"], ["u1 Speaker A", "u2 Speaker A"])
+        self.assertEqual(len(states[-1]["known_participants"]), 2)
 
 
 class HostedTranscriberTests(unittest.TestCase):

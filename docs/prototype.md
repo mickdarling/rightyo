@@ -119,7 +119,8 @@ and account `api-key`; create it with `security add-generic-password -s rightyo.
 -a api-key -w` (prompted, never on the command line). Deepgram labels speakers per
 request, so with this backend Speaker A in one utterance is not known to be the same
 person as Speaker A in the next; its turns carry `speaker_provenance:
-"diarization-utterance"`, and the native Nemotron stream is the only backend whose
+"diarization-utterance"` with utterance-namespaced labels such as `u7 Speaker A`, and
+the native Nemotron stream is the only backend whose
 labels persist for the session. The 18,000-segment timeline cap does not apply to it.
 A stop during an in-flight hosted request waits for that request's `timeout_seconds`
 at most; the endpoint must not carry its own query string or fragment.

@@ -95,8 +95,10 @@ overlap and unknown speakers retain their explicit meaning. Provenance distingui
 from one session-long speaker timeline (the native stream), so the same label across
 turns is the same anonymous voice for the session; `diarization-utterance` labels
 (the hosted per-request diarizer) are stable only within one utterance, and a label in
-one utterance does not identify the same voice in another; `authored-fixture` and
-`unknown` keep their meanings. None is an identity.
+one utterance does not identify the same voice in another. Such labels are namespaced
+by utterance (`u7 Speaker A`, `u8 Speaker A`), so they never compare equal across
+utterances and a decision provider sees each utterance's voices as distinct
+participants; `authored-fixture` and `unknown` keep their meanings. None is an identity.
 
 Decision evidence contains `label`, `recipient_kind`, `confidence`, `provider`, and
 `model`. A probability is not demonstrated accuracy or authority. A request is
