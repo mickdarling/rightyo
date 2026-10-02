@@ -19,13 +19,18 @@ from typing import Any
 from rightyo.capture import CaptureError, MacMicrophoneCapture
 from rightyo.contracts import Addressing, ContractError, SpeakerPriority, Turn, identifier
 from rightyo.credentials import CredentialError
-from rightyo.live_audio import LiveAudioError, LiveConfig, LiveProcessor
+from rightyo.live_audio import (
+    DiarizerTimelineLimitError,
+    LiveAudioError,
+    LiveConfig,
+    LiveProcessor,
+)
 from rightyo.memory import MemorySessionLimitError, TranscriptMemory
 from rightyo.pipeline import ReplayRunner
 from rightyo.providers import ConfiguredPriorityProvider, JevProvider, MockProvider, ProviderError
 
-SESSION_SECONDS = 900
 BROWSER_LEASE_SECONDS = 15
+PCM_BYTES_PER_MS = 32
 
 
 class PrototypeError(ValueError):
@@ -34,6 +39,15 @@ class PrototypeError(ValueError):
 
 def _reject_constant(_value):
     raise ValueError("Invalid JSON constant")
+
+
+def validate_session_budget(value: Any) -> int | None:
+    """None means no session ceiling; otherwise a positive whole number of seconds."""
+    if value is None:
+        return None
+    if type(value) is not int or value < 1:
+        raise PrototypeError("Session budget must be a positive number of seconds")
+    return value
 
 
 @dataclass(frozen=True)
@@ -46,6 +60,7 @@ class PrototypeConfig:
     demo_audio: Path | None = None
     addressing: Addressing | None = None
     speakers: SpeakerPriority | None = None
+    session_budget_seconds: int | None = None
 
     @classmethod
     def load(cls, path: Path) -> PrototypeConfig:
@@ -64,7 +79,16 @@ class PrototypeConfig:
             }
             if not isinstance(raw, dict) or not required <= raw.keys():
                 raise ValueError
-            if raw.keys() - required - {"demo_audio", "addressing", "speakers"}:
+            if (
+                raw.keys()
+                - required
+                - {
+                    "demo_audio",
+                    "addressing",
+                    "speakers",
+                    "session_budget_seconds",
+                }
+            ):
                 raise ValueError
             addressing = raw.pop("addressing", None)
             if addressing is not None:
@@ -72,12 +96,18 @@ class PrototypeConfig:
             speakers = raw.pop("speakers", None)
             if speakers is not None:
                 speakers = SpeakerPriority.from_dict(speakers)
+            budget = validate_session_budget(raw.pop("session_budget_seconds", None))
             values = {}
             for name, value in raw.items():
                 if not isinstance(value, str) or not value or not Path(value).is_absolute():
                     raise ValueError
                 values[name] = Path(value)
-            config = cls(**values, addressing=addressing, speakers=speakers)
+            config = cls(
+                **values,
+                addressing=addressing,
+                speakers=speakers,
+                session_budget_seconds=budget,
+            )
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
             return config
@@ -127,6 +157,8 @@ class PrototypeController:
         self._request_limit = 20
         self._received_ms = 0
         self._received_bytes = 0
+        self._budget_ms: int | None = None
+        self._budget_reached = False
         self._audio_started: float | None = None
         self._completed_at: float | None = None
         self._started = 0.0
@@ -149,9 +181,16 @@ class PrototypeController:
         while not self._closed.wait(0.5):
             with self._lock:
                 active = self._phase in {"starting", "listening", "replaying", "finishing"}
+                # Microphone sessions are wall-clock bounded from Start; replay feeders
+                # end only at the exact audio boundary, however slowly they process.
                 expired = active and (
                     time.monotonic() - self._last_browser > BROWSER_LEASE_SECONDS
-                    or time.monotonic() - self._started > SESSION_SECONDS
+                    or self._budget_reached
+                    or (
+                        self._budget_ms is not None
+                        and self._mode == "microphone"
+                        and (time.monotonic() - self._started) * 1000 > self._budget_ms
+                    )
                 )
                 if self._runner is not None:
                     self._runner.expire(self._now_ms())
@@ -204,6 +243,7 @@ class PrototypeController:
                 "Model-sourced speaker roles are not available in live microphone or demo "
                 "mode yet; use configured roles, or tool-replay (tracked in #55)"
             )
+        budget_seconds = validate_session_budget(self.config.session_budget_seconds)
         with self._lock:
             if self._phase in {"starting", "listening", "replaying", "finishing", "stopping"}:
                 raise PrototypeError("Stop the active session before starting another")
@@ -251,6 +291,8 @@ class PrototypeController:
             self._decisions = {}
             self._pending = self._requests = self._received_ms = 0
             self._received_bytes = 0
+            self._budget_ms = None if budget_seconds is None else budget_seconds * 1000
+            self._budget_reached = False
             self._audio_started = None
             self._completed_at = None
             self._request_limit = budget
@@ -313,6 +355,7 @@ class PrototypeController:
                     diarization_model=self.config.diarization_model,
                     provenance="live-microphone" if mode == "microphone" else "causal-replay",
                     cancelled=stop.is_set,
+                    session_budget_ms=self._budget_ms,
                 ),
                 lambda turn: self._accept(generation, work, memory, turn),
             )
@@ -341,12 +384,17 @@ class PrototypeController:
                         or not 0 < audio.getnframes() <= 180 * 16000
                     ):
                         raise PrototypeError("Demo requires bounded mono PCM16 16 kHz audio")
+                    accepted = True
                     while not stop.is_set():
                         pcm = audio.readframes(3200)
                         if not pcm:
                             break
-                        self._feed(generation, processor, pcm, mode)
-                if not stop.is_set():
+                        accepted = self._feed(generation, processor, pcm, mode)
+                        if not accepted:
+                            break
+                # A session budget ends like any other cancellation: the timer stops it
+                # and the unfinished utterance is discarded rather than flushed.
+                if accepted and not stop.is_set():
                     processor.finish()
                     with self._lock:
                         if generation == self._generation:
@@ -363,11 +411,16 @@ class PrototypeController:
             with self._lock:
                 if generation == self._generation and not stop.is_set():
                     self._phase = "error"
-                    self._error = (
-                        "Session reached its 1,000-turn limit; start a new session."
-                        if isinstance(error, MemorySessionLimitError)
-                        else "Audio stopped. Check microphone permission and local model setup."
-                    )
+                    if isinstance(error, MemorySessionLimitError):
+                        self._error = "Session reached its 1,000-turn limit; start a new session."
+                    elif isinstance(error, DiarizerTimelineLimitError):
+                        self._error = (
+                            "Session reached the speaker timeline limit; start a new session."
+                        )
+                    else:
+                        self._error = (
+                            "Audio stopped. Check microphone permission and local model setup."
+                        )
                     stop.set()
                     if self._decision_status != "off":
                         self._decision_status = "unavailable"
@@ -400,16 +453,33 @@ class PrototypeController:
                 elif generation + 1 == self._generation and self._phase == "stopping":
                     self._phase = "idle"
 
-    def _feed(self, generation, processor, pcm, mode):
+    def _feed(self, generation, processor, pcm, mode) -> bool:
+        """Push audio up to the session budget; False once the session accepts no more."""
+        boundary = False
         with self._lock:
-            if generation != self._generation or self._stop.is_set():
-                return
+            if generation != self._generation or self._stop.is_set() or self._budget_reached:
+                return False
+            if self._budget_ms is not None:
+                remaining = self._budget_ms * PCM_BYTES_PER_MS - self._received_bytes
+                if len(pcm) >= remaining:
+                    # Accept exactly up to the boundary.
+                    pcm = pcm[:remaining]
+                    boundary = True
+            if not pcm:
+                return False
             self._received_bytes += len(pcm)
-            self._received_ms = self._received_bytes // 32
+            self._received_ms = self._received_bytes // PCM_BYTES_PER_MS
             if self._audio_started is None:
                 self._audio_started = time.monotonic()
             self._phase = "listening" if mode == "microphone" else "replaying"
         processor.push_pcm16(pcm)
+        if boundary:
+            # Publish only after the boundary audio is processed, so the timer cannot
+            # stop the session before that final push completes.
+            with self._lock:
+                if generation == self._generation:
+                    self._budget_reached = True
+        return not boundary
 
     def _decide(self, generation, stop, work, runner, hosted):
         enabled = hosted
@@ -534,7 +604,7 @@ class PrototypeController:
                     "asr": "Whisper (configured model)",
                     "decision": "Jev 1.13.0 (opt-in)",
                 },
-                "session_limit_seconds": SESSION_SECONDS,
+                "session_limit_seconds": self.config.session_budget_seconds,
             }
 
     def stop(self) -> None:
@@ -555,6 +625,8 @@ class PrototypeController:
             self._decisions.clear()
             self._pending = self._received_ms = 0
             self._received_bytes = 0
+            self._budget_ms = None
+            self._budget_reached = False
             self._audio_started = None
             self._completed_at = None
             self._decision_status = "off"
@@ -733,13 +805,23 @@ class PrototypeHandler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True})
 
 
-def serve(config_path: Path, port: int = 8765, *, addressing: Addressing | None = None) -> None:
+def serve(
+    config_path: Path,
+    port: int = 8765,
+    *,
+    addressing: Addressing | None = None,
+    session_budget_seconds: int | None = None,
+) -> None:
     if type(port) is not int or not 0 <= port <= 65535:
         raise PrototypeError("Invalid local port")
     config = PrototypeConfig.load(config_path)
     if addressing is not None:
         # Command-line names take precedence over the configuration file's names.
         config = replace(config, addressing=addressing)
+    if session_budget_seconds is not None:
+        config = replace(
+            config, session_budget_seconds=validate_session_budget(session_budget_seconds)
+        )
     controller = PrototypeController(config)
     server = None
     try:
