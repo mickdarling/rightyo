@@ -39,11 +39,12 @@ the runtime forms of address described in [the tool API](tool-api.md); `--name` 
 the command line replace the file's names. An optional `"session_budget_seconds": 7200`
 ends a session after that many seconds; `--session-budget SECONDS` on the command line
 replaces the file's value. The budget is a positive whole number of seconds; omitting it
-means there is no session ceiling, which is the default. A live microphone session ends
-when the wall clock since Start reaches the budget, which includes diarizer start-up, so
-somewhat less than the budget's worth of audio is processed. Faster-than-real-time
-feeders such as replay are trimmed at the exact audio boundary instead. Demo audio whose
-length equals the budget exactly ends `cancelled` (budget reached) rather than `complete`.
+means there is no session ceiling, which is the default. In microphone mode the budget is
+wall clock from Start, which includes diarizer start-up, so somewhat less than the
+budget's worth of audio is processed. In replay/demo mode the budget is the exact audio
+boundary: the replay is trimmed there however slowly it processes, and the wall clock
+does not apply. Demo audio whose length equals the budget exactly ends `cancelled`
+(budget reached) rather than `complete`.
 Replay accepts mono PCM16 WAV at
 16 kHz, at most three minutes; it feeds real PCM in causal order as quickly as processing
 permits. It is not a wall-clock streaming latency measurement. Playback through speakers is

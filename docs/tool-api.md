@@ -73,10 +73,10 @@ uncertain application action.
 A session has no default duration ceiling; it listens until the host stops it or a
 terminal condition occurs. `--session-budget SECONDS` on `listen` and `prototype`, or
 `session_budget_seconds` in the prototype configuration, ends a session with the ordinary
-`cancelled` event, the same as a host-initiated stop. A live microphone session ends when
-the wall clock since start reaches the budget, including diarizer start-up, so somewhat
-less audio than the budget is processed; faster-than-real-time feeders are trimmed at the
-exact audio boundary. The budget is a positive whole number of seconds; the command line
+`cancelled` event, the same as a host-initiated stop. In microphone mode the budget is
+wall clock from start, including diarizer start-up, so somewhat less audio than the budget
+is processed; in replay/demo mode it is the exact audio boundary, however slowly the replay
+processes. The budget is a positive whole number of seconds; the command line
 replaces the file's value. Timestamps are plain integers in stream milliseconds and do not
 wrap. Memory is bounded independently of session length by the rolling retention limits
 below, the per-utterance audio window, and the per-session unique-turn count.

@@ -160,11 +160,14 @@ class PrototypeController:
         while not self._closed.wait(0.5):
             with self._lock:
                 active = self._phase in {"starting", "listening", "replaying", "finishing"}
+                # Microphone sessions are wall-clock bounded from Start; replay feeders
+                # end only at the exact audio boundary, however slowly they process.
                 expired = active and (
                     time.monotonic() - self._last_browser > BROWSER_LEASE_SECONDS
                     or self._budget_reached
                     or (
                         self._budget_ms is not None
+                        and self._mode == "microphone"
                         and (time.monotonic() - self._started) * 1000 > self._budget_ms
                     )
                 )
@@ -414,15 +417,16 @@ class PrototypeController:
 
     def _feed(self, generation, processor, pcm, mode) -> bool:
         """Push audio up to the session budget; False once the session accepts no more."""
+        boundary = False
         with self._lock:
             if generation != self._generation or self._stop.is_set() or self._budget_reached:
                 return False
             if self._budget_ms is not None:
                 remaining = self._budget_ms * PCM_BYTES_PER_MS - self._received_bytes
                 if len(pcm) >= remaining:
-                    # Accept exactly up to the boundary; the timer then stops the session.
+                    # Accept exactly up to the boundary.
                     pcm = pcm[:remaining]
-                    self._budget_reached = True
+                    boundary = True
             if not pcm:
                 return False
             self._received_bytes += len(pcm)
@@ -431,7 +435,13 @@ class PrototypeController:
                 self._audio_started = time.monotonic()
             self._phase = "listening" if mode == "microphone" else "replaying"
         processor.push_pcm16(pcm)
-        return not self._budget_reached
+        if boundary:
+            # Publish only after the boundary audio is processed, so the timer cannot
+            # stop the session before that final push completes.
+            with self._lock:
+                if generation == self._generation:
+                    self._budget_reached = True
+        return not boundary
 
     def _decide(self, generation, stop, work, runner, hosted):
         enabled = hosted

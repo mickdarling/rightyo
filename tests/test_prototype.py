@@ -663,6 +663,59 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(controller.drain_events()[-1]["phase"], "cancelled")
         self.capture.assert_not_called()
 
+    def test_slow_replay_still_receives_the_whole_budget_before_cancellation(self):
+        class SlowProcessor(FakeProcessor):
+            pushing = False
+            closed_mid_push = False
+
+            def push_pcm16(self, pcm):
+                self.pushing = True
+                # Slower than real time: 200 ms of audio takes 300 ms of wall clock.
+                threading.Event().wait(0.3)
+                super().push_pcm16(pcm)
+                self.pushing = False
+
+            def close(self):
+                self.closed_mid_push |= self.pushing
+                super().close()
+
+        demo = Path(self.directory.name) / "generated-two-second.wav"
+        with wave.open(str(demo), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(16000)
+            audio.writeframes(bytes(2 * 32000))
+        self.processor.side_effect = SlowProcessor
+        events = SpeechEvents()
+        controller = PrototypeController(
+            replace(self.config, demo_audio=demo, session_budget_seconds=1),
+            processor_factory=self.processor,
+            capture_factory=self.capture,
+            provider_factory=self.hosted,
+            event_publisher=events,
+        )
+        self.addCleanup(controller.close)
+        controller.start({"mode": "demo"})
+        with controller._lock:
+            # Even a long-expired wall clock must not end a replay before its boundary.
+            controller._started -= 3600
+        emitted = []
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            emitted.extend(controller.drain_events())
+            if controller.snapshot(heartbeat=False)["phase"] == "idle":
+                break
+            threading.Event().wait(0.01)
+        emitted.extend(controller.drain_events())
+        processor = FakeProcessor.instances[0]
+        self.assertEqual(controller.snapshot()["phase"], "idle")
+        self.assertEqual(processor.received_ms, 1000)
+        self.assertEqual(processor.index, 5)
+        self.assertFalse(processor.closed_mid_push)
+        self.assertFalse(processor.finished)
+        self.assertEqual(sum(e["type"] == "transcript" for e in emitted), 5)
+        self.assertEqual(emitted[-1]["phase"], "cancelled")
+
     def test_invalid_session_budget_is_rejected_before_any_capture(self):
         for invalid in (0, -1, True, 1.5, "60"):
             self.controller.config = replace(self.config, session_budget_seconds=invalid)
