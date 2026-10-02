@@ -9,11 +9,17 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TextIO
 
-from rightyo.cli import addressing_from_args, load_turns
+from rightyo.cli import addressing_from_args, load_turns, priority_from_args
 from rightyo.contracts import ContractError
 from rightyo.pipeline import ReplayRunner
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
-from rightyo.providers import JevProvider, MockProvider, ProviderError
+from rightyo.providers import (
+    ConfiguredPriorityProvider,
+    JevProvider,
+    MockProvider,
+    ModelPriorityProvider,
+    ProviderError,
+)
 from rightyo.tool_events import SpeechEvents, encode_json
 
 
@@ -29,10 +35,23 @@ def replay(args, *, output=None) -> int:
     """Replay explicit supplied text; mock is visibly labelled fixture behavior."""
     output = sys.stdout if output is None else output
     addressing = addressing_from_args(args)
+    speakers = priority_from_args(args)
+    model_roles = speakers is not None and speakers.source == "model"
+    if model_roles and args.provider != "jev":
+        raise ProviderError("model-assigned speaker roles require the Jev provider")
     turns = load_turns(args.input)
     preflight = ReplayRunner(MockProvider(), addressing=addressing)
     committed = [turn for turn in turns if preflight.process(turn) is not None]
     required_requests = len(committed)
+    if model_roles:
+        # One role question per newly observed unconfigured speaker shares the budget.
+        required_requests += len(
+            {
+                turn.speaker_id
+                for turn in committed
+                if turn.speaker_id is not None and speakers.configured_role(turn.speaker_id) is None
+            }
+        )
     if args.provider == "jev" and required_requests > args.max_requests:
         raise ProviderError("session exceeds Jev request budget; no requests were sent")
     provider = (
@@ -45,10 +64,17 @@ def replay(args, *, output=None) -> int:
             min_confidence=args.min_confidence,
         )
     )
+    priority = None
+    if speakers is not None:
+        priority = (
+            ModelPriorityProvider(provider, speakers)
+            if model_roles
+            else ConfiguredPriorityProvider(speakers)
+        )
     runner = ReplayRunner(provider, addressing=addressing)
     events = SpeechEvents()
     now = 0
-    events.start(turns[0].session_id, now_ms=now, addressing=addressing)
+    events.start(turns[0].session_id, now_ms=now, addressing=addressing, priority=priority)
     _emit(events.drain(), output)
     try:
         for turn in committed:

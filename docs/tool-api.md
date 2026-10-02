@@ -32,10 +32,12 @@ The events are:
 | `transcript` | `turn` | One immutable finalized transcript turn |
 | `attention` | `utterance_id`, `speech_end_ms`, `decision`, optional `request_id` | `attend`, `ignore`, or `uncertain` evidence |
 | `request` | `request_id`, `turn`, `decision`, `context`, `decision_at_ms` | Complete attended input available for host handling |
+| `override` | `superseded_request_id`, `by_utterance_id`, `role` | An owner's turn supersedes an earlier open non-owner request |
 
 Initial capabilities declare `activation: "finalized-turn"` when decisions are
 available, or `"disabled"` for transcription-only listening, `partials: false`,
-`speakers: "anonymous"`, and `context: true`. Mock replay decisions are identified
+`speakers: "anonymous"` (or `"enrolled"` when [speaker roles](#speaker-roles-and-owner-override)
+are configured), and `context: true`. Mock replay decisions are identified
 by `provider: "mock"` and `model: "mock-v1"`; they are fixture rules. A local
 listener without Jev opt-in emits no invented attention decisions.
 
@@ -105,6 +107,48 @@ request. Drain continuously and start a new bounded session when necessary.
 discussion, ignored attention, an attended retrospective request with prior context,
 and normal termination. Producer tests generate and compare this exact fixture;
 the Hailing Station consumer uses the same authored contract fixture.
+
+## Speaker roles and owner override
+
+Without configuration the tool behaves exactly as above: `speakers` is `"anonymous"`
+and no `role` field exists. When speaker roles are configured, through the prototype
+configuration's `speakers` object or the `--owner`, `--trusted`, `--owner-only` and
+`--role-source` options of `tool-replay`, the started event declares
+`speakers: "enrolled"` and every turn object (in `transcript`, the `request` turn and
+`context.turns`) and every decision object carries `role`, one of the literals `owner`,
+`trusted`, `participant` or `unknown`. A role is fixed the first time a speaker is
+emitted in a session and never changes afterwards; a turn without a speaker label is
+`unknown`. Roles are descriptive data from configuration or a model answer. They are
+not authentication, they do not verify who is speaking, and they never unlock anything
+on the host: the host's own policy and confirmation flow decide what any request may do.
+
+Owners and trusted speakers are configured by session speaker label or enrolled
+identifier. With `"source": "configured"` (the default) every other speaker is a
+`participant`. With `"source": "model"` the opted-in Jev provider is asked once per
+newly observed unconfigured speaker, from the bounded recent conversation, whether that
+speaker is `trusted`, `participant` or `unknown`; low confidence is `unknown`. The model
+is never offered `owner`, and configured roles replace its answer, so an owner cannot be
+downgraded by a transcript that claims otherwise. Each role question shares the hosted
+request budget and consent; without hosted opt-in only the configured roles apply.
+
+Precedence is applied by the producer before emission. An owner's attended turn, or an
+owner turn that is only a stop phrase (default `stop`, `cancel`, `ignore that`, `never
+mind`; matched case-insensitively against the whole utterance after punctuation is
+removed), emits one `override` event per earlier non-owner request that is still open:
+`superseded_request_id` names the request, `by_utterance_id` names the owner's turn and
+`role` is `owner`. Overrides follow the owner's `attention` event and precede the owner's
+own `request`; a stop phrase produces no request even when the decision was `attend`, and
+its attention evidence is emitted unchanged without a `request_id`. A non-owner request
+stays open until an override, retention expiry or a terminal event; at most 32 are
+tracked, oldest first. A stop phrase with nothing open emits no override. With
+`owner_only: true`, a non-owner `attend` decision is emitted as `ignore` and no request
+is delivered; non-owner turns remain ordinary context. The producer adds no free-text
+markers: interpreting non-owner context as information rather than instructions is the
+host's responsibility, informed by the `role` on every context turn.
+
+[The enrolled fixture](../examples/enrolled-override.jsonl) shows a participant's
+attended request followed by the owner's "Ignore that." override; the shared anonymous
+fixture above is byte-identical to before.
 
 ## Python extension boundaries
 

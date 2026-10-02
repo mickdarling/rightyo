@@ -9,7 +9,7 @@ from functools import wraps
 from threading import RLock
 from typing import Any
 
-from rightyo.contracts import ContractError, Turn, integer
+from rightyo.contracts import ContractError, Turn, integer, speaker_role
 
 
 def _locked(method):
@@ -53,7 +53,8 @@ class TranscriptMemory:
 
     @_locked
     def clear(self) -> None:
-        self._turns: deque[tuple[Turn, int]] = deque()
+        # Each entry retains the turn, its encoded size and the role fixed at acceptance.
+        self._turns: deque[tuple[Turn, int, str | None]] = deque()
         self._bytes = 0
         self._now_ms = 0
         self._last_end_ms = 0
@@ -69,19 +70,28 @@ class TranscriptMemory:
         self._now_ms = max(self._now_ms, now_ms)
         cutoff = self._now_ms - self.retention_ms
         while self._turns and self._turns[0][0].end_ms <= cutoff:
-            _, size = self._turns.popleft()
+            _, size, _role = self._turns.popleft()
             self._bytes -= size
             self._expired += 1
 
     @_locked
-    def append(self, turn: Turn) -> None:
+    def append(self, turn: Turn, role: str | None = None) -> None:
+        """Retain a final turn; an optional role is fixed with it and never revised."""
         if not isinstance(turn, Turn) or not turn.finalized:
             raise ContractError("transcript memory accepts only final turns")
         if self._session_id is not None and turn.session_id != self._session_id:
             raise ContractError("memory session changed without explicit clear")
+        if role is not None:
+            speaker_role(role)
         key = hashlib.sha256(turn.utterance_id.encode("utf-8")).digest()
-        encoded = json.dumps(turn.to_dict(), sort_keys=True, ensure_ascii=False).encode("utf-8")
-        digest = hashlib.sha256(encoded).digest()
+        record = turn.to_dict()
+        # Revision checks compare the turn alone; the role is producer-assigned metadata.
+        digest = hashlib.sha256(
+            json.dumps(record, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).digest()
+        if role is not None:
+            record["role"] = role
+        encoded = json.dumps(record, sort_keys=True, ensure_ascii=False).encode("utf-8")
         previous = self._seen.get(key)
         if previous is not None:
             if previous != digest:
@@ -101,24 +111,29 @@ class TranscriptMemory:
         if turn.end_ms <= self._now_ms - self.retention_ms:
             self._expired += 1
             return
-        self._turns.append((turn, size))
+        self._turns.append((turn, size, role))
         self._bytes += size
         while len(self._turns) > self.max_turns or self._bytes > self.max_bytes:
-            _, removed_size = self._turns.popleft()
+            _, removed_size, _role = self._turns.popleft()
             self._bytes -= removed_size
             self._capacity_evicted += 1
 
     @property
     @_locked
     def retained_ids(self) -> frozenset[str]:
-        return frozenset(turn.utterance_id for turn, _ in self._turns)
+        return frozenset(turn.utterance_id for turn, _, _ in self._turns)
 
     @_locked
     def snapshot(self, now_ms: int) -> dict[str, Any]:
         """Return detached dictionaries; callers cannot mutate retained state."""
         self.expire(now_ms)
         cutoff = max(0, self._now_ms - self.retention_ms)
-        turns = [turn.to_dict() for turn, _ in self._turns]
+        turns = []
+        for turn, _, role in self._turns:
+            record = turn.to_dict()
+            if role is not None:
+                record["role"] = role
+            turns.append(record)
         return {
             "turns": turns,
             "retention": {

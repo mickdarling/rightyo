@@ -17,12 +17,18 @@ from pathlib import Path
 from typing import Any
 
 from rightyo.capture import CaptureError, MacMicrophoneCapture
-from rightyo.contracts import Addressing, ContractError, Turn, identifier
+from rightyo.contracts import Addressing, ContractError, SpeakerPriority, Turn, identifier
 from rightyo.credentials import CredentialError
 from rightyo.live_audio import LiveAudioError, LiveConfig, LiveProcessor
 from rightyo.memory import MemorySessionLimitError, TranscriptMemory
 from rightyo.pipeline import ReplayRunner
-from rightyo.providers import JevProvider, MockProvider, ProviderError
+from rightyo.providers import (
+    ConfiguredPriorityProvider,
+    JevProvider,
+    MockProvider,
+    ModelPriorityProvider,
+    ProviderError,
+)
 
 SESSION_SECONDS = 900
 BROWSER_LEASE_SECONDS = 15
@@ -45,6 +51,7 @@ class PrototypeConfig:
     microphone_helper: Path
     demo_audio: Path | None = None
     addressing: Addressing | None = None
+    speakers: SpeakerPriority | None = None
 
     @classmethod
     def load(cls, path: Path) -> PrototypeConfig:
@@ -63,17 +70,20 @@ class PrototypeConfig:
             }
             if not isinstance(raw, dict) or not required <= raw.keys():
                 raise ValueError
-            if raw.keys() - required - {"demo_audio", "addressing"}:
+            if raw.keys() - required - {"demo_audio", "addressing", "speakers"}:
                 raise ValueError
             addressing = raw.pop("addressing", None)
             if addressing is not None:
                 addressing = Addressing.from_dict(addressing)
+            speakers = raw.pop("speakers", None)
+            if speakers is not None:
+                speakers = SpeakerPriority.from_dict(speakers)
             values = {}
             for name, value in raw.items():
                 if not isinstance(value, str) or not value or not Path(value).is_absolute():
                     raise ValueError
                 values[name] = Path(value)
-            config = cls(**values, addressing=addressing)
+            config = cls(**values, addressing=addressing, speakers=speakers)
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
             return config
@@ -218,6 +228,16 @@ class PrototypeController:
             runner = ReplayRunner(
                 provider, memory=memory, cancelled=cancelled, addressing=self.config.addressing
             )
+            speakers = self.config.speakers
+            priority = None
+            if speakers is not None:
+                # Model-assigned roles need the hosted opt-in; otherwise only the
+                # configured roles apply and nothing leaves the machine.
+                priority = (
+                    ModelPriorityProvider(provider, speakers)
+                    if hosted and speakers.source == "model"
+                    else ConfiguredPriorityProvider(speakers)
+                )
             runner.restart(session)
             self._generation += 1
             generation = self._generation
@@ -243,6 +263,7 @@ class PrototypeController:
                     now_ms=0,
                     attention_enabled=hosted,
                     addressing=self.config.addressing,
+                    priority=priority,
                 )
                 self._event_terminal = False
             threading.Thread(

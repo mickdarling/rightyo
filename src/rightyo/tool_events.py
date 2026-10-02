@@ -8,12 +8,40 @@ import json
 from collections import deque
 from threading import RLock
 
-from rightyo.contracts import Addressing, ContractError, DecisionEvent, Turn, identifier, integer
+from rightyo.contracts import (
+    Addressing,
+    ContractError,
+    DecisionEvent,
+    SpeakerPriority,
+    Turn,
+    identifier,
+    integer,
+    speaker_role,
+)
 from rightyo.memory import TranscriptMemory
 
 MAX_EVENT_BYTES = 1200000
 MAX_QUEUE_BYTES = 4194304
 MAX_PENDING_BYTES = 1048576
+# Emitted non-owner requests an owner can still supersede, and the context a role
+# provider sees when a speaker first appears.
+MAX_OPEN_REQUESTS = 32
+ROLE_CONTEXT_TURNS = 8
+
+
+def _role_state(record):
+    """The bounded fields a role provider needs; session/source identifiers are omitted."""
+    state = {name: record[name] for name in ("text", "speaker_id", "start_ms", "end_ms", "overlap")}
+    if "role" in record:
+        state["role"] = record["role"]
+    return state
+
+
+def _with_role(turn, role):
+    record = turn.to_dict()
+    if role is not None:
+        record["role"] = role
+    return record
 
 
 def encode_json(payload):
@@ -49,6 +77,11 @@ class SpeechEvents:
         self._pending_bytes = 0
         self._seen = {}
         self._decided = set()
+        # Speaker roles are fixed per speaker when first emitted; open requests are the
+        # emitted non-owner requests an owner's attended turn or stop phrase supersedes.
+        self._priority = None
+        self._roles = {}
+        self._open = {}
 
     def _emit(self, kind, **fields):
         self._sequence += 1
@@ -78,8 +111,11 @@ class SpeechEvents:
         self._pending_bytes = 0
         self._queue.clear()
         self._queue_bytes = 0
+        self._open.clear()
 
-    def start(self, session_id, now_ms=0, *, attention_enabled=True, addressing=None):
+    def start(
+        self, session_id, now_ms=0, *, attention_enabled=True, addressing=None, priority=None
+    ):
         with self._lock:
             identifier(session_id, "session_id")
             integer(now_ms, "now_ms")
@@ -87,6 +123,11 @@ class SpeechEvents:
                 raise ContractError("invalid attention capability")
             if addressing is not None and not isinstance(addressing, Addressing):
                 raise ContractError("invalid addressing")
+            if priority is not None and (
+                not callable(getattr(priority, "assign", None))
+                or not isinstance(getattr(priority, "priority", None), SpeakerPriority)
+            ):
+                raise ContractError("invalid speaker priority provider")
             if self._active or self._queue:
                 raise ContractError("finish and drain the previous event session")
             session_key = hashlib.sha256(session_id.encode("utf-8")).digest()
@@ -99,6 +140,8 @@ class SpeechEvents:
             self._clear_content()
             self._seen.clear()
             self._decided.clear()
+            self._roles.clear()
+            self._priority = priority
             self._session = session_id
             self._sequence = 0
             self._now = now_ms
@@ -110,7 +153,7 @@ class SpeechEvents:
                 capabilities={
                     "activation": "finalized-turn" if attention_enabled else "disabled",
                     "partials": False,
-                    "speakers": "anonymous",
+                    "speakers": "anonymous" if priority is None else "enrolled",
                     "context": True,
                 },
                 # Configured forms of address are advertised beside, not inside, the
@@ -124,17 +167,20 @@ class SpeechEvents:
             self._now = max(self._now, now_ms)
             self._memory.expire(self._now)
             cutoff = self._now - self.retention_ms
-            for key, (turn, _context, size) in list(self._pending.items()):
+            for key, (turn, _context, size, _role) in list(self._pending.items()):
                 if turn.end_ms <= cutoff:
                     del self._pending[key]
                     self._pending_bytes -= size
             # Reclaim accounting as well as plaintext when a frozen context shrinks.
             self._pending_bytes = 0
-            for key, (turn, context, _size) in list(self._pending.items()):
+            for key, (turn, context, _size, role) in list(self._pending.items()):
                 context["turns"] = [t for t in context["turns"] if t["end_ms"] > cutoff]
                 size = len(encode_json(context))
-                self._pending[key] = (turn, context, size)
+                self._pending[key] = (turn, context, size, role)
                 self._pending_bytes += size
+            for request_id, end_ms in list(self._open.items()):
+                if end_ms <= cutoff:
+                    del self._open[request_id]
             kept = deque()
             self._queue_bytes = 0
             for payload, _size in self._queue:
@@ -173,7 +219,10 @@ class SpeechEvents:
                 raise ContractError("event session turn budget exceeded")
             context = self._memory.snapshot(self._now)
             context["turns"] = [t for t in context["turns"] if t["end_ms"] <= turn.start_ms]
-            self._memory.append(turn)
+            # The role is fixed before the first emission and repeated unchanged on the
+            # decision, the request turn and every later context snapshot.
+            role = None if self._priority is None else self._assign_role(turn, context["turns"])
+            self._memory.append(turn, role=role)
             self._seen[turn.utterance_id] = digest
             if turn.end_ms <= self._now - self.retention_ms:
                 return
@@ -183,9 +232,38 @@ class SpeechEvents:
                     self._clear_content()
                     self._active = False
                     raise ContractError("pending attention context budget exceeded")
-                self._pending[turn.utterance_id] = (turn, context, size)
+                self._pending[turn.utterance_id] = (turn, context, size, role)
                 self._pending_bytes += size
-            self._emit("transcript", turn=turn.to_dict())
+            self._emit("transcript", turn=_with_role(turn, role))
+
+    def _assign_role(self, turn, past):
+        """Fix a speaker's role the first time that speaker is emitted in this session."""
+        if turn.speaker_id is None:
+            return "unknown"
+        role = self._roles.get(turn.speaker_id)
+        if role is not None:
+            return role
+        recent = [_role_state(record) for record in past[-ROLE_CONTEXT_TURNS:]]
+        current = _role_state(turn.to_dict())
+        state = {
+            "past_turns": recent,
+            "current_turn": current,
+            "known_participants": sorted(
+                {r["speaker_id"] for r in [*recent, current] if r["speaker_id"] is not None}
+            ),
+            "roles": dict(self._roles),
+        }
+        assigned = self._priority.assign(state)
+        if not isinstance(assigned, dict):
+            raise ContractError("invalid speaker role assignment")
+        validated = {
+            identifier(speaker, "speaker_id"): speaker_role(value)
+            for speaker, value in assigned.items()
+        }
+        for speaker, value in validated.items():
+            # An earlier fixed role is never revised by a later answer.
+            self._roles.setdefault(speaker, value)
+        return self._roles.get(turn.speaker_id, "unknown")
 
     def decision(self, event, now_ms):
         with self._lock:
@@ -201,7 +279,7 @@ class SpeechEvents:
             pending = self._pending.pop(key, None)
             if pending is None:
                 return
-            turn, context, size = pending
+            turn, context, size, role = pending
             self._pending_bytes -= size
             if turn != event.turn:
                 raise ContractError("decision does not match the committed transcript")
@@ -212,8 +290,20 @@ class SpeechEvents:
                 for name, value in event.public_dict().items()
                 if name in {"label", "recipient_kind", "confidence", "provider", "model"}
             }
+            stop = False
+            if role is not None:
+                evidence["role"] = role
+                rules = self._priority.priority
+                if rules.owner_only and role != "owner" and evidence["label"] == "attend":
+                    # Owner-only mode: other speakers remain context, never a request.
+                    evidence["label"] = "ignore"
+                stop = role == "owner" and rules.is_stop_phrase(turn.text)
             request_id = self._session + ":" + key
-            attended = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
+            attended = (
+                evidence["label"] == "attend"
+                and evidence["recipient_kind"] == "system"
+                and not stop
+            )
             self._emit(
                 "attention",
                 utterance_id=key,
@@ -221,15 +311,30 @@ class SpeechEvents:
                 decision=evidence,
                 **({"request_id": request_id} if attended else {}),
             )
+            if role == "owner" and (attended or stop):
+                # The owner's own attended turn or a stop phrase supersedes every open
+                # non-owner request before any new request of the owner's is delivered.
+                for superseded in list(self._open):
+                    self._emit(
+                        "override",
+                        superseded_request_id=superseded,
+                        by_utterance_id=key,
+                        role="owner",
+                    )
+                self._open.clear()
             if attended:
                 self._emit(
                     "request",
                     request_id=request_id,
-                    turn=turn.to_dict(),
+                    turn=_with_role(turn, role),
                     decision=evidence,
                     context=context,
                     decision_at_ms=self._now,
                 )
+                if role is not None and role != "owner":
+                    self._open[request_id] = turn.end_ms
+                    while len(self._open) > MAX_OPEN_REQUESTS:
+                        del self._open[next(iter(self._open))]
 
     def end(self, phase="cancelled", now_ms=0, reason=None):
         with self._lock:
@@ -247,6 +352,7 @@ class SpeechEvents:
             self._memory.clear()
             self._pending.clear()
             self._pending_bytes = 0
+            self._open.clear()
             self._active = False
             self._terminal = True
             self._emit("session", phase=phase, **({"reason": reason} if reason else {}))
