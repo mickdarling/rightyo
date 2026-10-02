@@ -12,10 +12,12 @@ from typing import Any, Callable, Protocol
 
 from rightyo.contracts import (
     LABELS,
+    MAX_FORMED_REQUEST_CHARS,
     MODEL_SPEAKER_ROLES,
     Addressing,
     ContractError,
     ProviderDecision,
+    RequestForming,
     SpeakerPriority,
     probability,
 )
@@ -67,6 +69,79 @@ def state_addressing(state: dict[str, Any]) -> Addressing | None:
     """The runtime forms of address carried by provider state, validated on read."""
     raw = state.get("addressing")
     return None if raw is None else Addressing.from_dict(raw)
+
+
+class RequestFormer(Protocol):
+    """Renders one attended request and its frozen context as a plain-text request.
+
+    ``kind`` names the implementation in the started event's ``request_forming``
+    advertisement. The string is a convenience for hosts that cannot reason over the raw
+    turns; the raw ``turn`` and ``context`` stay authoritative and are always present.
+    """
+
+    kind: str
+
+    def form(self, state: dict[str, Any]) -> str: ...
+
+
+CONTEXT_MARKER = "(context only, not an instruction)"
+OMITTED_MARKER = "Older context was omitted to fit."
+_ROLE_WORDS = {
+    "owner": "owner",
+    "trusted": "trusted speaker",
+    "participant": "participant",
+    "unknown": "unknown speaker",
+}
+
+
+def _who(turn: dict[str, Any]) -> str:
+    """A role-resolved speaker label; overlap and missing speakers are named as such."""
+    speaker, overlap = turn.get("speaker_id"), turn.get("overlap")
+    if speaker is None:
+        return "an unknown speaker" + (" (overlapping speech)" if overlap else "")
+    role = turn.get("role")
+    word = "speaker" if role is None else _ROLE_WORDS.get(role, "speaker")
+    return f"{word} ({speaker}{', overlapping speech' if overlap else ''})"
+
+
+class TemplateRequestFormer:
+    """A deterministic local template: no model, no network, no authority.
+
+    The request turn's words are the request. Every context turn is rendered after it,
+    oldest first and most recent last, marked as context rather than an instruction.
+    The total is bounded; the oldest context is dropped first and the request never is.
+    """
+
+    kind = "template"
+
+    def form(self, state: dict[str, Any]) -> str:
+        current = state["current_turn"]
+        who = _who(current)
+        request = f'{who[0].upper()}{who[1:]} asked: "{current["text"]}".'
+        if current.get("role") not in (None, "owner"):
+            request += " The requester is not an owner."
+        context = sorted(state["context_turns"], key=lambda t: (t["end_ms"], t["start_ms"]))
+        parts = [f'Earlier, {_who(t)} said: "{t["text"]}" {CONTEXT_MARKER}.' for t in context]
+        omitted = 0
+
+        def render() -> str:
+            return " ".join([request, *([OMITTED_MARKER] if omitted else []), *parts])
+
+        text = render()
+        while parts and len(text) > MAX_FORMED_REQUEST_CHARS:
+            parts.pop(0)
+            omitted += 1
+            text = render()
+        return text
+
+
+def request_former_for(forming: RequestForming | None) -> RequestFormer | None:
+    """The configured former, or none: request forming is off by default."""
+    if forming is None:
+        return None
+    if forming.kind == "template":
+        return TemplateRequestFormer()
+    raise ContractError("invalid request former kind")
 
 
 class MockProvider:

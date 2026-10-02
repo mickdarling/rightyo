@@ -9,7 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TextIO
 
-from rightyo.cli import addressing_from_args, load_turns, priority_from_args
+from rightyo.cli import addressing_from_args, forming_from_args, load_turns, priority_from_args
 from rightyo.contracts import ContractError
 from rightyo.pipeline import ReplayRunner
 from rightyo.prototype import (
@@ -24,6 +24,7 @@ from rightyo.providers import (
     MockProvider,
     ModelPriorityProvider,
     ProviderError,
+    request_former_for,
 )
 from rightyo.tool_events import SpeechEvents, encode_json
 
@@ -41,6 +42,7 @@ def replay(args, *, output=None) -> int:
     output = sys.stdout if output is None else output
     addressing = addressing_from_args(args)
     speakers = priority_from_args(args)
+    former = request_former_for(forming_from_args(args))
     model_roles = speakers is not None and speakers.source == "model"
     if model_roles and args.provider != "jev":
         raise ProviderError("model-assigned speaker roles require the Jev provider")
@@ -79,7 +81,13 @@ def replay(args, *, output=None) -> int:
     runner = ReplayRunner(provider, addressing=addressing)
     events = SpeechEvents()
     now = 0
-    events.start(turns[0].session_id, now_ms=now, addressing=addressing, priority=priority)
+    events.start(
+        turns[0].session_id,
+        now_ms=now,
+        addressing=addressing,
+        priority=priority,
+        former=former,
+    )
     _emit(events.drain(), output)
     try:
         for turn in committed:
@@ -116,6 +124,10 @@ def listen(args, *, output=None, controller_factory=PrototypeController) -> int:
     if budget is not None:
         # The command line's budget likewise replaces the configuration file's.
         config = replace(config, session_budget_seconds=validate_session_budget(budget))
+    forming = forming_from_args(args)
+    if forming is not None:
+        # The command-line former replaces the configuration file's, like --name.
+        config = replace(config, request_former=forming)
     events = SpeechEvents()
     controller = controller_factory(config, event_publisher=events)
     # Signal handlers are installed only by this explicit foreground operation.

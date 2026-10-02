@@ -14,6 +14,7 @@ from rightyo.contracts import (
     DecisionEvent,
     SpeakerPriority,
     Turn,
+    formed_request_text,
     identifier,
     integer,
     speaker_role,
@@ -95,6 +96,10 @@ class SpeechEvents:
         # degrades roles to configured/unknown for the rest of the session.
         self.role_status = "off"
         self._degraded_turn = None
+        # Optional request forming renders a convenience string beside the raw turns;
+        # off by default, and the raw turn/context are unchanged either way.
+        self._former = None
+        self._addressing = None
 
     def _payload(self, kind, sequence, fields):
         return {
@@ -135,7 +140,14 @@ class SpeechEvents:
         self._superseded.clear()
 
     def start(
-        self, session_id, now_ms=0, *, attention_enabled=True, addressing=None, priority=None
+        self,
+        session_id,
+        now_ms=0,
+        *,
+        attention_enabled=True,
+        addressing=None,
+        priority=None,
+        former=None,
     ):
         with self._lock:
             identifier(session_id, "session_id")
@@ -149,6 +161,10 @@ class SpeechEvents:
                 or not isinstance(getattr(priority, "priority", None), SpeakerPriority)
             ):
                 raise ContractError("invalid speaker priority provider")
+            if former is not None and not callable(getattr(former, "form", None)):
+                raise ContractError("invalid request former")
+            if former is not None:
+                identifier(getattr(former, "kind", None), "request former kind")
             if self._active or self._queue:
                 raise ContractError("finish and drain the previous event session")
             session_key = hashlib.sha256(session_id.encode("utf-8")).digest()
@@ -163,6 +179,8 @@ class SpeechEvents:
             self._decided.clear()
             self._roles.clear()
             self._priority = priority
+            self._former = former
+            self._addressing = addressing
             self.role_status = "off" if priority is None else "ready"
             self._degraded_turn = None
             self._session = session_id
@@ -182,6 +200,9 @@ class SpeechEvents:
                 # Configured forms of address are advertised beside, not inside, the
                 # existing capability set so strict consumers of that set are unchanged.
                 **({} if addressing is None else {"addressing": addressing.to_dict()}),
+                # Likewise for request forming: a separate top-level object, never a key
+                # inside the strictly validated capability set.
+                **({} if former is None else {"request_forming": {"kind": former.kind}}),
             )
 
     def expire(self, now_ms):
@@ -215,10 +236,29 @@ class SpeechEvents:
                     if end is not None and end <= cutoff:
                         continue
                     if payload["type"] == "request":
-                        payload["context"]["turns"] = [
-                            t for t in payload["context"]["turns"] if t["end_ms"] > cutoff
-                        ]
+                        turns = [t for t in payload["context"]["turns"] if t["end_ms"] > cutoff]
+                        if len(turns) != len(payload["context"]["turns"]):
+                            payload["context"]["turns"] = turns
+                            if "formed_request" in payload:
+                                # The convenience string must not outlive the retention
+                                # window either: re-render it from the pruned context,
+                                # failing closed exactly as at emission. An unpruned
+                                # request keeps its string byte-identical.
+                                payload["formed_request"] = self._render_request(
+                                    payload["turn"], turns
+                                )
                 size = len(encode_json(payload)) + 1
+                # A re-rendered string may grow, so the rebuilt queue is held to the
+                # same per-event, count and aggregate bounds as emission, failing closed
+                # the same way rather than letting the backlog exceed its budget.
+                if (
+                    size > MAX_EVENT_BYTES
+                    or len(kept) >= self.max_pending
+                    or self._queue_bytes + size > MAX_QUEUE_BYTES
+                ):
+                    self._clear_content()
+                    self._active = False
+                    raise ContractError("speech event consumer backlog exceeded")
                 kept.append((payload, size))
                 self._queue_bytes += size
             self._queue = kept
@@ -363,6 +403,10 @@ class SpeechEvents:
             would_attend = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
             attended = would_attend and not stop and superseded_by is None
             overriding = role == "owner" and (attended or stop)
+            # Form before any reservation or emission so the burst reserve below counts
+            # the exact request bytes, formed string included, and a failing former
+            # fails closed before anything of this decision is queued.
+            formed = self._form_request(turn, role, context) if attended else {}
             to_supersede = []
             if overriding:
                 # Earlier is decided by turn time (end_ms at or before the owner's), not by
@@ -415,6 +459,7 @@ class SpeechEvents:
                                 "decision": evidence,
                                 "context": context,
                                 "decision_at_ms": self._now,
+                                **formed,
                             },
                         )
                     )
@@ -468,6 +513,7 @@ class SpeechEvents:
                     decision=evidence,
                     context=context,
                     decision_at_ms=self._now,
+                    **formed,
                 )
                 if role is not None and role != "owner":
                     if len(self._open) >= self.max_open:
@@ -477,6 +523,35 @@ class SpeechEvents:
                         self._active = False
                         raise ContractError("open request budget exceeded")
                     self._open[request_id] = turn.end_ms
+
+    def _form_request(self, turn, role, context):
+        """The optional ``formed_request`` field, present only when a former is configured.
+
+        A former that raises or returns an invalid value fails closed: the session's
+        content is released and the error ends the session, never a silently dropped field.
+        """
+        if self._former is None:
+            return {}
+        return {"formed_request": self._render_request(_with_role(turn, role), context["turns"])}
+
+    def _render_request(self, record, context_turns):
+        """Run the former on the bounded state for one request record and its context."""
+        state = {
+            "current_turn": copy.deepcopy(record),
+            "context_turns": copy.deepcopy(context_turns),
+            "addressing": None if self._addressing is None else self._addressing.to_dict(),
+            "speakers": "anonymous" if self._priority is None else "enrolled",
+        }
+        formed = None
+        try:
+            formed = formed_request_text(self._former.form(state))
+        except Exception:
+            pass
+        if formed is None:
+            self._clear_content()
+            self._active = False
+            raise ContractError("request forming failed")
+        return formed
 
     def end(self, phase="cancelled", now_ms=0, reason=None):
         with self._lock:
