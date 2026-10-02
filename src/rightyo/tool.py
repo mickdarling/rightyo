@@ -5,10 +5,11 @@ from __future__ import annotations
 import signal
 import sys
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import TextIO
 
-from rightyo.cli import load_turns
+from rightyo.cli import addressing_from_args, load_turns
 from rightyo.contracts import ContractError
 from rightyo.pipeline import ReplayRunner
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
@@ -27,8 +28,9 @@ def _emit(events, output: TextIO):
 def replay(args, *, output=None) -> int:
     """Replay explicit supplied text; mock is visibly labelled fixture behavior."""
     output = sys.stdout if output is None else output
+    addressing = addressing_from_args(args)
     turns = load_turns(args.input)
-    preflight = ReplayRunner(MockProvider())
+    preflight = ReplayRunner(MockProvider(), addressing=addressing)
     committed = [turn for turn in turns if preflight.process(turn) is not None]
     required_requests = len(committed)
     if args.provider == "jev" and required_requests > args.max_requests:
@@ -43,10 +45,10 @@ def replay(args, *, output=None) -> int:
             min_confidence=args.min_confidence,
         )
     )
-    runner = ReplayRunner(provider)
+    runner = ReplayRunner(provider, addressing=addressing)
     events = SpeechEvents()
     now = 0
-    events.start(turns[0].session_id, now_ms=now)
+    events.start(turns[0].session_id, now_ms=now, addressing=addressing)
     _emit(events.drain(), output)
     try:
         for turn in committed:
@@ -74,7 +76,11 @@ def listen(args, *, output=None, controller_factory=PrototypeController) -> int:
     if args.allow_hosted and not args.use_jev:
         raise PrototypeError("--allow-hosted requires --use-jev")
     output = sys.stdout if output is None else output
+    addressing = addressing_from_args(args)
     config = PrototypeConfig.load(Path(args.config))
+    if addressing is not None:
+        # Command-line names take precedence over the configuration file's names.
+        config = replace(config, addressing=addressing)
     events = SpeechEvents()
     controller = controller_factory(config, event_publisher=events)
     # Signal handlers are installed only by this explicit foreground operation.

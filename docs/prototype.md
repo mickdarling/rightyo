@@ -34,9 +34,12 @@ Create the ignored `local/prototype.json` with absolute paths to your existing a
 }
 ```
 
-`demo_audio` is optional. Replay accepts mono PCM16 WAV at 16 kHz, at most three minutes;
-it feeds real PCM in causal order as quickly as processing permits. It is not a wall-clock
-streaming latency measurement. Playback through speakers is a separate physical test.
+`demo_audio` is optional, as is `"addressing": {"names": ["Hailing Station", "computer"]}`,
+the runtime forms of address described in [the tool API](tool-api.md); `--name` flags on
+the command line replace the file's names. Replay accepts mono PCM16 WAV at 16 kHz, at most
+three minutes; it feeds real PCM in causal order as quickly as processing permits. It is not
+a wall-clock streaming latency measurement. Playback through speakers is a separate physical
+test.
 
 ```sh
 .venv/bin/rightyo prototype --config local/prototype.json --port 8766

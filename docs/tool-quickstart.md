@@ -41,6 +41,12 @@ the same absolute-path `local/prototype.json` used by the lab. Then choose one s
   --session-id demo-session-001
 ```
 
+Repeatable `--name` flags (for example `--name "Hailing Station" --name computer`) declare
+the forms of address the system answers to for `listen`, `tool-replay` and `prototype`. They
+are advertised in the started session event and given to the decision provider as evidence,
+not as a required wake word; see [the API reference](tool-api.md). Nothing is configured by
+default.
+
 No attention is fabricated in these commands: local-only audio emits transcript and session
 events. Optional Jev inference requires both `--use-jev --allow-hosted`, with the existing
 [secure credential setup](mvp.md#secure-jev-setup-on-macos). The native audio tool remains

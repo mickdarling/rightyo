@@ -39,6 +39,22 @@ available, or `"disabled"` for transcription-only listening, `partials: false`,
 by `provider: "mock"` and `model: "mock-v1"`; they are fixture rules. A local
 listener without Jev opt-in emits no invented attention decisions.
 
+When the host configures forms of address, the `started` event also carries a
+separate top-level `addressing` object, for example
+`"addressing": {"names": ["Hailing Station", "Station", "computer"]}`. The names
+are supplied at runtime through repeatable `--name` flags on `listen`,
+`tool-replay` and `prototype`, or through the prototype configuration's
+`addressing.names`; the command line takes precedence over the file. Each name is
+one to 48 characters of letters, digits, spaces, dots, underscores or hyphens,
+starting with a letter or digit, with at most eight distinct names. The names
+are passed to the decision provider as evidence that speech using one of them is
+addressed to the system; a name alone is neither required nor a transcript
+filter, and the complete turn is still judged from context. The mock fixture rule
+accepts a configured name followed by a comma or colon, case-insensitively, and
+keeps its authored `Rightyo,` prefix when nothing is configured. Without
+configuration the field is absent and the existing `capabilities` set is
+unchanged; no name is built into the tool.
+
 A transcript precedes its decision. For an accepted system-addressed request,
 attention precedes request delivery and both reference the same `request_id`.
 Decisions may arrive after later transcripts. Receivers correlate identities rather
