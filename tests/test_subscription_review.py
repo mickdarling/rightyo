@@ -33,6 +33,7 @@ from scripts.subscription_review import (
     record_request,
     request_markers,
     review_candidates,
+    review_has_findings,
     timestamp,
 )
 
@@ -656,6 +657,128 @@ class InlineSourceBindingTests(unittest.TestCase):
         ):
             with self.assertRaises(GateError):
                 inline_revision(self.inline(), parents)
+
+
+def empty_review(head=HEAD, review_id=100):
+    """A connector review object recording a pass with only boilerplate and no comments."""
+    return {
+        "id": review_id,
+        "user": completion()["user"],
+        "commit_id": head,
+        "state": "COMMENTED",
+        "body": (
+            "\n### 💡 Codex Review\n\n"
+            "Here are some automated review suggestions for this pull request.\n\n"
+            f"**Reviewed commit:** `{head[:10]}`\n    \n\n"
+            "<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n"
+            "[Your team has set up Codex to review pull requests in this repo]"
+            "(https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n"
+            "- Open a pull request for review\n"
+            "- Mark a draft as ready\n"
+            '- Comment "@codex review".\n\n'
+            "If Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\n"
+            "Codex can also answer questions or update the PR. "
+            'Try commenting "@codex address that feedback".\n            \n</details>\n'
+        ),
+    }
+
+
+class EmptyNativeReviewTests(unittest.TestCase):
+    def check(self, comments, reviews, inline=(), reactions=(), authorize=True):
+        return clean_completion(
+            HEAD,
+            comments,
+            reviews,
+            list(inline),
+            lambda short: HEAD,
+            lambda item, is_summary: True,
+            list(reactions),
+            lambda item: authorize,
+        )
+
+    def bound_inline(self, review_id=100):
+        return {
+            "user": completion()["user"],
+            "commit_id": HEAD,
+            "original_commit_id": HEAD,
+            "pull_request_review_id": review_id,
+        }
+
+    def test_empty_review_at_head_then_explicit_clean_verdict_is_accepted(self):
+        self.assertFalse(review_has_findings(empty_review(), []))
+        result = self.check([summary(), completion()], [empty_review()])
+        self.assertIsNotNone(result)
+        self.assertEqual(result["kind"], "explicit")
+        # Re-request after the empty review, then a fresh verdict and completed summary cycle.
+        request = {
+            "body": "@codex review",
+            "updated_at": "2026-09-30T07:09:50Z",
+            "created_at": "2026-09-30T07:09:50Z",
+            "user": {"type": "User", "login": "maintainer"},
+        }
+        fresh = completion()
+        fresh["created_at"] = fresh["updated_at"] = "2026-09-30T07:10:50Z"
+        anchor = summary()
+        anchor["updated_at"] = "2026-09-30T07:10:50Z"
+        anchor["body"] = anchor["body"].replace("07:08:49.384854Z", "07:10:49.384854Z")
+        self.assertIsNotNone(self.check([summary(), request, fresh, anchor], [empty_review()]))
+        self.assertIsNone(self.check([summary(), request], [empty_review()]))
+
+    def test_empty_review_with_authentic_summary_and_thumbs_up_is_accepted(self):
+        result = self.check([summary()], [empty_review()], reactions=[reaction()])
+        self.assertEqual(result["kind"], "summary")
+        self.assertEqual(result["reaction_id"], 23)
+        self.assertIsNone(self.check([summary()], [empty_review()]))
+
+    def test_bound_inline_comment_still_blocks(self):
+        self.assertTrue(review_has_findings(empty_review(), [self.bound_inline()]))
+        self.assertFalse(review_has_findings(empty_review(), [self.bound_inline(101)]))
+        unbound = {**self.bound_inline(), "user": {"id": 3, "login": "other", "type": "User"}}
+        self.assertFalse(review_has_findings(empty_review(), [unbound]))
+        self.assertIsNone(
+            self.check([summary(), completion()], [empty_review()], inline=[self.bound_inline()])
+        )
+        self.assertIsNone(
+            self.check(
+                [summary()],
+                [empty_review()],
+                inline=[self.bound_inline()],
+                reactions=[reaction()],
+            )
+        )
+
+    def test_any_text_beyond_boilerplate_still_blocks(self):
+        base = empty_review()
+        for body in (
+            base["body"] + "\nPlease guard the null case in `publish`.",
+            base["body"].replace("\n    \n\n<details>", "\nSee the inline note.\n<details>"),
+            base["body"].replace(
+                "**Reviewed commit:**", "**Reviewed commit:** `aaaaaaaaaa`\n**Reviewed commit:**"
+            ),
+            base["body"] + "<details>second</details>",
+            base["body"].replace("### 💡 Codex Review", "### Codex Review"),
+            base["body"].replace("`aaaaaaaaaa`", "`aaaaaaaa`"),
+            base["body"].replace("Here are some", "Here are two"),
+            "",
+            None,
+        ):
+            item = {**base, "body": body}
+            self.assertTrue(review_has_findings(item, []), repr(body)[:60])
+            self.assertIsNone(self.check([summary(), completion()], [item]))
+            self.assertIsNone(self.check([summary()], [item], reactions=[reaction()]))
+        for review_id in (None, 0, True, "100"):
+            self.assertTrue(review_has_findings({**base, "id": review_id}, []))
+        self.assertIsNone(self.check([summary(), completion()], [{**base, "id": None}]))
+
+    def test_empty_review_at_other_head_is_ignored_as_before(self):
+        self.assertIsNotNone(self.check([summary(), completion()], [empty_review(BASE)]))
+        noisy = empty_review(BASE)
+        noisy["body"] += "\nOlder finding on a previous head."
+        self.assertIsNotNone(self.check([summary(), completion()], [noisy]))
+        self.assertIsNotNone(self.check([summary()], [noisy], reactions=[reaction()]))
+        unrelated = {**empty_review(), "user": {"id": 3, "login": "other", "type": "User"}}
+        unrelated["body"] += "\nHuman commentary is not a native finding."
+        self.assertIsNotNone(self.check([summary(), completion()], [unrelated]))
 
 
 class DurableRequestTests(unittest.TestCase):

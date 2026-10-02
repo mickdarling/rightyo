@@ -48,6 +48,14 @@ SUMMARY = re.compile(
     r"\| `([0-9a-f]{7,40})` \| [^|\n]+\|$",
     re.M,
 )
+# The connector sometimes records a clean pass as a review object whose body is only this
+# fixed header, with no inline comments. Whitespace is collapsed before matching.
+REVIEW_BOILERPLATE = re.compile(
+    r"### 💡 Codex Review "
+    r"Here are some automated review suggestions for this pull request\. "
+    r"\*\*Reviewed commit:\*\* `[0-9a-f]{10,40}`"
+)
+DETAILS_BLOCK = re.compile(r"<details>.*?</details>", re.S)
 COMMENT_QUERY = (
     "query($id:ID!){node(id:$id){... on IssueComment{"
     "id body databaseId updatedAt lastEditedAt editor{__typename login ... on Bot{id}}}}}"
@@ -309,6 +317,27 @@ def inline_revision(comment, reviews):
     return original
 
 
+def review_has_findings(record, inline_comments):
+    """A native review object carries findings through bound inline comments or prose.
+
+    An empty native review, whose body is exactly the connector's boilerplate header plus
+    one informational details block, is neutral. Anything unknown counts as findings.
+    """
+    review_id = record.get("id")
+    if type(review_id) is not int or review_id < 1:
+        return True
+    if any(
+        native(comment) and comment.get("pull_request_review_id") == review_id
+        for comment in inline_comments
+    ):
+        return True
+    body = record.get("body")
+    if not isinstance(body, str):
+        return True
+    collapsed = " ".join(DETAILS_BLOCK.sub("", body, count=1).split())
+    return REVIEW_BOILERPLATE.fullmatch(collapsed) is None
+
+
 def review_candidates(
     head,
     comments,
@@ -323,7 +352,11 @@ def review_candidates(
     if not isinstance(head, str) or not SHA.fullmatch(head):
         raise GateError("Invalid immutable PR head")
     for record in reviews:
-        if native(record) and record.get("commit_id") == head:
+        if (
+            native(record)
+            and record.get("commit_id") == head
+            and review_has_findings(record, inline_comments)
+        ):
             return []
     for record in inline_comments:
         if native(record) and inline_revision(record, reviews) == head:

@@ -212,6 +212,18 @@ to a new head do not impersonate a review of that head.
 Current-head connector reviews or original inline findings block
 even after thread resolution or dismissal: fix on a new head and obtain a fresh review.
 
+A native review object at the current head counts as findings only when it carries them:
+at least one native inline comment bound to it through `pull_request_review_id`, or a body
+with any content beyond the connector's fixed boilerplate (the `### 💡 Codex Review` header,
+the automated-suggestions sentence and the **Reviewed commit** line, after removing one
+`<details>` block and collapsing whitespace). An empty native review object is neutral: the
+connector sometimes records a clean pass this way with no inline comments and no thumbs-up,
+and review objects cannot be deleted, so treating it as findings blocked the head permanently
+([#56](https://github.com/mickdarling/rightyo/issues/56)). Neutral never means approval.
+Unknown extra text, a missing body or ID, or a bound inline comment still blocks, and success
+still requires positive evidence: an explicit clean verdict, or a completed summary plus a
+fresh connector thumbs-up, for the exact current head.
+
 Summary completion times include fractions of a second while reaction timestamps use
 whole seconds; comparison floors the completion time to that same precision. PR reactions
 are not cryptographically bound to a commit, so this is a conservative observed native
