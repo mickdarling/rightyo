@@ -295,11 +295,19 @@ configuration select an implementation by name, described in
 also provides the hosted implementations and the factories that section maps to.
 Word-to-speaker attribution, grouping and the `Turn` contract are the same for every
 backend. Hosted backends refuse to send audio without explicit consent (`--allow-hosted`),
-and no hosted backend has been accuracy-tested here. The hosted transcriber ignores the
-`register` cancellation hook: the `cancelled` guard is checked before each request, but a
-request already in flight is bounded only by its `timeout_seconds` (default 30, at most
-120), so a stop during hosted recognition can block for up to that long before the
-session reports stopped.
+and no hosted backend has been accuracy-tested here. Turns from the hosted transcriber
+carry `recognizer_id` `hosted-openai-compatible <model>`, the configured model name with
+characters outside the identifier charset replaced by `-` and the whole truncated to 96
+characters, so transcripts from different models stay distinguishable in exported events;
+the endpoint never appears. `DeepgramDiarizer.diarizer_id` names that backend the same way
+(`hosted-deepgram <model> <diarize_model>`) while `speaker_provenance` keeps its
+allowlisted value. The hosted transcriber ignores the `register` cancellation hook: the
+`cancelled` guard is checked before each request and between body chunks, and the body is
+read against one wall-clock deadline of `timeout_seconds` (default 30, at most 120) from
+the start of the request. Connection, TLS and response-header waits each use the same
+value as an inactivity timeout, so an unresponsive endpoint is abandoned within a small
+multiple of `timeout_seconds`, and a stop during hosted recognition waits at most for the
+current chunk.
 
 The current native implementation still uses conservative endpointing and completed
 Whisper windows. Persistent ASR, early attention, lower endpoint latency and other

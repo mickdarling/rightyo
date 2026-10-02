@@ -36,6 +36,7 @@ from rightyo.speech_backends import (
     deepgram_timeline,
     diarizer_factory,
     openai_units,
+    provenance_id,
     transcriber_factory,
 )
 from rightyo.tool import listen
@@ -55,12 +56,14 @@ class FakeResponse:
         self.payload = payload
 
     def read(self, limit):
-        return self.payload[:limit]
+        chunk, self.payload = self.payload[:limit], self.payload[limit:]
+        return chunk
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_exc):
+        self.closed = True
         return False
 
 
@@ -399,6 +402,77 @@ class HostedTranscriberTests(unittest.TestCase):
             with self.assertRaisesRegex(HostedSpeechError, "Invalid utterance audio"):
                 self.transcriber().transcribe(b"")
         self.assertEqual(requests, [])
+
+    def test_recognizer_id_names_the_configured_model_safely(self):
+        first = self.transcriber(model="whisper-1").recognizer_id
+        second = self.transcriber(model="gpt-4o-transcribe").recognizer_id
+        self.assertEqual(first, "hosted-openai-compatible whisper-1")
+        self.assertNotEqual(first, second)
+        odd = self.transcriber(model="org/model:v1.2").recognizer_id
+        self.assertEqual(odd, "hosted-openai-compatible org-model-v1.2")
+        long = self.transcriber(model="m" * 128).recognizer_id
+        self.assertEqual(len(long), 96)
+        for value in (first, second, odd, long):
+            identifier(value, "recognizer_id")
+            self.assertNotIn("example.test", value)
+        self.assertEqual(
+            provenance_id("hosted-deepgram", "nova-3", "latest"), "hosted-deepgram nova-3 latest"
+        )
+        diarizer = DeepgramDiarizer(allow_hosted=True, model="nova-2", diarize_model="v2")
+        self.assertEqual(diarizer.diarizer_id, "hosted-deepgram nova-2 v2")
+        self.assertEqual(diarizer.speaker_provenance, "diarization-utterance")
+        turns = []
+        document = {"text": "Hi.", "words": [{"word": "Hi", "start": 0.0, "end": 0.1}]}
+        opener, _ = patched_opener(json.dumps(document).encode())
+        with opener:
+            processor = LiveProcessor(
+                LiveConfig(
+                    "provenance-test",
+                    provenance="causal-replay",
+                    transcriber=self.transcriber(model="whisper-1"),
+                    diarizer=StubDiarizer(),
+                ),
+                turns.append,
+            )
+            for _ in range(10):
+                processor.push_pcm16(VOICE)
+            processor.finish()
+        self.assertEqual([turn.recognizer_id for turn in turns], [first])
+
+    def test_slow_body_is_abandoned_at_the_wall_clock_deadline_and_closed(self):
+        clock = [0.0]
+
+        def monotonic():
+            clock[0] += 10.0
+            return clock[0]
+
+        response = FakeResponse(b"{" * 10)
+        original = response.read
+        response.read = lambda limit: original(1)  # a dripping body, one byte per read
+        with patch("urllib.request.build_opener", return_value=Mock(open=lambda *a, **k: response)):
+            with patch("rightyo.speech_backends.time.monotonic", monotonic):
+                with self.assertRaisesRegex(HostedSpeechError, "deadline") as caught:
+                    self.transcriber(timeout_seconds=30).transcribe(bytes(640))
+        self.assertTrue(response.closed)
+        self.assertGreater(len(response.payload), 0)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertNotIn(ENDPOINT, str(caught.exception))
+
+    def test_cancellation_mid_read_stops_the_request_and_closes_it(self):
+        reads = []
+        response = FakeResponse(b"{" * 10)
+        original = response.read
+
+        def read(limit):
+            reads.append(limit)
+            return original(1)
+
+        response.read = read
+        with patch("urllib.request.build_opener", return_value=Mock(open=lambda *a, **k: response)):
+            with self.assertRaisesRegex(HostedSpeechError, "cancelled"):
+                self.transcriber(cancelled=lambda: len(reads) >= 3).transcribe(bytes(640))
+        self.assertEqual(len(reads), 3)
+        self.assertTrue(response.closed)
 
     def test_redirects_are_refused_before_forwarding_credentials(self):
         source = Mock()

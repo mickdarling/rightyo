@@ -16,6 +16,7 @@ import math
 import re
 import secrets
 import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -34,10 +35,29 @@ TRANSCRIBER_KINDS = ("whisper.cpp", "hosted-openai-compatible")
 DIARIZER_KINDS = ("nemotron.cpp", "hosted-deepgram")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
 _LANGUAGE = re.compile(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?")
+_UNSAFE = re.compile(r"[^A-Za-z0-9_. -]")
+READ_CHUNK_BYTES = 65536
 
 
 class HostedSpeechError(LiveAudioError):
     """Sanitized hosted-backend failure: no audio, transcript, URL or credential content."""
+
+
+class _ReadDeadline(Exception):
+    """The wall-clock deadline passed while reading a response body."""
+
+
+class _ReadCancelled(Exception):
+    """The owner cancelled while a response body was being read."""
+
+
+def provenance_id(prefix: str, *parts: str) -> str:
+    """A `contracts.identifier`-safe label naming the backend family and its model.
+
+    Characters outside the identifier charset become `-`; the result is truncated to 96.
+    Only the configured model/version names are included, never an endpoint or key.
+    """
+    return " ".join([prefix, *(_UNSAFE.sub("-", part) for part in parts)])[:96].strip()
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -145,9 +165,28 @@ class _HostedClient:
         del key
         failure = None
         content = b""
+        # urllib's timeout is per operation, so a slowly dripping body could outlive it;
+        # the body is read in bounded chunks against one wall-clock deadline instead.
+        deadline = time.monotonic() + self.timeout
         try:
             with self._opener.open(request, timeout=self.timeout) as response:
-                content = response.read(MAX_RESPONSE_BYTES + 1)
+                chunks: list[bytes] = []
+                size = 0
+                while size <= MAX_RESPONSE_BYTES:
+                    if self.cancelled():
+                        raise _ReadCancelled
+                    if time.monotonic() >= deadline:
+                        raise _ReadDeadline
+                    chunk = response.read(min(READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - size))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    size += len(chunk)
+                content = b"".join(chunks)
+        except _ReadDeadline:
+            failure = f"{self.label} response exceeded the request deadline"
+        except _ReadCancelled:
+            failure = f"{self.label} request was cancelled"
         except urllib.error.HTTPError as error:
             try:
                 error.close()
@@ -288,7 +327,7 @@ class OpenAICompatibleTranscriber:
     guard before each request plus the request timeout.
     """
 
-    recognizer_id = "hosted-openai-compatible"
+    recognizer_id = "hosted-openai-compatible"  # instances append the configured model
 
     def __init__(
         self,
@@ -303,6 +342,7 @@ class OpenAICompatibleTranscriber:
     ) -> None:
         self.endpoint = _https_endpoint(endpoint, "Hosted transcriber")
         self.model = _name(model, "hosted transcriber model")
+        self.recognizer_id = provenance_id("hosted-openai-compatible", self.model)
         if language is not None and (
             not isinstance(language, str) or not _LANGUAGE.fullmatch(language)
         ):
@@ -417,6 +457,8 @@ class DeepgramDiarizer:
         if diarize_model not in DEEPGRAM_DIARIZE_MODELS:
             raise LiveAudioError("Invalid hosted diarizer version")
         self.diarize_model = diarize_model
+        # `speaker_provenance` stays the allowlisted contract value; this names the backend.
+        self.diarizer_id = provenance_id("hosted-deepgram", self.model, diarize_model)
         if type(window_ms) is not int or not 1000 <= window_ms <= MAX_AUDIO_MS:
             raise LiveAudioError("Invalid hosted diarizer window")
         self.window_bytes = window_ms * BYTES_PER_MS
