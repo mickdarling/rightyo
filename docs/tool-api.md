@@ -161,7 +161,12 @@ attention decision, is the signal, as chosen in
 fails (timeout, unavailability, budget exhaustion or cancellation), the session keeps
 listening: that speaker receives the configured role if any, otherwise `unknown`, fixed
 as usual, and no further model questions are asked in that session; the prototype
-reports this as `role_status: "unavailable"`.
+reports this as `role_status: "unavailable"`. A provider answer that names an
+unconfigured speaker as `owner` is rejected the same way (`role_status: "rejected"`):
+owners come only from configuration. Because decisions can arrive out of order, an
+owner override supersedes only turns earlier than the owner's turn, compared by turn
+time (a turn whose `end_ms` is at or before the owner turn's `end_ms`), never by
+emission order; a later non-owner request that happened to be decided first stays open.
 
 [The enrolled fixture](../examples/enrolled-override.jsonl) shows a participant's
 attended request followed by the owner's "Ignore that." override; the shared anonymous

@@ -295,9 +295,9 @@ class PrototypeController:
             memory.append(turn)
             if self._events is not None:
                 self._publish("transcript", turn)
-                if self._events.role_status == "unavailable":
-                    # A failed hosted role question degraded roles; listening continues.
-                    self._role_status = "unavailable"
+                if self._events.role_status in {"unavailable", "rejected"}:
+                    # A failed or rejected role answer degraded roles; listening continues.
+                    self._role_status = self._events.role_status
             if self._decision_status == "off" or self._decision_cancel.is_set():
                 return
             try:

@@ -263,22 +263,28 @@ class SpeechEvents:
             ),
             "roles": dict(self._roles),
         }
+        rules = self._priority.priority
+        degraded = None
         try:
             assigned = self._priority.assign(state)
+            if not isinstance(assigned, dict):
+                raise ContractError("invalid speaker role assignment")
+            validated = {
+                identifier(speaker, "speaker_id"): speaker_role(value)
+                for speaker, value in assigned.items()
+            }
+            if any(v == "owner" and s not in rules.owners for s, v in validated.items()):
+                # Owners come only from configuration; a provider naming one is rejected.
+                degraded = "rejected"
         except ProviderError:
             # A hosted role question failed (timeout, unavailability, budget, cancellation).
+            degraded = "unavailable"
+        if degraded is not None:
             # Degrade rather than abort: this speaker takes the configured role or unknown,
             # later speakers use configured roles only, and the session keeps listening.
-            rules = self._priority.priority
             self._priority = ConfiguredPriorityProvider(rules)
-            self.role_status = "unavailable"
-            assigned = {turn.speaker_id: rules.configured_role(turn.speaker_id) or "unknown"}
-        if not isinstance(assigned, dict):
-            raise ContractError("invalid speaker role assignment")
-        validated = {
-            identifier(speaker, "speaker_id"): speaker_role(value)
-            for speaker, value in assigned.items()
-        }
+            self.role_status = degraded
+            validated = {turn.speaker_id: rules.configured_role(turn.speaker_id) or "unknown"}
         for speaker, value in validated.items():
             # An earlier fixed role is never revised by a later answer.
             self._roles.setdefault(speaker, value)
@@ -339,17 +345,21 @@ class SpeechEvents:
                     role="owner",
                 )
             if role == "owner" and (attended or stop):
-                # The owner's own attended turn or a stop phrase supersedes every open
-                # non-owner request before any new request of the owner's is delivered,
-                # and every earlier non-owner turn still awaiting its decision.
-                for superseded in list(self._open):
-                    self._emit(
-                        "override",
-                        superseded_request_id=superseded,
-                        by_utterance_id=key,
-                        role="owner",
-                    )
-                self._open.clear()
+                # The owner's own attended turn or a stop phrase supersedes every earlier
+                # open non-owner request before any new request of the owner's is
+                # delivered, and every earlier non-owner turn still awaiting its decision.
+                # Earlier is decided by turn time (end_ms at or before the owner's), not by
+                # emission order: decisions arrive out of order, and a request spoken after
+                # the owner's turn is not what the owner was superseding.
+                for superseded, end_ms in list(self._open.items()):
+                    if end_ms <= turn.end_ms:
+                        self._emit(
+                            "override",
+                            superseded_request_id=superseded,
+                            by_utterance_id=key,
+                            role="owner",
+                        )
+                        del self._open[superseded]
                 for other, (earlier, _context, _size, other_role) in self._pending.items():
                     if other_role != "owner" and earlier.end_ms <= turn.end_ms:
                         self._superseded.setdefault(other, key)

@@ -480,6 +480,45 @@ class EnrolledEventTests(unittest.TestCase):
         )
         self.assertEqual(self.events._open, {})
 
+    def test_late_owner_decision_supersedes_only_earlier_turns(self):
+        self.start()
+        before = turn("before", 0, 300, "Rightyo, delete the project.")
+        owner = turn("owner", 400, 500, "Rightyo, status.", "Speaker A")
+        after = turn("after", 1000, 1500, "Rightyo, empty the trash.")
+        for current in (before, owner, after):
+            self.events.transcript(current, current.end_ms)
+        self.events.decision(decision(before), 1600)
+        self.events.decision(decision(after), 1700)
+        self.events.decision(decision(owner), 1800)
+        drained = self.events.drain()[3:]
+        self.assertEqual(
+            [e["type"] for e in drained],
+            ["attention", "request", "attention", "request", "attention", "override", "request"],
+        )
+        self.assertEqual(drained[5]["superseded_request_id"], "enrolled-demo:before")
+        self.assertEqual(list(self.events._open), ["enrolled-demo:after"])
+
+    def test_provider_naming_an_unconfigured_owner_is_rejected_without_override_power(self):
+        self.start()
+        self.provider.assign = lambda state: {"Speaker B": "owner", "Speaker A": "owner"}
+        request = turn("request", 0, 500, "Rightyo, delete the project.")
+        impostor = turn("impostor", 1000, 1500, "Stop.")
+        own = turn("own", 2000, 2500, "Rightyo, status.", "Speaker A")
+        for current in (request, impostor, own):
+            self.events.transcript(current, current.end_ms)
+            self.events.decision(decision(current), current.end_ms + 100)
+        drained = self.events.drain()
+        self.assertEqual(self.events.role_status, "rejected")
+        roles = [e["turn"]["role"] for e in drained if e["type"] == "transcript"]
+        self.assertEqual(roles, ["unknown", "unknown", "owner"])
+        self.assertEqual(
+            [e["type"] for e in drained if e["type"] in {"override", "request"}],
+            ["request", "request", "override", "override", "request"],
+        )
+        self.assertEqual(
+            [e["by_utterance_id"] for e in drained if e["type"] == "override"], ["own", "own"]
+        )
+
     def test_invalid_providers_and_assignments_fail_closed_without_echo(self):
         events = SpeechEvents()
         for invalid in (OWNER, object(), {"assign": lambda state: {}}):
