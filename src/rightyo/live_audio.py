@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .contracts import PROVENANCE, Turn, identifier
+from .contracts import PROVENANCE, Turn, identifier, utterance_scoped_speaker
 from .providers import Diarizer, Transcriber
 
 SAMPLE_RATE = 16000
@@ -796,7 +796,7 @@ class LiveProcessor:
             if speaker is not None and provenance == "diarization-utterance":
                 # Per-request labels are namespaced by utterance so that equal labels
                 # from independent requests can never be merged into one participant.
-                speaker = f"u{self._utterances} {speaker}"
+                speaker = utterance_scoped_speaker(self._utterances, speaker)
             if groups and (groups[-1]["speaker"], groups[-1]["overlap"]) == (speaker, overlap):
                 groups[-1]["text"] += unit["text"]
                 groups[-1]["end_ms"] = max(groups[-1]["end_ms"], end)

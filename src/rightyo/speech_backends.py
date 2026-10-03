@@ -45,7 +45,11 @@ _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
 _LANGUAGE = re.compile(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?")
 _UNSAFE = re.compile(r"[^A-Za-z0-9_. -]")
 MERGE_GAP_MS = 300  # same-speaker words further apart than this stay separate segments
-MAX_STALLED_CONNECTS = 4  # abandoned resolver threads a client tolerates before refusing
+MAX_STALLED_CONNECTS = 4  # abandoned resolver threads the process tolerates before refusing
+# Helper threads abandoned inside a name lookup, shared by every client so that a
+# session restart cannot reset the bound. They hold no audio.
+_STALLED: list[threading.Thread] = []
+_STALLED_LOCK = threading.Lock()
 READ_POLL_SECONDS = 0.05  # how often the waiting loop re-checks cancel/deadline
 READ_ABORT_JOIN_SECONDS = 2  # how long an aborted reader is given to notice the shutdown
 MIN_TRANSPORT_SECONDS = 0.1  # the least a nearly exhausted budget gives the transport
@@ -199,6 +203,13 @@ def _abort_connection(connection: Any) -> None:
         pass
 
 
+def _stalled_count() -> int:
+    """Prune finished resolver threads and count those still alive, process-wide."""
+    with _STALLED_LOCK:
+        _STALLED[:] = [thread for thread in _STALLED if thread.is_alive()]
+        return len(_STALLED)
+
+
 class _HostedClient:
     """One consented endpoint: bounded, sanitized, redirect-free, credential at use only.
 
@@ -225,9 +236,6 @@ class _HostedClient:
         self.timeout = _timeout(timeout_seconds)
         self.cancelled = cancelled if cancelled is not None else (lambda: False)
         self.load_key = load_key
-        # Helper threads abandoned inside a name lookup: they hold no audio, and their
-        # number is bounded so repeated stalls cannot accumulate threads without limit.
-        self._stalled: list[threading.Thread] = []
 
     def _read_body(self, response: Any, deadline: float) -> bytes:
         """Read at most the byte cap, ending early on cancellation or the deadline.
@@ -278,7 +286,8 @@ class _HostedClient:
             if cancelled or remaining <= 0:
                 state["abort"] = True
                 _abort_connection(connection)
-                self._stalled.append(thread)
+                with _STALLED_LOCK:
+                    _STALLED.append(thread)
                 raise _ReadCancelled if cancelled else _OpenDeadline
             thread.join(min(READ_POLL_SECONDS, remaining))
 
@@ -289,8 +298,9 @@ class _HostedClient:
         caller shuts the socket, records the thread as stalled and returns at once; the
         thread's closure references only the connection, never the request body, and
         when the resolver finally returns it finds the abort flag and closes without
-        connecting. At most `MAX_STALLED_CONNECTS` such threads may be alive per client;
-        beyond that a new request is refused rather than growing without bound.
+        connecting. At most `MAX_STALLED_CONNECTS` such threads may be alive in the
+        process, whichever clients abandoned them; beyond that a new request is refused
+        rather than growing without bound, and a session restart does not reset it.
         """
         state = {"abort": False}
         outcome: dict[str, Any] = {}
@@ -407,8 +417,7 @@ class _HostedClient:
         }
         del key
         # Refuse before anything is created while too many earlier resolvers still stall.
-        self._stalled = [thread for thread in self._stalled if thread.is_alive()]
-        if len(self._stalled) >= MAX_STALLED_CONNECTS:
+        if _stalled_count() >= MAX_STALLED_CONNECTS:
             raise HostedSpeechError(f"{self.label} has too many stalled connections; retry later")
         failure = None
         content = b""

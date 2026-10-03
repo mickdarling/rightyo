@@ -100,7 +100,9 @@ turns is the same anonymous voice for the session; `diarization-utterance` label
 one utterance does not identify the same voice in another. Such labels are namespaced
 by utterance (`u7 Speaker A`, `u8 Speaker A`), so they never compare equal across
 utterances and a decision provider sees each utterance's voices as distinct
-participants; `authored-fixture` and `unknown` keep their meanings. None is an identity.
+participants; the `Turn` contract enforces this, so a replayed or imported
+`diarization-utterance` turn whose `speaker_id` lacks the `u<n> ` prefix is rejected
+rather than merged with unrelated voices or matched to a configured role; `authored-fixture` and `unknown` keep their meanings. None is an identity.
 
 Decision evidence contains `label`, `recipient_kind`, `confidence`, `provider`, and
 `model`. A probability is not demonstrated accuracy or authority. A request is
@@ -341,8 +343,9 @@ response headers) and the body read each run on a helper thread; a stop or the d
 is noticed within about 50 ms, the connection is shut, and the caller returns at once. A
 name lookup cannot be interrupted, so an abandoned connect thread ends when the resolver
 returns, without holding up the stop; such a thread holds no audio (the request body is
-handed over only after the connection exists), and a client refuses further requests
-while more than four of them are still alive, so stalls cannot accumulate memory.
+handed over only after the connection exists), and hosted requests are refused
+process-wide while more than four of them are still alive, whichever sessions abandoned
+them, so stalls cannot accumulate memory across restarts.
 
 The current native implementation still uses conservative endpointing and completed
 Whisper windows. Persistent ASR, early attention, lower endpoint latency and other

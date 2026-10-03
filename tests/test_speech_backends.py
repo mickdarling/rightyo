@@ -15,7 +15,8 @@ from argparse import Namespace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from rightyo.contracts import ContractError, identifier
+import rightyo.speech_backends as speech_backends
+from rightyo.contracts import ContractError, Turn, identifier, utterance_scoped_speaker
 from rightyo.credentials import CredentialError, load_diarizer_api_key, load_transcriber_api_key
 from rightyo.live_audio import (
     BYTES_PER_MS,
@@ -461,6 +462,32 @@ class ProtocolAndSelectionTests(unittest.TestCase):
             with self.assertRaisesRegex(LiveAudioError, name):
                 self.local_config(**{name: object()})
 
+    def test_turn_contract_scopes_utterance_local_speaker_ids(self):
+        base = dict(
+            session_id="replay",
+            utterance_id="u1",
+            revision=1,
+            start_ms=0,
+            end_ms=100,
+            text="Hi.",
+            finalized=True,
+            overlap=False,
+            recognizer_id="hosted-openai-compatible x 0123456789ab",
+            provenance="causal-replay",
+            speaker_provenance="diarization-utterance",
+        )
+        # A bare label would merge unrelated voices on replay; the contract refuses it.
+        with self.assertRaisesRegex(ContractError, "utterance-scoped"):
+            Turn.from_dict(base | {"speaker_id": "Speaker A"})
+        self.assertEqual(
+            Turn.from_dict(base | {"speaker_id": "u7 Speaker A"}).speaker_id, "u7 Speaker A"
+        )
+        self.assertIsNone(Turn.from_dict(base | {"speaker_id": None}).speaker_id)
+        # Session-stable provenance keeps bare labels.
+        stable = base | {"speaker_provenance": "diarization-timeline", "speaker_id": "Speaker A"}
+        self.assertEqual(Turn.from_dict(stable).speaker_id, "Speaker A")
+        self.assertEqual(utterance_scoped_speaker(7, "Speaker A"), "u7 Speaker A")
+
     def test_per_utterance_labels_never_merge_into_one_participant(self):
         turns = []
         per_utterance = StubDiarizer()
@@ -769,6 +796,8 @@ class HostedTranscriberTests(unittest.TestCase):
 
     def test_stalled_resolver_holds_no_audio_and_stalls_are_bounded(self):
         import gc
+
+        self.assertEqual(speech_backends._stalled_count(), 0)
         import sys
         import types
 
@@ -785,7 +814,7 @@ class HostedTranscriberTests(unittest.TestCase):
         self.assertEqual(len(connections), 1)
         self.assertTrue(connections[0].closed)
         self.assertEqual(connections[0].body, b"")
-        (stalled,) = client._stalled
+        (stalled,) = speech_backends._STALLED
         self.assertTrue(stalled.is_alive())
         # The resolver thread is still blocked: neither its frames nor its closure may
         # reference the utterance, so Stop leaves no audio behind in memory.
@@ -808,17 +837,26 @@ class HostedTranscriberTests(unittest.TestCase):
             with patched:
                 with self.assertRaisesRegex(HostedSpeechError, "cancelled"):
                     client.post(ENDPOINT, audio, {"Content-Type": "audio/wav"}, "Bearer ")
-        self.assertEqual(len(client._stalled), 4)
+        self.assertEqual(len(speech_backends._STALLED), 4)
         client.cancelled = lambda: False
         with patched:
             with self.assertRaisesRegex(HostedSpeechError, "too many stalled") as caught:
                 client.post(ENDPOINT, audio, {"Content-Type": "audio/wav"}, "Bearer ")
         self.assertEqual(len(connections), 4)
         self.assertNotIn(ENDPOINT, str(caught.exception))
+        # The bound is process-wide: a fresh client (a restarted session) that never
+        # stalled anything is refused just the same while those resolvers still hang.
+        del client
+        fresh = self.transcriber(timeout_seconds=30)
+        with patched:
+            with self.assertRaisesRegex(HostedSpeechError, "too many stalled"):
+                fresh.transcribe(bytes(640))
+        self.assertEqual(len(connections), 4)
+        client = fresh._client
         # Once the resolvers return they close without connecting further; the stalled
         # list drains and requests resume.
         released.set()
-        for thread in list(client._stalled):
+        for thread in list(speech_backends._STALLED):
             thread.join(2)
         self.assertTrue(all(c.calls == ["connect"] and c.body == b"" for c in connections))
         patched_ok, ok = patched_connection(b'{"text": ""}')
@@ -827,7 +865,7 @@ class HostedTranscriberTests(unittest.TestCase):
                 client.post(ENDPOINT, audio, {"Content-Type": "audio/wav"}, "Bearer "),
                 {"text": ""},
             )
-        self.assertEqual(client._stalled, [])
+        self.assertEqual(speech_backends._STALLED, [])
         self.assertEqual(len(ok), 1)
 
     def test_deadline_during_connect_returns_at_once(self):
