@@ -272,7 +272,12 @@ class StdinPcmCapture:
             return None
 
     def stop(self) -> None:
-        """Discard pending PCM; a reader blocked on the stream exits at its next read."""
+        """Discard pending PCM; a reader blocked on the stream exits at its next read.
+
+        A blocking read cannot be interrupted portably, so the stream belongs to this
+        capture alone: whatever the stopped reader still reads is discarded, never
+        queued, and the controller refuses to start another session on that stream.
+        """
         self._stopped.set()
         while True:
             try:

@@ -195,6 +195,10 @@ class PrototypeController:
         self.audio_provenance = audio_provenance
         self.report = report
         self._stdin_capture: StdinPcmCapture | None = None
+        # The stream is consumed by one session only. A stopped session's reader may
+        # still be blocked in a read it cannot be interrupted from; it discards whatever
+        # it reads, so no later session may share the stream with it.
+        self._stdin_used = False
         # Optional host-facing stream. The lab retains its browser lease and UI controls.
         self._events = event_publisher
         self._event_terminal = True
@@ -309,6 +313,8 @@ class PrototypeController:
             raise PrototypeError("Stdin audio is available only from the listen command")
         if mode == "stdin" and self.audio_provenance not in PROVENANCE:
             raise PrototypeError("Stdin audio requires an explicit source provenance")
+        if mode == "stdin" and self._stdin_used:
+            raise PrototypeError("Stdin audio feeds one session only; start a new process")
         if self.config.speakers is not None and self.config.speakers.source == "model":
             # A hosted role question would run on the audio path under the controller
             # lock, where Stop and lease expiry cannot reach it; tool-replay has no such
@@ -386,6 +392,7 @@ class PrototypeController:
             self._request_limit = budget
             self._mode = mode
             self._stdin_capture = None
+            self._stdin_used = self._stdin_used or mode == "stdin"
             self._error = None
             self._decision_status = "ready" if hosted else "off"
             self._role_status = "off" if priority is None else "configured"

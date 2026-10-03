@@ -367,6 +367,37 @@ class StdinListenTests(unittest.TestCase):
         # Ten 200 ms chunks of media elapsed, including the trailing drop.
         self.assertGreaterEqual(events[-1]["emitted_at_ms"], 2000)
 
+    def test_stop_with_a_blocked_reader_never_lets_it_feed_a_later_session(self):
+        stream = Gated([bytes(PCM_CHUNK_BYTES)], gate_at=0)
+        self.addCleanup(stream.release.set)
+        captures = []
+
+        def capture_factory(*args, **kwargs):
+            captures.append(StdinPcmCapture(*args, **kwargs))
+            return captures[-1]
+
+        config = PrototypeConfig.load(self.config)
+        controller = PrototypeController(
+            config,
+            processor_factory=Processor,
+            audio_input=stream,
+            audio_provenance="causal-replay",
+        )
+        self.addCleanup(controller.close)
+        with patch("rightyo.prototype.StdinPcmCapture", capture_factory):
+            controller.start({"mode": "stdin", "session_id": "stdin-first"})
+            self.assertTrue(stream.paused.wait(5))  # The reader is blocked in read().
+            controller.stop()
+            with self.assertRaisesRegex(PrototypeError, "one session only"):
+                controller.start({"mode": "stdin", "session_id": "stdin-second"})
+            # The stale reader's late read is discarded, never queued or delivered.
+            stream.release.set()
+            captures[0]._reader.join(5)
+        self.assertFalse(captures[0]._reader.is_alive())
+        self.assertEqual(len(captures), 1)
+        self.assertEqual(captures[0]._queue.qsize(), 0)
+        self.assertEqual([bytes(p.received) for p in Processor.instances], [b""])
+
 
 def slow_push(push):
     def slowed(self, pcm):

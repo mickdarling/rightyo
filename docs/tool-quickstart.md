@@ -40,10 +40,17 @@ the same absolute-path `local/prototype.json` used by the lab. Then choose one s
 .venv/bin/rightyo listen --config local/prototype.json --mode demo \
   --session-id demo-session-001
 
-# A host (for example Hailing Station relaying a phone microphone) pipes raw PCM in.
-some-pcm-source | .venv/bin/rightyo listen --config local/prototype.json --mode stdin \
-  --provenance live-microphone --session-id phone-session-001
+# A local process pipes raw PCM in and declares where it came from.
+some-local-pcm-source | .venv/bin/rightyo listen --config local/prototype.json \
+  --mode stdin --provenance causal-replay --session-id stdin-session-001
 ```
+
+`--mode stdin` is a local adapter only. It adds no network transport, authentication, or
+source authorization, and the provenance it reports is whatever the local caller declares.
+Hailing Station's ambient-audio path, which will pipe a phone's microphone into this
+command, is in progress (hailing-station #203) and is not yet available. In that setup the
+Hailing Station daemon owns transport and authentication, runs this command as a local
+child process, and declares `--provenance live-microphone` for the audio it relays.
 
 `--mode stdin` reads headerless mono 16,000 Hz signed 16-bit little-endian PCM (the format
 the Mac capture helper produces and `push_pcm16` accepts) from stdin. Nothing else is
@@ -52,8 +59,8 @@ is carried to the next read. EOF finishes the open utterance and ends with the o
 `stopped` event. stdout carries only JSONL; diagnostics go to stderr. The bytes do not
 say where they came from, so `--provenance` is required with `--mode stdin` and refused
 otherwise. There is no default. Pass `live-microphone` only for a person speaking live
-(for example a relayed phone microphone), and `causal-replay`, `recorded-file` or
-`synthetic` for anything else. Turns carry exactly that value. Timing follows it too.
+(for example a phone microphone relayed by the Hailing Station daemon), and
+`causal-replay`, `recorded-file` or `synthetic` for anything else. Turns carry exactly that value. Timing follows it too.
 `live-microphone` uses the wall clock for the session budget and retention, as microphone
 mode does. The replay values use media time, as demo mode does, so a slow producer is never
 cut off early. The started session
