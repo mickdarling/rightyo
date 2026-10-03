@@ -80,21 +80,29 @@ class CredentialTests(unittest.TestCase):
             self.assertNotIn(TOKEN, str(error.exception))
             self.assertIsNone(error.exception.__context__)
 
-    def test_invalid_environment_is_redacted(self):
-        with patch.dict(os.environ, {"TYPESAFE_API_KEY": TOKEN + "\nINJECTED"}, clear=True):
-            with self.assertRaises(CredentialError) as error:
-                load_jev_api_key()
-            self.assertNotIn(TOKEN, str(error.exception))
-            self.assertNoSecretInFrames(error.exception)
+    def load_expecting_failure(self):
+        """Run the loader, and inspect its traceback frames BEFORE anything clears them.
 
-    def assertNoSecretInFrames(self, exception):
-        """No frame on the exception's traceback may hold the credential in a local."""
+        `assertRaises.__exit__` calls `traceback.clear_frames`, so a check made after it
+        would pass even if a frame still held the credential; the walk happens here,
+        inside the except block, and the exception is returned for further assertions.
+        """
         import traceback
 
-        held = []
-        for frame, _line in traceback.walk_tb(exception.__traceback__):
-            held.extend(repr(value) for value in frame.f_locals.values())
-        self.assertFalse(any(TOKEN in value for value in held), held)
+        try:
+            load_jev_api_key()
+        except CredentialError as error:
+            held = []
+            for frame, _line in traceback.walk_tb(error.__traceback__):
+                held.extend(repr(value) for value in frame.f_locals.values())
+            self.assertFalse(any(TOKEN in value for value in held), held)
+            return error
+        self.fail("a malformed credential must be refused")
+
+    def test_invalid_environment_is_redacted(self):
+        with patch.dict(os.environ, {"TYPESAFE_API_KEY": TOKEN + "\nINJECTED"}, clear=True):
+            error = self.load_expecting_failure()
+            self.assertNotIn(TOKEN, str(error))
 
     def test_malformed_keychain_value_leaves_no_secret_in_tracebacks(self):
         for output in (TOKEN.encode() + b"\xff", (TOKEN + " with space").encode(), b"short"):
@@ -105,11 +113,9 @@ class CredentialTests(unittest.TestCase):
                 patch("rightyo.credentials.sys.platform", "darwin"),
                 popen,
             ):
-                with self.assertRaises(CredentialError) as error:
-                    load_jev_api_key()
-                self.assertNotIn(TOKEN, str(error.exception))
-                self.assertIsNone(error.exception.__context__)
-                self.assertNoSecretInFrames(error.exception)
+                error = self.load_expecting_failure()
+                self.assertNotIn(TOKEN, str(error))
+                self.assertIsNone(error.__context__)
 
     def test_timeout_terminates_the_lookup_and_is_sanitized(self):
         clock = [0.0]
