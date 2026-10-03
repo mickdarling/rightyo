@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import io
+import ipaddress
 import json
 import math
 import re
@@ -98,6 +99,22 @@ def provenance_id(prefix: str, *parts: str) -> str:
     return f"{prefix} {safe[:budget].strip()} {digest}"
 
 
+def _valid_host(netloc: str, hostname: str) -> bool:
+    """A DNS hostname (IDNA in ASCII form), an IPv4 address, or a bracketed IPv6 literal.
+
+    IPv6 zone identifiers (`%en0`) are refused: they name a local interface, not a host.
+    """
+    if netloc.startswith("["):
+        if "%" in hostname:
+            return False
+        try:
+            ipaddress.IPv6Address(hostname)
+        except ValueError:
+            return False
+        return True
+    return _HOSTNAME.fullmatch(hostname) is not None
+
+
 def _https_endpoint(value: Any, label: str) -> str:
     parts = None
     # A bare trailing `?` or `#` parses as an empty query/fragment yet would still
@@ -125,7 +142,7 @@ def _https_endpoint(value: Any, label: str) -> str:
         or parts.query
         or parts.fragment
         or "@" in parts.netloc
-        or not _HOSTNAME.fullmatch(parts.hostname)
+        or not _valid_host(parts.netloc, parts.hostname)
         or not _PATH.fullmatch(parts.path)
     ):
         # Query and fragment are refused: the backend appends its own query string.

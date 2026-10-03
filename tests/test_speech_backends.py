@@ -597,6 +597,9 @@ class HostedTranscriberTests(unittest.TestCase):
             ENDPOINT.replace("example.test", "exa_mple.test"),
             ENDPOINT.replace("audio/", 'audio"/'),
             ENDPOINT.replace("audio/", "audio\x7f/"),
+            "https://[::1%en0]/v1",
+            "https://[::1%25en0]/v1",
+            "https://[not-an-address]/v1",
             5,
         ):
             with self.subTest(endpoint=endpoint), self.assertRaisesRegex(LiveAudioError, "https"):
@@ -668,6 +671,8 @@ class HostedTranscriberTests(unittest.TestCase):
             "https://xn--bcher-kva.example/v1/audio/transcriptions",
             "https://10.0.0.5:8443/v1/a%20b/x-y_z~.;v=1",
             "https://api.example.test",
+            "https://[::1]:8443/v1",
+            "https://[2001:db8::7]/v1/audio/transcriptions",
         ):
             with self.subTest(endpoint=endpoint):
                 self.assertEqual(self.transcriber(endpoint=endpoint).endpoint, endpoint)

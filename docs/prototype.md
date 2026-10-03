@@ -137,6 +137,10 @@ A hosted request's Keychain credential lookup and whole exchange share a wall-cl
 deadline of `timeout_seconds`; a stop is honoured during the lookup and within about 50 ms
 while the connection is opened or the body is read, and a mid-body pause shorter than the
 remaining budget is tolerated. The endpoint must not carry its own query string or fragment.
+Its host is a DNS name (internationalized names in their ASCII `xn--` form), an IPv4
+address, or a bracketed IPv6 literal such as `https://[::1]:8443/v1` without a zone
+identifier; whitespace, control characters, user information and characters outside
+RFC 3986 paths are rejected when the configuration loads.
 
 The lab page labels the two speech stages from the loaded configuration: `LOCAL` with the
 local runtime name, or `HOSTED` with the service family ("OpenAI-compatible hosted",
