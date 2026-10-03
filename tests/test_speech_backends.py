@@ -41,6 +41,7 @@ from rightyo.speech_backends import (
     provenance_id,
     speech_summary,
     transcriber_factory,
+    utterance_local_labels,
 )
 from rightyo.tool import listen
 from rightyo.tool_events import SpeechEvents
@@ -827,9 +828,24 @@ class HostedTranscriberTests(unittest.TestCase):
             with self.subTest(contradictory=contradictory):
                 with self.assertRaisesRegex(HostedSpeechError, "inconsistent"):
                     openai_units(contradictory, 600)
-        for silent in ({"text": ""}, {"text": " ", "words": [], "segments": []}):
+        blank_units = [{"word": " ", "start": 0.0, "end": 0.1}]
+        for silent in (
+            {"text": ""},
+            {"text": " ", "words": [], "segments": []},
+            {"text": "", "words": blank_units},
+        ):
             with self.subTest(silent=silent):
                 self.assertEqual(openai_units(silent, 600), [])
+        # A present timed field that is not a list is never silence.
+        for wrong_type in (
+            {"text": "", "words": {}},
+            {"text": "", "segments": "x"},
+            {"text": "", "words": None},
+            {"text": "", "words": ["x"]},
+        ):
+            with self.subTest(wrong_type=wrong_type):
+                with self.assertRaisesRegex(HostedSpeechError, "inconsistent"):
+                    openai_units(wrong_type, 600)
         segments = {"text": "A. B.", "segments": [{"text": "A. B.", "start": 0, "end": 0.4}]}
         self.assertEqual(
             openai_units(segments, 300), [{"text": " A. B.", "start_ms": 0, "end_ms": 300}]
@@ -1179,11 +1195,21 @@ class ConfigurationSelectionTests(unittest.TestCase):
         snapshot = local.snapshot()
         self.assertEqual(
             snapshot["transcriber"],
-            {"kind": "whisper.cpp", "hosted": False, "service": "Whisper (configured model)"},
+            {
+                "kind": "whisper.cpp",
+                "hosted": False,
+                "service": "Whisper (configured model)",
+                "utterance_local": False,
+            },
         )
         self.assertEqual(
             snapshot["diarizer"],
-            {"kind": "nemotron.cpp", "hosted": False, "service": "Nemotron 3 (configured GGUF)"},
+            {
+                "kind": "nemotron.cpp",
+                "hosted": False,
+                "service": "Nemotron 3 (configured GGUF)",
+                "utterance_local": False,
+            },
         )
         self.assertEqual(snapshot["models"]["asr"], "Whisper (configured model)")
         hosted = PrototypeController(
@@ -1205,13 +1231,23 @@ class ConfigurationSelectionTests(unittest.TestCase):
                 "kind": "hosted-openai-compatible",
                 "hosted": True,
                 "service": "OpenAI-compatible hosted",
+                "utterance_local": False,
             },
         )
         self.assertEqual(
             snapshot["diarizer"],
-            {"kind": "hosted-deepgram", "hosted": True, "service": "Deepgram hosted"},
+            {
+                "kind": "hosted-deepgram",
+                "hosted": True,
+                "service": "Deepgram hosted",
+                "utterance_local": True,
+            },
         )
         self.assertEqual(snapshot["models"]["diarization"], "Deepgram hosted")
+        # The legend flag follows the implementation's declared provenance, not its name.
+        self.assertTrue(utterance_local_labels(self.hosted_diarizer))
+        self.assertFalse(utterance_local_labels({"kind": "nemotron.cpp"}))
+        self.assertEqual(DeepgramDiarizer.speaker_provenance, "diarization-utterance")
         with patch.dict(os.environ, {"RIGHTYO_TRANSCRIBER_API_KEY": KEY}):
             encoded = json.dumps(hosted.snapshot())
         for secret in (ENDPOINT, DEEPGRAM_ENDPOINT, "whisper-1", "nova-3", KEY, "api.deepgram"):

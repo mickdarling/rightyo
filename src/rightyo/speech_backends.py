@@ -382,10 +382,20 @@ def openai_units(document: dict[str, Any], duration_ms: int) -> list[dict[str, A
         raise HostedSpeechError(f"{label} returned an invalid response")
     words, segments = document.get("words"), document.get("segments")
     if not text.strip():
-        # Silence is only silence when nothing was timed; timed units beside an empty
-        # transcript contradict it and must not be dropped as if nothing was said.
-        if any(isinstance(value, list) and value for value in (words, segments)):
-            raise HostedSpeechError(f"{label} returned inconsistent word timing")
+        # Silence is only silence when nothing was timed: every timed field that is
+        # present must be a list whose units, if any, carry blank text; anything else
+        # contradicts the empty transcript and must not be dropped as if unsaid.
+        for name, field in (("words", "word"), ("segments", "text")):
+            if name not in document:
+                continue
+            value = document[name]
+            if not isinstance(value, list) or not all(
+                isinstance(unit, dict)
+                and isinstance(unit.get(field), str)
+                and not unit[field].strip()
+                for unit in value
+            ):
+                raise HostedSpeechError(f"{label} returned inconsistent word timing")
         return []
     if isinstance(words, list) and words:
         if len(words) > 4000:
@@ -724,7 +734,9 @@ def utterance_local_labels(spec: dict[str, Any]) -> bool:
     Such labels are namespaced per utterance (`u7 Speaker A`), so a configured role for
     `Speaker A` could never match one; only a session-stable diarizer can carry roles.
     """
-    return spec["kind"] == "hosted-deepgram"
+    implementation = _DIARIZERS.get(spec["kind"])
+    provenance = getattr(implementation, "speaker_provenance", "diarization-timeline")
+    return provenance == "diarization-utterance"
 
 
 def transcriber_id(spec: dict[str, Any]) -> str:
@@ -762,6 +774,7 @@ def speech_summary(transcriber: dict[str, Any], diarizer: dict[str, Any]) -> dic
     }
 
 
+_DIARIZERS = {"nemotron.cpp": NemotronCppDiarizer, "hosted-deepgram": DeepgramDiarizer}
 SERVICE_NAMES = {
     "whisper.cpp": "Whisper (configured model)",
     "nemotron.cpp": "Nemotron 3 (configured GGUF)",
@@ -776,7 +789,14 @@ def describe(spec: dict[str, Any]) -> dict[str, Any]:
     Never includes the endpoint, model name, language or any credential, so it can be
     shown to a page or written to a snapshot.
     """
-    return {"kind": spec["kind"], "hosted": is_hosted(spec), "service": SERVICE_NAMES[spec["kind"]]}
+    return {
+        "kind": spec["kind"],
+        "hosted": is_hosted(spec),
+        "service": SERVICE_NAMES[spec["kind"]],
+        # True only for a diarizer whose labels hold within one utterance; the page
+        # words its legend from this.
+        "utterance_local": utterance_local_labels(spec),
+    }
 
 
 def transcriber_factory(

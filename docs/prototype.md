@@ -143,7 +143,8 @@ local runtime name, or `HOSTED` with the service family ("OpenAI-compatible host
 "Deepgram hosted"); the masthead then reads "Audio leaves this Mac" and the Start status
 says "Connecting to hosted speech service" instead of "Loading local models". The
 controller snapshot carries the same `transcriber`/`diarizer` summaries (`kind`, `hosted`,
-`service`) and never the endpoint, model name or credential.
+`service`, and `utterance_local`, from which the page words its speaker-label legend) and
+never the endpoint, model name or credential.
 
 Hosted calls use the standard library only, send no environment proxy, refuse redirects,
 cap responses at 2 MiB, and report failures as "Hosted speech backend failed" without

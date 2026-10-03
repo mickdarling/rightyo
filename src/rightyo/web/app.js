@@ -121,6 +121,10 @@
     stage("diarizer", state.diarizer, "Who is speaking");
     stage("transcriber", state.transcriber, "What was said");
     $("locality-label").textContent = hostedSpeech(state) ? "Audio leaves this Mac · hosted speech configured" : "On this Mac";
+    const diarizer = state.diarizer && typeof state.diarizer === "object" ? state.diarizer : null;
+    $("attribution-note").textContent = diarizer && diarizer.utterance_local === true
+      ? "Speaker labels such as u7 Speaker A are anonymous and hold only within one utterance; the same label in another utterance is not known to be the same voice."
+      : "Speaker A/B labels are anonymous within this session.";
     const transcriber = state.transcriber && typeof state.transcriber === "object" ? state.transcriber : null;
     $("footer-locality").textContent = transcriber && transcriber.hosted === true
       ? `Hosted transcription (${String(transcriber.service || transcriber.kind || "hosted")}) · temporary context`
