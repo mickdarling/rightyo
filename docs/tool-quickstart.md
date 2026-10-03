@@ -53,7 +53,10 @@ is carried to the next read. EOF finishes the open utterance and ends with the o
 say where they came from, so `--provenance` is required with `--mode stdin` and refused
 otherwise. There is no default. Pass `live-microphone` only for a person speaking live
 (for example a relayed phone microphone), and `causal-replay`, `recorded-file` or
-`synthetic` for anything else. Turns carry exactly that value. The started session
+`synthetic` for anything else. Turns carry exactly that value. Timing follows it too.
+`live-microphone` uses the wall clock for the session budget and retention, as microphone
+mode does. The replay values use media time, as demo mode does, so a slow producer is never
+cut off early. The started session
 event adds a top-level `audio_input` object
 (`{"source": "stdin", "encoding": "s16le", "sample_rate": 16000, "channels": 1}`) beside
 the unchanged capability set. If processing falls behind, at most 32 seconds of audio is

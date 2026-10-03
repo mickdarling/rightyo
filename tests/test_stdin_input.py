@@ -301,6 +301,38 @@ class StdinListenTests(unittest.TestCase):
         self.assertGreaterEqual(events[-1]["emitted_at_ms"], 1200)
         self.assertIn("dropping", diagnostics.getvalue())
 
+    def _stalled_session(self, provenance, wait_seconds):
+        """A producer that sends nothing for ``wait_seconds`` under a 1 s session budget."""
+        stream = Gated([bytes(PCM_CHUNK_BYTES)], gate_at=0)
+        self.addCleanup(stream.release.set)
+        args = Namespace(**{**vars(self.args), "provenance": provenance, "session_budget": 1})
+        output, result = io.StringIO(), {}
+        thread = threading.Thread(
+            target=lambda: result.setdefault(
+                "code",
+                listen(args, output=output, controller_factory=self.factory, audio_input=stream),
+            )
+        )
+        thread.start()
+        thread.join(wait_seconds)
+        finished_while_stalled = not thread.is_alive()
+        stream.release.set()
+        thread.join(10)
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        return finished_while_stalled, result.get("code"), events
+
+    def test_live_stdin_session_budget_follows_the_wall_clock(self):
+        stalled, code, events = self._stalled_session("live-microphone", 4)
+        self.assertTrue(stalled)
+        self.assertEqual((code, events[-1]["phase"]), (0, "cancelled"))
+
+    def test_replay_stdin_session_budget_follows_media_time_not_the_wall_clock(self):
+        stalled, code, events = self._stalled_session("causal-replay", 2.5)
+        self.assertFalse(stalled)
+        # Released: 200 ms of media fits the 1 s budget, so EOF ends it normally.
+        self.assertEqual((code, events[-1]["phase"]), (0, "stopped"))
+        self.assertLess(events[-1]["emitted_at_ms"], 1000)
+
 
 def slow_push(push):
     def slowed(self, pcm):

@@ -55,8 +55,6 @@ from rightyo.speech_backends import (
 
 BROWSER_LEASE_SECONDS = 15
 PCM_BYTES_PER_MS = 32
-# Modes whose audio is a live human microphone, wherever the samples are captured.
-LIVE_MODES = frozenset({"microphone", "stdin"})
 # Advertised on `session` started for stdin input: a separate top-level object, so the
 # strictly validated capability set is unchanged. Turn provenance is host-declared.
 STDIN_AUDIO_INPUT = {
@@ -233,12 +231,18 @@ class PrototypeController:
         self._timer = threading.Thread(target=self._tick, daemon=True)
         self._timer.start()
 
+    def _live(self) -> bool:
+        """Wall-clock timing for live speech only; declared replays use media time."""
+        return self._mode == "microphone" or (
+            self._mode == "stdin" and self.audio_provenance == "live-microphone"
+        )
+
     def _now_ms(self) -> int:
         if self._completed_at is not None:
             return self._received_ms + int((time.monotonic() - self._completed_at) * 1000)
         wall_ms = (
             int((time.monotonic() - self._audio_started) * 1000)
-            if self._mode in LIVE_MODES and self._audio_started is not None
+            if self._live() and self._audio_started is not None
             else 0
         )
         return max(self._received_ms, wall_ms)
@@ -254,7 +258,7 @@ class PrototypeController:
                     or self._budget_reached
                     or (
                         self._budget_ms is not None
-                        and self._mode in LIVE_MODES
+                        and self._live()
                         and (time.monotonic() - self._started) * 1000 > self._budget_ms
                     )
                 )
@@ -608,7 +612,7 @@ class PrototypeController:
             self._received_ms = self._received_bytes // PCM_BYTES_PER_MS
             if self._audio_started is None:
                 self._audio_started = time.monotonic()
-            self._phase = "listening" if mode in LIVE_MODES else "replaying"
+            self._phase = "listening" if self._live() else "replaying"
         processor.push_pcm16(pcm)
         if boundary:
             # Publish only after the boundary audio is processed, so the timer cannot
