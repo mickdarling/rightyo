@@ -67,6 +67,10 @@ class _ReadFailed(Exception):
     """The body read ended without content; details stay on the reader thread."""
 
 
+class _OpenDeadline(Exception):
+    """The wall-clock deadline passed before a response existed."""
+
+
 def provenance_id(prefix: str, *parts: str) -> str:
     """A `contracts.identifier`-safe label naming the backend family and its model.
 
@@ -243,6 +247,43 @@ class _HostedClient:
             raise _ReadFailed
         return outcome["content"]
 
+    def _open(self, request: Any, timeout: float, deadline: float) -> Any:
+        """Open the exchange on a helper thread the caller can stop waiting for.
+
+        DNS, connect, TLS, the upload and the response headers all happen inside
+        `open`, before any response exists, so the body reader's abort has nothing to
+        act on. The caller polls cancellation and the deadline every 50 ms instead and,
+        on either, stops waiting at once; a response that still arrives on the abandoned
+        thread is closed there. A DNS lookup cannot be interrupted: the daemon thread then
+        ends when the resolver returns, and never holds up the caller or a stop.
+        """
+        outcome: dict[str, Any] = {}
+
+        def connect() -> None:
+            try:
+                response = self._opener.open(request, timeout=timeout)
+            except BaseException as error:
+                outcome["error"] = error
+                return
+            outcome["response"] = response
+            if outcome.get("abandoned"):
+                _abort_response(response)
+
+        thread = threading.Thread(target=connect, name="rightyo-hosted-open", daemon=True)
+        thread.start()
+        while thread.is_alive():
+            cancelled = self.cancelled()
+            remaining = deadline - time.monotonic()
+            if cancelled or remaining <= 0:
+                outcome["abandoned"] = True
+                if "response" in outcome:
+                    _abort_response(outcome["response"])
+                raise _ReadCancelled if cancelled else _OpenDeadline
+            thread.join(min(READ_POLL_SECONDS, remaining))
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["response"]
+
     def post(self, url: str, body: bytes, headers: dict[str, str], scheme: str) -> dict[str, Any]:
         if self.cancelled():
             raise HostedSpeechError(f"{self.label} request was cancelled")
@@ -273,12 +314,13 @@ class _HostedClient:
         failure = None
         content = b""
         # urllib's timeout is per operation, so a slowly dripping body could outlive it;
-        # the body is read on a helper thread that the deadline or cancellation aborts.
+        # both the open phase and the body read run on helper threads that the
+        # deadline or cancellation stops waiting for.
         try:
-            with self._opener.open(
-                request, timeout=max(remaining, MIN_TRANSPORT_SECONDS)
-            ) as response:
+            with self._open(request, max(remaining, MIN_TRANSPORT_SECONDS), deadline) as response:
                 content = self._read_body(response, deadline)
+        except _OpenDeadline:
+            failure = f"{self.label} request exceeded its deadline"
         except _ReadDeadline:
             failure = f"{self.label} response exceeded the request deadline"
         except _ReadCancelled:

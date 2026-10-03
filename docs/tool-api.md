@@ -336,8 +336,11 @@ the whole exchange share one wall-clock deadline of `timeout_seconds` (default 3
 most 120) from the start of the request. A Keychain lookup that is cancelled or outlives
 the deadline is terminated; the transport is given only the budget that lookup left, as
 its inactivity timeout for connect, TLS, headers and body, so a pause shorter than the
-remaining budget is tolerated and the connection is shut when the deadline passes or a
-stop arrives, ending the read within about 50 ms.
+remaining budget is tolerated. The open phase (name resolution, connect, TLS, upload and
+response headers) and the body read each run on a helper thread; a stop or the deadline
+is noticed within about 50 ms, the connection is shut, and the caller returns at once. A
+name lookup cannot be interrupted, so an abandoned open thread ends when the resolver
+returns, without holding up the stop.
 
 The current native implementation still uses conservative endpointing and completed
 Whisper windows. Persistent ASR, early attention, lower endpoint latency and other

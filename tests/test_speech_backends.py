@@ -83,6 +83,7 @@ class FakeProcess:
 class FakeResponse:
     def __init__(self, payload):
         self.payload = payload
+        self.closed = False
 
     def read(self, limit):
         chunk, self.payload = self.payload[:limit], self.payload[limit:]
@@ -636,6 +637,59 @@ class HostedTranscriberTests(unittest.TestCase):
                 return FakeResponse.read(self, limit)
 
         return Blocking()
+
+    def blocking_opener(self, response):
+        """An opener whose `open` blocks until released, then returns `response`."""
+        released = threading.Event()
+        calls = []
+
+        def open_request(request, timeout):
+            calls.append(timeout)
+            released.wait(5)
+            return response
+
+        return Mock(open=open_request), released, calls
+
+    def test_cancel_during_open_returns_at_once_and_closes_a_late_response(self):
+        late = FakeResponse(b'{"text": ""}')
+        opener, released, calls = self.blocking_opener(late)
+        checks = []
+        with patch("urllib.request.build_opener", return_value=opener):
+            started = time.monotonic()
+            with self.assertRaisesRegex(HostedSpeechError, "cancelled") as caught:
+                self.transcriber(
+                    cancelled=lambda: checks.append(1) is None and len(checks) >= 4,
+                    timeout_seconds=30,
+                ).transcribe(bytes(640))
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.0)
+        # The transport got the budget left after the (instant) credential lookup.
+        self.assertEqual(len(calls), 1)
+        self.assertAlmostEqual(calls[0], 30, delta=0.5)
+        self.assertIsNone(caught.exception.__context__)
+        # The abandoned thread's response, arriving later, is closed rather than leaked.
+        released.set()
+        deadline = time.monotonic() + 2
+        while not late.closed and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(late.closed)
+
+    def test_deadline_during_open_returns_at_once(self):
+        late = FakeResponse(b'{"text": ""}')
+        opener, released, _calls = self.blocking_opener(late)
+        self.addCleanup(released.set)
+        clock = [0.0]
+
+        def monotonic():
+            clock[0] += 10.0
+            return clock[0]
+
+        started = time.monotonic()  # the real clock; the module sees the fake one below
+        with patch("urllib.request.build_opener", return_value=opener):
+            with patch("rightyo.speech_backends.time.monotonic", monotonic):
+                with self.assertRaisesRegex(HostedSpeechError, "exceeded its deadline"):
+                    self.transcriber(timeout_seconds=30).transcribe(bytes(640))
+        self.assertLess(time.monotonic() - started, 1.0)
 
     def test_blocked_body_is_abandoned_at_the_wall_clock_deadline_and_closed(self):
         clock = [0.0]
