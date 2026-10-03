@@ -372,7 +372,9 @@ class HostedTranscriberTests(unittest.TestCase):
         )
         (request, timeout), *_rest = requests
         self.assertEqual(len(requests), 1)
-        self.assertEqual(timeout, 7)
+        # The transport gets the budget left after the credential lookup, never more.
+        self.assertLessEqual(timeout, 7)
+        self.assertGreater(timeout, 6.5)
         self.assertEqual(request.full_url, ENDPOINT)
         self.assertEqual(request.get_method(), "POST")
         # The credential is removed from the request object after the exchange.
@@ -592,6 +594,58 @@ class HostedTranscriberTests(unittest.TestCase):
             self.assertTrue(spawned[1].terminated)
         self.assertEqual(requests, [])
         self.assertNotIn(KEY, "".join(str(process.args) for process in spawned))
+
+    def test_transport_receives_only_the_budget_the_credential_lookup_left(self):
+        clock = [0.0]
+
+        def monotonic():
+            return clock[0]
+
+        def slow_key(**_options):
+            clock[0] += 25.0  # the Keychain lookup consumed most of a 30-second budget
+            return KEY
+
+        class Layer:
+            def __init__(self, **attributes):
+                self.__dict__.update(attributes)
+
+        class Socket:
+            def __init__(self):
+                self.timeouts = []
+
+            def settimeout(self, value):
+                self.timeouts.append(value)
+
+        socket_ = Socket()
+        response = FakeResponse(b'{"text": ""}')
+        # urllib's chain: response.fp (HTTPResponse).fp (BufferedReader).raw (SocketIO)._sock
+        response.fp = Layer(fp=Layer(raw=Layer(_sock=socket_)))
+        seen = []
+
+        def open_request(request, timeout):
+            seen.append(timeout)
+            return response
+
+        with patch("urllib.request.build_opener", return_value=Mock(open=open_request)):
+            with patch("rightyo.speech_backends.time.monotonic", monotonic):
+                self.transcriber(load_key=slow_key, timeout_seconds=30).transcribe(bytes(640))
+        self.assertEqual(seen, [5.0])
+        self.assertTrue(socket_.timeouts)
+        self.assertTrue(all(0 < value <= 0.5 for value in socket_.timeouts))
+
+        def exhausting_key(**_options):
+            clock[0] += 31.0
+            return KEY
+
+        seen.clear()
+        with patch("urllib.request.build_opener", return_value=Mock(open=open_request)):
+            with patch("rightyo.speech_backends.time.monotonic", monotonic):
+                with self.assertRaisesRegex(HostedSpeechError, "deadline") as caught:
+                    self.transcriber(load_key=exhausting_key, timeout_seconds=30).transcribe(
+                        bytes(640)
+                    )
+        self.assertEqual(seen, [])
+        self.assertNotIn(KEY, str(caught.exception))
 
     def test_redirects_are_refused_before_forwarding_credentials(self):
         source = Mock()

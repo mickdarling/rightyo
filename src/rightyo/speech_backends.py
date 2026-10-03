@@ -45,6 +45,8 @@ _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
 _LANGUAGE = re.compile(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?")
 _UNSAFE = re.compile(r"[^A-Za-z0-9_. -]")
 READ_CHUNK_BYTES = 65536
+READ_STEP_SECONDS = 0.5  # socket timeout per body read step
+MIN_TRANSPORT_SECONDS = 0.1  # the least a nearly exhausted budget gives the transport
 
 
 class HostedSpeechError(LiveAudioError):
@@ -139,6 +141,28 @@ def _interval(start: Any, end: Any, duration_ms: int, label: str) -> tuple[int, 
     return start_ms, min(end_ms, duration_ms)
 
 
+def _bound_read(response: Any, seconds: float) -> None:
+    """Give the underlying socket, when reachable, at most `seconds` for the next read.
+
+    urllib's response wraps `http.client.HTTPResponse` -> `BufferedReader` (`fp`) ->
+    `SocketIO` (`raw`) -> socket (`_sock`); the walk stops at the first `settimeout`.
+    """
+    layer = response
+    for _ in range(6):
+        if callable(getattr(layer, "settimeout", None)):
+            layer.settimeout(max(seconds, MIN_TRANSPORT_SECONDS))
+            return
+        following = None
+        for name in ("raw", "fp", "_sock"):
+            candidate = getattr(layer, name, None)
+            if candidate is not None:
+                following = candidate
+                break
+        if following is None:
+            return
+        layer = following
+
+
 class _HostedClient:
     """One consented endpoint: bounded, sanitized, redirect-free, credential at use only."""
 
@@ -176,6 +200,12 @@ class _HostedClient:
         if self.cancelled():
             del key
             raise HostedSpeechError(f"{self.label} request was cancelled")
+        # Only the budget the credential lookup left is given to the transport, so the
+        # whole operation stays within one `timeout_seconds` of its start.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            del key
+            raise HostedSpeechError(f"{self.label} request exceeded its deadline")
         request = urllib.request.Request(
             url, data=body, method="POST", headers={**headers, "Authorization": scheme + key}
         )
@@ -185,14 +215,18 @@ class _HostedClient:
         # urllib's timeout is per operation, so a slowly dripping body could outlive it;
         # the body is read in bounded chunks against the same deadline instead.
         try:
-            with self._opener.open(request, timeout=self.timeout) as response:
+            with self._opener.open(
+                request, timeout=max(remaining, MIN_TRANSPORT_SECONDS)
+            ) as response:
                 chunks: list[bytes] = []
                 size = 0
                 while size <= MAX_RESPONSE_BYTES:
                     if self.cancelled():
                         raise _ReadCancelled
-                    if time.monotonic() >= deadline:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
                         raise _ReadDeadline
+                    _bound_read(response, min(remaining, READ_STEP_SECONDS))
                     # `read1` returns as soon as any body bytes arrive, so a dripping
                     # endpoint cannot hold a full-chunk `read` past the deadline checks.
                     reader = getattr(response, "read1", None) or response.read
