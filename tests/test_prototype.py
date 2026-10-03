@@ -38,6 +38,47 @@ def await_condition(condition):
         raise AssertionError("Fake prototype worker did not reach expected state")
 
 
+class TimerGate:
+    """Stands in for the controller's `_closed` event so each timer tick runs on demand."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._closed = False
+        self._grants = 0
+        self._waits = 0
+
+    def install(self, controller):
+        controller._closed = self
+        # The timer thread leaves its original 0.5 s wait and parks here; no tick runs
+        # again until the test grants one.
+        with self._condition:
+            if not self._condition.wait_for(lambda: self._waits, timeout=5):
+                raise AssertionError("Controller timer did not park on the gate")
+
+    def wait(self, timeout=None):
+        with self._condition:
+            self._waits += 1
+            self._condition.notify_all()
+            self._condition.wait_for(lambda: self._closed or self._grants)
+            if not self._closed:
+                self._grants -= 1
+            return self._closed
+
+    def set(self):
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+    def tick(self):
+        """Run exactly one complete timer iteration, returning once it parks again."""
+        with self._condition:
+            target = self._waits + 1
+            self._grants += 1
+            self._condition.notify_all()
+            if not self._condition.wait_for(lambda: self._waits >= target, timeout=5):
+                raise AssertionError("Controller timer tick did not complete")
+
+
 class FakeProcessor:
     instances = []
 
@@ -664,15 +705,17 @@ class ControllerTests(unittest.TestCase):
         self.capture.assert_not_called()
 
     def test_slow_replay_still_receives_the_whole_budget_before_cancellation(self):
+        timer = TimerGate()
+
         class SlowProcessor(FakeProcessor):
             pushing = False
             closed_mid_push = False
 
             def push_pcm16(self, pcm):
                 self.pushing = True
-                # Slower than real time: 200 ms of audio takes 300 ms of wall clock.
-                threading.Event().wait(0.3)
                 super().push_pcm16(pcm)
+                # Slower than real time: a full timer tick runs inside every push.
+                timer.tick()
                 self.pushing = False
 
             def close(self):
@@ -695,17 +738,17 @@ class ControllerTests(unittest.TestCase):
             event_publisher=events,
         )
         self.addCleanup(controller.close)
+        timer.install(controller)
         controller.start({"mode": "demo"})
         with controller._lock:
             # Even a long-expired wall clock must not end a replay before its boundary.
             controller._started -= 3600
-        emitted = []
-        deadline = time.monotonic() + 6
-        while time.monotonic() < deadline:
-            emitted.extend(controller.drain_events())
-            if controller.snapshot(heartbeat=False)["phase"] == "idle":
-                break
-            threading.Event().wait(0.01)
+        controller._audio_thread.join(timeout=5)
+        self.assertFalse(controller._audio_thread.is_alive())
+        self.assertEqual(controller.snapshot(heartbeat=False)["phase"], "replaying")
+        # Drain before the timer observes the boundary: cancellation discards the queue.
+        emitted = controller.drain_events()
+        timer.tick()
         emitted.extend(controller.drain_events())
         processor = FakeProcessor.instances[0]
         self.assertEqual(controller.snapshot()["phase"], "idle")
