@@ -1,14 +1,15 @@
 """Offline backend-selection tests: mocked HTTP, no network, credentials, models or audio."""
 
 import array
+import http.client
 import io
 import json
 import os
+import ssl
 import tempfile
 import threading
 import time
 import unittest
-import urllib.error
 import wave
 from argparse import Namespace
 from pathlib import Path
@@ -34,7 +35,6 @@ from rightyo.speech_backends import (
     DeepgramDiarizer,
     HostedSpeechError,
     OpenAICompatibleTranscriber,
-    _NoRedirect,
     deepgram_timeline,
     diarizer_factory,
     openai_units,
@@ -81,8 +81,9 @@ class FakeProcess:
 
 
 class FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, status=200):
         self.payload = payload
+        self.status = status
         self.closed = False
 
     def read(self, limit):
@@ -100,22 +101,89 @@ class FakeResponse:
         self.closed = True
 
 
-def patched_opener(payload=None, error=None):
-    """Replace the module's opener; returns the recorded requests."""
-    requests = []
+class FakeConnection:
+    """Records the `http.client` calls the backend makes; never opens a socket."""
 
-    def open_request(request, timeout):
-        requests.append((request, timeout))
-        if error is not None:
-            raise error
-        return FakeResponse(payload)
+    def __init__(
+        self,
+        host,
+        port=None,
+        *,
+        timeout=None,
+        context=None,
+        response=None,
+        error=None,
+        error_at="connect",
+        block=None,
+        block_at="connect",
+    ):
+        self.host, self.port, self.timeout, self.context = host, port, timeout, context
+        self.response, self.error, self.error_at = response, error, error_at
+        self.block, self.block_at = block, block_at
+        self.calls = []
+        self.headers = {}
+        self.body = b""
+        self.target = None
+        self.closed = False
+        self.shut = False
+        self.auto_open = 1
+        self.sock = Mock(shutdown=lambda _how: setattr(self, "shut", True))
 
-    opener = Mock(open=open_request)
-    return patch("urllib.request.build_opener", return_value=opener), requests
+    def _step(self, name):
+        self.calls.append(name)
+        if self.block is not None and self.block_at == name:
+            self.block.wait(5)
+        if self.closed:
+            raise OSError("socket closed")
+        if self.error is not None and self.error_at == name:
+            raise self.error
+
+    def connect(self):
+        self._step("connect")
+
+    def putrequest(self, method, target):
+        self._step("putrequest")
+        self.method, self.target = method, target
+
+    def putheader(self, name, value):
+        self.headers[name] = value
+
+    def endheaders(self):
+        self._step("endheaders")
+
+    def send(self, data):
+        self._step("send")
+        self.body += data
+
+    def getresponse(self):
+        self._step("getresponse")
+        return self.response
+
+    def close(self):
+        self.closed = True
+        self.sock = None
 
 
-def http_error(code, body=PRIVATE.encode()):
-    return urllib.error.HTTPError("https://x.test", code, PRIVATE, {}, io.BytesIO(body))
+def connection_for(response):
+    """A connection factory whose exchange yields exactly `response`."""
+    return lambda host, port=None, **keywords: FakeConnection(
+        host, port, response=response, **keywords
+    )
+
+
+def patched_connection(payload=None, status=200, error=None, **options):
+    """Replace `http.client.HTTPSConnection`; returns the recorded connections."""
+    connections = []
+
+    def factory(host, port=None, **keywords):
+        response = FakeResponse(payload, status=status)
+        connection = FakeConnection(
+            host, port, response=response, error=error, **options, **keywords
+        )
+        connections.append(connection)
+        return connection
+
+    return patch("http.client.HTTPSConnection", side_effect=factory), connections
 
 
 class StubDiarizer:
@@ -468,8 +536,8 @@ class HostedTranscriberTests(unittest.TestCase):
                 ],
             }
         ).encode()
-        opener, requests = patched_opener(payload)
-        with opener:
+        patched, connections = patched_connection(payload)
+        with patched:
             units = self.transcriber(language="en", timeout_seconds=7).transcribe(pcm, Mock())
         self.assertEqual(
             units,
@@ -478,19 +546,23 @@ class HostedTranscriberTests(unittest.TestCase):
                 {"text": " world.", "start_ms": 250, "end_ms": 500},
             ],
         )
-        (request, timeout), *_rest = requests
-        self.assertEqual(len(requests), 1)
+        (connection,) = connections
+        self.assertEqual((connection.host, connection.port), ("transcribe.example.test", 443))
+        self.assertEqual(connection.target, "/v1/audio/transcriptions")
+        self.assertEqual(connection.method, "POST")
+        self.assertEqual(
+            connection.calls, ["connect", "putrequest", "endheaders", "send", "getresponse"]
+        )
         # The transport gets the budget left after the credential lookup, never more.
-        self.assertLessEqual(timeout, 7)
-        self.assertGreater(timeout, 6.5)
-        self.assertEqual(request.full_url, ENDPOINT)
-        self.assertEqual(request.get_method(), "POST")
-        # The credential is removed from the request object after the exchange.
-        self.assertFalse(request.has_header("Authorization"))
-        content_type = request.get_header("Content-type")
+        self.assertLessEqual(connection.timeout, 7)
+        self.assertGreater(connection.timeout, 6.5)
+        self.assertIsInstance(connection.context, ssl.SSLContext)
+        self.assertTrue(connection.closed)
+        self.assertEqual(connection.headers["Content-Length"], str(len(connection.body)))
+        content_type = connection.headers["Content-Type"]
         self.assertTrue(content_type.startswith("multipart/form-data; boundary="))
         boundary = content_type.split("boundary=")[1].encode()
-        parts = request.data.split(b"--" + boundary)
+        parts = connection.body.split(b"--" + boundary)
         fields = {}
         for part in parts[1:-1]:
             header, _, value = part.partition(b"\r\n\r\n")
@@ -510,40 +582,39 @@ class HostedTranscriberTests(unittest.TestCase):
         self.assertEqual(parts[-1], b"--\r\n")
 
     def test_authorization_header_carries_the_bearer_key_at_point_of_use_only(self):
-        seen = []
-
-        def open_request(request, timeout):
-            seen.append(request.get_header("Authorization"))
-            return FakeResponse(b'{"text": ""}')
-
-        with patch("urllib.request.build_opener", return_value=Mock(open=open_request)):
+        patched, connections = patched_connection(b'{"text": ""}')
+        with patched:
             self.assertEqual(self.transcriber().transcribe(bytes(640)), [])
-        self.assertEqual(seen, ["Bearer " + KEY])
+        self.assertEqual([c.headers["Authorization"] for c in connections], ["Bearer " + KEY])
 
     def test_failures_are_sanitized_and_bounded(self):
         pcm = bytes(640)
         cases = [
-            (http_error(401), "HTTP 401"),
-            (http_error(429), "temporarily unavailable"),
-            (urllib.error.URLError(PRIVATE), "connection failed"),
-            (TimeoutError(PRIVATE), "connection failed"),
-            (HostedSpeechError("Hosted speech redirect refused"), "redirect refused"),
+            (dict(payload=PRIVATE.encode(), status=401), "HTTP 401"),
+            (dict(payload=PRIVATE.encode(), status=429), "temporarily unavailable"),
+            (dict(payload=PRIVATE.encode(), status=302), "redirect refused"),
+            (dict(error=OSError(PRIVATE)), "connection failed"),
+            (dict(error=TimeoutError(PRIVATE), error_at="send"), "connection failed"),
+            (dict(error=http.client.BadStatusLine(PRIVATE), error_at="getresponse"), "connection"),
         ]
-        for error, expected in cases:
-            opener, _ = patched_opener(error=error)
-            with self.subTest(expected=expected), opener:
+        for options, expected in cases:
+            patched, connections = patched_connection(**options)
+            with self.subTest(expected=expected), patched:
                 with self.assertRaisesRegex(HostedSpeechError, expected) as caught:
                     self.transcriber().transcribe(pcm)
                 self.assertNotIn(PRIVATE, str(caught.exception))
                 self.assertNotIn(KEY, str(caught.exception))
                 self.assertNotIn(ENDPOINT, str(caught.exception))
                 self.assertIsNone(caught.exception.__context__)
-        opener, _ = patched_opener(b"{" * (MAX_RESPONSE_BYTES + 1))
-        with opener, self.assertRaisesRegex(HostedSpeechError, "size limit"):
+                # A redirect is never followed: one connection, closed, and no second host.
+                self.assertEqual(len(connections), 1)
+                self.assertTrue(connections[0].closed)
+        patched, _ = patched_connection(b"{" * (MAX_RESPONSE_BYTES + 1))
+        with patched, self.assertRaisesRegex(HostedSpeechError, "size limit"):
             self.transcriber().transcribe(pcm)
         for payload in (b"not json", b"[]", json.dumps({"text": PRIVATE}).encode()):
-            opener, _ = patched_opener(payload)
-            with self.subTest(payload=payload), opener:
+            patched, _ = patched_connection(payload)
+            with self.subTest(payload=payload), patched:
                 with self.assertRaises(HostedSpeechError) as caught:
                     self.transcriber().transcribe(pcm)
                 self.assertNotIn(PRIVATE, str(caught.exception))
@@ -552,8 +623,8 @@ class HostedTranscriberTests(unittest.TestCase):
         def missing(**_options):
             raise CredentialError("Synthetic missing credential")
 
-        opener, requests = patched_opener(b"{}")
-        with opener:
+        patched, requests = patched_connection(b"{}")
+        with patched:
             with self.assertRaisesRegex(HostedSpeechError, "credential is unavailable") as caught:
                 self.transcriber(load_key=missing).transcribe(bytes(640))
             self.assertIsNone(caught.exception.__context__)
@@ -593,8 +664,8 @@ class HostedTranscriberTests(unittest.TestCase):
         self.assertEqual(diarizer.speaker_provenance, "diarization-utterance")
         turns = []
         document = {"text": "Hi.", "words": [{"word": "Hi", "start": 0.0, "end": 0.1}]}
-        opener, _ = patched_opener(json.dumps(document).encode())
-        with opener:
+        patched, _ = patched_connection(json.dumps(document).encode())
+        with patched:
             processor = LiveProcessor(
                 LiveConfig(
                     "provenance-test",
@@ -638,23 +709,25 @@ class HostedTranscriberTests(unittest.TestCase):
 
         return Blocking()
 
-    def blocking_opener(self, response):
-        """An opener whose `open` blocks until released, then returns `response`."""
+    def blocking_connection(self, response, block_at="connect"):
+        """A connection factory whose `block_at` step blocks until released."""
         released = threading.Event()
-        calls = []
+        connections = []
 
-        def open_request(request, timeout):
-            calls.append(timeout)
-            released.wait(5)
-            return response
+        def factory(host, port=None, **keywords):
+            connection = FakeConnection(
+                host, port, response=response, block=released, block_at=block_at, **keywords
+            )
+            connections.append(connection)
+            return connection
 
-        return Mock(open=open_request), released, calls
+        return patch("http.client.HTTPSConnection", side_effect=factory), released, connections
 
-    def test_cancel_during_open_returns_at_once_and_closes_a_late_response(self):
+    def test_cancel_during_connect_closes_the_socket_and_never_sends_the_audio(self):
         late = FakeResponse(b'{"text": ""}')
-        opener, released, calls = self.blocking_opener(late)
+        patched, released, connections = self.blocking_connection(late)
         checks = []
-        with patch("urllib.request.build_opener", return_value=opener):
+        with patched:
             started = time.monotonic()
             with self.assertRaisesRegex(HostedSpeechError, "cancelled") as caught:
                 self.transcriber(
@@ -663,20 +736,26 @@ class HostedTranscriberTests(unittest.TestCase):
                 ).transcribe(bytes(640))
             elapsed = time.monotonic() - started
         self.assertLess(elapsed, 1.0)
-        # The transport got the budget left after the (instant) credential lookup.
-        self.assertEqual(len(calls), 1)
-        self.assertAlmostEqual(calls[0], 30, delta=0.5)
+        (connection,) = connections
+        self.assertAlmostEqual(connection.timeout, 30, delta=0.5)
+        self.assertTrue(connection.closed)
+        self.assertTrue(connection.shut)
         self.assertIsNone(caught.exception.__context__)
-        # The abandoned thread's response, arriving later, is closed rather than leaked.
+        # The stalled connect returns later: the helper finds the abort flag and sends
+        # nothing, so no headers, credential or audio ever leave the process.
         released.set()
         deadline = time.monotonic() + 2
-        while not late.closed and time.monotonic() < deadline:
+        while "connect" not in connection.calls and time.monotonic() < deadline:
             time.sleep(0.01)
-        self.assertTrue(late.closed)
+        time.sleep(0.1)
+        self.assertEqual(connection.calls, ["connect"])
+        self.assertEqual(connection.body, b"")
+        self.assertEqual(connection.headers, {})
+        self.assertFalse(late.closed)
 
-    def test_deadline_during_open_returns_at_once(self):
+    def test_deadline_during_connect_returns_at_once(self):
         late = FakeResponse(b'{"text": ""}')
-        opener, released, _calls = self.blocking_opener(late)
+        patched, released, connections = self.blocking_connection(late)
         self.addCleanup(released.set)
         clock = [0.0]
 
@@ -685,11 +764,56 @@ class HostedTranscriberTests(unittest.TestCase):
             return clock[0]
 
         started = time.monotonic()  # the real clock; the module sees the fake one below
-        with patch("urllib.request.build_opener", return_value=opener):
+        with patched:
             with patch("rightyo.speech_backends.time.monotonic", monotonic):
                 with self.assertRaisesRegex(HostedSpeechError, "exceeded its deadline"):
                     self.transcriber(timeout_seconds=30).transcribe(bytes(640))
         self.assertLess(time.monotonic() - started, 1.0)
+        self.assertTrue(connections[0].closed)
+        self.assertEqual(connections[0].body, b"")
+
+    def test_deadline_during_the_upload_closes_the_connection(self):
+        late = FakeResponse(b'{"text": ""}')
+        patched, released, connections = self.blocking_connection(late, block_at="send")
+        self.addCleanup(released.set)
+        clock = [0.0]
+
+        def monotonic():
+            clock[0] += 10.0
+            return clock[0]
+
+        with patched:
+            with patch("rightyo.speech_backends.time.monotonic", monotonic):
+                with self.assertRaisesRegex(HostedSpeechError, "exceeded its deadline") as caught:
+                    self.transcriber(timeout_seconds=30).transcribe(bytes(640))
+        (connection,) = connections
+        self.assertTrue(connection.closed)
+        self.assertTrue(connection.shut)
+        self.assertNotIn("getresponse", connection.calls)
+        self.assertNotIn(ENDPOINT, str(caught.exception))
+        self.assertNotIn(KEY, str(caught.exception))
+
+    def test_connect_completing_after_cancel_sends_no_request(self):
+        late = FakeResponse(b'{"text": ""}')
+        patched, released, connections = self.blocking_connection(late)
+        with patched:
+            with self.assertRaisesRegex(HostedSpeechError, "cancelled"):
+                self.transcriber(cancelled=lambda: True, timeout_seconds=30).transcribe(bytes(640))
+        # Cancelled before any connection was made at all.
+        self.assertEqual(connections, [])
+        checks = []
+        with patched:
+            with self.assertRaisesRegex(HostedSpeechError, "cancelled"):
+                self.transcriber(
+                    cancelled=lambda: checks.append(1) is None and len(checks) >= 4,
+                    timeout_seconds=30,
+                ).transcribe(bytes(640))
+        (connection,) = connections
+        released.set()
+        time.sleep(0.2)
+        self.assertNotIn("putrequest", connection.calls)
+        self.assertNotIn("send", connection.calls)
+        self.assertTrue(connection.closed)
 
     def test_blocked_body_is_abandoned_at_the_wall_clock_deadline_and_closed(self):
         clock = [0.0]
@@ -699,7 +823,7 @@ class HostedTranscriberTests(unittest.TestCase):
             return clock[0]
 
         response = self.blocking_response()
-        with patch("urllib.request.build_opener", return_value=Mock(open=lambda *a, **k: response)):
+        with patch("http.client.HTTPSConnection", side_effect=connection_for(response)):
             with patch("rightyo.speech_backends.time.monotonic", monotonic):
                 with self.assertRaisesRegex(HostedSpeechError, "deadline") as caught:
                     self.transcriber(timeout_seconds=30).transcribe(bytes(640))
@@ -710,7 +834,7 @@ class HostedTranscriberTests(unittest.TestCase):
 
     def test_a_pause_shorter_than_the_budget_is_tolerated_mid_body(self):
         response = self.blocking_response(pause=0.3)
-        with patch("urllib.request.build_opener", return_value=Mock(open=lambda *a, **k: response)):
+        with patch("http.client.HTTPSConnection", side_effect=connection_for(response)):
             self.assertEqual(self.transcriber(timeout_seconds=30).transcribe(bytes(640)), [])
         self.assertFalse(response.fp.raw._sock.shut)
         self.assertTrue(response.closed)
@@ -718,7 +842,7 @@ class HostedTranscriberTests(unittest.TestCase):
     def test_cancellation_mid_read_stops_the_request_and_closes_it(self):
         checks = []
         response = self.blocking_response()
-        with patch("urllib.request.build_opener", return_value=Mock(open=lambda *a, **k: response)):
+        with patch("http.client.HTTPSConnection", side_effect=connection_for(response)):
             with self.assertRaisesRegex(HostedSpeechError, "cancelled"):
                 self.transcriber(
                     cancelled=lambda: checks.append(1) is None and len(checks) >= 4
@@ -735,13 +859,13 @@ class HostedTranscriberTests(unittest.TestCase):
             spawned.append(FakeProcess(args, **options))
             return spawned[-1]
 
-        opener, requests = patched_opener(b"{}")
+        patched, requests = patched_connection(b"{}")
         with (
             patch.dict(os.environ, {}, clear=True),
             patch("rightyo.credentials.sys.platform", "darwin"),
             patch("rightyo.credentials.subprocess.Popen", side_effect=popen),
             patch("rightyo.credentials.time.sleep", lambda _s: polls.append(1)),
-            opener,
+            patched,
         ):
             transcriber = self.transcriber(
                 load_key=load_transcriber_api_key, cancelled=lambda: len(polls) >= 2
@@ -792,36 +916,40 @@ class HostedTranscriberTests(unittest.TestCase):
         response = FakeResponse(b'{"text": ""}')
         # urllib's chain: response.fp (HTTPResponse).fp (BufferedReader).raw (SocketIO)._sock
         response.fp = Layer(fp=Layer(raw=Layer(_sock=socket_)))
-        seen = []
+        connections = []
 
-        def open_request(request, timeout):
-            seen.append(timeout)
-            return response
+        def factory(host, port=None, **keywords):
+            connections.append(FakeConnection(host, port, response=response, **keywords))
+            return connections[-1]
 
-        with patch("urllib.request.build_opener", return_value=Mock(open=open_request)):
+        with patch("http.client.HTTPSConnection", side_effect=factory):
             with patch("rightyo.speech_backends.time.monotonic", monotonic):
                 self.transcriber(load_key=slow_key, timeout_seconds=30).transcribe(bytes(640))
-        self.assertEqual(seen, [5.0])
+        self.assertEqual([c.timeout for c in connections], [5.0])
 
         def exhausting_key(**_options):
             clock[0] += 31.0
             return KEY
 
-        seen.clear()
-        with patch("urllib.request.build_opener", return_value=Mock(open=open_request)):
+        connections.clear()
+        with patch("http.client.HTTPSConnection", side_effect=factory):
             with patch("rightyo.speech_backends.time.monotonic", monotonic):
                 with self.assertRaisesRegex(HostedSpeechError, "deadline") as caught:
                     self.transcriber(load_key=exhausting_key, timeout_seconds=30).transcribe(
                         bytes(640)
                     )
-        self.assertEqual(seen, [])
+        self.assertEqual(connections, [])
         self.assertNotIn(KEY, str(caught.exception))
 
     def test_redirects_are_refused_before_forwarding_credentials(self):
-        source = Mock()
-        with self.assertRaisesRegex(HostedSpeechError, "redirect refused"):
-            _NoRedirect().redirect_request(Mock(), source, 302, "Found", {}, "https://o.test")
-        source.close.assert_called_once()
+        for status in (301, 302, 307, 308):
+            patched, connections = patched_connection(b"", status=status)
+            with self.subTest(status=status), patched:
+                with self.assertRaisesRegex(HostedSpeechError, "redirect refused"):
+                    self.transcriber().transcribe(bytes(640))
+            # One connection to the configured host only; the credential went nowhere else.
+            self.assertEqual([c.host for c in connections], ["transcribe.example.test"])
+            self.assertTrue(connections[0].closed)
 
     def test_units_restore_punctuation_only_when_words_align_and_fall_back_to_segments(self):
         words = [
@@ -979,13 +1107,8 @@ class HostedDiarizerTests(unittest.TestCase):
                 },
             }
         ).encode()
-        seen = []
-
-        def open_request(request, timeout):
-            seen.append(request)
-            return FakeResponse(payload)
-
-        with patch("urllib.request.build_opener", return_value=Mock(open=open_request)):
+        patched, seen = patched_connection(payload)
+        with patched:
             diarizer = self.diarizer()
             for index in range(5):
                 diarizer.push(bytes([index]) * (1000 * BYTES_PER_MS))
@@ -994,15 +1117,15 @@ class HostedDiarizerTests(unittest.TestCase):
             finished = diarizer.finish()
         self.assertEqual(len(seen), 2)
         request = seen[0]
+        self.assertEqual((request.host, request.port), ("api.deepgram.com", 443))
         self.assertEqual(
-            request.full_url,
-            DEEPGRAM_ENDPOINT + "?model=nova-3&diarize_model=latest&mip_opt_out=true",
+            request.target, "/v1/listen?model=nova-3&diarize_model=latest&mip_opt_out=true"
         )
         # Consented audio is excluded from the provider's model improvement program.
-        self.assertIn("mip_opt_out=true", request.full_url)
-        self.assertEqual(request.get_header("Content-type"), "audio/wav")
-        self.assertFalse(request.has_header("Authorization"))
-        with wave.open(io.BytesIO(request.data), "rb") as audio:
+        self.assertIn("mip_opt_out=true", request.target)
+        self.assertEqual(request.headers["Content-Type"], "audio/wav")
+        self.assertTrue(request.closed)
+        with wave.open(io.BytesIO(request.body), "rb") as audio:
             frames = audio.readframes(audio.getnframes())
         # Only the last two seconds (the window) leave the process, never older audio.
         self.assertEqual(
@@ -1022,22 +1145,17 @@ class HostedDiarizerTests(unittest.TestCase):
             diarizer.push(bytes(640))
 
     def test_authorization_uses_the_documented_token_scheme(self):
-        seen = []
-
-        def open_request(request, timeout):
-            seen.append(request.get_header("Authorization"))
-            return FakeResponse(json.dumps(DIARIZED_EMPTY).encode())
-
-        with patch("urllib.request.build_opener", return_value=Mock(open=open_request)):
+        patched, connections = patched_connection(json.dumps(DIARIZED_EMPTY).encode())
+        with patched:
             diarizer = self.diarizer()
             diarizer.push(bytes(640))
             self.assertEqual(diarizer.segments(), [])
-        self.assertEqual(seen, ["Token " + KEY])
+        self.assertEqual([c.headers["Authorization"] for c in connections], ["Token " + KEY])
 
     def test_finish_without_a_pending_utterance_sends_no_audio(self):
-        opener, requests = patched_opener(json.dumps(DIARIZED_EMPTY).encode())
+        patched, requests = patched_connection(json.dumps(DIARIZED_EMPTY).encode())
         turns = []
-        with opener:
+        with patched:
             silent = LiveProcessor(
                 LiveConfig(
                     "silent-finish",
@@ -1068,14 +1186,17 @@ class HostedDiarizerTests(unittest.TestCase):
         self.assertEqual(turns[0].speaker_provenance, "unknown")
 
     def test_silence_without_pushed_audio_and_failures_send_or_reveal_nothing(self):
-        opener, requests = patched_opener(b"{}")
-        with opener:
+        patched, requests = patched_connection(b"{}")
+        with patched:
             self.assertEqual(self.diarizer().segments(), [])
             self.assertEqual(self.diarizer().finish(), [])
         self.assertEqual(requests, [])
-        for error, expected in ((http_error(403), "HTTP 403"), (OSError(PRIVATE), "connection")):
-            opener, _ = patched_opener(error=error)
-            with self.subTest(expected=expected), opener:
+        for options, expected in (
+            (dict(payload=PRIVATE.encode(), status=403), "HTTP 403"),
+            (dict(error=OSError(PRIVATE)), "connection"),
+        ):
+            patched, _ = patched_connection(**options)
+            with self.subTest(expected=expected), patched:
                 diarizer = self.diarizer()
                 diarizer.push(bytes(640))
                 with self.assertRaisesRegex(HostedSpeechError, expected) as caught:

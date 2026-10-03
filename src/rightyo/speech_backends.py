@@ -17,11 +17,10 @@ import math
 import re
 import secrets
 import socket
+import ssl
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import wave
 from typing import Any, Callable
 
@@ -83,13 +82,6 @@ def provenance_id(prefix: str, *parts: str) -> str:
     safe = " ".join(_UNSAFE.sub("-", part) for part in parts)
     budget = 96 - len(prefix) - len(digest) - 2
     return f"{prefix} {safe[:budget].strip()} {digest}"
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req: Any, fp: Any, code: Any, msg: Any, headers: Any, newurl: Any):
-        # Never forward a credential to a redirected endpoint.
-        fp.close()
-        raise HostedSpeechError("Hosted speech redirect refused")
 
 
 def _https_endpoint(value: Any, label: str) -> str:
@@ -188,8 +180,30 @@ def _abort_response(response: Any) -> None:
         pass
 
 
+def _abort_connection(connection: Any) -> None:
+    """Wake any blocked connect/send/recv on the connection's socket, then close it."""
+    sock = getattr(connection, "sock", None)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    try:
+        connection.close()
+    except OSError:
+        pass
+
+
 class _HostedClient:
-    """One consented endpoint: bounded, sanitized, redirect-free, credential at use only."""
+    """One consented endpoint: bounded, sanitized, redirect-free, credential at use only.
+
+    The exchange uses a caller-owned `http.client.HTTPSConnection` rather than an opaque
+    opener, so a stop or the deadline can close the socket from the waiting thread and
+    the helper thread checks an abort flag before sending headers, before sending the
+    audio and before waiting for the response: no audio is uploaded after the caller
+    gave up, and a name lookup that returns late finds the flag set and closes without
+    connecting. Redirects are never followed (a 3xx status is refused).
+    """
 
     def __init__(
         self,
@@ -206,7 +220,6 @@ class _HostedClient:
         self.timeout = _timeout(timeout_seconds)
         self.cancelled = cancelled if cancelled is not None else (lambda: False)
         self.load_key = load_key
-        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
     def _read_body(self, response: Any, deadline: float) -> bytes:
         """Read at most the byte cap, ending early on cancellation or the deadline.
@@ -247,35 +260,59 @@ class _HostedClient:
             raise _ReadFailed
         return outcome["content"]
 
-    def _open(self, request: Any, timeout: float, deadline: float) -> Any:
-        """Open the exchange on a helper thread the caller can stop waiting for.
+    def _exchange(
+        self,
+        connection: Any,
+        target: str,
+        body: bytes,
+        headers: dict[str, str],
+        deadline: float,
+    ) -> Any:
+        """Connect, send and wait for headers on a helper thread the caller can abandon.
 
-        DNS, connect, TLS, the upload and the response headers all happen inside
-        `open`, before any response exists, so the body reader's abort has nothing to
-        act on. The caller polls cancellation and the deadline every 50 ms instead and,
-        on either, stops waiting at once; a response that still arrives on the abandoned
-        thread is closed there. A DNS lookup cannot be interrupted: the daemon thread then
-        ends when the resolver returns, and never holds up the caller or a stop.
+        The caller polls cancellation and the deadline every 50 ms; on either it sets the
+        abort flag, shuts the socket (which makes a blocked connect, send or recv raise
+        on the helper thread) and stops waiting at once. The helper checks the flag
+        before `putrequest`, before sending the body and before `getresponse`, so an
+        abandoned exchange never uploads audio. A name lookup cannot be interrupted: the
+        daemon thread then ends when the resolver returns, without holding up the caller.
         """
+        state = {"abort": False}
         outcome: dict[str, Any] = {}
 
-        def connect() -> None:
+        def run() -> None:
             try:
-                response = self._opener.open(request, timeout=timeout)
+                connection.connect()
+                if state["abort"]:
+                    connection.close()
+                    return
+                connection.putrequest("POST", target)
+                for name, value in headers.items():
+                    connection.putheader(name, value)
+                connection.endheaders()
+                if state["abort"]:
+                    connection.close()
+                    return
+                connection.send(body)
+                if state["abort"]:
+                    connection.close()
+                    return
+                response = connection.getresponse()
+                outcome["response"] = response
+                if state["abort"]:
+                    _abort_response(response)
+                    connection.close()
             except BaseException as error:
                 outcome["error"] = error
-                return
-            outcome["response"] = response
-            if outcome.get("abandoned"):
-                _abort_response(response)
 
-        thread = threading.Thread(target=connect, name="rightyo-hosted-open", daemon=True)
+        thread = threading.Thread(target=run, name="rightyo-hosted-exchange", daemon=True)
         thread.start()
         while thread.is_alive():
             cancelled = self.cancelled()
             remaining = deadline - time.monotonic()
             if cancelled or remaining <= 0:
-                outcome["abandoned"] = True
+                state["abort"] = True
+                _abort_connection(connection)
                 if "response" in outcome:
                     _abort_response(outcome["response"])
                 raise _ReadCancelled if cancelled else _OpenDeadline
@@ -307,17 +344,37 @@ class _HostedClient:
         if remaining <= 0:
             del key
             raise HostedSpeechError(f"{self.label} request exceeded its deadline")
-        request = urllib.request.Request(
-            url, data=body, method="POST", headers={**headers, "Authorization": scheme + key}
-        )
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme != "https" or not parts.hostname:
+            del key
+            raise HostedSpeechError(f"{self.label} requires an https endpoint")
+        target = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+        request_headers = {
+            **headers,
+            "Authorization": scheme + key,
+            "Content-Length": str(len(body)),
+            "Accept": "application/json",
+        }
         del key
         failure = None
         content = b""
-        # urllib's timeout is per operation, so a slowly dripping body could outlive it;
-        # both the open phase and the body read run on helper threads that the
-        # deadline or cancellation stops waiting for.
+        status = None
+        response = None
+        connection = http.client.HTTPSConnection(
+            parts.hostname,
+            parts.port or 443,
+            timeout=max(remaining, MIN_TRANSPORT_SECONDS),
+            context=ssl.create_default_context(),
+        )
+        # Never reconnect behind the caller's back: a socket closed on abort stays closed.
+        connection.auto_open = 0
+        # The transport's timeout is per operation, so a slowly dripping body could
+        # outlive it; the exchange and the body read run on helper threads that the
+        # deadline or cancellation stops waiting for, closing the connection.
         try:
-            with self._open(request, max(remaining, MIN_TRANSPORT_SECONDS), deadline) as response:
+            response = self._exchange(connection, target, body, request_headers, deadline)
+            status = response.status
+            if type(status) is int and 200 <= status <= 299:
                 content = self._read_body(response, deadline)
         except _OpenDeadline:
             failure = f"{self.label} request exceeded its deadline"
@@ -327,29 +384,30 @@ class _HostedClient:
             failure = f"{self.label} request was cancelled"
         except _ReadFailed:
             failure = f"{self.label} connection failed or timed out"
-        except urllib.error.HTTPError as error:
-            try:
-                error.close()
-            except OSError:
-                pass
-            if error.code in (429, 503):
+        except (TimeoutError, socket.timeout, OSError, http.client.HTTPException):
+            failure = f"{self.label} connection failed or timed out"
+        finally:
+            request_headers.pop("Authorization", None)
+            if response is not None:
+                try:
+                    response.close()
+                except OSError:
+                    pass
+            _abort_connection(connection)
+        if (
+            failure is None
+            and status is not None
+            and not (type(status) is int and 200 <= status <= 299)
+        ):
+            if type(status) is int and 300 <= status <= 399:
+                # Never follow a redirect: the credential must not reach another host.
+                failure = f"{self.label} redirect refused"
+            elif status in (429, 503):
                 failure = f"{self.label} temporarily unavailable; no automatic retry"
-            elif type(error.code) is int and 100 <= error.code <= 599:
-                failure = f"{self.label} request failed (HTTP {error.code})"
+            elif type(status) is int and 100 <= status <= 599:
+                failure = f"{self.label} request failed (HTTP {status})"
             else:
                 failure = f"{self.label} request failed"
-        except (
-            urllib.error.URLError,
-            TimeoutError,
-            socket.timeout,
-            OSError,
-            http.client.HTTPException,
-        ):
-            failure = f"{self.label} connection failed or timed out"
-        except HostedSpeechError:
-            failure = f"{self.label} redirect refused"
-        finally:
-            request.remove_header("Authorization")
         # Raise outside the handlers so reflected bodies never survive as __context__.
         if failure is not None:
             raise HostedSpeechError(failure)
