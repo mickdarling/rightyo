@@ -44,6 +44,14 @@ DIARIZER_KINDS = ("nemotron.cpp", "hosted-deepgram")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
 _LANGUAGE = re.compile(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?")
 _UNSAFE = re.compile(r"[^A-Za-z0-9_. -]")
+# Endpoint pieces: printable ASCII with no whitespace or controls; a DNS hostname
+# (IDNA names in their ASCII form); an RFC 3986 path of segments of `pchar`.
+_VISIBLE = re.compile(r"[\x21-\x7e]+")
+_HOSTNAME = re.compile(
+    r"(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?"
+)
+_PATH = re.compile(r"(?:/(?:[A-Za-z0-9\-._~!$&'()*+,;=:@]|%[0-9A-Fa-f]{2})*)*")
 MERGE_GAP_MS = 300  # same-speaker words further apart than this stay separate segments
 MAX_STALLED_CONNECTS = 4  # abandoned resolver threads the process tolerates before refusing
 # Helper threads abandoned inside a name lookup, shared by every client so that a
@@ -97,7 +105,7 @@ def _https_endpoint(value: Any, label: str) -> str:
     if (
         isinstance(value, str)
         and len(value) <= 2048
-        and value.isascii()
+        and _VISIBLE.fullmatch(value)
         and not set(value) & set("?#")
     ):
         try:
@@ -116,6 +124,9 @@ def _https_endpoint(value: Any, label: str) -> str:
         or parts.password is not None
         or parts.query
         or parts.fragment
+        or "@" in parts.netloc
+        or not _HOSTNAME.fullmatch(parts.hostname)
+        or not _PATH.fullmatch(parts.path)
     ):
         # Query and fragment are refused: the backend appends its own query string.
         raise LiveAudioError(f"{label} requires an https endpoint")

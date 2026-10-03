@@ -589,6 +589,14 @@ class HostedTranscriberTests(unittest.TestCase):
             ENDPOINT.replace("example.test", "example.test:notaport"),
             ENDPOINT.replace("example.test", "example.test:99999"),
             ENDPOINT.replace("example.test", "example.test:0"),
+            ENDPOINT.replace("audio/", "audio /"),
+            ENDPOINT.replace("audio/", "audio\t/"),
+            ENDPOINT + "\n",
+            ENDPOINT.replace("https://", "https://user@"),
+            ENDPOINT.replace("https://", "https://@"),
+            ENDPOINT.replace("example.test", "exa_mple.test"),
+            ENDPOINT.replace("audio/", 'audio"/'),
+            ENDPOINT.replace("audio/", "audio\x7f/"),
             5,
         ):
             with self.subTest(endpoint=endpoint), self.assertRaisesRegex(LiveAudioError, "https"):
@@ -653,6 +661,16 @@ class HostedTranscriberTests(unittest.TestCase):
             )
             self.assertEqual(audio.readframes(audio.getnframes()), pcm)
         self.assertEqual(parts[-1], b"--\r\n")
+
+    def test_valid_endpoints_with_rfc3986_paths_are_accepted(self):
+        for endpoint in (
+            ENDPOINT,
+            "https://xn--bcher-kva.example/v1/audio/transcriptions",
+            "https://10.0.0.5:8443/v1/a%20b/x-y_z~.;v=1",
+            "https://api.example.test",
+        ):
+            with self.subTest(endpoint=endpoint):
+                self.assertEqual(self.transcriber(endpoint=endpoint).endpoint, endpoint)
 
     def test_an_explicit_port_is_accepted_and_used(self):
         patched, connections = patched_connection(b'{"text": ""}')
