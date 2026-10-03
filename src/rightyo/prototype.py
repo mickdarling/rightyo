@@ -70,6 +70,37 @@ class PrototypeError(ValueError):
     """A safe configuration or control error."""
 
 
+class DecisionConfigError(PrototypeError):
+    """An invalid `decision` section; its message names the rule rather than a value."""
+
+
+DECISION_PROVIDERS = ("mock", "jev")
+
+
+def decision_spec(value: Any) -> bool:
+    """Whether a configuration `decision` section selects hosted Jev decisions.
+
+    The section is the file form of `listen --use-jev --allow-hosted`: both keys are
+    required and exactly typed, and consent must match the provider, as on the CLI.
+    """
+    if not isinstance(value, dict):
+        raise DecisionConfigError("The decision section must be an object")
+    if set(value) != {"provider", "allow_hosted"}:
+        raise DecisionConfigError(
+            "The decision section requires exactly the keys provider and allow_hosted"
+        )
+    provider, allow_hosted = value["provider"], value["allow_hosted"]
+    if type(provider) is not str or provider not in DECISION_PROVIDERS:
+        raise DecisionConfigError("Unknown decision provider; expected mock or jev")
+    if type(allow_hosted) is not bool:
+        raise DecisionConfigError("The decision allow_hosted value must be true or false")
+    if provider == "jev" and not allow_hosted:
+        raise DecisionConfigError('The jev decision provider requires "allow_hosted": true')
+    if provider == "mock" and allow_hosted:
+        raise DecisionConfigError('"allow_hosted": true applies only to the jev decision provider')
+    return provider == "jev"
+
+
 def _reject_constant(_value):
     raise ValueError("Invalid JSON constant")
 
@@ -99,6 +130,8 @@ class PrototypeConfig:
     # Validated `transcriber`/`diarizer` sections; the defaults are the local backends.
     transcriber: dict[str, Any] = field(default_factory=lambda: transcriber_spec(None))
     diarizer: dict[str, Any] = field(default_factory=lambda: diarizer_spec(None))
+    # The optional `decision` section: hosted Jev decisions with their consent, for `listen`.
+    hosted_decisions: bool = False
 
     @property
     def hosted_speech(self) -> bool:
@@ -117,6 +150,7 @@ class PrototypeConfig:
                 raise ValueError
             transcriber = transcriber_spec(raw.pop("transcriber", None))
             diarizer = diarizer_spec(raw.pop("diarizer", None))
+            hosted_decisions = "decision" in raw and decision_spec(raw.pop("decision"))
             required = {"microphone_helper"}
             if not is_hosted(transcriber):
                 required |= {"whisper_executable", "whisper_model"}
@@ -159,10 +193,13 @@ class PrototypeConfig:
                 request_former=forming,
                 transcriber=transcriber,
                 diarizer=diarizer,
+                hosted_decisions=hosted_decisions,
             )
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
             return config
+        except DecisionConfigError:
+            raise
         except (OSError, ValueError, TypeError, UnicodeError, RecursionError):
             raise PrototypeError(
                 "Prototype requires an existing local asset configuration"

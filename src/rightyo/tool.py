@@ -127,11 +127,15 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
     output = sys.stdout if output is None else output
     addressing = addressing_from_args(args)
     config = PrototypeConfig.load(Path(args.config))
+    # The configuration's `decision` section is the file form of --use-jev --allow-hosted
+    # (both validated at load). Flags still apply on their own; neither source can turn
+    # the other's Jev selection off, and the section never consents to hosted speech.
+    use_jev = args.use_jev or config.hosted_decisions
     # --allow-hosted is the one consent for sending text (Jev) or audio (configured
     # hosted speech backends); it is meaningless, and refused, without either.
     if config.hosted_speech and not args.allow_hosted:
         raise PrototypeError("Hosted speech backends require --allow-hosted")
-    if args.allow_hosted and not (args.use_jev or config.hosted_speech):
+    if args.allow_hosted and not (use_jev or config.hosted_speech):
         raise PrototypeError("--allow-hosted requires --use-jev or a hosted speech backend")
     if addressing is not None:
         # Command-line names take precedence over the configuration file's names.
@@ -161,7 +165,7 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
 
         signal.signal(signal.SIGTERM, interrupted)
     try:
-        options = {"mode": args.mode, "use_jev": args.use_jev}
+        options = {"mode": args.mode, "use_jev": use_jev}
         if args.session_id is not None:
             options["session_id"] = args.session_id
         controller.start(options)
