@@ -179,7 +179,7 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
     except KeyboardInterrupt:
         controller.stop()
         _emit(controller.drain_events(), output)
-        return 0
+        return 2 if getattr(controller, "input_overrun", False) else 0
     finally:
         controller.close()
         if previous is not None:

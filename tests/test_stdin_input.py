@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import signal
 import tempfile
 import threading
 import time
@@ -266,41 +268,62 @@ class StdinListenTests(unittest.TestCase):
         self.assertEqual((code, events[-1]["phase"]), (0, "stopped"))
         self.assertLess(events[-1]["emitted_at_ms"], 1000)
 
-    def test_overrun_finalizes_then_fails_closed_with_a_reason_and_nonzero_exit(self):
-        chunk = PCM_CHUNK_BYTES
+    def _overrun_session(self, chunks, queue_chunks, delay, during=None):
         output, diagnostics, captures = io.StringIO(), io.StringIO(), []
 
         def capture_factory(*args, **kwargs):
-            captures.append(StdinPcmCapture(*args, queue_chunks=2, **kwargs))
+            captures.append(StdinPcmCapture(*args, queue_chunks=queue_chunks, **kwargs))
             return captures[-1]
 
-        # A fast finite input of ten chunks into a queue of two, with a slow consumer.
+        # A fast finite input into a small queue, with a slow consumer.
         with patch("rightyo.prototype.StdinPcmCapture", capture_factory):
-            with patch.object(Processor, "push_pcm16", slow_push(Processor.push_pcm16)):
-                with contextlib.redirect_stderr(diagnostics):
-                    code = listen(
-                        self.args,
-                        output=output,
-                        controller_factory=self.factory,
-                        audio_input=io.BytesIO(bytes(10 * chunk)),
-                    )
+            with patch.object(Processor, "push_pcm16", slow_push(Processor.push_pcm16, delay)):
+                with patch.object(Processor, "finish", clipped_finish):
+                    if during is not None:
+                        threading.Thread(target=during, args=(captures,), daemon=True).start()
+                    with contextlib.redirect_stderr(diagnostics):
+                        code = listen(
+                            self.args,
+                            output=output,
+                            controller_factory=self.factory,
+                            audio_input=io.BytesIO(bytes(chunks * PCM_CHUNK_BYTES)),
+                        )
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        return code, captures[0], events, diagnostics.getvalue()
+
+    def test_overrun_discards_the_clipped_utterance_and_fails_closed(self):
+        code, capture, events, diagnostics = self._overrun_session(20, 6, 0.05)
         self.assertEqual(code, 2)
         (processor,) = Processor.instances
-        dropped = captures[0].dropped_bytes
-        self.assertGreater(dropped, 0)
-        # Only contiguous pre-drop audio was processed; the open utterance was finalized.
-        self.assertLess(len(processor.received) + dropped, 10 * chunk)
-        self.assertTrue(processor.finished and processor.closed)
-        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertTrue(capture.overrun)
+        # The clipped open utterance is never finalized; turns finalized before it stand.
+        self.assertFalse(processor.finished)
+        self.assertTrue(processor.closed)
+        texts = [e["turn"]["utterance_id"] for e in events if e["type"] == "transcript"]
+        self.assertEqual(texts, ["stdin-5"])
+        self.assertFalse(any(e["type"] in {"attention", "request"} for e in events))
         self.assertEqual(
             (events[-1]["type"], events[-1]["phase"], events[-1]["reason"]),
             ("session", "error", "input-overrun"),
         )
         self.assertEqual(
             events[-1]["input_gaps"],
-            {"gaps": 1, "dropped_bytes": dropped, "discarded_tail_bytes": 0},
+            {"gaps": 1, "dropped_bytes": capture.dropped_bytes, "discarded_tail_bytes": 0},
         )
-        self.assertIn("overran", diagnostics.getvalue())
+        self.assertIn("overran", diagnostics)
+
+    def test_sigterm_after_an_overrun_still_reports_the_overrun(self):
+        def terminate_after_overrun(captures):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not (captures and captures[0].overrun):
+                time.sleep(0.01)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        # The consumer is still working through the queue when SIGTERM arrives.
+        code, capture, events, _ = self._overrun_session(10, 2, 0.5, terminate_after_overrun)
+        self.assertTrue(capture.overrun)
+        self.assertEqual(code, 2)
+        self.assertEqual((events[-1]["phase"], events[-1]["reason"]), ("error", "input-overrun"))
 
     def test_stop_with_a_blocked_reader_never_lets_it_feed_a_later_session(self):
         stream = Gated([bytes(PCM_CHUNK_BYTES)], gate_at=0)
@@ -334,12 +357,33 @@ class StdinListenTests(unittest.TestCase):
         self.assertEqual([bytes(p.received) for p in Processor.instances], [b""])
 
 
-def slow_push(push):
+def slow_push(push, delay=0.05):
     def slowed(self, pcm):
-        time.sleep(0.05)
+        time.sleep(delay)
         push(self, pcm)
 
     return slowed
+
+
+def clipped_finish(self):
+    """A finish that would emit the open utterance; overrun sessions must never call it."""
+    self.finished = True
+    self.callback(
+        Turn(
+            self.config.session_id,
+            "clipped",
+            1,
+            0,
+            len(self.received) // 32,
+            "Rightyo, delete every",
+            "Speaker A",
+            True,
+            False,
+            "authored-fixture",
+            self.config.provenance,
+            "authored-fixture",
+        )
+    )
 
 
 if __name__ == "__main__":

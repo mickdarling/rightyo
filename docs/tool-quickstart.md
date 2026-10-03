@@ -68,10 +68,12 @@ event adds a top-level `audio_input` object
 (`{"source": "stdin", "encoding": "s16le", "sample_rate": 16000, "channels": 1}`) beside
 the unchanged capability set. At most 32 seconds of audio is queued. If processing falls
 further behind, the input overruns and the session fails closed. RightyO stops reading,
-drops the unqueued audio, processes the audio already queued, and finalizes the open
-utterance. It then ends with a `session` `error` event with reason `input-overrun` and
-exits non-zero. No audio after the drop reaches speech recognition or the diarizer, so
-speech is never spliced across a gap and speaker labels stay consistent for the session.
+drops the unqueued audio, and processes the audio already queued. Turns finalized before
+the drop stand. The open utterance is clipped mid-speech, so it is discarded and never
+emitted. The session then ends with a `session` `error` event with reason
+`input-overrun` and exits non-zero, even if it is stopped or sent SIGTERM while finishing.
+No audio after the drop reaches speech recognition or the diarizer, so speech is never
+spliced across a gap and speaker labels stay consistent for the session.
 A notice goes to stderr. The terminal session event of every stdin session carries
 `input_gaps` (`gaps`, 0 or 1; `dropped_bytes`; `discarded_tail_bytes`).
 

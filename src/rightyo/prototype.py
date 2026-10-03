@@ -496,13 +496,15 @@ class PrototypeController:
                 while accepted and not stop.is_set():
                     pcm = capture.read(timeout=0.25)
                     if pcm == b"":
-                        # EOF or overrun: finalize the open utterance from contiguous audio.
-                        # An overrun then ends the session as an error (see _event_end).
+                        # EOF finalizes the open utterance. After an overrun it is clipped
+                        # mid-speech, so close() discards it instead; turns finalized
+                        # before the drop stand, and the session ends as an error.
                         break
                     if pcm:
                         accepted = self._feed(generation, processor, pcm, mode)
                 if accepted and not stop.is_set():
-                    processor.finish()
+                    if not capture.overrun:
+                        processor.finish()
                     with self._lock:
                         if generation == self._generation:
                             self._phase = "finishing" if self._pending else "complete"
@@ -833,9 +835,9 @@ class PrototypeController:
             capture = self._stdin_capture
             gaps = None
             if capture is not None:
-                if capture.overrun and phase == "stopped":
+                if capture.overrun and phase in {"stopped", "cancelled"}:
                     # Dropped audio would splice speech across a gap and corrupt the
-                    # session-persistent diarizer state: fail closed after finalizing.
+                    # session-persistent diarizer state: fail closed, even on a later Stop.
                     phase, reason = "error", "input-overrun"
                 gaps = {
                     "gaps": int(capture.overrun),
