@@ -123,11 +123,10 @@ requests. Expiry also removes stale context while awaiting a decision.
 cutoff, capacity/expiry counts and whole-turn boundary policy. It is not a claim
 that every retained turn is included: overlap filtering or subsequent expiry can
 reduce the handoff. Compare the supplied turns themselves for actual coverage.
-Two per-session counts end a native session with a distinct error and require a new
-session identity: 1,000 unique finalized turns, and the native diarizer's whole-session
-speaker timeline of at most 18,000 segments, which is returned in full at every utterance
-and so is reached by very long sessions with frequent speaker changes (a windowed timeline
-is tracked in [#54](https://github.com/mickdarling/rightyo/issues/54)).
+One per-session count ends a native session with a distinct error and requires a new
+session identity: 1,000 unique finalized turns. The native diarizer returns only the
+trailing 60 seconds of its speaker timeline at each utterance, so it adds no session-length
+limit ([#54](https://github.com/mickdarling/rightyo/issues/54)).
 The default history is five minutes, with 1,000 unique turns and 1 MiB of retained
 transcript data. There are additional independent bounds: at most 32 frozen pending
 contexts totalling 1 MiB, 128 queued events (configurable from 5 to 128) totalling

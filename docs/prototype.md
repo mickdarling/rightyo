@@ -132,7 +132,8 @@ request, so with this backend Speaker A in one utterance is not known to be the 
 person as Speaker A in the next; its turns carry `speaker_provenance:
 "diarization-utterance"` with utterance-namespaced labels such as `u7 Speaker A`, and
 the native Nemotron stream is the only backend whose
-labels persist for the session. The 18,000-segment timeline cap does not apply to it.
+labels persist for the session. The Deepgram backend sends and diarizes only a trailing
+utterance window.
 A hosted request's Keychain credential lookup and whole exchange share a wall-clock
 deadline of `timeout_seconds`; a stop is honoured during the lookup and within about 50 ms
 while the connection is opened or the body is read, and a mid-body pause shorter than the
@@ -181,10 +182,9 @@ including turns already expired or evicted. Hash-only duplicate bookkeeping keep
 session bound; word-timed ASR fragments each count as a turn, so fragmented speech can
 reach it well within a long ambient session. Reaching 1,000 turns stops processing with
 an explicit message to start a new session, preserving valid history until expiry or Stop.
-The native diarizer separately keeps one whole-session speaker timeline capped at 18,000
-segments, returned in full at every utterance; very long sessions with frequent speaker
-changes reach it, stop with a distinct timeline-limit message, and likewise need a new
-session. A windowed timeline is tracked in [#54](https://github.com/mickdarling/rightyo/issues/54).
+The native diarizer returns only the trailing 60 seconds of its speaker timeline at each
+utterance (an utterance spans at most 15 seconds), so it imposes no session-length limit
+([#54](https://github.com/mickdarling/rightyo/issues/54)).
 The whole turn overlapping the time boundary is retained and its overlap is reported. Ignore and uncertain decisions remain in local context: a later
 request can refer to the preceding discussion. Copy context produces speaker-labelled text
 for manual use downstream, including unknown-speaker and overlap indications.

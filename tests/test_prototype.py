@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 from rightyo.contracts import Turn
 from rightyo.credentials import CredentialError
-from rightyo.live_audio import DiarizerTimelineLimitError, LiveAudioError
+from rightyo.live_audio import LiveAudioError
 from rightyo.memory import MemorySessionLimitError
 from rightyo.prototype import (
     PrototypeConfig,
@@ -283,7 +283,6 @@ class ControllerTests(unittest.TestCase):
             LiveAudioError,
             RuntimeError,
             MemorySessionLimitError,
-            DiarizerTimelineLimitError,
         ):
             with self.subTest(failure=failure):
                 provider = FakeHosted()
@@ -295,8 +294,6 @@ class ControllerTests(unittest.TestCase):
                 class FailingProcessor(FakeProcessor):
                     def push_pcm16(self, pcm):
                         if self.index == 2:
-                            if failure is DiarizerTimelineLimitError:
-                                raise failure()
                             raise failure("synthetic-private-audio-detail")
                         super().push_pcm16(pcm)
                         if self.index == 1 and not provider.entered.wait(1):
@@ -323,11 +320,6 @@ class ControllerTests(unittest.TestCase):
                     self.assertEqual(
                         snapshot["error"],
                         "Session reached its 1,000-turn limit; start a new session.",
-                    )
-                elif failure is DiarizerTimelineLimitError:
-                    self.assertEqual(
-                        snapshot["error"],
-                        "Session reached the speaker timeline limit; start a new session.",
                     )
                 else:
                     self.assertNotIn("limit", snapshot["error"])
