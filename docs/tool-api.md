@@ -88,7 +88,9 @@ below, the per-utterance audio window, and the per-session unique-turn count.
 `turn` uses the existing validated `Turn` contract: `session_id`, `utterance_id`,
 `revision`, `start_ms`, `end_ms`, `text`, nullable `speaker_id`, `finalized`,
 `overlap`, `recognizer_id`, `provenance`, and `speaker_provenance`. Current emitted
-turns are final. Labels are anonymous within a session, not verified identities;
+turns are final. Labels are anonymous within a session, not verified identities; they
+are numbered like spreadsheet columns (`Speaker A`..`Speaker Z`, then `Speaker AA`,
+`Speaker AB`, ...), so a backend reporting more than 26 voices still yields valid labels;
 overlap and unknown speakers retain their explicit meaning. Provenance distinguishes
 `synthetic`, `recorded-file`, `causal-replay`, and `live-microphone`.
 `speaker_provenance` says how far a label reaches: `diarization-timeline` labels come

@@ -117,6 +117,8 @@ def http_error(code, body=PRIVATE.encode()):
 
 
 class StubDiarizer:
+    speaker = 2
+
     def __init__(self, config=None):
         self.frames = []
         self.closed = False
@@ -125,7 +127,8 @@ class StubDiarizer:
         self.frames.append(pcm)
 
     def segments(self):
-        return [{"start_ms": 0, "end_ms": 900000, "speaker": 2}]
+        pushed_ms = sum(map(len, self.frames)) // BYTES_PER_MS
+        return [{"start_ms": 0, "end_ms": pushed_ms, "speaker": self.speaker}]
 
     def finish(self):
         return self.segments()
@@ -275,6 +278,66 @@ class ProtocolAndSelectionTests(unittest.TestCase):
                 processor.finish()
                 self.assertEqual(len(turns), 1)
 
+    def test_adapter_timelines_are_validated_at_the_common_boundary(self):
+        cases = {
+            "end past the stream": [{"start_ms": 0, "end_ms": 900000, "speaker": 1}],
+            "negative start": [{"start_ms": -1, "end_ms": 100, "speaker": 1}],
+            "reversed": [{"start_ms": 150, "end_ms": 100, "speaker": 1}],
+            "float": [{"start_ms": 0.0, "end_ms": 100, "speaker": 1}],
+            "speaker zero": [{"start_ms": 0, "end_ms": 100, "speaker": 0}],
+            "speaker too large": [{"start_ms": 0, "end_ms": 100, "speaker": 703}],
+            "not a dict": ["segment"],
+            "not a list": {"start_ms": 0, "end_ms": 100, "speaker": 1},
+            "over count": [{"start_ms": 0, "end_ms": 1, "speaker": 1}] * 18001,
+        }
+        for name, timeline in cases.items():
+            with self.subTest(case=name):
+                turns = []
+                diarizer = StubDiarizer()
+                diarizer.segments = lambda timeline=timeline: timeline
+                processor = LiveProcessor(
+                    LiveConfig(
+                        "timeline-test",
+                        provenance="causal-replay",
+                        transcriber=StubTranscriber(),
+                        diarizer=diarizer,
+                    ),
+                    turns.append,
+                )
+                for _ in range(10):
+                    processor.push_pcm16(VOICE)
+                with self.assertRaisesRegex(LiveAudioError, "diarizer timeline"):
+                    processor.finish()
+                self.assertTrue(processor.failed)
+                self.assertEqual(turns, [])
+
+    def test_speaker_numbers_beyond_z_become_column_style_labels(self):
+        from rightyo.live_audio import _speaker_label
+
+        expected = {1: "A", 26: "Z", 27: "AA", 28: "AB", 52: "AZ", 53: "BA", 702: "ZZ"}
+        for number, label in expected.items():
+            self.assertEqual(_speaker_label(number), label)
+        turns = []
+        for number in (26, 27, 52, 53, 702):
+            with self.subTest(speaker=number):
+                turns.clear()
+                diarizer = StubDiarizer()
+                diarizer.speaker = number
+                processor = LiveProcessor(
+                    LiveConfig(
+                        "label-test",
+                        provenance="causal-replay",
+                        transcriber=StubTranscriber(),
+                        diarizer=diarizer,
+                    ),
+                    turns.append,
+                )
+                for _ in range(10):
+                    processor.push_pcm16(VOICE)
+                processor.finish()
+                self.assertEqual(turns[0].speaker_id, "Speaker " + expected[number])
+                identifier(turns[0].speaker_id, "speaker_id")
+
     def test_adapter_units_are_validated_at_the_common_boundary(self):
         duration = 10 * 640 // BYTES_PER_MS
         cases = {
@@ -332,7 +395,7 @@ class ProtocolAndSelectionTests(unittest.TestCase):
         turns = []
         per_utterance = StubDiarizer()
         per_utterance.speaker_provenance = "diarization-utterance"
-        per_utterance.segments = lambda: [{"start_ms": 0, "end_ms": 900000, "speaker": 1}]
+        per_utterance.speaker = 1
         processor = LiveProcessor(
             LiveConfig(
                 "namespace-test",

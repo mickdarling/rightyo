@@ -36,6 +36,7 @@ FRAME_BYTES = 640  # 20 ms of mono signed little-endian PCM16
 BYTES_PER_MS = 32  # mono PCM16 at 16 kHz
 MAX_CHUNK_BYTES = 32000  # one second of audio per push
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_SPEAKER = 702  # "Speaker A" .. "Speaker ZZ"; native streams use 1..8
 
 
 class LiveAudioError(ValueError):
@@ -464,7 +465,41 @@ def _attribute(start: int, end: int, timeline: list[dict[str, Any]]) -> tuple[st
     if ambiguous or len(speakers) != 1:
         return None, overlap
     # Native channels are arrival-ordered and persist for the whole session.
-    return "Speaker " + chr(64 + next(iter(speakers))), overlap
+    return "Speaker " + _speaker_label(next(iter(speakers))), overlap
+
+
+def _speaker_label(number: int) -> str:
+    """Spreadsheet-column letters: 1..26 -> A..Z (unchanged), 27 -> AA, 52 -> AZ, 53 -> BA."""
+    letters = ""
+    while number > 0:
+        number, remainder = divmod(number - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
+def _check_timeline(timeline: Any, received_ms: int) -> None:
+    """Enforce the `Diarizer` contract at the common boundary, whatever the backend.
+
+    A list of at most 18,000 dicts, each with integer `0 <= start_ms <= end_ms` within
+    the audio received so far plus one second of lookahead (the native stream's own
+    bound) and a positive integer `speaker` no greater than `MAX_SPEAKER`. Order is not
+    required: attribution intersects intervals and the native ABI promises none.
+    """
+    if not isinstance(timeline, list) or len(timeline) > 18000:
+        raise LiveAudioError("Invalid diarizer timeline")
+    horizon = received_ms + 1000
+    for segment in timeline:
+        if not isinstance(segment, dict):
+            raise LiveAudioError("Invalid diarizer timeline")
+        start, end, speaker = (segment.get(k) for k in ("start_ms", "end_ms", "speaker"))
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or type(speaker) is not int
+            or not 0 <= start <= end <= horizon
+            or not 1 <= speaker <= MAX_SPEAKER
+        ):
+            raise LiveAudioError("Invalid diarizer timeline")
 
 
 def _terminate(process: subprocess.Popen) -> None:
@@ -740,6 +775,7 @@ class LiveProcessor:
     def _finalize(self, timeline: list[dict[str, Any]]) -> None:
         if not self._utterance:
             return
+        _check_timeline(timeline, self._received_ms)
         pcm = bytes(self._utterance)
         offset = self._utterance_start
         self._utterance.clear()

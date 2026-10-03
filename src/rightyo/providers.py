@@ -86,8 +86,12 @@ class Transcriber(Protocol):
 class Diarizer(Protocol):
     """Stream-relative anonymous speaker timeline over pushed mono 16 kHz PCM16 audio.
 
-    `segments` and `finish` return `{"speaker": int >= 1, "start_ms", "end_ms"}` entries
-    in stream milliseconds; `finish` flushes any lookahead first. Whether labels stay
+    `segments` and `finish` return `{"speaker": int, "start_ms", "end_ms"}` entries in
+    stream milliseconds with `0 <= start_ms <= end_ms` no later than one second past the
+    audio pushed so far and `1 <= speaker <= 702`; `finish` flushes any lookahead first.
+    Speaker numbers become labels like spreadsheet columns: 1..26 are `Speaker A`..
+    `Speaker Z`, 27 is `Speaker AA`, 52 `Speaker AZ`, 53 `Speaker BA`. The processor
+    validates every returned timeline and fails closed on anything else. Whether labels stay
     stable across utterances is a property of the implementation: an implementation
     whose labels hold only within one utterance declares `speaker_provenance =
     "diarization-utterance"`; without the attribute, turns carry the session-stable
