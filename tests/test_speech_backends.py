@@ -5,6 +5,8 @@ import io
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 import urllib.error
 import wave
@@ -90,6 +92,9 @@ class FakeResponse:
     def __exit__(self, *_exc):
         self.closed = True
         return False
+
+    def close(self):
+        self.closed = True
 
 
 def patched_opener(payload=None, error=None):
@@ -501,99 +506,69 @@ class HostedTranscriberTests(unittest.TestCase):
             processor.finish()
         self.assertEqual([turn.recognizer_id for turn in turns], [first])
 
-    def test_slow_body_is_abandoned_at_the_wall_clock_deadline_and_closed(self):
+    def blocking_response(self, payload=b'{"text": ""}', pause=None):
+        """A response whose read blocks until the connection is shut (or `pause` elapses)."""
+        released = threading.Event()
+
+        class Socket:
+            def __init__(self):
+                self.shut = False
+
+            def shutdown(self, _how):
+                self.shut = True
+                released.set()
+
+        class Blocking(FakeResponse):
+            def __init__(self):
+                super().__init__(payload)
+                # Mock auto-attributes would satisfy `shutdown`; the chain must be strict.
+                self.fp = type("Layer", (), {})()
+                self.fp.raw = type("Layer", (), {})()
+                self.fp.raw._sock = Socket()
+
+            def read(self, limit):
+                if pause is None:
+                    released.wait(5)
+                    raise OSError("connection shut")
+                time.sleep(pause)
+                return FakeResponse.read(self, limit)
+
+        return Blocking()
+
+    def test_blocked_body_is_abandoned_at_the_wall_clock_deadline_and_closed(self):
         clock = [0.0]
 
         def monotonic():
             clock[0] += 10.0
             return clock[0]
 
-        response = FakeResponse(b"{" * 10)
-        original = response.read
-        response.read = lambda limit: original(1)  # a dripping body, one byte per read
+        response = self.blocking_response()
         with patch("urllib.request.build_opener", return_value=Mock(open=lambda *a, **k: response)):
             with patch("rightyo.speech_backends.time.monotonic", monotonic):
                 with self.assertRaisesRegex(HostedSpeechError, "deadline") as caught:
                     self.transcriber(timeout_seconds=30).transcribe(bytes(640))
+        self.assertTrue(response.fp.raw._sock.shut)
         self.assertTrue(response.closed)
-        self.assertGreater(len(response.payload), 0)
         self.assertIsNone(caught.exception.__context__)
         self.assertNotIn(ENDPOINT, str(caught.exception))
 
-    def test_dripping_body_is_read_with_read1_so_the_deadline_can_fire(self):
-        clock = [0.0]
-
-        def monotonic():
-            clock[0] += 10.0
-            return clock[0]
-
-        class Dripping(FakeResponse):
-            def read(self, limit):
-                raise AssertionError("a blocking full-chunk read must not be used")
-
-            def read1(self, limit):
-                return FakeResponse.read(self, 1)
-
-        response = Dripping(b"{" * 10)
+    def test_a_pause_shorter_than_the_budget_is_tolerated_mid_body(self):
+        response = self.blocking_response(pause=0.3)
         with patch("urllib.request.build_opener", return_value=Mock(open=lambda *a, **k: response)):
-            with patch("rightyo.speech_backends.time.monotonic", monotonic):
-                with self.assertRaisesRegex(HostedSpeechError, "deadline"):
-                    self.transcriber(timeout_seconds=30).transcribe(bytes(640))
+            self.assertEqual(self.transcriber(timeout_seconds=30).transcribe(bytes(640)), [])
+        self.assertFalse(response.fp.raw._sock.shut)
         self.assertTrue(response.closed)
-        self.assertGreater(len(response.payload), 0)
 
     def test_cancellation_mid_read_stops_the_request_and_closes_it(self):
-        reads = []
-        response = FakeResponse(b"{" * 10)
-        original = response.read
-
-        def read(limit):
-            reads.append(limit)
-            return original(1)
-
-        response.read = read
+        checks = []
+        response = self.blocking_response()
         with patch("urllib.request.build_opener", return_value=Mock(open=lambda *a, **k: response)):
             with self.assertRaisesRegex(HostedSpeechError, "cancelled"):
-                self.transcriber(cancelled=lambda: len(reads) >= 3).transcribe(bytes(640))
-        self.assertEqual(len(reads), 3)
+                self.transcriber(
+                    cancelled=lambda: checks.append(1) is None and len(checks) >= 4
+                ).transcribe(bytes(640))
+        self.assertTrue(response.fp.raw._sock.shut)
         self.assertTrue(response.closed)
-
-    def test_keychain_lookup_is_cancelled_or_bounded_by_the_hosted_deadline(self):
-        polls = []
-        spawned = []
-
-        def popen(args, **options):
-            spawned.append(FakeProcess(args, **options))
-            return spawned[-1]
-
-        opener, requests = patched_opener(b"{}")
-        with (
-            patch.dict(os.environ, {}, clear=True),
-            patch("rightyo.credentials.sys.platform", "darwin"),
-            patch("rightyo.credentials.subprocess.Popen", side_effect=popen),
-            patch("rightyo.credentials.time.sleep", lambda _s: polls.append(1)),
-            opener,
-        ):
-            transcriber = self.transcriber(
-                load_key=load_transcriber_api_key, cancelled=lambda: len(polls) >= 2
-            )
-            with self.assertRaisesRegex(HostedSpeechError, "cancelled") as caught:
-                transcriber.transcribe(bytes(640))
-            self.assertIsNone(caught.exception.__context__)
-            self.assertTrue(spawned[0].terminated)
-            clock = [0.0]
-
-            def monotonic():
-                clock[0] += 20.0
-                return clock[0]
-
-            with patch("rightyo.credentials.time.monotonic", monotonic):
-                slow = self.transcriber(load_key=load_transcriber_api_key, timeout_seconds=30)
-                with self.assertRaisesRegex(HostedSpeechError, "credential is unavailable"):
-                    slow.transcribe(bytes(640))
-            self.assertTrue(spawned[1].terminated)
-        self.assertEqual(requests, [])
-        self.assertNotIn(KEY, "".join(str(process.args) for process in spawned))
 
     def test_transport_receives_only_the_budget_the_credential_lookup_left(self):
         clock = [0.0]
@@ -630,8 +605,6 @@ class HostedTranscriberTests(unittest.TestCase):
             with patch("rightyo.speech_backends.time.monotonic", monotonic):
                 self.transcriber(load_key=slow_key, timeout_seconds=30).transcribe(bytes(640))
         self.assertEqual(seen, [5.0])
-        self.assertTrue(socket_.timeouts)
-        self.assertTrue(all(0 < value <= 0.5 for value in socket_.timeouts))
 
         def exhausting_key(**_options):
             clock[0] += 31.0

@@ -322,12 +322,13 @@ distinguishable in exported events, and the endpoint never appears.
 (`hosted-deepgram <model> <diarize_model> <hash>`) while `speaker_provenance` keeps its
 allowlisted value. The hosted transcriber ignores the `register` cancellation hook: the
 `cancelled` guard is checked before each request, during a login Keychain credential
-lookup and between body chunks, and the credential lookup plus the body read share one
-wall-clock deadline of `timeout_seconds` (default 30, at most 120) from the start of the
-request; a Keychain lookup that is cancelled or outlives the deadline is terminated. Connection, TLS and response-header waits each use the same
-value as an inactivity timeout, so an unresponsive endpoint is abandoned within a small
-multiple of `timeout_seconds`, and a stop during hosted recognition waits at most for the
-current chunk.
+lookup and every 50 ms while the response body is read, and the credential lookup plus
+the whole exchange share one wall-clock deadline of `timeout_seconds` (default 30, at
+most 120) from the start of the request. A Keychain lookup that is cancelled or outlives
+the deadline is terminated; the transport is given only the budget that lookup left, as
+its inactivity timeout for connect, TLS, headers and body, so a pause shorter than the
+remaining budget is tolerated and the connection is shut when the deadline passes or a
+stop arrives, ending the read within about 50 ms.
 
 The current native implementation still uses conservative endpointing and completed
 Whisper windows. Persistent ASR, early attention, lower endpoint latency and other

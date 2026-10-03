@@ -17,6 +17,7 @@ import math
 import re
 import secrets
 import socket
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -44,8 +45,8 @@ DIARIZER_KINDS = ("nemotron.cpp", "hosted-deepgram")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
 _LANGUAGE = re.compile(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?")
 _UNSAFE = re.compile(r"[^A-Za-z0-9_. -]")
-READ_CHUNK_BYTES = 65536
-READ_STEP_SECONDS = 0.5  # socket timeout per body read step
+READ_POLL_SECONDS = 0.05  # how often the waiting loop re-checks cancel/deadline
+READ_ABORT_JOIN_SECONDS = 2  # how long an aborted reader is given to notice the shutdown
 MIN_TRANSPORT_SECONDS = 0.1  # the least a nearly exhausted budget gives the transport
 
 
@@ -59,6 +60,10 @@ class _ReadDeadline(Exception):
 
 class _ReadCancelled(Exception):
     """The owner cancelled while a response body was being read."""
+
+
+class _ReadFailed(Exception):
+    """The body read ended without content; details stay on the reader thread."""
 
 
 def provenance_id(prefix: str, *parts: str) -> str:
@@ -141,17 +146,21 @@ def _interval(start: Any, end: Any, duration_ms: int, label: str) -> tuple[int, 
     return start_ms, min(end_ms, duration_ms)
 
 
-def _bound_read(response: Any, seconds: float) -> None:
-    """Give the underlying socket, when reachable, at most `seconds` for the next read.
+def _abort_response(response: Any) -> None:
+    """End a body read in progress by shutting the connection, then closing the response.
 
     urllib's response wraps `http.client.HTTPResponse` -> `BufferedReader` (`fp`) ->
-    `SocketIO` (`raw`) -> socket (`_sock`); the walk stops at the first `settimeout`.
+    `SocketIO` (`raw`) -> socket (`_sock`); shutting the first layer with `shutdown`
+    makes a blocked `recv` return, so the reader thread ends without a step timeout.
     """
     layer = response
     for _ in range(6):
-        if callable(getattr(layer, "settimeout", None)):
-            layer.settimeout(max(seconds, MIN_TRANSPORT_SECONDS))
-            return
+        if callable(getattr(layer, "shutdown", None)):
+            try:
+                layer.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            break
         following = None
         for name in ("raw", "fp", "_sock"):
             candidate = getattr(layer, name, None)
@@ -159,8 +168,12 @@ def _bound_read(response: Any, seconds: float) -> None:
                 following = candidate
                 break
         if following is None:
-            return
+            break
         layer = following
+    try:
+        response.close()
+    except OSError:
+        pass
 
 
 class _HostedClient:
@@ -182,6 +195,45 @@ class _HostedClient:
         self.cancelled = cancelled if cancelled is not None else (lambda: False)
         self.load_key = load_key
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+    def _read_body(self, response: Any, deadline: float) -> bytes:
+        """Read at most the byte cap, ending early on cancellation or the deadline.
+
+        A helper thread performs the blocking read with the transport's own inactivity
+        timeout, so a pause shorter than the remaining budget is tolerated and chunked
+        framing is never interrupted; the waiting loop polls the cancellation guard and
+        the wall-clock deadline and, on either, shuts the connection so the read returns.
+        """
+        outcome: dict[str, Any] = {}
+
+        def read() -> None:
+            try:
+                outcome["content"] = response.read(MAX_RESPONSE_BYTES + 1)
+            except BaseException:
+                # Any transport detail stays on this thread; the caller reports a
+                # sanitized failure.
+                outcome["failed"] = True
+
+        thread = threading.Thread(target=read, name="rightyo-hosted-read", daemon=True)
+        thread.start()
+        while thread.is_alive():
+            if self.cancelled():
+                _abort_response(response)
+                thread.join(READ_ABORT_JOIN_SECONDS)
+                raise _ReadCancelled
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _abort_response(response)
+                thread.join(READ_ABORT_JOIN_SECONDS)
+                raise _ReadDeadline
+            thread.join(min(READ_POLL_SECONDS, remaining))
+        if "content" not in outcome:
+            # The transport's own inactivity timeout equals the remaining budget, so a
+            # read that dies at the deadline is reported as the deadline, not a failure.
+            if time.monotonic() >= deadline:
+                raise _ReadDeadline
+            raise _ReadFailed
+        return outcome["content"]
 
     def post(self, url: str, body: bytes, headers: dict[str, str], scheme: str) -> dict[str, Any]:
         if self.cancelled():
@@ -213,33 +265,18 @@ class _HostedClient:
         failure = None
         content = b""
         # urllib's timeout is per operation, so a slowly dripping body could outlive it;
-        # the body is read in bounded chunks against the same deadline instead.
+        # the body is read on a helper thread that the deadline or cancellation aborts.
         try:
             with self._opener.open(
                 request, timeout=max(remaining, MIN_TRANSPORT_SECONDS)
             ) as response:
-                chunks: list[bytes] = []
-                size = 0
-                while size <= MAX_RESPONSE_BYTES:
-                    if self.cancelled():
-                        raise _ReadCancelled
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise _ReadDeadline
-                    _bound_read(response, min(remaining, READ_STEP_SECONDS))
-                    # `read1` returns as soon as any body bytes arrive, so a dripping
-                    # endpoint cannot hold a full-chunk `read` past the deadline checks.
-                    reader = getattr(response, "read1", None) or response.read
-                    chunk = reader(min(READ_CHUNK_BYTES, MAX_RESPONSE_BYTES + 1 - size))
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    size += len(chunk)
-                content = b"".join(chunks)
+                content = self._read_body(response, deadline)
         except _ReadDeadline:
             failure = f"{self.label} response exceeded the request deadline"
         except _ReadCancelled:
             failure = f"{self.label} request was cancelled"
+        except _ReadFailed:
+            failure = f"{self.label} connection failed or timed out"
         except urllib.error.HTTPError as error:
             try:
                 error.close()
