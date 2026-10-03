@@ -85,6 +85,31 @@ class CredentialTests(unittest.TestCase):
             with self.assertRaises(CredentialError) as error:
                 load_jev_api_key()
             self.assertNotIn(TOKEN, str(error.exception))
+            self.assertNoSecretInFrames(error.exception)
+
+    def assertNoSecretInFrames(self, exception):
+        """No frame on the exception's traceback may hold the credential in a local."""
+        import traceback
+
+        held = []
+        for frame, _line in traceback.walk_tb(exception.__traceback__):
+            held.extend(repr(value) for value in frame.f_locals.values())
+        self.assertFalse(any(TOKEN in value for value in held), held)
+
+    def test_malformed_keychain_value_leaves_no_secret_in_tracebacks(self):
+        for output in (TOKEN.encode() + b"\xff", (TOKEN + " with space").encode(), b"short"):
+            popen, _ = fake_popen(output=output)
+            with (
+                self.subTest(output=output),
+                patch.dict(os.environ, {}, clear=True),
+                patch("rightyo.credentials.sys.platform", "darwin"),
+                popen,
+            ):
+                with self.assertRaises(CredentialError) as error:
+                    load_jev_api_key()
+                self.assertNotIn(TOKEN, str(error.exception))
+                self.assertIsNone(error.exception.__context__)
+                self.assertNoSecretInFrames(error.exception)
 
     def test_timeout_terminates_the_lookup_and_is_sanitized(self):
         clock = [0.0]

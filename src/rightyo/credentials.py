@@ -23,11 +23,17 @@ class CredentialError(RuntimeError):
     """A credential is missing or inaccessible; messages never include its value."""
 
 
-def _validate_key(value: str, label: str) -> str:
+def _validate_key(value: str) -> str | None:
+    """The usable key, or None when malformed; never raises while holding the value."""
     key = value.strip()
     if not 8 <= len(key) <= 8192 or any(ord(char) < 33 or ord(char) > 126 for char in key):
-        raise CredentialError(f"The configured {label} credential is invalid.")
+        return None
     return key
+
+
+def _invalid(label: str) -> CredentialError:
+    """Built in a frame that holds no secret, so tracebacks never carry the value."""
+    return CredentialError(f"The configured {label} credential is invalid.")
 
 
 def _keychain_lookup(
@@ -90,9 +96,15 @@ def _load_api_key(
     cancelled: Callable[[], bool] | None = None,
     timeout_seconds: float = 120,
 ) -> str:
+    # Every raise below happens after the secret-bearing locals are dropped, so a
+    # retained traceback can show this frame without the credential in it.
     configured = os.environ.get(environment)
     if configured is not None:
-        return _validate_key(configured, label)
+        key = _validate_key(configured)
+        del configured
+        if key is None:
+            raise _invalid(label)
+        return key
     if sys.platform != "darwin":
         raise CredentialError(f"Configure {environment} through your secret manager.")
     result = _keychain_lookup(service, cancelled, timeout_seconds)
@@ -101,16 +113,19 @@ def _load_api_key(
     if isinstance(result, str):
         raise CredentialError(f"The {label} login Keychain item could not be accessed.")
     status, output = result
+    del result
     if status != 0:
+        del output
         raise CredentialError(hint)
-    decoded = None
+    key = None
     try:
-        decoded = output.decode("utf-8")
+        key = _validate_key(output.decode("utf-8"))
     except UnicodeDecodeError:
         pass
-    if decoded is None:
-        raise CredentialError(f"The configured {label} credential is invalid.")
-    return _validate_key(decoded, label)
+    del output
+    if key is None:
+        raise _invalid(label)
+    return key
 
 
 def load_jev_api_key(

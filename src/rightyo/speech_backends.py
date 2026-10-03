@@ -455,9 +455,13 @@ class _HostedClient:
         request_headers: dict[str, str] = {}
         # From here on every exit passes the `finally` that strips the credential.
         try:
+            # TLS setup already spent part of the shared budget; the lookup gets the rest.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HostedSpeechError(f"{self.label} request exceeded its deadline")
             key = None
             try:
-                key = self.load_key(cancelled=self.cancelled, timeout_seconds=self.timeout)
+                key = self.load_key(cancelled=self.cancelled, timeout_seconds=remaining)
             except CredentialError:
                 pass
             if key is None:

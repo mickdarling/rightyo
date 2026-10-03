@@ -665,6 +665,38 @@ class HostedTranscriberTests(unittest.TestCase):
             [(c.host, c.port) for c in connections], [("transcribe.example.test", 8443)]
         )
 
+    def test_credential_lookup_receives_only_the_budget_tls_setup_left(self):
+        clock = [0.0]
+        budgets = []
+
+        def monotonic():
+            return clock[0]
+
+        def slow_context():
+            clock[0] += 12.0  # TLS setup consumed part of a 30-second budget
+            return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+        def loader(**options):
+            budgets.append(options["timeout_seconds"])
+            return KEY
+
+        patched, _connections = patched_connection(b'{"text": ""}')
+        with patched, patch("ssl.create_default_context", side_effect=slow_context):
+            with patch("rightyo.speech_backends.time.monotonic", monotonic):
+                self.transcriber(load_key=loader, timeout_seconds=30).transcribe(bytes(640))
+        self.assertEqual(budgets, [18.0])
+
+        def exhausting_context():
+            clock[0] += 31.0
+            return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+        budgets.clear()
+        with patched, patch("ssl.create_default_context", side_effect=exhausting_context):
+            with patch("rightyo.speech_backends.time.monotonic", monotonic):
+                with self.assertRaisesRegex(HostedSpeechError, "exceeded its deadline"):
+                    self.transcriber(load_key=loader, timeout_seconds=30).transcribe(bytes(640))
+        self.assertEqual(budgets, [])
+
     def test_tls_setup_failure_is_sanitized_and_never_loads_a_credential(self):
         loader = Mock(side_effect=AssertionError("credential loaded before TLS setup"))
         patched, connections = patched_connection(b'{"text": ""}')
