@@ -506,7 +506,9 @@ class PrototypeController:
                     if not capture.overrun:
                         processor.finish()
                     with self._lock:
-                        if generation == self._generation:
+                        # The flush can itself end the session (an attention backlog
+                        # records an error terminal and sets stop); never overwrite that.
+                        if generation == self._generation and not stop.is_set():
                             self._phase = "finishing" if self._pending else "complete"
                             self._completed_at = time.monotonic()
             else:

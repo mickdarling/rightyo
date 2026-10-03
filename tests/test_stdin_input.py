@@ -19,6 +19,7 @@ from rightyo.capture import PCM_CHUNK_BYTES, StdinPcmCapture
 from rightyo.contracts import Turn
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
 from rightyo.tool import listen
+from rightyo.tool_events import SpeechEvents
 
 
 class Pieces:
@@ -324,6 +325,69 @@ class StdinListenTests(unittest.TestCase):
         self.assertTrue(capture.overrun)
         self.assertEqual(code, 2)
         self.assertEqual((events[-1]["phase"], events[-1]["reason"]), ("error", "input-overrun"))
+
+    def test_an_error_raised_during_the_eof_flush_is_kept(self):
+        failed = threading.Event()
+
+        class FailingProvider:
+            def __init__(self, **_options):
+                self.requests = 0
+
+            def decide(self, state):
+                self.requests += 1
+                failed.set()
+                raise RuntimeError("attention failed")
+
+        class FlushProcessor(Processor):
+            def push_pcm16(self, pcm):
+                self.received += pcm
+
+            def finish(self):
+                # The EOF flush finalizes a turn whose attention fails while it is
+                # still flushing; the flush returns only after that error is recorded.
+                self.finished = True
+                turn = Turn(
+                    self.config.session_id,
+                    "flush-1",
+                    1,
+                    0,
+                    50,
+                    "Rightyo, tell me what happened.",
+                    "Speaker A",
+                    True,
+                    False,
+                    "authored-fixture",
+                    self.config.provenance,
+                    "authored-fixture",
+                )
+                self.callback(turn)
+                if not failed.wait(5):
+                    raise AssertionError("attention did not run")
+                time.sleep(0.1)
+
+        events = SpeechEvents()
+        controller = PrototypeController(
+            PrototypeConfig.load(self.config),
+            event_publisher=events,
+            processor_factory=FlushProcessor,
+            provider_factory=FailingProvider,
+            audio_input=io.BytesIO(bytes(PCM_CHUNK_BYTES)),
+            audio_provenance="causal-replay",
+        )
+        self.addCleanup(controller.close)
+        controller.start({"mode": "stdin", "use_jev": True, "session_id": "stdin-flush"})
+        controller._audio_thread.join(5)
+        self.assertEqual(controller.snapshot()["phase"], "error")
+        controller.stop()
+        terminals = [
+            e
+            for e in controller.drain_events()
+            if e["type"] == "session" and e["phase"] != "started"
+        ]
+        # Exactly one terminal: the error recorded during the flush, never a normal stop.
+        self.assertEqual(
+            [(e["phase"], e.get("reason")) for e in terminals], [("error", "attention-unavailable")]
+        )
 
     def test_stop_with_a_blocked_reader_never_lets_it_feed_a_later_session(self):
         stream = Gated([bytes(PCM_CHUNK_BYTES)], gate_at=0)
