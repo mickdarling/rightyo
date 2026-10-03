@@ -45,6 +45,7 @@ DIARIZER_KINDS = ("nemotron.cpp", "hosted-deepgram")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
 _LANGUAGE = re.compile(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?")
 _UNSAFE = re.compile(r"[^A-Za-z0-9_. -]")
+MERGE_GAP_MS = 300  # same-speaker words further apart than this stay separate segments
 READ_POLL_SECONDS = 0.05  # how often the waiting loop re-checks cancel/deadline
 READ_ABORT_JOIN_SECONDS = 2  # how long an aborted reader is given to notice the shutdown
 MIN_TRANSPORT_SECONDS = 0.1  # the least a nearly exhausted budget gives the transport
@@ -512,6 +513,19 @@ def deepgram_timeline(
         pass
     if not isinstance(words, list) or len(words) > 4000:
         raise HostedSpeechError(f"{label} returned an invalid response")
+    # Evidence that the diarizer ran: per developers.deepgram.com/docs/diarization (read
+    # 2026-10-03) `metadata.diarize_info` "is either present with both fields
+    # [`model_uuid`, `arch`] or absent entirely", and "An absent block on a request that
+    # asked for diarization means the diarizer did not run." A transcription without it
+    # must not pass as valid unknown-speaker output.
+    metadata = document.get("metadata")
+    info = metadata.get("diarize_info") if isinstance(metadata, dict) else None
+    if (
+        not isinstance(info, dict)
+        or not isinstance(info.get("model_uuid"), str)
+        or not isinstance(info.get("arch"), str)
+    ):
+        raise HostedSpeechError(f"{label} diarization unavailable")
     timeline: list[dict[str, Any]] = []
     previous = None
     for word in words:
@@ -526,10 +540,13 @@ def deepgram_timeline(
         if type(speaker) is not int or not 0 <= speaker <= 25:
             raise HostedSpeechError(f"{label} returned an invalid response")
         start, end = start + offset_ms, end + offset_ms
+        # Only words that touch or nearly touch are joined; a longer gap between two
+        # words of one speaker stays uncovered so a unit inside it remains unknown.
         if (
             previous is not None
             and previous["speaker"] == speaker + 1
             and start >= previous["start_ms"]
+            and start - previous["end_ms"] <= MERGE_GAP_MS
         ):
             previous["end_ms"] = max(previous["end_ms"], end)
         else:
@@ -558,7 +575,8 @@ class DeepgramDiarizer:
     Labels are assigned per request. Each `segments`/`finish` call sends only the
     trailing `window_ms` of pushed audio, sized to cover one utterance, and returns
     that window's timeline in stream milliseconds with consecutive words of one
-    speaker merged into a segment. "Speaker A" in one utterance is therefore not
+    speaker at most `MERGE_GAP_MS` apart merged into a segment (a wider gap stays
+    uncovered, so a unit inside it is unknown). "Speaker A" in one utterance is therefore not
     known to be the same person as "Speaker A" in the next: the service documents no
     cross-request label stability and none is invented here, so turns carry
     `speaker_provenance="diarization-utterance"`. Audio outside the window is not

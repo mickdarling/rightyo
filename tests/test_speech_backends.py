@@ -23,6 +23,7 @@ from rightyo.live_audio import (
     LiveProcessor,
     NemotronCppDiarizer,
     WhisperCppTranscriber,
+    _attribute,
 )
 from rightyo.pipeline import ReplayRunner
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
@@ -273,6 +274,41 @@ class ProtocolAndSelectionTests(unittest.TestCase):
                     processor.push_pcm16(VOICE)
                 processor.finish()
                 self.assertEqual(len(turns), 1)
+
+    def test_adapter_units_are_validated_at_the_common_boundary(self):
+        duration = 10 * 640 // BYTES_PER_MS
+        cases = {
+            "negative start": [{"text": " a", "start_ms": -1, "end_ms": 10}],
+            "end past the utterance": [{"text": " a", "start_ms": 0, "end_ms": duration + 1}],
+            "reversed interval": [{"text": " a", "start_ms": 50, "end_ms": 40}],
+            "reordered units": [
+                {"text": " b", "start_ms": 100, "end_ms": 150},
+                {"text": " a", "start_ms": 0, "end_ms": 50},
+            ],
+            "float timestamps": [{"text": " a", "start_ms": 0.0, "end_ms": 50}],
+            "not a list": {"text": " a"},
+        }
+        for name, units in cases.items():
+            with self.subTest(case=name):
+                turns = []
+                transcriber = StubTranscriber()
+                transcriber.transcribe = lambda pcm, register=None, units=units: units
+                processor = LiveProcessor(
+                    LiveConfig(
+                        "boundary-test",
+                        provenance="causal-replay",
+                        transcriber=transcriber,
+                        diarizer=StubDiarizer(),
+                    ),
+                    turns.append,
+                )
+                for _ in range(10):
+                    processor.push_pcm16(VOICE)
+                with self.assertRaisesRegex(LiveAudioError, "recognizer") as caught:
+                    processor.finish()
+                self.assertTrue(processor.failed)
+                self.assertEqual(turns, [])
+                self.assertNotIn(" a", str(caught.exception))
 
     def test_local_assets_are_required_only_by_the_local_defaults(self):
         with self.assertRaisesRegex(LiveAudioError, "existing"):
@@ -737,6 +773,20 @@ class HostedTranscriberTests(unittest.TestCase):
                 openai_units(bad, 600)
 
 
+DIARIZE_INFO = {"diarize_info": {"model_uuid": "synthetic-uuid", "arch": "v2"}}
+DIARIZED_EMPTY = {
+    "metadata": DIARIZE_INFO,
+    "results": {"channels": [{"alternatives": [{"words": []}]}]},
+}
+
+
+def diarized(words):
+    return {
+        "metadata": DIARIZE_INFO,
+        "results": {"channels": [{"alternatives": [{"words": words}]}]},
+    }
+
+
 class HostedDiarizerTests(unittest.TestCase):
     def diarizer(self, **overrides):
         values = dict(allow_hosted=True, window_ms=2000, load_key=load_key)
@@ -762,6 +812,7 @@ class HostedDiarizerTests(unittest.TestCase):
         diarizer = self.diarizer()
         payload = json.dumps(
             {
+                "metadata": {"diarize_info": {"model_uuid": "synthetic-uuid", "arch": "v2"}},
                 "results": {
                     "channels": [
                         {
@@ -778,7 +829,7 @@ class HostedDiarizerTests(unittest.TestCase):
                             ]
                         }
                     ]
-                }
+                },
             }
         ).encode()
         seen = []
@@ -828,7 +879,7 @@ class HostedDiarizerTests(unittest.TestCase):
 
         def open_request(request, timeout):
             seen.append(request.get_header("Authorization"))
-            return FakeResponse(b'{"results":{"channels":[{"alternatives":[{"words":[]}]}]}}')
+            return FakeResponse(json.dumps(DIARIZED_EMPTY).encode())
 
         with patch("urllib.request.build_opener", return_value=Mock(open=open_request)):
             diarizer = self.diarizer()
@@ -837,9 +888,7 @@ class HostedDiarizerTests(unittest.TestCase):
         self.assertEqual(seen, ["Token " + KEY])
 
     def test_finish_without_a_pending_utterance_sends_no_audio(self):
-        opener, requests = patched_opener(
-            b'{"results":{"channels":[{"alternatives":[{"words":[]}]}]}}'
-        )
+        opener, requests = patched_opener(json.dumps(DIARIZED_EMPTY).encode())
         turns = []
         with opener:
             silent = LiveProcessor(
@@ -890,25 +939,65 @@ class HostedDiarizerTests(unittest.TestCase):
             {},
             {"results": {"channels": []}},
             {"results": {"channels": [{"alternatives": [{"words": PRIVATE}]}]}},
-            {"results": {"channels": [{"alternatives": [{"words": [{"speaker": 0}]}]}]}},
-            {
-                "results": {
-                    "channels": [
-                        {"alternatives": [{"words": [{"start": 0, "end": 0.1, "speaker": 26}]}]}
-                    ]
-                }
-            },
-            {
-                "results": {
-                    "channels": [
-                        {"alternatives": [{"words": [{"start": 0, "end": 9.0, "speaker": 0}]}]}
-                    ]
-                }
-            },
+            diarized([{"speaker": 0}]),
+            diarized([{"start": 0, "end": 0.1, "speaker": 26}]),
+            diarized([{"start": 0, "end": 9.0, "speaker": 0}]),
         ):
             with self.subTest(bad=bad), self.assertRaises(HostedSpeechError) as caught:
                 deepgram_timeline(bad, 1000, 0)
             self.assertNotIn(PRIVATE, str(caught.exception))
+
+    def test_a_response_without_diarizer_evidence_is_refused_not_treated_as_unknown(self):
+        labelled = [{"word": "a", "start": 0.0, "end": 0.2, "speaker": 0}]
+        unlabelled = [{"word": "a", "start": 0.0, "end": 0.2}]
+        for document in (
+            {"results": {"channels": [{"alternatives": [{"words": labelled}]}]}},
+            {"metadata": {}, "results": {"channels": [{"alternatives": [{"words": labelled}]}]}},
+            {
+                "metadata": {"diarize_info": {"arch": "v2"}},
+                "results": {"channels": [{"alternatives": [{"words": labelled}]}]},
+            },
+            {
+                "metadata": DIARIZE_INFO,
+                "results": {"channels": [{"alternatives": [{"words": unlabelled}]}]},
+            },
+            {"results": {"channels": [{"alternatives": [{"words": unlabelled}]}]}},
+        ):
+            with self.subTest(document=document):
+                if document.get("metadata") == DIARIZE_INFO:
+                    # Diarizer ran, but it labelled nothing: honestly unknown, not an error.
+                    self.assertEqual(deepgram_timeline(document, 1000, 0), [])
+                    continue
+                with self.assertRaisesRegex(HostedSpeechError, "diarization unavailable"):
+                    deepgram_timeline(document, 1000, 0)
+        self.assertEqual(
+            deepgram_timeline(diarized(labelled), 1000, 0),
+            [{"speaker": 1, "start_ms": 0, "end_ms": 200}],
+        )
+
+    def test_same_speaker_words_across_a_wide_gap_stay_separate(self):
+        words = [
+            {"word": "a", "start": 0.0, "end": 0.2, "speaker": 0},
+            {"word": "b", "start": 2.0, "end": 2.2, "speaker": 0},
+        ]
+        timeline = deepgram_timeline(diarized(words), 3000, 0)
+        self.assertEqual(
+            timeline,
+            [
+                {"speaker": 1, "start_ms": 0, "end_ms": 200},
+                {"speaker": 1, "start_ms": 2000, "end_ms": 2200},
+            ],
+        )
+        # A unit transcribed inside the gap is unknown rather than "Speaker A".
+        self.assertEqual(_attribute(1000, 1100, timeline), (None, False))
+        close = [
+            {"word": "a", "start": 0.0, "end": 0.2, "speaker": 0},
+            {"word": "b", "start": 0.5, "end": 0.7, "speaker": 0},
+        ]
+        self.assertEqual(
+            deepgram_timeline(diarized(close), 3000, 0),
+            [{"speaker": 1, "start_ms": 0, "end_ms": 700}],
+        )
 
 
 class ConfigurationSelectionTests(unittest.TestCase):

@@ -623,6 +623,31 @@ class WhisperCppTranscriber:
         return _units(document, len(pcm) // BYTES_PER_MS)
 
 
+def _check_units(units: Any, duration_ms: int) -> None:
+    """Enforce the `Transcriber` contract at the common boundary, whatever the backend.
+
+    Units are dicts with `text` (str) and integer `start_ms`/`end_ms` with
+    `0 <= start_ms <= end_ms <= duration_ms`, non-decreasing in order. Anything else
+    fails closed like a malformed native document; nothing is clamped or reordered.
+    """
+    if not isinstance(units, list) or len(units) > 4000:
+        raise LiveAudioError("Invalid recognizer result")
+    previous_start = previous_end = 0
+    for unit in units:
+        if not isinstance(unit, dict) or not isinstance(unit.get("text"), str):
+            raise LiveAudioError("Invalid recognizer result")
+        start, end = unit.get("start_ms"), unit.get("end_ms")
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or not 0 <= start <= end <= duration_ms
+            or start < previous_start
+            or end < previous_end
+        ):
+            raise LiveAudioError("Invalid recognizer timestamp")
+        previous_start, previous_end = start, end
+
+
 def _select(value: Any, default: Callable[[LiveConfig], Any], config: LiveConfig, method: str):
     if value is None:
         return default(config)
@@ -727,6 +752,7 @@ class LiveProcessor:
             raise LiveAudioError("Audio session was stopped")
         provenance = getattr(self._diarizer, "speaker_provenance", "diarization-timeline")
         self._utterances += 1
+        _check_units(units, len(pcm) // BYTES_PER_MS)
         groups: list[dict[str, Any]] = []
         for unit in units:
             start, end = unit["start_ms"] + offset, unit["end_ms"] + offset

@@ -116,7 +116,11 @@ Keychain item with service `rightyo.transcriber` and account `api-key`.
 documents as excluding the request from its Model Improvement Program (participation is
 otherwise the default) with zero data retention after the response; it reads the
 word-level `speaker` labels,
-merging consecutive words of one speaker into timeline segments. `endpoint` may be
+merging consecutive words of one speaker that are at most 300 ms apart into timeline
+segments (a wider gap stays uncovered, so speech inside it is unknown). A response
+without Deepgram's `metadata.diarize_info` marker, which Deepgram documents as absent
+when the diarizer did not run, fails the session as "diarization unavailable" rather than
+passing as unknown-speaker output. `endpoint` may be
 overridden with another `https` URL. The credential is read from
 `RIGHTYO_DIARIZER_API_KEY` or the login Keychain item with service `rightyo.diarizer`
 and account `api-key`; create it with `security add-generic-password -s rightyo.diarizer
