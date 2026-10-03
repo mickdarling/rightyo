@@ -816,6 +816,20 @@ class HostedTranscriberTests(unittest.TestCase):
             {"word": "here", "start": 0.3, "end": 0.5},
         ]
         self.assertEqual(len(openai_units({"text": "I'm here", "words": overlapping}, 600)), 2)
+        # An empty transcript beside timed units is a contradiction, not silence.
+        timed_word = [{"word": "x", "start": 0.0, "end": 0.1}]
+        timed_segment = [{"text": "x", "start": 0.0, "end": 0.1}]
+        for contradictory in (
+            {"text": "", "words": timed_word},
+            {"text": "   ", "segments": timed_segment},
+            {"text": "", "words": timed_word, "segments": timed_segment},
+        ):
+            with self.subTest(contradictory=contradictory):
+                with self.assertRaisesRegex(HostedSpeechError, "inconsistent"):
+                    openai_units(contradictory, 600)
+        for silent in ({"text": ""}, {"text": " ", "words": [], "segments": []}):
+            with self.subTest(silent=silent):
+                self.assertEqual(openai_units(silent, 600), [])
         segments = {"text": "A. B.", "segments": [{"text": "A. B.", "start": 0, "end": 0.4}]}
         self.assertEqual(
             openai_units(segments, 300), [{"text": " A. B.", "start_ms": 0, "end_ms": 300}]
@@ -1254,6 +1268,56 @@ class ConfigurationSelectionTests(unittest.TestCase):
         self.assertNotIn("speech", started["capabilities"])
         with self.assertRaises(ContractError):
             SpeechEvents().start("bad", speech={"transcriber": {"kind": "x"}})
+
+    def test_configured_roles_are_refused_with_an_utterance_local_diarizer(self):
+        roles = {"owner": ["Speaker A"], "trusted": [], "owner_only": False}
+        processors = []
+
+        def processor(live, on_turn):
+            processors.append(live)
+            raise LiveAudioError("stop before any audio")
+
+        for speakers in (
+            roles,
+            {"owner": ["Speaker A"], "trusted": [], "owner_only": True},
+            {"owner": [], "trusted": ["Speaker B"], "owner_only": False},
+        ):
+            with self.subTest(speakers=speakers):
+                config = self.load(
+                    self.local | {"diarizer": self.hosted_diarizer, "speakers": speakers}
+                )
+                controller = PrototypeController(
+                    config,
+                    processor_factory=processor,
+                    capture_factory=Mock(),
+                    allow_hosted_speech=True,
+                )
+                self.addCleanup(controller.close)
+                with self.assertRaisesRegex(PrototypeError, "session-stable diarizer") as error:
+                    controller.start({"mode": "microphone"})
+                self.assertNotIn(ENDPOINT, str(error.exception))
+        self.assertEqual(processors, [])
+        self.path.write_text(
+            json.dumps(self.local | {"diarizer": self.hosted_diarizer, "speakers": roles})
+        )
+        args = Namespace(
+            config=self.path, mode="microphone", session_id=None, use_jev=False, allow_hosted=True
+        )
+        with self.assertRaisesRegex(PrototypeError, "session-stable diarizer"):
+            listen(args, controller_factory=PrototypeController)
+        # The native, session-stable diarizer still starts with the same roles.
+        native = PrototypeController(
+            self.load(self.local | {"speakers": roles}),
+            processor_factory=processor,
+            capture_factory=Mock(),
+        )
+        self.addCleanup(native.close)
+        native.start({"mode": "microphone"})
+        deadline = 100
+        while not processors and deadline:
+            deadline -= 1
+            native._audio_thread.join(0.05)
+        self.assertEqual(len(processors), 1)
 
     def test_controller_and_listen_require_explicit_hosted_consent(self):
         config = self.load(self.local | {"transcriber": self.hosted_transcriber})

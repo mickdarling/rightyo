@@ -50,6 +50,7 @@ from rightyo.speech_backends import (
     speech_summary,
     transcriber_factory,
     transcriber_spec,
+    utterance_local_labels,
 )
 
 BROWSER_LEASE_SECONDS = 15
@@ -291,6 +292,18 @@ class PrototypeController:
             )
         if self.config.hosted_speech and not self.allow_hosted_speech:
             raise PrototypeError("Hosted speech backends require explicit hosted consent")
+        roles = self.config.speakers
+        if (
+            roles is not None
+            and (roles.owners or roles.trusted or roles.owner_only)
+            and utterance_local_labels(self.config.diarizer)
+        ):
+            # Utterance-local labels never equal a configured `Speaker A`, so roles
+            # could never apply and `owner_only` would silence every request.
+            raise PrototypeError(
+                "Configured speaker roles require a session-stable diarizer; the selected "
+                "diarizer labels speakers per utterance"
+            )
         budget_seconds = validate_session_budget(self.config.session_budget_seconds)
         with self._lock:
             if self._phase in {"starting", "listening", "replaying", "finishing", "stopping"}:

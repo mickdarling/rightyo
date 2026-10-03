@@ -41,7 +41,10 @@ hard-coded speaker roles for the headless tool, for example
 `"speakers": {"owner": ["Speaker A"], "trusted": [], "owner_only": false}`; it may also
 set `"stop_phrases"`. Session speaker labels such as `Speaker A` are anonymous and are
 assigned per session by the diarizer, so a configured label names whichever voice
-receives it; roles are precedence data for the host, not a verified identity.
+receives it; roles are precedence data for the host, not a verified identity. Roles
+need the session-stable native diarizer: with `hosted-deepgram`, whose labels hold only
+within one utterance, a `speakers` object naming owners or trusted speakers or setting
+`owner_only` is refused at Start rather than silently never matching.
 `"source": "model"` is refused by the lab and by `listen`, in both microphone and demo
 modes, with a clear error before any capture starts: a hosted role question would run on
 the audio path under the controller lock, where Stop and lease expiry cannot reach it.

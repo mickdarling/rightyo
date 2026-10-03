@@ -380,9 +380,13 @@ def openai_units(document: dict[str, Any], duration_ms: int) -> list[dict[str, A
     text = document.get("text")
     if not isinstance(text, str) or len(text) > 4000:
         raise HostedSpeechError(f"{label} returned an invalid response")
+    words, segments = document.get("words"), document.get("segments")
     if not text.strip():
+        # Silence is only silence when nothing was timed; timed units beside an empty
+        # transcript contradict it and must not be dropped as if nothing was said.
+        if any(isinstance(value, list) and value for value in (words, segments)):
+            raise HostedSpeechError(f"{label} returned inconsistent word timing")
         return []
-    words = document.get("words")
     if isinstance(words, list) and words:
         if len(words) > 4000:
             raise HostedSpeechError(f"{label} returned an invalid response")
@@ -712,6 +716,15 @@ def diarizer_spec(value: Any) -> dict[str, Any]:
 
 def is_hosted(spec: dict[str, Any]) -> bool:
     return spec["kind"].startswith("hosted-")
+
+
+def utterance_local_labels(spec: dict[str, Any]) -> bool:
+    """Whether the selected diarizer's labels hold only within one utterance.
+
+    Such labels are namespaced per utterance (`u7 Speaker A`), so a configured role for
+    `Speaker A` could never match one; only a session-stable diarizer can carry roles.
+    """
+    return spec["kind"] == "hosted-deepgram"
 
 
 def transcriber_id(spec: dict[str, Any]) -> str:

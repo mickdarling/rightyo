@@ -136,6 +136,13 @@ the Hailing Station consumer uses the same authored contract fixture.
 
 ## Speaker roles and owner override
 
+Configured roles name session-stable labels, so they require a diarizer whose labels
+persist for the session (the native stream, `diarization-timeline`). A diarizer with
+utterance-local labels (`diarization-utterance`, namespaced as `u7 Speaker A`) can never
+match a configured `Speaker A`, and `owner_only` would then silence every request, so
+`listen` and the lab refuse to start a session that combines configured owners, trusted
+speakers or `owner_only` with such a diarizer.
+
 Without configuration the tool behaves exactly as above: `speakers` is `"anonymous"`
 and no `role` field exists. When speaker roles are configured, through the prototype
 configuration's `speakers` object or the `--owner`, `--trusted`, `--owner-only` and
