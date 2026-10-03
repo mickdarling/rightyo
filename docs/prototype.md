@@ -132,7 +132,8 @@ request, so with this backend Speaker A in one utterance is not known to be the 
 person as Speaker A in the next; its turns carry `speaker_provenance:
 "diarization-utterance"` with utterance-namespaced labels such as `u7 Speaker A`, and
 the native Nemotron stream is the only backend whose
-labels persist for the session. It sends and diarizes only a trailing utterance window.
+labels persist for the session. The Deepgram backend sends and diarizes only a trailing
+utterance window.
 A hosted request's Keychain credential lookup and whole exchange share a wall-clock
 deadline of `timeout_seconds`; a stop is honoured during the lookup and within about 50 ms
 while the connection is opened or the body is read, and a mid-body pause shorter than the
