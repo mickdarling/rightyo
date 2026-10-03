@@ -339,8 +339,10 @@ its inactivity timeout for connect, TLS, headers and body, so a pause shorter th
 remaining budget is tolerated. The open phase (name resolution, connect, TLS, upload and
 response headers) and the body read each run on a helper thread; a stop or the deadline
 is noticed within about 50 ms, the connection is shut, and the caller returns at once. A
-name lookup cannot be interrupted, so an abandoned open thread ends when the resolver
-returns, without holding up the stop.
+name lookup cannot be interrupted, so an abandoned connect thread ends when the resolver
+returns, without holding up the stop; such a thread holds no audio (the request body is
+handed over only after the connection exists), and a client refuses further requests
+while more than four of them are still alive, so stalls cannot accumulate memory.
 
 The current native implementation still uses conservative endpointing and completed
 Whisper windows. Persistent ASR, early attention, lower endpoint latency and other

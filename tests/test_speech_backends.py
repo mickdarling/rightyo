@@ -516,6 +516,9 @@ class HostedTranscriberTests(unittest.TestCase):
             ENDPOINT + "#fragment",
             ENDPOINT + "?",
             ENDPOINT + "#",
+            ENDPOINT.replace("example.test", "example.test:notaport"),
+            ENDPOINT.replace("example.test", "example.test:99999"),
+            ENDPOINT.replace("example.test", "example.test:0"),
             5,
         ):
             with self.subTest(endpoint=endpoint), self.assertRaisesRegex(LiveAudioError, "https"):
@@ -580,6 +583,17 @@ class HostedTranscriberTests(unittest.TestCase):
             )
             self.assertEqual(audio.readframes(audio.getnframes()), pcm)
         self.assertEqual(parts[-1], b"--\r\n")
+
+    def test_an_explicit_port_is_accepted_and_used(self):
+        patched, connections = patched_connection(b'{"text": ""}')
+        with patched:
+            explicit = self.transcriber(
+                endpoint=ENDPOINT.replace("example.test", "example.test:8443")
+            )
+            self.assertEqual(explicit.transcribe(bytes(640)), [])
+        self.assertEqual(
+            [(c.host, c.port) for c in connections], [("transcribe.example.test", 8443)]
+        )
 
     def test_authorization_header_carries_the_bearer_key_at_point_of_use_only(self):
         patched, connections = patched_connection(b'{"text": ""}')
@@ -752,6 +766,69 @@ class HostedTranscriberTests(unittest.TestCase):
         self.assertEqual(connection.body, b"")
         self.assertEqual(connection.headers, {})
         self.assertFalse(late.closed)
+
+    def test_stalled_resolver_holds_no_audio_and_stalls_are_bounded(self):
+        import gc
+        import sys
+        import types
+
+        late = FakeResponse(b'{"text": ""}')
+        patched, released, connections = self.blocking_connection(late)
+        self.addCleanup(released.set)
+        client = self.transcriber(timeout_seconds=30)._client
+        checks = []
+        client.cancelled = lambda: checks.append(1) is None and len(checks) >= 4
+        audio = b"\x7f" * 640 + b"-sentinel-utterance"
+        with patched:
+            with self.assertRaisesRegex(HostedSpeechError, "cancelled"):
+                client.post(ENDPOINT, audio, {"Content-Type": "audio/wav"}, "Bearer ")
+        self.assertEqual(len(connections), 1)
+        self.assertTrue(connections[0].closed)
+        self.assertEqual(connections[0].body, b"")
+        (stalled,) = client._stalled
+        self.assertTrue(stalled.is_alive())
+        # The resolver thread is still blocked: neither its frames nor its closure may
+        # reference the utterance, so Stop leaves no audio behind in memory.
+        frame = sys._current_frames().get(stalled.ident)
+        held = []
+        while frame is not None:
+            held.extend(frame.f_locals.values())
+            frame = frame.f_back
+        # Plain loops only: a comprehension here would itself capture `audio` in a cell.
+        for value in held:
+            self.assertIsNot(value, audio)
+        cells = []
+        for referrer in gc.get_referrers(audio):
+            if isinstance(referrer, types.CellType):
+                cells.append(referrer)
+        self.assertEqual(cells, [])
+        # Stalled resolvers are bounded: beyond the limit a new request is refused.
+        for _ in range(3):
+            checks.clear()
+            with patched:
+                with self.assertRaisesRegex(HostedSpeechError, "cancelled"):
+                    client.post(ENDPOINT, audio, {"Content-Type": "audio/wav"}, "Bearer ")
+        self.assertEqual(len(client._stalled), 4)
+        client.cancelled = lambda: False
+        with patched:
+            with self.assertRaisesRegex(HostedSpeechError, "too many stalled") as caught:
+                client.post(ENDPOINT, audio, {"Content-Type": "audio/wav"}, "Bearer ")
+        self.assertEqual(len(connections), 4)
+        self.assertNotIn(ENDPOINT, str(caught.exception))
+        # Once the resolvers return they close without connecting further; the stalled
+        # list drains and requests resume.
+        released.set()
+        for thread in list(client._stalled):
+            thread.join(2)
+        self.assertTrue(all(c.calls == ["connect"] and c.body == b"" for c in connections))
+        patched_ok, ok = patched_connection(b'{"text": ""}')
+        with patched_ok:
+            self.assertEqual(
+                client.post(ENDPOINT, audio, {"Content-Type": "audio/wav"}, "Bearer "),
+                {"text": ""},
+            )
+        self.assertEqual(client._stalled, [])
+        self.assertEqual(len(ok), 1)
 
     def test_deadline_during_connect_returns_at_once(self):
         late = FakeResponse(b'{"text": ""}')
