@@ -10,13 +10,14 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from rightyo.live_audio import (
     BYTES_PER_MS,
     FRAME_BYTES,
-    DiarizerTimelineLimitError,
+    TIMELINE_WINDOW_MS,
     LiveAudioError,
     LiveConfig,
     LiveProcessor,
@@ -409,17 +410,9 @@ class NativeSegmentBoundTests(unittest.TestCase):
         stream, _ = _native_stream([(0.5, 5.0, 1)], 5 * 1000 * BYTES_PER_MS)
         self.assertEqual(stream.segments(), [{"start_ms": 500, "end_ms": 5000, "speaker": 1}])
 
-    def test_timeline_segment_cap_is_a_distinct_value_free_failure(self):
-        stream, _ = _native_stream([(0.0, 0.5, 1)] * 18001, 10 * 1000 * BYTES_PER_MS)
-        with self.assertRaises(DiarizerTimelineLimitError) as error:
-            stream.segments()
-        self.assertIsInstance(error.exception, LiveAudioError)
-        self.assertEqual(
-            str(error.exception), "Local diarizer timeline limit reached; restart the session"
-        )
-        # The parent reconstructs the same distinct error from the worker's reason code only.
+    def test_worker_failures_are_value_free_and_carry_no_reason_codes(self):
         for line, expected in (
-            (b'{"ok":false,"reason":"timeline-limit"}\n', DiarizerTimelineLimitError),
+            (b'{"ok":false,"reason":"timeline-limit"}\n', LiveAudioError),
             (b'{"ok":false,"reason":"private-detail"}\n', LiveAudioError),
             (b'{"ok":false}\n', LiveAudioError),
         ):
@@ -448,6 +441,116 @@ class NativeSegmentBoundTests(unittest.TestCase):
         self.assertEqual(pushed, [16000])
         self.assertEqual(stream.pushed_bytes, 1000 * BYTES_PER_MS)
         self.assertEqual(stream.segments(), [{"start_ms": 0, "end_ms": 1500, "speaker": 1}])
+
+
+SEGMENT_MS = 300  # a speaker change every 300 ms: far denser than real conversation
+
+
+def _session_timeline(until_ms):
+    """Contiguous segments cycling three speakers, as the native stream would report."""
+    return [
+        (start / 1000, min(start + SEGMENT_MS, until_ms) / 1000, start // SEGMENT_MS % 3 + 1)
+        for start in range(0, until_ms, SEGMENT_MS)
+    ]
+
+
+def _as_dicts(segments):
+    return [
+        {"start_ms": round(start * 1000), "end_ms": round(end * 1000), "speaker": speaker}
+        for start, end, speaker in segments
+    ]
+
+
+class WindowedTimelineTests(unittest.TestCase):
+    """#54: a simulated multi-hour session; no library, model or audio is involved."""
+
+    def test_multi_hour_session_never_hits_a_segment_limit_and_stays_bounded(self):
+        bound = TIMELINE_WINDOW_MS // SEGMENT_MS + 1
+        for hours in (1, 3, 6):
+            now = hours * 60 * 60 * 1000 + 170  # not aligned to a segment boundary
+            full = _session_timeline(now)
+            stream, _ = _native_stream(full, now * BYTES_PER_MS)
+            window = stream.segments()
+            with self.subTest(hours=hours, session_segments=len(full)):
+                self.assertGreater(len(full), 18000 if hours > 1 else 11000)
+                self.assertLessEqual(len(window), bound)
+                self.assertEqual(window, [s for s in _as_dicts(full) if s["end_ms"] > now - 60000])
+                # The segment straddling the cutoff is kept; the one before it is not.
+                self.assertLess(window[0]["start_ms"], now - TIMELINE_WINDOW_MS)
+
+    def test_attribution_over_any_utterance_matches_the_whole_session_timeline(self):
+        now = 6 * 60 * 60 * 1000 + 170
+        full = _as_dicts(_session_timeline(now))
+        stream, _ = _native_stream(_session_timeline(now), now * BYTES_PER_MS)
+        window = stream.segments()
+        # Words anywhere an un-finalized utterance can reach (15 s plus a tail), at and
+        # across segment boundaries, plus words spanning the whole utterance.
+        earliest = now - 15000 - 40
+        probes = [(start, start + 200) for start in range(earliest, now - 200, 397)]
+        probes += [(earliest + 140, earliest + 160), (earliest, now), (now - 300, now)]
+        for start, end in probes:
+            with self.subTest(start=start, end=end):
+                self.assertEqual(_attribute(start, end, window), _attribute(start, end, full))
+        self.assertIn(("Speaker C", False), {_attribute(s, e, window) for s, e in probes})
+
+    def test_a_quiet_window_keeps_one_segment_so_provenance_is_unchanged(self):
+        now = 2 * 60 * 60 * 1000
+        stream, _ = _native_stream([(1.0, 2.0, 2), (5.0, 9.0, 1)], now * BYTES_PER_MS)
+        self.assertEqual(stream.segments(), [{"start_ms": 5000, "end_ms": 9000, "speaker": 1}])
+        stream, _ = _native_stream([], now * BYTES_PER_MS)
+        self.assertEqual(stream.segments(), [])
+
+    def test_processor_turns_match_a_whole_session_timeline_across_hours(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "supplied-local-runtime"
+        path.touch()
+        results = {}
+        for mode in ("window", "full"):
+            turns = []
+            clock = {}
+
+            class SessionDiarizer:
+                def __init__(self, _config):
+                    pass
+
+                def push(self, _pcm):
+                    pass
+
+                def segments(self):
+                    now = clock["processor"].received_ms
+                    if mode == "full":
+                        return _as_dicts(_session_timeline(now))
+                    stream, _ = _native_stream(_session_timeline(now), now * BYTES_PER_MS)
+                    return stream.segments()
+
+                finish = segments
+
+                def close(self):
+                    pass
+
+            config = LiveConfig("windowed", path, path, path, path, diarizer=SessionDiarizer)
+            # The whole-session baseline exceeds the per-response bound by design; only
+            # the comparison run skips that check.
+            check = patch("rightyo.live_audio._check_timeline") if mode == "full" else nullcontext()
+            with check, patch("rightyo.live_audio._transcribe", return_value=document()):
+                processor = LiveProcessor(config, turns.append)
+                clock["processor"] = processor
+                for hours in (1, 2, 4):
+                    # Advance the stream clock instead of computing millions of RMS frames.
+                    processor._received_ms = hours * 60 * 60 * 1000 + 40 * hours
+                    for _ in range(10):
+                        processor.push_pcm16(VOICE)
+                    for _ in range(72):
+                        processor.push_pcm16(SILENCE)
+                processor.close()
+            results[mode] = turns
+        self.assertEqual(len(results["window"]), 3)
+        self.assertEqual(results["window"], results["full"])
+        # Both attributed and boundary-straddling (unknown) words occur.
+        speakers = [t.speaker_id for t in results["window"]]
+        self.assertIn(None, speakers)
+        self.assertTrue(any(speakers))
 
 
 class ConservativeAlignmentTests(unittest.TestCase):

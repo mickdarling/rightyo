@@ -37,21 +37,17 @@ BYTES_PER_MS = 32  # mono PCM16 at 16 kHz
 MAX_CHUNK_BYTES = 32000  # one second of audio per push
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_SPEAKER = 702  # "Speaker A" .. "Speaker ZZ"; native streams use 1..8
+# The native stream returns only segments ending within this trailing window of pushed
+# audio. An utterance spans at most `max_utterance_ms` (<= 15 s, pre-roll included), so
+# every segment that can overlap one is inside it with a wide margin, and per-utterance
+# transfer and attribution stay constant however long the session runs (#54).
+TIMELINE_WINDOW_MS = 60000
+# Per-response bound for any backend: a 60 s window holds 6,000 native 10 ms frames.
+MAX_TIMELINE_SEGMENTS = 18000
 
 
 class LiveAudioError(ValueError):
     """Sanitized failure: never embeds paths, PCM, transcripts, or native logs."""
-
-
-class DiarizerTimelineLimitError(LiveAudioError):
-    """The native stream's whole-session timeline reached its fixed segment cap.
-
-    The full timeline is returned per utterance, so very long sessions with frequent
-    speaker changes reach it; a windowed timeline is tracked in #54.
-    """
-
-    def __init__(self) -> None:
-        super().__init__("Local diarizer timeline limit reached; restart the session")
 
 
 def _is_backend_instance(value: Any, method: str) -> bool:
@@ -248,14 +244,13 @@ class _NativeStream:
         count = ctypes.c_size_t()
         fn = self.lib.nemo_speech_diar_segments
         self.check(fn(self.stream, None, None, 0, ctypes.byref(count)))
-        if count.value > 18000:
-            raise DiarizerTimelineLimitError()
         output = (_Segment * count.value)()
         self.check(fn(self.stream, None, output, count.value, ctypes.byref(count)))
         # Segment times must lie within audio actually pushed (plus one second of
         # native lookahead/rounding); the bound follows the stream, not a fixed ceiling.
         horizon = self.pushed_bytes / (BYTES_PER_MS * 1000) + 1
-        result = []
+        cutoff_ms = self.pushed_bytes // BYTES_PER_MS - TIMELINE_WINDOW_MS
+        result, latest = [], None
         for segment in output[: count.value]:
             start, end = segment.start_time, segment.end_time
             if (
@@ -265,13 +260,22 @@ class _NativeStream:
                 or not 1 <= segment.speaker <= 8
             ):
                 raise LiveAudioError("Invalid local diarizer result")
-            result.append(
-                {
-                    "start_ms": round(start * 1000),
-                    "end_ms": round(end * 1000),
-                    "speaker": segment.speaker,
-                }
-            )
+            item = {
+                "start_ms": round(start * 1000),
+                "end_ms": round(end * 1000),
+                "speaker": segment.speaker,
+            }
+            if item["end_ms"] > cutoff_ms:
+                result.append(item)
+            elif latest is None or item["end_ms"] > latest["end_ms"]:
+                latest = item
+        # Older segments cannot overlap any pending utterance and are not returned. When
+        # none is recent, the latest one is kept so that a non-empty session timeline
+        # stays non-empty (it decides `speaker_provenance`); it overlaps no utterance.
+        if not result and latest is not None:
+            result.append(latest)
+        if len(result) > MAX_TIMELINE_SEGMENTS:
+            raise LiveAudioError("Invalid local diarizer result")
         return result
 
     def close(self) -> None:
@@ -316,10 +320,6 @@ def _native_worker(library: str, model: str) -> int:
                 raise LiveAudioError("Invalid native command")
             protocol.write(json.dumps(response, separators=(",", ":")) + "\n")
         return 0
-    except DiarizerTimelineLimitError:
-        # A value-free reason code only; no native detail crosses the protocol.
-        protocol.write('{"ok":false,"reason":"timeline-limit"}\n')
-        return 1
     except Exception:
         protocol.write('{"ok":false}\n')
         return 1
@@ -332,9 +332,9 @@ def _native_worker(library: str, model: str) -> int:
 class NemotronCppDiarizer:
     """The default `Diarizer`: one persistent native stream in a private subprocess.
 
-    Speaker channels are arrival-ordered and stable for the whole session. The
-    whole-session timeline is capped at 18,000 segments (`DiarizerTimelineLimitError`,
-    windowing tracked in #54).
+    Speaker channels are arrival-ordered and stable for the whole session. Each
+    `segments`/`finish` call returns only the trailing `TIMELINE_WINDOW_MS` of the
+    timeline, so there is no session-length segment limit.
     """
 
     diarizer_id = "nemotron.cpp v3-streaming"
@@ -399,11 +399,7 @@ class NemotronCppDiarizer:
             if not isinstance(result, dict):
                 raise ValueError
             if result.get("ok") is not True:
-                if result.get("reason") == "timeline-limit":
-                    raise DiarizerTimelineLimitError()
                 raise ValueError
-        except DiarizerTimelineLimitError:
-            raise
         except (ValueError, RecursionError):
             raise LiveAudioError("Local diarizer failed") from None
         return result
@@ -480,12 +476,13 @@ def _speaker_label(number: int) -> str:
 def _check_timeline(timeline: Any, received_ms: int) -> None:
     """Enforce the `Diarizer` contract at the common boundary, whatever the backend.
 
-    A list of at most 18,000 dicts, each with integer `0 <= start_ms <= end_ms` within
-    the audio received so far plus one second of lookahead (the native stream's own
-    bound) and a positive integer `speaker` no greater than `MAX_SPEAKER`. Order is not
-    required: attribution intersects intervals and the native ABI promises none.
+    A list of at most `MAX_TIMELINE_SEGMENTS` dicts (one call's window, not the
+    session), each with integer `0 <= start_ms <= end_ms` within the audio received so
+    far plus one second of lookahead (the native stream's own bound) and a positive
+    integer `speaker` no greater than `MAX_SPEAKER`. Order is not required: attribution
+    intersects intervals and the native ABI promises none.
     """
-    if not isinstance(timeline, list) or len(timeline) > 18000:
+    if not isinstance(timeline, list) or len(timeline) > MAX_TIMELINE_SEGMENTS:
         raise LiveAudioError("Invalid diarizer timeline")
     horizon = received_ms + 1000
     for segment in timeline:
@@ -789,10 +786,13 @@ class LiveProcessor:
         provenance = getattr(self._diarizer, "speaker_provenance", "diarization-timeline")
         self._utterances += 1
         _check_units(units, len(pcm) // BYTES_PER_MS)
+        # Units start at or after `offset`; a segment ending by then overlaps none of them,
+        # so attribution scans only this utterance's part of the timeline.
+        relevant = [segment for segment in timeline if segment["end_ms"] > offset]
         groups: list[dict[str, Any]] = []
         for unit in units:
             start, end = unit["start_ms"] + offset, unit["end_ms"] + offset
-            speaker, overlap = _attribute(start, end, timeline)
+            speaker, overlap = _attribute(start, end, relevant)
             if speaker is not None and provenance == "diarization-utterance":
                 # Per-request labels are namespaced by utterance so that equal labels
                 # from independent requests can never be merged into one participant.

@@ -27,7 +27,6 @@ from rightyo.contracts import (
 )
 from rightyo.credentials import CredentialError
 from rightyo.live_audio import (
-    DiarizerTimelineLimitError,
     LiveAudioError,
     LiveConfig,
     LiveProcessor,
@@ -482,10 +481,6 @@ class PrototypeController:
                     self._phase = "error"
                     if isinstance(error, MemorySessionLimitError):
                         self._error = "Session reached its 1,000-turn limit; start a new session."
-                    elif isinstance(error, DiarizerTimelineLimitError):
-                        self._error = (
-                            "Session reached the speaker timeline limit; start a new session."
-                        )
                     elif isinstance(error, HostedSpeechError):
                         self._error = "Hosted speech backend failed; the session is incomplete."
                     else:
