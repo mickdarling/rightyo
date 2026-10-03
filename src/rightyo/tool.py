@@ -112,11 +112,15 @@ def listen(args, *, output=None, controller_factory=PrototypeController) -> int:
     """The command itself authorizes foreground capture; startup/import never does."""
     if args.use_jev and not args.allow_hosted:
         raise PrototypeError("Jev requires both --use-jev and --allow-hosted")
-    if args.allow_hosted and not args.use_jev:
-        raise PrototypeError("--allow-hosted requires --use-jev")
     output = sys.stdout if output is None else output
     addressing = addressing_from_args(args)
     config = PrototypeConfig.load(Path(args.config))
+    # --allow-hosted is the one consent for sending text (Jev) or audio (configured
+    # hosted speech backends); it is meaningless, and refused, without either.
+    if config.hosted_speech and not args.allow_hosted:
+        raise PrototypeError("Hosted speech backends require --allow-hosted")
+    if args.allow_hosted and not (args.use_jev or config.hosted_speech):
+        raise PrototypeError("--allow-hosted requires --use-jev or a hosted speech backend")
     if addressing is not None:
         # Command-line names take precedence over the configuration file's names.
         config = replace(config, addressing=addressing)
@@ -129,7 +133,8 @@ def listen(args, *, output=None, controller_factory=PrototypeController) -> int:
         # The command-line former replaces the configuration file's, like --name.
         config = replace(config, request_former=forming)
     events = SpeechEvents()
-    controller = controller_factory(config, event_publisher=events)
+    consent = {"allow_hosted_speech": True} if config.hosted_speech else {}
+    controller = controller_factory(config, event_publisher=events, **consent)
     # Signal handlers are installed only by this explicit foreground operation.
     previous = None
     if threading.current_thread() is threading.main_thread():

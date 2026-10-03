@@ -88,9 +88,24 @@ below, the per-utterance audio window, and the per-session unique-turn count.
 `turn` uses the existing validated `Turn` contract: `session_id`, `utterance_id`,
 `revision`, `start_ms`, `end_ms`, `text`, nullable `speaker_id`, `finalized`,
 `overlap`, `recognizer_id`, `provenance`, and `speaker_provenance`. Current emitted
-turns are final. Labels are anonymous within a session, not verified identities;
+turns are final. Labels are anonymous within a session, not verified identities; they
+are numbered like spreadsheet columns (`Speaker A`..`Speaker Z`, then `Speaker AA`,
+`Speaker AB`, ...), so a backend reporting more than 26 voices still yields valid labels;
 overlap and unknown speakers retain their explicit meaning. Provenance distinguishes
 `synthetic`, `recorded-file`, `causal-replay`, and `live-microphone`.
+`speaker_provenance` says how far a label reaches: `diarization-timeline` labels come
+from one session-long speaker timeline (the native stream), so the same label across
+turns is the same anonymous voice for the session; `diarization-utterance` labels
+(the hosted per-request diarizer) are stable only within one utterance, and a label in
+one utterance does not identify the same voice in another. Such labels are namespaced
+by utterance (`u7 Speaker A`, `u8 Speaker A`), so they never compare equal across
+utterances and a decision provider sees each utterance's voices as distinct
+participants; the `Turn` contract enforces this, so a replayed or imported
+`diarization-utterance` turn whose `speaker_id` lacks the `u<n> ` prefix is rejected
+rather than merged with unrelated voices or matched to a configured role, and because
+only the live processor can guarantee that each prefix names one utterance, authored or
+replayed input (`tool-replay`, `evaluate`) never carries this provenance at all: `load_turns`
+rejects it; `authored-fixture` and `unknown` keep their meanings. None is an identity.
 
 Decision evidence contains `label`, `recipient_kind`, `confidence`, `provider`, and
 `model`. A probability is not demonstrated accuracy or authority. A request is
@@ -112,7 +127,7 @@ Two per-session counts end a native session with a distinct error and require a 
 session identity: 1,000 unique finalized turns, and the native diarizer's whole-session
 speaker timeline of at most 18,000 segments, which is returned in full at every utterance
 and so is reached by very long sessions with frequent speaker changes (a windowed timeline
-is tracked in [#49](https://github.com/mickdarling/rightyo/issues/49)).
+is tracked in [#54](https://github.com/mickdarling/rightyo/issues/54)).
 The default history is five minutes, with 1,000 unique turns and 1 MiB of retained
 transcript data. There are additional independent bounds: at most 32 frozen pending
 contexts totalling 1 MiB, 128 queued events (configurable from 5 to 128) totalling
@@ -125,6 +140,13 @@ and normal termination. Producer tests generate and compare this exact fixture;
 the Hailing Station consumer uses the same authored contract fixture.
 
 ## Speaker roles and owner override
+
+Configured roles name session-stable labels, so they require a diarizer whose labels
+persist for the session (the native stream, `diarization-timeline`). A diarizer with
+utterance-local labels (`diarization-utterance`, namespaced as `u7 Speaker A`) can never
+match a configured `Speaker A`, and `owner_only` would then silence every request, so
+`listen` and the lab refuse to start a session that combines configured owners, trusted
+speakers or `owner_only` with such a diarizer.
 
 Without configuration the tool behaves exactly as above: `speakers` is `"anonymous"`
 and no `role` field exists. When speaker roles are configured, through the prototype
@@ -209,6 +231,17 @@ selected through the prototype configuration's `request_former` object, for exam
 Only the `kind` key is accepted and `template` is the only kind; an unknown kind or an extra
 key is rejected before any session starts.
 
+A live session (`listen` or the lab) also advertises its selected speech backends on the
+`started` event as a separate top-level `speech` object beside the capability set, for
+example `"speech": {"transcriber": {"kind": "whisper.cpp", "id":
+"whisper.cpp-live-window"}, "diarizer": {"kind": "nemotron.cpp", "id": "nemotron.cpp
+v3-streaming"}}`. The transcriber `id` is the `recognizer_id` its turns carry; the
+diarizer `id` names the backend and, for the hosted diarizer, the configured model and
+diarizer version (`hosted-deepgram <model> <diarize_model> <hash>`), so exported sessions
+record which diarizer labelled them without changing the `Turn` contract. Ids are display
+safe: never an endpoint, local path, model file or credential. Authored replay
+(`tool-replay`) does not advertise `speech`, so the shared fixtures are unchanged.
+
 When a former is configured, the `started` event advertises it as a separate top-level
 object beside the capability set, `"request_forming": {"kind": "template"}`, in the same
 way `addressing` is advertised: the existing `capabilities` set is unchanged, so consumers
@@ -272,6 +305,51 @@ processor closed once more audio than the budget arrives. Native paths are expli
 separately provisioned trusted assets. The controller connects its finalized turns
 to the replaceable `DecisionProvider` and event publisher. Alternative backends can
 produce the same validated `Turn`/`DecisionEvent` values without changing consumers.
+
+Speech recognition and speaker labelling are replaceable at the same kind of boundary.
+`rightyo.providers.Transcriber` turns one finalized utterance of PCM16 mono 16 kHz bytes
+into utterance-relative `{"text", "start_ms", "end_ms"}` units and names the
+`recognizer_id` of emitted turns; `rightyo.providers.Diarizer` receives every pushed
+frame (`push`) and returns a stream-relative `{"speaker", "start_ms", "end_ms"}` timeline
+(`segments`, `finish`, `close`). `LiveConfig.transcriber` and `LiveConfig.diarizer` take
+an instance or a factory called with the config; `None` keeps the local defaults,
+`WhisperCppTranscriber` and `NemotronCppDiarizer` in `rightyo.live_audio`, whose
+behaviour is unchanged. The `transcriber`/`diarizer` sections of the prototype
+configuration select an implementation by name, described in
+[the prototype document](prototype.md#speech-backends); `rightyo.speech_backends`
+also provides the hosted implementations and the factories that section maps to.
+Word-to-speaker attribution, grouping and the `Turn` contract are the same for every
+backend. Hosted backends refuse to send audio without explicit consent (`--allow-hosted`),
+and no hosted backend has been accuracy-tested here. Every Deepgram request carries
+`mip_opt_out=true`, which per Deepgram's documentation excludes it from the Model
+Improvement Program (participation is otherwise the default) and gives it zero data
+retention after the response. The OpenAI-compatible transcription request has no
+request-level training or retention control in the cited schema: the operator must
+configure data-use and retention controls on the provider account, and confirm the
+provider's policy, before pointing this backend at it. Turns from the hosted transcriber
+carry `recognizer_id` `hosted-openai-compatible <model> <hash>`: the configured model name
+with characters outside the identifier charset replaced by `-`, followed by the first 12
+hex digits of the SHA-256 of the original name so sanitized or truncated names cannot
+collide, the whole within 96 characters; transcripts from different models therefore stay
+distinguishable in exported events, and the endpoint never appears.
+`DeepgramDiarizer.diarizer_id` names that backend the same way
+(`hosted-deepgram <model> <diarize_model> <hash>`) while `speaker_provenance` keeps its
+allowlisted value. The hosted transcriber ignores the `register` cancellation hook: the
+`cancelled` guard is checked before each request, during a login Keychain credential
+lookup and every 50 ms while the response body is read, and the credential lookup plus
+the whole exchange share one wall-clock deadline of `timeout_seconds` (default 30, at
+most 120) from the start of the request. A Keychain lookup that is cancelled or outlives
+the deadline is terminated; the transport is given only the budget that lookup left, as
+its inactivity timeout for connect, TLS, headers and body, so a pause shorter than the
+remaining budget is tolerated. The open phase (name resolution, connect, TLS, upload and
+response headers) and the body read each run on a helper thread; a stop or the deadline
+is noticed within about 50 ms, the connection is shut, and the caller returns at once. A
+name lookup cannot be interrupted, so an abandoned connect thread ends when the resolver
+returns, without holding up the stop; such a thread holds no audio (the request body is
+handed over only after the connection exists), and hosted requests are refused
+process-wide while exchanges in flight plus such stalled threads reach four, whichever
+sessions own them: the slot is reserved atomically before any credential is loaded, so
+stalls cannot accumulate memory across restarts or through concurrent sessions.
 
 The current native implementation still uses conservative endpointing and completed
 Whisper windows. Persistent ASR, early attention, lower endpoint latency and other

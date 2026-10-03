@@ -9,7 +9,19 @@ from typing import Any
 
 LABELS = frozenset({"attend", "ignore", "uncertain"})
 PROVENANCE = frozenset({"synthetic", "recorded-file", "causal-replay", "live-microphone"})
-SPEAKER_PROVENANCE = frozenset({"authored-fixture", "diarization-timeline", "unknown"})
+SPEAKER_PROVENANCE = frozenset(
+    {"authored-fixture", "diarization-timeline", "diarization-utterance", "unknown"}
+)
+# Labels from a per-utterance diarizer are scoped by utterance number so that equal
+# labels from independent requests never merge into one participant.
+UTTERANCE_SCOPE = re.compile(r"u[0-9]+ ")
+
+
+def utterance_scoped_speaker(utterance: int, label: str) -> str:
+    """The speaker id a `diarization-utterance` turn must carry: `u<n> <label>`."""
+    return f"u{utterance} {label}"
+
+
 MAX_TEXT_CHARS = 4000
 MAX_ADDRESS_NAMES = 8
 MAX_ADDRESS_NAME_CHARS = 48
@@ -282,6 +294,14 @@ class Turn:
             raise ContractError("invalid turn provenance")
         if self.speaker_provenance not in SPEAKER_PROVENANCE:
             raise ContractError("invalid speaker provenance")
+        if (
+            self.speaker_provenance == "diarization-utterance"
+            and self.speaker_id is not None
+            and not UTTERANCE_SCOPE.match(self.speaker_id)
+        ):
+            # Enforced at the contract so replayed or imported turns cannot merge
+            # unrelated voices, or match a configured role, through a bare label.
+            raise ContractError("utterance-local speaker ids must be utterance-scoped")
 
     @classmethod
     def from_dict(cls, raw: Any) -> Turn:

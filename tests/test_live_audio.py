@@ -41,7 +41,9 @@ class FakeDiarizer:
         self.frames.append(pcm)
 
     def segments(self):
-        return [{"start_ms": 0, "end_ms": 900000, "speaker": 1}]
+        # One speaker covering everything pushed so far (a contract-valid timeline).
+        pushed_ms = sum(map(len, self.frames)) // BYTES_PER_MS
+        return [{"start_ms": 0, "end_ms": pushed_ms + 1000, "speaker": 1}]
 
     def finish(self):
         self.flushed = True
@@ -174,14 +176,12 @@ class LiveProcessorTests(unittest.TestCase):
         executable = Path(self.directory.name) / "slow-recognizer"
         executable.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n")
         executable.chmod(0o700)
-        self.processor.config = LiveConfig(
-            **(
-                vars(self.config)
-                | {
-                    "whisper_executable": executable,
-                }
-            )
+        self.processor.close()
+        self.processor = LiveProcessor(
+            LiveConfig(**(vars(self.config) | {"whisper_executable": executable})),
+            self.turns.append,
         )
+        self.addCleanup(self.processor.close)
         self.feed(VOICE, 10)
         failures = []
 
@@ -221,7 +221,7 @@ class LiveProcessorTests(unittest.TestCase):
         # every later offset is derived from this clock exactly as in a real session.
         self.processor._received_ms = THREE_HOURS_MS
         diarizer = self.processor._diarizer
-        diarizer.segments = lambda: [{"start_ms": 0, "end_ms": THREE_HOURS_MS * 2, "speaker": 1}]
+        diarizer.segments = lambda: [{"start_ms": 0, "end_ms": THREE_HOURS_MS + 2000, "speaker": 1}]
         self.feed(VOICE, 10)
         self.feed(SILENCE, 72)
         self.assertEqual(len(self.turns), 1)

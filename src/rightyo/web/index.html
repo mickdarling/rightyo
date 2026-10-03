@@ -12,7 +12,7 @@
   <div class="shell">
     <header class="masthead">
       <div class="brand" aria-label="RightyO speech lab"><span class="brand-mark" aria-hidden="true">R<span>o</span></span><span>RightyO<span class="brand-subtitle">SPEECH LAB</span></span></div>
-      <div class="local-label"><span class="dot"></span> On this Mac</div>
+      <div class="local-label"><span class="dot"></span> <span id="locality-label">On this Mac</span></div>
     </header>
     <main>
       <section class="intro" aria-labelledby="page-title">
@@ -20,8 +20,8 @@
         <div id="phase-pill" class="phase-pill" data-phase="idle"><span class="dot"></span><span id="phase-label">Idle · microphone off</span></div>
       </section>
       <section class="model-strip" aria-label="The model pipeline">
-        <div class="model-step"><span class="step-number">01</span><div><strong>Nemotron 3</strong><span>Who is speaking · configured GGUF</span></div><span class="step-tag">LOCAL</span></div>
-        <div class="model-step"><span class="step-number">02</span><div><strong>Whisper</strong><span>What was said · configured model</span></div><span class="step-tag">LOCAL</span></div>
+        <div class="model-step"><span class="step-number">01</span><div><strong id="diarizer-name">Nemotron 3</strong><span id="diarizer-detail">Who is speaking · configured GGUF</span></div><span id="diarizer-tag" class="step-tag">LOCAL</span></div>
+        <div class="model-step"><span class="step-number">02</span><div><strong id="transcriber-name">Whisper</strong><span id="transcriber-detail">What was said · configured model</span></div><span id="transcriber-tag" class="step-tag">LOCAL</span></div>
         <div class="model-step"><span class="step-number">03</span><div><strong>Jev</strong><span>Is this for the agent?</span></div><span id="jev-model-tag" class="step-tag">OFF</span></div>
       </section>
       <div class="workspace">
@@ -42,7 +42,7 @@
             </div>
             <div class="hosted-setting">
               <label class="checkbox-label" for="use-jev"><input id="use-jev" type="checkbox"><span>Enable Jev decisions<span class="optional">Optional · hosted</span></span></label>
-              <p class="help">Sends bounded transcript text and recent context to TypeSafe. Audio stays local. Unchecked means no hosted calls.</p>
+              <p class="help">Sends bounded transcript text and recent context to TypeSafe. Unchecked means no hosted decision calls; the speech stages above show whether audio leaves this Mac.</p>
               <div id="jev-settings" class="number-settings">
                 <label for="confidence">Confidence threshold<input id="confidence" type="number" min="0" max="1" step="0.05" value="0.7" disabled></label>
                 <label for="max-requests">Maximum requests<input id="max-requests" type="number" min="1" max="100" step="1" value="20" disabled></label>
@@ -63,10 +63,10 @@
           <p id="message" class="message" role="status" aria-live="polite">Connecting to your local session…</p>
           <div id="empty-state" class="empty-state"><div class="empty-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><h3>The room is quiet here.</h3><p>Start a session to see speaker-labelled speech.<br>Try a conversation, then ask: “Hey, Hailing Station, what were we just discussing?”</p></div>
           <ol id="transcript" class="transcript" aria-label="Retained transcript turns"></ol>
-          <div class="transcript-note"><strong>Experimental attribution.</strong> Speaker A/B labels are anonymous within this session. Unknown and overlapping speech remain marked. Timing and speaker alignment are heuristic; this prototype detects attention and hands off context, without replying or executing tools.</div>
+          <div class="transcript-note"><strong>Experimental attribution.</strong> <span id="attribution-note">Speaker A/B labels are anonymous within this session.</span> Unknown and overlapping speech remain marked. Timing and speaker alignment are heuristic; this prototype detects attention and hands off context, without replying or executing tools.</div>
         </section>
       </div>
-      <footer><span><span class="dot"></span> Local transcription · temporary context</span><span>Stop clears this session. No default audio archive or transcript log.</span></footer>
+      <footer><span><span class="dot"></span> <span id="footer-locality">Local transcription · temporary context</span></span><span>Stop clears this session. No default audio archive or transcript log.</span></footer>
     </main>
   </div>
 </body>

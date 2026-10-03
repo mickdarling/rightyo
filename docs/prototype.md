@@ -41,7 +41,10 @@ hard-coded speaker roles for the headless tool, for example
 `"speakers": {"owner": ["Speaker A"], "trusted": [], "owner_only": false}`; it may also
 set `"stop_phrases"`. Session speaker labels such as `Speaker A` are anonymous and are
 assigned per session by the diarizer, so a configured label names whichever voice
-receives it; roles are precedence data for the host, not a verified identity.
+receives it; roles are precedence data for the host, not a verified identity. Roles
+need the session-stable native diarizer: with `hosted-deepgram`, whose labels hold only
+within one utterance, a `speakers` object naming owners or trusted speakers or setting
+`owner_only` is refused at Start rather than silently never matching.
 `"source": "model"` is refused by the lab and by `listen`, in both microphone and demo
 modes, with a clear error before any capture starts: a hosted role question would run on
 the audio path under the controller lock, where Stop and lease expiry cannot reach it.
@@ -70,6 +73,90 @@ a separate physical test.
 .venv/bin/rightyo prototype --config local/prototype.json --port 8766
 ```
 
+## Speech backends
+
+Recognition and speaker labelling are selected by two optional sections. Omitting them,
+as every existing configuration does, keeps the local runtimes above:
+
+```json
+{
+  "transcriber": {"kind": "whisper.cpp"},
+  "diarizer": {"kind": "nemotron.cpp"}
+}
+```
+
+The hosted alternatives are opt-in. Selecting one makes that side's local asset paths
+optional, and the lab or `listen` then refuses to start without `--allow-hosted`, which
+authorizes sending session audio to the named service for that run:
+
+```json
+{
+  "transcriber": {
+    "kind": "hosted-openai-compatible",
+    "endpoint": "https://api.openai.com/v1/audio/transcriptions",
+    "model": "whisper-1",
+    "language": "en",
+    "timeout_seconds": 30
+  },
+  "diarizer": {"kind": "hosted-deepgram", "model": "nova-3", "diarize_model": "latest"}
+}
+```
+
+`hosted-openai-compatible` posts each finalized utterance as a WAV file to the given
+`https` endpoint in the OpenAI `POST /v1/audio/transcriptions` schema with
+`response_format=verbose_json` and `timestamp_granularities[]` `word` and `segment`;
+per the API reference read on 2026-10-02, that is what `whisper-1` accepts, while
+`gpt-4o-transcribe` and `gpt-4o-mini-transcribe` return only `json` and
+`gpt-4o-transcribe-diarize` does not offer timestamp granularities. `endpoint` and
+`model` are required; `language` (ISO 639-1) and `timeout_seconds` (at most 120) are
+optional. The request has no training or retention opt-out parameter in the cited schema;
+configure data-use controls on the provider account and confirm its policy before use. The credential is read from `RIGHTYO_TRANSCRIBER_API_KEY` or the login
+Keychain item with service `rightyo.transcriber` and account `api-key`.
+
+`hosted-deepgram` posts the trailing utterance window to Deepgram's pre-recorded
+`https://api.deepgram.com/v1/listen` with `model` (default `nova-3`), `diarize_model`
+(`latest`, `v1` or `v2`; default `latest`) and always `mip_opt_out=true`, which Deepgram
+documents as excluding the request from its Model Improvement Program (participation is
+otherwise the default) with zero data retention after the response; it reads the
+word-level `speaker` labels,
+merging consecutive words of one speaker that are at most 300 ms apart into timeline
+segments (a wider gap stays uncovered, so speech inside it is unknown). A response
+without Deepgram's `metadata.diarize_info` marker, which Deepgram documents as absent
+when the diarizer did not run, fails the session as "diarization unavailable" rather than
+passing as unknown-speaker output. `endpoint` may be
+overridden with another `https` URL. The credential is read from
+`RIGHTYO_DIARIZER_API_KEY` or the login Keychain item with service `rightyo.diarizer`
+and account `api-key`; create it with `security add-generic-password -s rightyo.diarizer
+-a api-key -w` (prompted, never on the command line). Deepgram labels speakers per
+request, so with this backend Speaker A in one utterance is not known to be the same
+person as Speaker A in the next; its turns carry `speaker_provenance:
+"diarization-utterance"` with utterance-namespaced labels such as `u7 Speaker A`, and
+the native Nemotron stream is the only backend whose
+labels persist for the session. The 18,000-segment timeline cap does not apply to it.
+A hosted request's Keychain credential lookup and whole exchange share a wall-clock
+deadline of `timeout_seconds`; a stop is honoured during the lookup and within about 50 ms
+while the connection is opened or the body is read, and a mid-body pause shorter than the
+remaining budget is tolerated. The endpoint must not carry its own query string or fragment.
+Its host is a DNS name (internationalized names in their ASCII `xn--` form), an IPv4
+address, or a bracketed IPv6 literal such as `https://[::1]:8443/v1` without a zone
+identifier; whitespace, control characters, user information and characters outside
+RFC 3986 paths are rejected when the configuration loads.
+
+The lab page labels the two speech stages from the loaded configuration: `LOCAL` with the
+local runtime name, or `HOSTED` with the service family ("OpenAI-compatible hosted",
+"Deepgram hosted"); the masthead then reads "Audio leaves this Mac" and the Start status
+says "Connecting to hosted speech service" instead of "Loading local models". The
+controller snapshot carries the same `transcriber`/`diarizer` summaries (`kind`, `hosted`,
+`service`, and `utterance_local`, from which the page words its speaker-label legend) and
+never the endpoint, model name or credential.
+
+Hosted calls use the standard library only, send no environment proxy, refuse redirects,
+cap responses at 2 MiB, and report failures as "Hosted speech backend failed" without
+audio, transcript, URL or credential content; a failure stops the session like a local
+one. Unknown kinds, unknown keys and non-`https` endpoints are rejected when the file is
+loaded. No hosted backend has been accuracy-tested in this repository; the local smoke
+evidence below is for the local runtimes only.
+
 Open the printed local URL, including its one-time session fragment. The dashboard initially
 sits idle. **Start microphone** explicitly enables the default input and may prompt for
 macOS permission. A pending permission prompt can be cancelled with Stop. The capture helper
@@ -97,7 +184,7 @@ an explicit message to start a new session, preserving valid history until expir
 The native diarizer separately keeps one whole-session speaker timeline capped at 18,000
 segments, returned in full at every utterance; very long sessions with frequent speaker
 changes reach it, stop with a distinct timeline-limit message, and likewise need a new
-session. A windowed timeline is tracked in [#49](https://github.com/mickdarling/rightyo/issues/49).
+session. A windowed timeline is tracked in [#54](https://github.com/mickdarling/rightyo/issues/54).
 The whole turn overlapping the time boundary is retained and its overlap is reported. Ignore and uncertain decisions remain in local context: a later
 request can refer to the preceding discussion. Copy context produces speaker-labelled text
 for manual use downstream, including unknown-speaker and overlap indications.

@@ -8,7 +8,7 @@ import socket
 import threading
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, runtime_checkable
 
 from rightyo.contracts import (
     LABELS,
@@ -63,6 +63,48 @@ class ConfiguredPriorityProvider:
             speaker: self.priority.configured_role(speaker) or "participant"
             for speaker in state["known_participants"]
         }
+
+
+@runtime_checkable
+class Transcriber(Protocol):
+    """Recognize one finalized utterance of mono 16 kHz PCM16 bytes.
+
+    Returns utterance-relative units `{"text", "start_ms", "end_ms"}` in order, with
+    `0 <= start_ms <= end_ms <= len(pcm) // 32`; concatenated unit text is the transcript.
+    `register` receives a cancellable handle (a subprocess for local backends) so the
+    owner can stop work on close. `recognizer_id` labels emitted turns.
+    """
+
+    recognizer_id: str
+
+    def transcribe(
+        self, pcm: bytes, register: Callable[[Any], None] | None = None
+    ) -> list[dict[str, Any]]: ...
+
+
+@runtime_checkable
+class Diarizer(Protocol):
+    """Stream-relative anonymous speaker timeline over pushed mono 16 kHz PCM16 audio.
+
+    `segments` and `finish` return `{"speaker": int, "start_ms", "end_ms"}` entries in
+    stream milliseconds with `0 <= start_ms <= end_ms` no later than one second past the
+    audio pushed so far and `1 <= speaker <= 702`; `finish` flushes any lookahead first.
+    Speaker numbers become labels like spreadsheet columns: 1..26 are `Speaker A`..
+    `Speaker Z`, 27 is `Speaker AA`, 52 `Speaker AZ`, 53 `Speaker BA`. The processor
+    validates every returned timeline and fails closed on anything else. Whether labels stay
+    stable across utterances is a property of the implementation: an implementation
+    whose labels hold only within one utterance declares `speaker_provenance =
+    "diarization-utterance"`; without the attribute, turns carry the session-stable
+    `"diarization-timeline"`.
+    """
+
+    def push(self, pcm: bytes) -> None: ...
+
+    def segments(self) -> list[dict[str, Any]]: ...
+
+    def finish(self) -> list[dict[str, Any]]: ...
+
+    def close(self) -> None: ...
 
 
 def state_addressing(state: dict[str, Any]) -> Addressing | None:

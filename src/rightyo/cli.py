@@ -42,6 +42,12 @@ def load_turns(path: Path) -> list[Turn]:
     turns = [Turn.from_dict(item) for item in raw]
     if len({turn.session_id for turn in turns}) != 1:
         raise ContractError("evaluate one explicit session at a time")
+    # Utterance-scoped labels are unique only by construction in the live processor; a
+    # file could repeat a prefix across utterances, so this provenance never loads.
+    if any(turn.speaker_provenance == "diarization-utterance" for turn in turns):
+        raise ContractError(
+            "utterance-local speaker provenance is produced only by the live processor"
+        )
     return turns
 
 
@@ -281,6 +287,11 @@ def main(argv: list[str] | None = None) -> int:
     prototype = commands.add_parser("prototype", help="open an idle local Mac speech lab")
     prototype.add_argument("--config", type=Path, required=True, help="local asset configuration")
     prototype.add_argument("--port", type=int, default=8765)
+    prototype.add_argument(
+        "--allow-hosted",
+        action="store_true",
+        help="send session audio to the hosted speech backends named in the configuration",
+    )
     _add_name_option(prototype)
     _add_session_budget_option(prototype)
     listen = commands.add_parser("listen", help="explicit foreground speech JSONL tool")
@@ -325,6 +336,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.port,
                     addressing=addressing_from_args(args),
                     session_budget_seconds=args.session_budget,
+                    allow_hosted=args.allow_hosted,
                 )
             except (PrototypeError, OSError):
                 print(

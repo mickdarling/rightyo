@@ -104,7 +104,31 @@
     return node;
   }
 
+  function stage(id, backend, question) {
+    // Labels come from the server's backend summary (kind, hosted, service name only).
+    if (!backend || typeof backend !== "object") return;
+    const hosted = backend.hosted === true;
+    $(`${id}-tag`).textContent = hosted ? "HOSTED" : "LOCAL";
+    $(`${id}-name`).textContent = String(backend.service || backend.kind || "Unknown");
+    $(`${id}-detail`).textContent = `${question} · ${hosted ? "audio sent to the hosted service" : "on this Mac"}`;
+  }
+
+  function hostedSpeech(state) {
+    return (state.transcriber && state.transcriber.hosted === true) || (state.diarizer && state.diarizer.hosted === true);
+  }
+
   function render(state) {
+    stage("diarizer", state.diarizer, "Who is speaking");
+    stage("transcriber", state.transcriber, "What was said");
+    $("locality-label").textContent = hostedSpeech(state) ? "Audio leaves this Mac · hosted speech configured" : "On this Mac";
+    const diarizer = state.diarizer && typeof state.diarizer === "object" ? state.diarizer : null;
+    $("attribution-note").textContent = diarizer && diarizer.utterance_local === true
+      ? "Speaker labels such as u7 Speaker A are anonymous and hold only within one utterance; the same label in another utterance is not known to be the same voice."
+      : "Speaker A/B labels are anonymous within this session.";
+    const transcriber = state.transcriber && typeof state.transcriber === "object" ? state.transcriber : null;
+    $("footer-locality").textContent = transcriber && transcriber.hosted === true
+      ? `Hosted transcription (${String(transcriber.service || transcriber.kind || "hosted")}) · temporary context`
+      : "Local transcription · temporary context";
     connected = true;
     demoAvailable = state.demo_available === true;
     setPhase(state.phase);
@@ -167,7 +191,7 @@
       : `${count.attend} attend · ${count.ignore} ignore · ${count.uncertain} uncertain${state.pending_decisions ? ` · ${state.pending_decisions} pending` : ""}`;
     if (state.error) message(state.error, true);
     else if (state.phase === "idle") message("Ready when you are. The microphone is off.");
-    else if (state.phase === "starting") message("Loading local models. If macOS asks for microphone access, approve only when ready to record this session.");
+    else if (state.phase === "starting") message(`${hostedSpeech(state) ? "Connecting to hosted speech service" : "Loading local models"}. If macOS asks for microphone access, approve only when ready to record this session.`);
     else if (state.phase === "complete") message("Audio demo finished. Review the retained text, or Stop to clear it.");
     else {
       const boundary = Number(retention.boundary_overlap_ms || 0);
