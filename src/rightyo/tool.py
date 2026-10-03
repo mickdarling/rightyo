@@ -170,7 +170,8 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
             state = controller.snapshot()
             _emit(controller.drain_events(), output)
             if state["phase"] in {"complete", "idle", "error"}:
-                result = 2 if state["phase"] == "error" else 0
+                overrun = getattr(controller, "input_overrun", False)
+                result = 2 if state["phase"] == "error" or overrun else 0
                 controller.stop()
                 _emit(controller.drain_events(), output)
                 return result

@@ -494,15 +494,13 @@ class PrototypeController:
                     capture.start()
                 accepted = True
                 while accepted and not stop.is_set():
-                    item = capture.read(timeout=0.25)
-                    if item == b"":
-                        break  # EOF: a clean stop, flushing the open utterance.
-                    if item:
-                        gap, pcm = item
-                        if gap:
-                            accepted = self._gap(generation, processor, gap)
-                        if accepted and pcm:
-                            accepted = self._feed(generation, processor, pcm, mode)
+                    pcm = capture.read(timeout=0.25)
+                    if pcm == b"":
+                        # EOF or overrun: finalize the open utterance from contiguous audio.
+                        # An overrun then ends the session as an error (see _event_end).
+                        break
+                    if pcm:
+                        accepted = self._feed(generation, processor, pcm, mode)
                 if accepted and not stop.is_set():
                     processor.finish()
                     with self._lock:
@@ -587,19 +585,6 @@ class PrototypeController:
                     self._capture = self._processor = None
                 elif generation + 1 == self._generation and self._phase == "stopping":
                     self._phase = "idle"
-
-    def _gap(self, generation, processor, dropped_bytes) -> bool:
-        """Count dropped stdin audio as elapsed stream time and cut the open utterance."""
-        with self._lock:
-            if generation != self._generation or self._stop.is_set() or self._budget_reached:
-                return False
-            self._received_bytes += dropped_bytes
-            self._received_ms = self._received_bytes // PCM_BYTES_PER_MS
-            if self._budget_ms is not None and self._received_ms >= self._budget_ms:
-                self._budget_reached = True
-                return False
-        processor.mark_gap(dropped_bytes // PCM_BYTES_PER_MS)
-        return True
 
     def _feed(self, generation, processor, pcm, mode) -> bool:
         """Push audio up to the session budget; False once the session accepts no more."""
@@ -848,13 +833,23 @@ class PrototypeController:
             capture = self._stdin_capture
             gaps = None
             if capture is not None:
+                if capture.overrun and phase == "stopped":
+                    # Dropped audio would splice speech across a gap and corrupt the
+                    # session-persistent diarizer state: fail closed after finalizing.
+                    phase, reason = "error", "input-overrun"
                 gaps = {
-                    "gaps": capture.gaps,
+                    "gaps": int(capture.overrun),
                     "dropped_bytes": capture.dropped_bytes,
                     "discarded_tail_bytes": capture.discarded_tail_bytes,
                 }
             self._events.end(phase=phase, now_ms=self._now_ms(), reason=reason, input_gaps=gaps)
             self._event_terminal = True
+
+    @property
+    def input_overrun(self) -> bool:
+        """Whether the stdin input overran its queue; the session then ends as an error."""
+        capture = self._stdin_capture
+        return capture is not None and capture.overrun
 
     def drain_events(self):
         """Drain only this explicit session's events, independently of the lab UI."""

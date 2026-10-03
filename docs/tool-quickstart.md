@@ -66,13 +66,14 @@ mode does. The replay values use media time, as demo mode does, so a slow produc
 cut off early. The started session
 event adds a top-level `audio_input` object
 (`{"source": "stdin", "encoding": "s16le", "sample_rate": 16000, "channels": 1}`) beside
-the unchanged capability set. If processing falls behind, at most 32 seconds of audio is
-queued and further 200 ms chunks are dropped, not buffered. Audio on either side of a
-drop is never spliced together. At the first chunk after a drop, the open utterance is
-finalized, and stream time advances by the dropped duration, so later turn timestamps stay
-on the speaker's clock. No silence is synthesized. A notice goes to stderr when each gap
-starts, and the terminal session event carries
-`input_gaps` (`gaps`, `dropped_bytes`, `discarded_tail_bytes`).
+the unchanged capability set. At most 32 seconds of audio is queued. If processing falls
+further behind, the input overruns and the session fails closed. RightyO stops reading,
+drops the unqueued audio, processes the audio already queued, and finalizes the open
+utterance. It then ends with a `session` `error` event with reason `input-overrun` and
+exits non-zero. No audio after the drop reaches speech recognition or the diarizer, so
+speech is never spliced across a gap and speaker labels stay consistent for the session.
+A notice goes to stderr. The terminal session event of every stdin session carries
+`input_gaps` (`gaps`, 0 or 1; `dropped_bytes`; `discarded_tail_bytes`).
 
 Repeatable `--name` flags (for example `--name "Hailing Station" --name computer`) declare
 the forms of address the system answers to for `listen`, `tool-replay` and `prototype`. They

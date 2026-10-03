@@ -112,21 +112,6 @@ class LiveProcessorTests(unittest.TestCase):
         self.assertEqual([t.speaker_id for t in self.turns], ["Speaker A", "Speaker A"])
         self.assertEqual([t.utterance_id for t in self.turns], ["live-1", "live-2"])
 
-    def test_dropped_audio_gap_cuts_the_utterance_and_advances_timestamps(self):
-        self.feed(VOICE, 10)
-        self.processor.mark_gap(5000)  # 5 s of host audio dropped under back-pressure.
-        # The open utterance is finalized at the gap: nothing after it can be spliced in.
-        self.assertEqual([(t.start_ms, t.end_ms) for t in self.turns], [(0, 200)])
-        self.assertEqual(len(self.transcribe.call_args.args[1]), 200 * 32)
-        self.feed(VOICE, 10)
-        self.feed(SILENCE, 72)
-        self.assertEqual(len(self.turns), 2)
-        self.assertEqual((self.turns[1].start_ms, self.turns[1].end_ms), (5200, 5400))
-        self.assertEqual(len(self.transcribe.call_args.args[1]), (200 + 1440) * 32)
-        with self.assertRaises(LiveAudioError):
-            self.processor.mark_gap(-1)
-        self.assertTrue(self.processor.failed)
-
     def test_long_speech_audio_window_is_bounded(self):
         self.feed(VOICE, 620)
         self.assertEqual(len(self.turns), 1)

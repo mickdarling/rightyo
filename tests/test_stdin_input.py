@@ -51,18 +51,14 @@ class Gated:
         return self.pieces[self.index - 1]
 
 
-def drain(capture, gaps=None):
+def drain(capture):
     chunks = []
     while True:
-        item = capture.read(timeout=1)
-        if item == b"":
+        chunk = capture.read(timeout=1)
+        if chunk == b"":
             return chunks
-        if item:
-            gap, chunk = item
-            if gaps is not None:
-                gaps.append(gap)
-            if chunk:
-                chunks.append(chunk)
+        if chunk:
+            chunks.append(chunk)
 
 
 class Processor:
@@ -71,7 +67,6 @@ class Processor:
     def __init__(self, config, callback):
         self.config, self.callback = config, callback
         self.received = bytearray()
-        self.gaps = []
         self.finished = self.closed = False
         self.instances.append(self)
 
@@ -96,9 +91,6 @@ class Processor:
                 )
             )
 
-    def mark_gap(self, dropped_ms):
-        self.gaps.append((len(self.received), dropped_ms))
-
     def finish(self):
         self.finished = True
 
@@ -116,40 +108,21 @@ class StdinCaptureTests(unittest.TestCase):
         self.assertEqual(b"".join(chunks), data[:-1])
         self.assertTrue(all(len(chunk) == PCM_CHUNK_BYTES for chunk in chunks[:-1]))
         self.assertEqual(capture.discarded_tail_bytes, 1)
-        self.assertEqual((capture.gaps, capture.dropped_bytes), (0, 0))
+        self.assertEqual((capture.overrun, capture.dropped_bytes), (False, 0))
         self.assertEqual(len(messages), 1)
 
-    def test_back_pressure_drops_counted_chunks_instead_of_buffering(self):
+    def test_overrun_stops_reading_and_never_delivers_audio_after_the_drop(self):
         messages = []
-        capture = StdinPcmCapture(
-            io.BytesIO(bytes(10 * PCM_CHUNK_BYTES)), queue_chunks=2, report=messages.append
-        )
+        stream = io.BytesIO(b"".join(bytes([n]) * PCM_CHUNK_BYTES for n in range(10)))
+        capture = StdinPcmCapture(stream, queue_chunks=2, report=messages.append)
         capture.start()
         capture._reader.join(timeout=5)  # Consumer stalled for the whole input.
-        self.assertEqual(capture._queue.qsize(), 2)
-        self.assertEqual(capture.dropped_bytes, 8 * PCM_CHUNK_BYTES)
-        self.assertEqual(capture.gaps, 1)
+        self.assertTrue(capture.overrun)
+        self.assertEqual(capture.dropped_bytes, PCM_CHUNK_BYTES)
+        self.assertEqual(stream.tell(), 3 * PCM_CHUNK_BYTES)  # Reading stopped at the drop.
         self.assertEqual(len(messages), 1)
-        gaps = []
-        self.assertEqual(len(drain(capture, gaps)), 2)
-        # The trailing drop is reported once at EOF, after the queued audio.
-        self.assertEqual(gaps, [0, 0, 8 * PCM_CHUNK_BYTES])
-
-    def test_first_chunk_after_a_drop_carries_the_gap(self):
-        pieces = [bytes([n]) * PCM_CHUNK_BYTES for n in range(5)]
-        stream = Gated(pieces, gate_at=4)
-        capture = StdinPcmCapture(stream, queue_chunks=2, report=lambda _message: None)
-        capture.start()
-        self.assertTrue(stream.paused.wait(5))
-        gaps = []
-        first = [capture.read(timeout=1), capture.read(timeout=1)]
-        stream.release.set()
-        rest = drain(capture, gaps)
-        self.assertEqual([gap for gap, _chunk in first], [0, 0])
-        self.assertEqual([chunk[0] for _gap, chunk in first], [0, 1])
-        self.assertEqual([chunk[0] for chunk in rest], [4])
-        self.assertEqual(gaps, [2 * PCM_CHUNK_BYTES])
-        self.assertEqual((capture.gaps, capture.dropped_bytes), (1, 2 * PCM_CHUNK_BYTES))
+        # Only the contiguous audio queued before the drop is delivered, then end of input.
+        self.assertEqual([chunk[0] for chunk in drain(capture)], [0, 1])
 
     def test_stop_discards_pending_audio(self):
         capture = StdinPcmCapture(io.BytesIO(bytes(3 * PCM_CHUNK_BYTES)))
@@ -261,50 +234,6 @@ class StdinListenTests(unittest.TestCase):
             controller.start({"mode": "stdin"})
         self.assertEqual(Processor.instances, [])
 
-    def test_dropped_audio_marks_a_gap_and_advances_stream_time(self):
-        chunk = PCM_CHUNK_BYTES
-        stream = Gated([bytes(chunk)] * 6, gate_at=5)
-        output, diagnostics = io.StringIO(), io.StringIO()
-        result, captures = {}, []
-
-        def capture_factory(*args, **kwargs):
-            captures.append(StdinPcmCapture(*args, queue_chunks=2, **kwargs))
-            return captures[-1]
-
-        def run():
-            with contextlib.redirect_stderr(diagnostics):
-                result["code"] = listen(
-                    self.args, output=output, controller_factory=self.factory, audio_input=stream
-                )
-
-        # Five chunks race a slow consumer and a queue of two; once the consumer has
-        # caught up, a sixth chunk arrives after the gap, then EOF.
-        with patch("rightyo.prototype.StdinPcmCapture", capture_factory):
-            with patch.object(Processor, "push_pcm16", slow_push(Processor.push_pcm16)):
-                thread = threading.Thread(target=run)
-                thread.start()
-                self.assertTrue(stream.paused.wait(5))
-                deadline = time.monotonic() + 5
-                while time.monotonic() < deadline and (
-                    not Processor.instances
-                    or len(Processor.instances[0].received) + captures[0].dropped_bytes < 5 * chunk
-                ):
-                    time.sleep(0.01)
-                stream.release.set()
-                thread.join(10)
-        self.assertEqual(result.get("code"), 0)
-        (processor,) = Processor.instances
-        dropped = captures[0].dropped_bytes
-        self.assertGreater(dropped, 0)
-        self.assertEqual(processor.gaps, [(5 * chunk - dropped, dropped // 32)])
-        self.assertEqual(len(processor.received), 6 * chunk - dropped)
-        events = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual(events[-1]["phase"], "stopped")
-        self.assertEqual(events[-1]["input_gaps"]["dropped_bytes"], dropped)
-        # Stream time counts the dropped audio: six 200 ms chunks were spoken.
-        self.assertGreaterEqual(events[-1]["emitted_at_ms"], 1200)
-        self.assertIn("dropping", diagnostics.getvalue())
-
     def _stalled_session(self, provenance, wait_seconds):
         """A producer that sends nothing for ``wait_seconds`` under a 1 s session budget."""
         stream = Gated([bytes(PCM_CHUNK_BYTES)], gate_at=0)
@@ -337,7 +266,7 @@ class StdinListenTests(unittest.TestCase):
         self.assertEqual((code, events[-1]["phase"]), (0, "stopped"))
         self.assertLess(events[-1]["emitted_at_ms"], 1000)
 
-    def test_trailing_drop_at_eof_reaches_the_stream_clock(self):
+    def test_overrun_finalizes_then_fails_closed_with_a_reason_and_nonzero_exit(self):
         chunk = PCM_CHUNK_BYTES
         output, diagnostics, captures = io.StringIO(), io.StringIO(), []
 
@@ -345,7 +274,7 @@ class StdinListenTests(unittest.TestCase):
             captures.append(StdinPcmCapture(*args, queue_chunks=2, **kwargs))
             return captures[-1]
 
-        # A fast finite replay of ten chunks into a queue of two: the drop is trailing.
+        # A fast finite input of ten chunks into a queue of two, with a slow consumer.
         with patch("rightyo.prototype.StdinPcmCapture", capture_factory):
             with patch.object(Processor, "push_pcm16", slow_push(Processor.push_pcm16)):
                 with contextlib.redirect_stderr(diagnostics):
@@ -355,17 +284,23 @@ class StdinListenTests(unittest.TestCase):
                         controller_factory=self.factory,
                         audio_input=io.BytesIO(bytes(10 * chunk)),
                     )
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 2)
         (processor,) = Processor.instances
         dropped = captures[0].dropped_bytes
         self.assertGreater(dropped, 0)
-        self.assertEqual(len(processor.received) + dropped, 10 * chunk)
-        self.assertEqual(processor.gaps[-1], (10 * chunk - dropped, dropped // 32))
+        # Only contiguous pre-drop audio was processed; the open utterance was finalized.
+        self.assertLess(len(processor.received) + dropped, 10 * chunk)
+        self.assertTrue(processor.finished and processor.closed)
         events = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual(events[-1]["phase"], "stopped")
-        self.assertEqual(events[-1]["input_gaps"]["dropped_bytes"], dropped)
-        # Ten 200 ms chunks of media elapsed, including the trailing drop.
-        self.assertGreaterEqual(events[-1]["emitted_at_ms"], 2000)
+        self.assertEqual(
+            (events[-1]["type"], events[-1]["phase"], events[-1]["reason"]),
+            ("session", "error", "input-overrun"),
+        )
+        self.assertEqual(
+            events[-1]["input_gaps"],
+            {"gaps": 1, "dropped_bytes": dropped, "discarded_tail_bytes": 0},
+        )
+        self.assertIn("overran", diagnostics.getvalue())
 
     def test_stop_with_a_blocked_reader_never_lets_it_feed_a_later_session(self):
         stream = Gated([bytes(PCM_CHUNK_BYTES)], gate_at=0)

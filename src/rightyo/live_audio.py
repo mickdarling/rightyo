@@ -712,10 +712,6 @@ class LiveProcessor:
         self._utterance_start = 0
         self._last_voice_ms = 0
         self._received_ms = 0
-        # Audio a host dropped before delivery (stdin back-pressure). Frames and the
-        # diarizer timeline count delivered audio only; emitted turns add this offset,
-        # and no utterance spans a gap, so each utterance has a single offset.
-        self._gap_ms = 0
         self._counter = 0
         self._utterances = 0
         self._asr_process: subprocess.Popen | None = None
@@ -745,24 +741,6 @@ class LiveProcessor:
                 frame = bytes(self._partial[:FRAME_BYTES])
                 del self._partial[:FRAME_BYTES]
                 self._frame(frame)
-        except Exception:
-            self.failed = True
-            self.close()
-            raise
-
-    def mark_gap(self, dropped_ms: int) -> None:
-        """Record undelivered audio: finalize the open utterance, then advance the clock."""
-        if self.closed or self.failed:
-            raise LiveAudioError("Audio session is closed")
-        try:
-            if type(dropped_ms) is not int or dropped_ms < 0:
-                raise LiveAudioError("Invalid audio gap")
-            if self._utterance:
-                self._finalize(self._diarizer.segments())
-            # A sub-frame remainder never reaches the diarizer; count it as dropped too.
-            self._gap_ms += dropped_ms + len(self._partial) // BYTES_PER_MS
-            self._partial.clear()
-            self._pre_roll.clear()
         except Exception:
             self.failed = True
             self.close()
@@ -841,8 +819,8 @@ class LiveProcessor:
                 session_id=self.config.session_id,
                 utterance_id=f"live-{self._counter}",
                 revision=1,
-                start_ms=group["start_ms"] + self._gap_ms,
-                end_ms=group["end_ms"] + self._gap_ms,
+                start_ms=group["start_ms"],
+                end_ms=group["end_ms"],
                 text=text,
                 speaker_id=group["speaker"],
                 finalized=True,
