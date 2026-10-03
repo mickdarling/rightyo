@@ -494,7 +494,7 @@ class PrototypeController:
                         gap, pcm = item
                         if gap:
                             accepted = self._gap(generation, processor, gap)
-                        if accepted:
+                        if accepted and pcm:
                             accepted = self._feed(generation, processor, pcm, mode)
                 if accepted and not stop.is_set():
                     processor.finish()

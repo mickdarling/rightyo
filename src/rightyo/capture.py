@@ -251,7 +251,11 @@ class StdinPcmCapture:
         self._eof.set()
 
     def read(self, timeout: float = 0.25) -> tuple[int, bytes] | bytes | None:
-        """Return ``(gap_bytes_dropped_before, pcm)``; None means none yet; b"" means EOF."""
+        """Return ``(gap_bytes_dropped_before, pcm)``; None means none yet; b"" means EOF.
+
+        Chunks dropped after the last queued chunk are returned once at EOF as
+        ``(gap_bytes, b"")`` so the consumer's stream clock still counts them.
+        """
         if self._stopped.is_set():
             raise CaptureError("Stdin capture is not running")
         try:
@@ -260,6 +264,10 @@ class StdinPcmCapture:
             if self._eof.is_set() and self._queue.empty():
                 if self._failure is not None:
                     raise CaptureError(self._failure) from None
+                if self._unmarked_gap:
+                    # Audio dropped just before EOF still elapsed: report it once.
+                    gap, self._unmarked_gap = self._unmarked_gap, 0
+                    return gap, b""
                 return b""
             return None
 

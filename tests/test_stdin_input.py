@@ -61,7 +61,8 @@ def drain(capture, gaps=None):
             gap, chunk = item
             if gaps is not None:
                 gaps.append(gap)
-            chunks.append(chunk)
+            if chunk:
+                chunks.append(chunk)
 
 
 class Processor:
@@ -129,7 +130,10 @@ class StdinCaptureTests(unittest.TestCase):
         self.assertEqual(capture.dropped_bytes, 8 * PCM_CHUNK_BYTES)
         self.assertEqual(capture.gaps, 1)
         self.assertEqual(len(messages), 1)
-        self.assertEqual(len(drain(capture)), 2)
+        gaps = []
+        self.assertEqual(len(drain(capture, gaps)), 2)
+        # The trailing drop is reported once at EOF, after the queued audio.
+        self.assertEqual(gaps, [0, 0, 8 * PCM_CHUNK_BYTES])
 
     def test_first_chunk_after_a_drop_carries_the_gap(self):
         pieces = [bytes([n]) * PCM_CHUNK_BYTES for n in range(5)]
@@ -332,6 +336,36 @@ class StdinListenTests(unittest.TestCase):
         # Released: 200 ms of media fits the 1 s budget, so EOF ends it normally.
         self.assertEqual((code, events[-1]["phase"]), (0, "stopped"))
         self.assertLess(events[-1]["emitted_at_ms"], 1000)
+
+    def test_trailing_drop_at_eof_reaches_the_stream_clock(self):
+        chunk = PCM_CHUNK_BYTES
+        output, diagnostics, captures = io.StringIO(), io.StringIO(), []
+
+        def capture_factory(*args, **kwargs):
+            captures.append(StdinPcmCapture(*args, queue_chunks=2, **kwargs))
+            return captures[-1]
+
+        # A fast finite replay of ten chunks into a queue of two: the drop is trailing.
+        with patch("rightyo.prototype.StdinPcmCapture", capture_factory):
+            with patch.object(Processor, "push_pcm16", slow_push(Processor.push_pcm16)):
+                with contextlib.redirect_stderr(diagnostics):
+                    code = listen(
+                        self.args,
+                        output=output,
+                        controller_factory=self.factory,
+                        audio_input=io.BytesIO(bytes(10 * chunk)),
+                    )
+        self.assertEqual(code, 0)
+        (processor,) = Processor.instances
+        dropped = captures[0].dropped_bytes
+        self.assertGreater(dropped, 0)
+        self.assertEqual(len(processor.received) + dropped, 10 * chunk)
+        self.assertEqual(processor.gaps[-1], (10 * chunk - dropped, dropped // 32))
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(events[-1]["phase"], "stopped")
+        self.assertEqual(events[-1]["input_gaps"]["dropped_bytes"], dropped)
+        # Ten 200 ms chunks of media elapsed, including the trailing drop.
+        self.assertGreaterEqual(events[-1]["emitted_at_ms"], 2000)
 
 
 def slow_push(push):
