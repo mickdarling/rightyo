@@ -436,48 +436,65 @@ class _HostedClient:
     ) -> dict[str, Any]:
         # One wall-clock deadline covers the credential lookup and the whole exchange.
         deadline = time.monotonic() + self.timeout
-        key = None
-        try:
-            key = self.load_key(cancelled=self.cancelled, timeout_seconds=self.timeout)
-        except CredentialError:
-            pass
-        if key is None:
-            if self.cancelled():
-                raise HostedSpeechError(f"{self.label} request was cancelled")
-            raise HostedSpeechError(f"{self.label} credential is unavailable")
-        if self.cancelled():
-            del key
-            raise HostedSpeechError(f"{self.label} request was cancelled")
-        # Only the budget the credential lookup left is given to the transport, so the
-        # whole operation stays within one `timeout_seconds` of its start.
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            del key
-            raise HostedSpeechError(f"{self.label} request exceeded its deadline")
         parts = urllib.parse.urlsplit(url)
         if parts.scheme != "https" or not parts.hostname:
-            del key
             raise HostedSpeechError(f"{self.label} requires an https endpoint")
         target = (parts.path or "/") + ("?" + parts.query if parts.query else "")
-        request_headers = {
-            **headers,
-            "Authorization": scheme + key,
-            "Content-Length": str(len(body)),
-            "Accept": "application/json",
-        }
-        del key
+        # The TLS context and the connection object exist before any credential is
+        # loaded, so a TLS setup failure can never retain a key in its traceback.
+        try:
+            context = ssl.create_default_context()
+        except (ssl.SSLError, OSError, ValueError):
+            context = None
+        if context is None:
+            raise HostedSpeechError(f"{self.label} TLS configuration is unavailable")
         failure = None
         content = b""
         status = None
         response = None
-        connection = http.client.HTTPSConnection(
-            parts.hostname,
-            parts.port or 443,
-            timeout=max(remaining, MIN_TRANSPORT_SECONDS),
-            context=ssl.create_default_context(),
-        )
-        # Never reconnect behind the caller's back: a socket closed on abort stays closed.
-        connection.auto_open = 0
+        request_headers: dict[str, str] = {}
+        # From here on every exit passes the `finally` that strips the credential.
+        try:
+            key = None
+            try:
+                key = self.load_key(cancelled=self.cancelled, timeout_seconds=self.timeout)
+            except CredentialError:
+                pass
+            if key is None:
+                if self.cancelled():
+                    raise HostedSpeechError(f"{self.label} request was cancelled")
+                raise HostedSpeechError(f"{self.label} credential is unavailable")
+            if self.cancelled():
+                del key
+                raise HostedSpeechError(f"{self.label} request was cancelled")
+            # Only the budget the credential lookup left is given to the transport, so
+            # the whole operation stays within one `timeout_seconds` of its start.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                del key
+                raise HostedSpeechError(f"{self.label} request exceeded its deadline")
+            request_headers.update(
+                {
+                    **headers,
+                    "Authorization": scheme + key,
+                    "Content-Length": str(len(body)),
+                    "Accept": "application/json",
+                }
+            )
+            del key
+            # No connection object exists until a credential is in hand; construction
+            # touches no network, and any failure here still strips the header below.
+            connection = http.client.HTTPSConnection(
+                parts.hostname,
+                parts.port or 443,
+                timeout=max(remaining, MIN_TRANSPORT_SECONDS),
+                context=context,
+            )
+            # Never reconnect behind the caller's back: a socket closed on abort stays closed.
+            connection.auto_open = 0
+        except BaseException:
+            request_headers.pop("Authorization", None)
+            raise
         # The transport's timeout is per operation, so a slowly dripping body could
         # outlive it; the exchange and the body read run on helper threads that the
         # deadline or cancellation stops waiting for, closing the connection.

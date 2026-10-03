@@ -665,6 +665,18 @@ class HostedTranscriberTests(unittest.TestCase):
             [(c.host, c.port) for c in connections], [("transcribe.example.test", 8443)]
         )
 
+    def test_tls_setup_failure_is_sanitized_and_never_loads_a_credential(self):
+        loader = Mock(side_effect=AssertionError("credential loaded before TLS setup"))
+        patched, connections = patched_connection(b'{"text": ""}')
+        with patched, patch("ssl.create_default_context", side_effect=ssl.SSLError(PRIVATE)):
+            with self.assertRaisesRegex(HostedSpeechError, "TLS configuration") as caught:
+                self.transcriber(load_key=loader).transcribe(bytes(640))
+        loader.assert_not_called()
+        self.assertEqual(connections, [])
+        self.assertNotIn(PRIVATE, str(caught.exception))
+        self.assertNotIn(KEY, str(caught.exception))
+        self.assertIsNone(caught.exception.__context__)
+
     def test_authorization_header_carries_the_bearer_key_at_point_of_use_only(self):
         patched, connections = patched_connection(b'{"text": ""}')
         with patched:
