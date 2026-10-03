@@ -39,7 +39,43 @@ the same absolute-path `local/prototype.json` used by the lab. Then choose one s
 # Process a supplied authored WAV in causal order, faster than wall clock.
 .venv/bin/rightyo listen --config local/prototype.json --mode demo \
   --session-id demo-session-001
+
+# A local process pipes raw PCM in and declares where it came from.
+some-local-pcm-source | .venv/bin/rightyo listen --config local/prototype.json \
+  --mode stdin --provenance causal-replay --session-id stdin-session-001
 ```
+
+`--mode stdin` is a local adapter only. It adds no network transport, authentication, or
+source authorization, and the provenance it reports is whatever the local caller declares.
+Hailing Station's ambient-audio path, which will pipe a phone's microphone into this
+command, is in progress (hailing-station #203) and is not yet available. In that setup the
+Hailing Station daemon owns transport and authentication, runs this command as a local
+child process, and declares `--provenance live-microphone` for the audio it relays.
+
+`--mode stdin` reads headerless mono 16,000 Hz signed 16-bit little-endian PCM (the format
+the Mac capture helper produces and `push_pcm16` accepts) from stdin. Nothing else is
+accepted or detected. Reads of any size are regrouped into 200 ms chunks, and an odd byte
+is carried to the next read. EOF finishes the open utterance and ends with the ordinary
+`stopped` event. stdout carries only JSONL; diagnostics go to stderr. The bytes do not
+say where they came from, so `--provenance` is required with `--mode stdin` and refused
+otherwise. There is no default. Pass `live-microphone` only for a person speaking live
+(for example a phone microphone relayed by the Hailing Station daemon), and
+`causal-replay`, `recorded-file` or `synthetic` for anything else. Turns carry exactly that value. Timing follows it too.
+`live-microphone` uses the wall clock for the session budget and retention, as microphone
+mode does. The replay values use media time, as demo mode does, so a slow producer is never
+cut off early. The started session
+event adds a top-level `audio_input` object
+(`{"source": "stdin", "encoding": "s16le", "sample_rate": 16000, "channels": 1}`) beside
+the unchanged capability set. At most 32 seconds of audio is queued. If processing falls
+further behind, the input overruns and the session fails closed. RightyO stops reading,
+drops the unqueued audio, and processes the audio already queued. Turns finalized before
+the drop stand. The open utterance is clipped mid-speech, so it is discarded and never
+emitted. The session then ends with a `session` `error` event with reason
+`input-overrun` and exits non-zero, even if it is stopped or sent SIGTERM while finishing.
+No audio after the drop reaches speech recognition or the diarizer, so speech is never
+spliced across a gap and speaker labels stay consistent for the session.
+A notice goes to stderr. The terminal session event of every stdin session carries
+`input_gaps` (`gaps`, 0 or 1; `dropped_bytes`; `discarded_tail_bytes`).
 
 Repeatable `--name` flags (for example `--name "Hailing Station" --name computer`) declare
 the forms of address the system answers to for `listen`, `tool-replay` and `prototype`. They

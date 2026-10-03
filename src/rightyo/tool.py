@@ -108,10 +108,22 @@ def replay(args, *, output=None) -> int:
         runner.clear()
 
 
-def listen(args, *, output=None, controller_factory=PrototypeController) -> int:
-    """The command itself authorizes foreground capture; startup/import never does."""
+def _stderr(message: str) -> None:
+    print(f"rightyo: {message}", file=sys.stderr, flush=True)
+
+
+def listen(args, *, output=None, controller_factory=PrototypeController, audio_input=None) -> int:
+    """The command itself authorizes foreground capture; startup/import never does.
+
+    ``--mode stdin`` reads headerless mono 16 kHz s16le PCM from stdin (or
+    ``audio_input``) instead of the Mac microphone; EOF is a clean stop.
+    """
     if args.use_jev and not args.allow_hosted:
         raise PrototypeError("Jev requires both --use-jev and --allow-hosted")
+    # Stdin bytes carry no origin: the host declares it, and only for stdin.
+    provenance = getattr(args, "provenance", None)
+    if (args.mode == "stdin") != (provenance is not None):
+        raise PrototypeError("--provenance is required with, and only with, --mode stdin")
     output = sys.stdout if output is None else output
     addressing = addressing_from_args(args)
     config = PrototypeConfig.load(Path(args.config))
@@ -134,6 +146,10 @@ def listen(args, *, output=None, controller_factory=PrototypeController) -> int:
         config = replace(config, request_former=forming)
     events = SpeechEvents()
     consent = {"allow_hosted_speech": True} if config.hosted_speech else {}
+    if args.mode == "stdin":
+        consent["audio_input"] = sys.stdin.buffer if audio_input is None else audio_input
+        consent["audio_provenance"] = provenance
+        consent["report"] = _stderr
     controller = controller_factory(config, event_publisher=events, **consent)
     # Signal handlers are installed only by this explicit foreground operation.
     previous = None
@@ -154,7 +170,8 @@ def listen(args, *, output=None, controller_factory=PrototypeController) -> int:
             state = controller.snapshot()
             _emit(controller.drain_events(), output)
             if state["phase"] in {"complete", "idle", "error"}:
-                result = 2 if state["phase"] == "error" else 0
+                overrun = getattr(controller, "input_overrun", False)
+                result = 2 if state["phase"] == "error" or overrun else 0
                 controller.stop()
                 _emit(controller.drain_events(), output)
                 return result
@@ -162,7 +179,7 @@ def listen(args, *, output=None, controller_factory=PrototypeController) -> int:
     except KeyboardInterrupt:
         controller.stop()
         _emit(controller.drain_events(), output)
-        return 0
+        return 2 if getattr(controller, "input_overrun", False) else 0
     finally:
         controller.close()
         if previous is not None:
