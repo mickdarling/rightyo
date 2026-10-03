@@ -296,7 +296,12 @@ def main(argv: list[str] | None = None) -> int:
     _add_session_budget_option(prototype)
     listen = commands.add_parser("listen", help="explicit foreground speech JSONL tool")
     listen.add_argument("--config", type=Path, required=True)
-    listen.add_argument("--mode", choices=("microphone", "demo"), required=True)
+    listen.add_argument(
+        "--mode",
+        choices=("microphone", "demo", "stdin"),
+        required=True,
+        help="stdin reads headerless mono 16 kHz s16le PCM until EOF",
+    )
     listen.add_argument("--session-id", help="host-selected session ID (otherwise generated)")
     listen.add_argument("--use-jev", action="store_true")
     listen.add_argument("--allow-hosted", action="store_true")

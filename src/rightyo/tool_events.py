@@ -65,6 +65,14 @@ def _speech_summary(value):
     return summary
 
 
+def _audio_input(value):
+    """A detached copy of the advertised host-supplied audio input format."""
+    expected = {"source": "stdin", "encoding": "s16le", "sample_rate": 16000, "channels": 1}
+    if value != expected:
+        raise ContractError("invalid audio input summary")
+    return dict(expected)
+
+
 class SpeechEvents:
     """Local v1 producer. Frozen request context never observes later turns.
 
@@ -165,10 +173,13 @@ class SpeechEvents:
         priority=None,
         former=None,
         speech=None,
+        audio_input=None,
     ):
         with self._lock:
             identifier(session_id, "session_id")
             speech = _speech_summary(speech)
+            if audio_input is not None:
+                audio_input = _audio_input(audio_input)
             integer(now_ms, "now_ms")
             if type(attention_enabled) is not bool:
                 raise ContractError("invalid attention capability")
@@ -223,6 +234,8 @@ class SpeechEvents:
                 **({} if former is None else {"request_forming": {"kind": former.kind}}),
                 # And for the selected speech backends: kinds and display-safe ids only.
                 **({} if speech is None else {"speech": speech}),
+                # And for a host-supplied PCM stream: where the live audio came from.
+                **({} if audio_input is None else {"audio_input": audio_input}),
             )
 
     def expire(self, now_ms):
@@ -573,13 +586,23 @@ class SpeechEvents:
             raise ContractError("request forming failed")
         return formed
 
-    def end(self, phase="cancelled", now_ms=0, reason=None):
+    def end(self, phase="cancelled", now_ms=0, reason=None, input_gaps=None):
         with self._lock:
             if phase not in {"stopped", "cancelled", "error"}:
                 raise ContractError("invalid event terminal phase")
             integer(now_ms, "now_ms")
             if reason is not None:
                 identifier(reason, "reason")
+            if input_gaps is not None:
+                if not isinstance(input_gaps, dict) or set(input_gaps) != {
+                    "gaps",
+                    "dropped_bytes",
+                    "discarded_tail_bytes",
+                }:
+                    raise ContractError("invalid input gap report")
+                for name, value in input_gaps.items():
+                    integer(value, name)
+                input_gaps = dict(input_gaps)
             if self._session is None or self._terminal:
                 return
             self.expire(now_ms)
@@ -598,6 +621,8 @@ class SpeechEvents:
                 **({"reason": reason} if reason else {}),
                 # Only enrolled sessions report role health; anonymous output is unchanged.
                 **({"role_status": self.role_status} if self._priority is not None else {}),
+                # Stdin input only: audio dropped under back-pressure, never buffered unbounded.
+                **({} if input_gaps is None else {"input_gaps": input_gaps}),
             )
 
     def drain(self):

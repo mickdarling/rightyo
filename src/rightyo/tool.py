@@ -108,8 +108,16 @@ def replay(args, *, output=None) -> int:
         runner.clear()
 
 
-def listen(args, *, output=None, controller_factory=PrototypeController) -> int:
-    """The command itself authorizes foreground capture; startup/import never does."""
+def _stderr(message: str) -> None:
+    print(f"rightyo: {message}", file=sys.stderr, flush=True)
+
+
+def listen(args, *, output=None, controller_factory=PrototypeController, audio_input=None) -> int:
+    """The command itself authorizes foreground capture; startup/import never does.
+
+    ``--mode stdin`` reads headerless mono 16 kHz s16le PCM from stdin (or
+    ``audio_input``) instead of the Mac microphone; EOF is a clean stop.
+    """
     if args.use_jev and not args.allow_hosted:
         raise PrototypeError("Jev requires both --use-jev and --allow-hosted")
     output = sys.stdout if output is None else output
@@ -134,6 +142,9 @@ def listen(args, *, output=None, controller_factory=PrototypeController) -> int:
         config = replace(config, request_former=forming)
     events = SpeechEvents()
     consent = {"allow_hosted_speech": True} if config.hosted_speech else {}
+    if args.mode == "stdin":
+        consent["audio_input"] = sys.stdin.buffer if audio_input is None else audio_input
+        consent["report"] = _stderr
     controller = controller_factory(config, event_publisher=events, **consent)
     # Signal handlers are installed only by this explicit foreground operation.
     previous = None

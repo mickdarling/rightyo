@@ -39,7 +39,24 @@ the same absolute-path `local/prototype.json` used by the lab. Then choose one s
 # Process a supplied authored WAV in causal order, faster than wall clock.
 .venv/bin/rightyo listen --config local/prototype.json --mode demo \
   --session-id demo-session-001
+
+# A host (for example Hailing Station relaying a phone microphone) pipes raw PCM in.
+some-pcm-source | .venv/bin/rightyo listen --config local/prototype.json --mode stdin \
+  --session-id phone-session-001
 ```
+
+`--mode stdin` reads headerless mono 16,000 Hz signed 16-bit little-endian PCM (the format
+the Mac capture helper produces and `push_pcm16` accepts) from stdin. Nothing else is
+accepted or detected. Reads of any size are regrouped into 200 ms chunks, and an odd byte
+is carried to the next read. EOF finishes the open utterance and ends with the ordinary
+`stopped` event. stdout carries only JSONL; diagnostics go to stderr. Turns keep
+`provenance` `live-microphone`, since a person is still speaking live. The started session
+event adds a top-level `audio_input` object
+(`{"source": "stdin", "encoding": "s16le", "sample_rate": 16000, "channels": 1}`) beside
+the unchanged capability set. If processing falls behind, at most 32 seconds of audio is
+queued and further 200 ms chunks are dropped, not buffered. A notice goes to stderr when
+each gap starts, and the terminal session event carries
+`input_gaps` (`gaps`, `dropped_bytes`, `discarded_tail_bytes`).
 
 Repeatable `--name` flags (for example `--name "Hailing Station" --name computer`) declare
 the forms of address the system answers to for `listen`, `tool-replay` and `prototype`. They

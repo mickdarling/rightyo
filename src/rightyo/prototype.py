@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from rightyo.capture import CaptureError, MacMicrophoneCapture
+from rightyo.capture import CaptureError, MacMicrophoneCapture, StdinPcmCapture
 from rightyo.contracts import (
     Addressing,
     ContractError,
@@ -54,6 +54,16 @@ from rightyo.speech_backends import (
 
 BROWSER_LEASE_SECONDS = 15
 PCM_BYTES_PER_MS = 32
+# Modes whose audio is a live human microphone, wherever the samples are captured.
+LIVE_MODES = frozenset({"microphone", "stdin"})
+# Advertised on `session` started for stdin input: a separate top-level object, so the
+# strictly validated capability set and the `live-microphone` provenance are unchanged.
+STDIN_AUDIO_INPUT = {
+    "source": "stdin",
+    "encoding": "s16le",
+    "sample_rate": 16000,
+    "channels": 1,
+}
 LOCAL_ASSETS = ("whisper_executable", "whisper_model", "diarization_library", "diarization_model")
 
 
@@ -170,6 +180,8 @@ class PrototypeController:
         provider_factory=JevProvider,
         event_publisher=None,
         allow_hosted_speech=False,
+        audio_input=None,
+        report=None,
     ):
         self.config = config
         self.processor_factory = processor_factory
@@ -177,6 +189,10 @@ class PrototypeController:
         self.provider_factory = provider_factory
         # Explicit consent for configured hosted speech backends to receive audio.
         self.allow_hosted_speech = allow_hosted_speech is True
+        # A host-supplied raw PCM stream (`listen --mode stdin`); the web lab never has one.
+        self.audio_input = audio_input
+        self.report = report
+        self._stdin_capture: StdinPcmCapture | None = None
         # Optional host-facing stream. The lab retains its browser lease and UI controls.
         self._events = event_publisher
         self._event_terminal = True
@@ -218,7 +234,7 @@ class PrototypeController:
             return self._received_ms + int((time.monotonic() - self._completed_at) * 1000)
         wall_ms = (
             int((time.monotonic() - self._audio_started) * 1000)
-            if self._mode == "microphone" and self._audio_started is not None
+            if self._mode in LIVE_MODES and self._audio_started is not None
             else 0
         )
         return max(self._received_ms, wall_ms)
@@ -234,7 +250,7 @@ class PrototypeController:
                     or self._budget_reached
                     or (
                         self._budget_ms is not None
-                        and self._mode == "microphone"
+                        and self._mode in LIVE_MODES
                         and (time.monotonic() - self._started) * 1000 > self._budget_ms
                     )
                 )
@@ -268,7 +284,7 @@ class PrototypeController:
             raise PrototypeError("Invalid session identifier") from None
         if (
             not isinstance(mode, str)
-            or mode not in {"microphone", "demo"}
+            or mode not in {"microphone", "demo", "stdin"}
             or type(hosted) is not bool
             or type(retention) is not int
             or not 60 <= retention <= 600
@@ -281,6 +297,8 @@ class PrototypeController:
             raise PrototypeError("Invalid prototype setting")
         if mode == "demo" and self.config.demo_audio is None:
             raise PrototypeError("No generated audio demo is configured")
+        if mode == "stdin" and self.audio_input is None:
+            raise PrototypeError("Stdin audio is available only from the listen command")
         if self.config.speakers is not None and self.config.speakers.source == "model":
             # A hosted role question would run on the audio path under the controller
             # lock, where Stop and lease expiry cannot reach it; tool-replay has no such
@@ -357,6 +375,7 @@ class PrototypeController:
             self._completed_at = None
             self._request_limit = budget
             self._mode = mode
+            self._stdin_capture = None
             self._error = None
             self._decision_status = "ready" if hosted else "off"
             self._role_status = "off" if priority is None else "configured"
@@ -371,6 +390,7 @@ class PrototypeController:
                     priority=priority,
                     former=request_former_for(self.config.request_former),
                     speech=speech_summary(self.config.transcriber, self.config.diarizer),
+                    audio_input=STDIN_AUDIO_INPUT if mode == "stdin" else None,
                 )
                 self._event_terminal = False
             threading.Thread(
@@ -415,7 +435,7 @@ class PrototypeController:
                     whisper_model=self.config.whisper_model,
                     diarization_library=self.config.diarization_library,
                     diarization_model=self.config.diarization_model,
-                    provenance="live-microphone" if mode == "microphone" else "causal-replay",
+                    provenance="live-microphone" if mode in LIVE_MODES else "causal-replay",
                     cancelled=stop.is_set,
                     session_budget_ms=self._budget_ms,
                     transcriber=transcriber_factory(
@@ -442,6 +462,26 @@ class PrototypeController:
                     pcm = capture.read(timeout=0.25)
                     if pcm:
                         self._feed(generation, processor, pcm, mode)
+            elif mode == "stdin":
+                capture = StdinPcmCapture(self.audio_input, report=self.report)
+                with self._lock:
+                    if generation != self._generation or stop.is_set():
+                        return
+                    self._capture = self._stdin_capture = capture
+                    capture.start()
+                accepted = True
+                while accepted and not stop.is_set():
+                    pcm = capture.read(timeout=0.25)
+                    if pcm == b"":
+                        break  # EOF: a clean stop, flushing the open utterance.
+                    if pcm:
+                        accepted = self._feed(generation, processor, pcm, mode)
+                if accepted and not stop.is_set():
+                    processor.finish()
+                    with self._lock:
+                        if generation == self._generation:
+                            self._phase = "finishing" if self._pending else "complete"
+                            self._completed_at = time.monotonic()
             else:
                 with wave.open(str(self.config.demo_audio), "rb") as audio:
                     if (
@@ -537,7 +577,7 @@ class PrototypeController:
             self._received_ms = self._received_bytes // PCM_BYTES_PER_MS
             if self._audio_started is None:
                 self._audio_started = time.monotonic()
-            self._phase = "listening" if mode == "microphone" else "replaying"
+            self._phase = "listening" if mode in LIVE_MODES else "replaying"
         processor.push_pcm16(pcm)
         if boundary:
             # Publish only after the boundary audio is processed, so the timer cannot
@@ -763,7 +803,15 @@ class PrototypeController:
 
     def _event_end(self, phase, reason=None):
         if self._events is not None and not self._event_terminal:
-            self._events.end(phase=phase, now_ms=self._now_ms(), reason=reason)
+            capture = self._stdin_capture
+            gaps = None
+            if capture is not None:
+                gaps = {
+                    "gaps": capture.gaps,
+                    "dropped_bytes": capture.dropped_bytes,
+                    "discarded_tail_bytes": capture.discarded_tail_bytes,
+                }
+            self._events.end(phase=phase, now_ms=self._now_ms(), reason=reason, input_gaps=gaps)
             self._event_terminal = True
 
     def drain_events(self):

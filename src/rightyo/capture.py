@@ -172,3 +172,97 @@ class MacMicrophoneCapture:
                     self._queue.get_nowait()
                 except queue.Empty:
                     break
+
+
+class StdinPcmCapture:
+    """Raw PCM from a host-supplied binary stream (normally stdin), same format as the helper.
+
+    Format: mono, 16,000 Hz, signed 16-bit little-endian, headerless, no other
+    format is accepted or detected. Reads of any length are coalesced into 200 ms
+    chunks; an odd byte is carried to the next read, and a final odd byte at EOF is
+    discarded and counted. Unlike the microphone, a full queue does not fail the
+    session: the chunk is dropped and counted as a gap, so buffering stays bounded
+    (at most ``queue_chunks`` chunks plus one partial chunk). EOF ends the input.
+    """
+
+    def __init__(self, stream, *, queue_chunks: int = 160, report=None):
+        if type(queue_chunks) is not int or not 1 <= queue_chunks <= 256:
+            raise CaptureError("Invalid stdin queue bound")
+        self._stream = stream
+        self._report = report
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=queue_chunks)
+        self._reader: threading.Thread | None = None
+        self._stopped = threading.Event()
+        self._eof = threading.Event()
+        self._failure: str | None = None
+        self.dropped_bytes = 0
+        self.gaps = 0
+        self.discarded_tail_bytes = 0
+
+    def start(self) -> None:
+        if self._reader is not None or self._stopped.is_set():
+            raise CaptureError("Stdin capture cannot be restarted")
+        self._reader = threading.Thread(target=self._receive, daemon=True)
+        self._reader.start()
+
+    def _offer(self, chunk: bytes, dropping: bool) -> bool:
+        """Queue without blocking the reader; returns whether a gap is in progress."""
+        try:
+            self._queue.put_nowait(chunk)
+            return False
+        except queue.Full:
+            self.dropped_bytes += len(chunk)
+            if not dropping:
+                self.gaps += 1
+                if self._report is not None:
+                    self._report("stdin audio is arriving faster than it is processed; dropping")
+            return True
+
+    def _receive(self) -> None:
+        read = getattr(self._stream, "read1", None) or self._stream.read
+        carry = b""
+        dropping = False
+        try:
+            while not self._stopped.is_set():
+                data = read(PCM_CHUNK_BYTES)
+                if self._stopped.is_set():
+                    break
+                if not data:
+                    tail = len(carry) % PCM_SAMPLE_WIDTH
+                    self.discarded_tail_bytes = tail
+                    if len(carry) > tail:
+                        self._offer(carry[: len(carry) - tail], dropping)
+                    if tail and self._report is not None:
+                        self._report("stdin audio ended mid-sample; discarded the final byte")
+                    break
+                data = carry + data
+                while len(data) >= PCM_CHUNK_BYTES:
+                    dropping = self._offer(data[:PCM_CHUNK_BYTES], dropping)
+                    data = data[PCM_CHUNK_BYTES:]
+                carry = data
+        except (OSError, ValueError):
+            self._failure = "Stdin audio input failed"
+        carry = data = b""
+        self._eof.set()
+
+    def read(self, timeout: float = 0.25) -> bytes | None:
+        """Return PCM chunks; None means none yet; b"" means the input ended (EOF)."""
+        if self._stopped.is_set():
+            raise CaptureError("Stdin capture is not running")
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            if self._eof.is_set() and self._queue.empty():
+                if self._failure is not None:
+                    raise CaptureError(self._failure) from None
+                return b""
+            return None
+
+    def stop(self) -> None:
+        """Discard pending PCM; a reader blocked on the stream exits at its next read."""
+        self._stopped.set()
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
