@@ -6,9 +6,12 @@ import contextlib
 import io
 import json
 import tempfile
+import threading
+import time
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
 from rightyo.capture import PCM_CHUNK_BYTES, StdinPcmCapture
 from rightyo.contracts import Turn
@@ -31,13 +34,33 @@ class Pieces:
         return piece
 
 
-def drain(capture):
+class Gated:
+    """Reads pause at ``gate_at`` until the test releases them (a consumer catching up)."""
+
+    def __init__(self, pieces, gate_at):
+        self.pieces, self.gate_at, self.index = list(pieces), gate_at, 0
+        self.paused, self.release = threading.Event(), threading.Event()
+
+    def read(self, _limit):
+        if self.index == self.gate_at:
+            self.paused.set()
+            self.release.wait(5)
+        if self.index >= len(self.pieces):
+            return b""
+        self.index += 1
+        return self.pieces[self.index - 1]
+
+
+def drain(capture, gaps=None):
     chunks = []
     while True:
-        chunk = capture.read(timeout=1)
-        if chunk == b"":
+        item = capture.read(timeout=1)
+        if item == b"":
             return chunks
-        if chunk:
+        if item:
+            gap, chunk = item
+            if gaps is not None:
+                gaps.append(gap)
             chunks.append(chunk)
 
 
@@ -47,6 +70,7 @@ class Processor:
     def __init__(self, config, callback):
         self.config, self.callback = config, callback
         self.received = bytearray()
+        self.gaps = []
         self.finished = self.closed = False
         self.instances.append(self)
 
@@ -70,6 +94,9 @@ class Processor:
                     "authored-fixture",
                 )
             )
+
+    def mark_gap(self, dropped_ms):
+        self.gaps.append((len(self.received), dropped_ms))
 
     def finish(self):
         self.finished = True
@@ -103,6 +130,22 @@ class StdinCaptureTests(unittest.TestCase):
         self.assertEqual(capture.gaps, 1)
         self.assertEqual(len(messages), 1)
         self.assertEqual(len(drain(capture)), 2)
+
+    def test_first_chunk_after_a_drop_carries_the_gap(self):
+        pieces = [bytes([n]) * PCM_CHUNK_BYTES for n in range(5)]
+        stream = Gated(pieces, gate_at=4)
+        capture = StdinPcmCapture(stream, queue_chunks=2, report=lambda _message: None)
+        capture.start()
+        self.assertTrue(stream.paused.wait(5))
+        gaps = []
+        first = [capture.read(timeout=1), capture.read(timeout=1)]
+        stream.release.set()
+        rest = drain(capture, gaps)
+        self.assertEqual([gap for gap, _chunk in first], [0, 0])
+        self.assertEqual([chunk[0] for _gap, chunk in first], [0, 1])
+        self.assertEqual([chunk[0] for chunk in rest], [4])
+        self.assertEqual(gaps, [2 * PCM_CHUNK_BYTES])
+        self.assertEqual((capture.gaps, capture.dropped_bytes), (1, 2 * PCM_CHUNK_BYTES))
 
     def test_stop_discards_pending_audio(self):
         capture = StdinPcmCapture(io.BytesIO(bytes(3 * PCM_CHUNK_BYTES)))
@@ -138,13 +181,14 @@ class StdinListenTests(unittest.TestCase):
         self.args = Namespace(
             config=self.config,
             mode="stdin",
+            provenance="causal-replay",
             session_id="stdin-test",
             use_jev=False,
             allow_hosted=False,
         )
 
     @staticmethod
-    def factory(config, *, event_publisher, audio_input, report):
+    def factory(config, *, event_publisher, audio_input, audio_provenance, report):
         def no_device(*_args, **_kwargs):
             raise AssertionError("stdin mode must not start the microphone helper")
 
@@ -155,6 +199,7 @@ class StdinListenTests(unittest.TestCase):
             capture_factory=no_device,
             provider_factory=no_device,
             audio_input=audio_input,
+            audio_provenance=audio_provenance,
             report=report,
         )
 
@@ -181,7 +226,7 @@ class StdinListenTests(unittest.TestCase):
         self.assertEqual(
             sorted(events[0]["capabilities"]), ["activation", "context", "partials", "speakers"]
         )
-        self.assertTrue(all(e["turn"]["provenance"] == "live-microphone" for e in events[1:3]))
+        self.assertTrue(all(e["turn"]["provenance"] == "causal-replay" for e in events[1:3]))
         self.assertEqual(events[-1]["phase"], "stopped")
         self.assertEqual(
             events[-1]["input_gaps"], {"gaps": 0, "dropped_bytes": 0, "discarded_tail_bytes": 1}
@@ -197,6 +242,72 @@ class StdinListenTests(unittest.TestCase):
         with self.assertRaisesRegex(PrototypeError, "listen command"):
             controller.start({"mode": "stdin"})
         self.assertEqual(Processor.instances, [])
+
+    def test_provenance_is_required_with_stdin_and_refused_without_it(self):
+        for mode, provenance in (("stdin", None), ("demo", "live-microphone")):
+            args = Namespace(**{**vars(self.args), "mode": mode, "provenance": provenance})
+            with self.assertRaisesRegex(PrototypeError, "--provenance"):
+                listen(args, controller_factory=self.factory, audio_input=io.BytesIO())
+        config = PrototypeConfig.load(self.config)
+        controller = PrototypeController(
+            config, processor_factory=Processor, audio_input=io.BytesIO()
+        )
+        self.addCleanup(controller.close)
+        with self.assertRaisesRegex(PrototypeError, "provenance"):
+            controller.start({"mode": "stdin"})
+        self.assertEqual(Processor.instances, [])
+
+    def test_dropped_audio_marks_a_gap_and_advances_stream_time(self):
+        chunk = PCM_CHUNK_BYTES
+        stream = Gated([bytes(chunk)] * 6, gate_at=5)
+        output, diagnostics = io.StringIO(), io.StringIO()
+        result, captures = {}, []
+
+        def capture_factory(*args, **kwargs):
+            captures.append(StdinPcmCapture(*args, queue_chunks=2, **kwargs))
+            return captures[-1]
+
+        def run():
+            with contextlib.redirect_stderr(diagnostics):
+                result["code"] = listen(
+                    self.args, output=output, controller_factory=self.factory, audio_input=stream
+                )
+
+        # Five chunks race a slow consumer and a queue of two; once the consumer has
+        # caught up, a sixth chunk arrives after the gap, then EOF.
+        with patch("rightyo.prototype.StdinPcmCapture", capture_factory):
+            with patch.object(Processor, "push_pcm16", slow_push(Processor.push_pcm16)):
+                thread = threading.Thread(target=run)
+                thread.start()
+                self.assertTrue(stream.paused.wait(5))
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and (
+                    not Processor.instances
+                    or len(Processor.instances[0].received) + captures[0].dropped_bytes < 5 * chunk
+                ):
+                    time.sleep(0.01)
+                stream.release.set()
+                thread.join(10)
+        self.assertEqual(result.get("code"), 0)
+        (processor,) = Processor.instances
+        dropped = captures[0].dropped_bytes
+        self.assertGreater(dropped, 0)
+        self.assertEqual(processor.gaps, [(5 * chunk - dropped, dropped // 32)])
+        self.assertEqual(len(processor.received), 6 * chunk - dropped)
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(events[-1]["phase"], "stopped")
+        self.assertEqual(events[-1]["input_gaps"]["dropped_bytes"], dropped)
+        # Stream time counts the dropped audio: six 200 ms chunks were spoken.
+        self.assertGreaterEqual(events[-1]["emitted_at_ms"], 1200)
+        self.assertIn("dropping", diagnostics.getvalue())
+
+
+def slow_push(push):
+    def slowed(self, pcm):
+        time.sleep(0.05)
+        push(self, pcm)
+
+    return slowed
 
 
 if __name__ == "__main__":

@@ -120,6 +120,10 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
     """
     if args.use_jev and not args.allow_hosted:
         raise PrototypeError("Jev requires both --use-jev and --allow-hosted")
+    # Stdin bytes carry no origin: the host declares it, and only for stdin.
+    provenance = getattr(args, "provenance", None)
+    if (args.mode == "stdin") != (provenance is not None):
+        raise PrototypeError("--provenance is required with, and only with, --mode stdin")
     output = sys.stdout if output is None else output
     addressing = addressing_from_args(args)
     config = PrototypeConfig.load(Path(args.config))
@@ -144,6 +148,7 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
     consent = {"allow_hosted_speech": True} if config.hosted_speech else {}
     if args.mode == "stdin":
         consent["audio_input"] = sys.stdin.buffer if audio_input is None else audio_input
+        consent["audio_provenance"] = provenance
         consent["report"] = _stderr
     controller = controller_factory(config, event_publisher=events, **consent)
     # Signal handlers are installed only by this explicit foreground operation.

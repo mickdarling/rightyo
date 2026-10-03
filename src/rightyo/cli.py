@@ -10,7 +10,14 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from rightyo.contracts import Addressing, ContractError, RequestForming, SpeakerPriority, Turn
+from rightyo.contracts import (
+    PROVENANCE,
+    Addressing,
+    ContractError,
+    RequestForming,
+    SpeakerPriority,
+    Turn,
+)
 from rightyo.credentials import CredentialError
 from rightyo.pipeline import ReplayRunner
 from rightyo.providers import JevProvider, MockProvider, ProviderError
@@ -301,6 +308,11 @@ def main(argv: list[str] | None = None) -> int:
         choices=("microphone", "demo", "stdin"),
         required=True,
         help="stdin reads headerless mono 16 kHz s16le PCM until EOF",
+    )
+    listen.add_argument(
+        "--provenance",
+        choices=sorted(PROVENANCE),
+        help="required with --mode stdin: where the piped audio came from (no default)",
     )
     listen.add_argument("--session-id", help="host-selected session ID (otherwise generated)")
     listen.add_argument("--use-jev", action="store_true")

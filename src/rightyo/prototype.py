@@ -18,6 +18,7 @@ from typing import Any
 
 from rightyo.capture import CaptureError, MacMicrophoneCapture, StdinPcmCapture
 from rightyo.contracts import (
+    PROVENANCE,
     Addressing,
     ContractError,
     RequestForming,
@@ -57,7 +58,7 @@ PCM_BYTES_PER_MS = 32
 # Modes whose audio is a live human microphone, wherever the samples are captured.
 LIVE_MODES = frozenset({"microphone", "stdin"})
 # Advertised on `session` started for stdin input: a separate top-level object, so the
-# strictly validated capability set and the `live-microphone` provenance are unchanged.
+# strictly validated capability set is unchanged. Turn provenance is host-declared.
 STDIN_AUDIO_INPUT = {
     "source": "stdin",
     "encoding": "s16le",
@@ -181,6 +182,7 @@ class PrototypeController:
         event_publisher=None,
         allow_hosted_speech=False,
         audio_input=None,
+        audio_provenance=None,
         report=None,
     ):
         self.config = config
@@ -191,6 +193,8 @@ class PrototypeController:
         self.allow_hosted_speech = allow_hosted_speech is True
         # A host-supplied raw PCM stream (`listen --mode stdin`); the web lab never has one.
         self.audio_input = audio_input
+        # Stdin bytes say nothing about their origin, so the host must declare it.
+        self.audio_provenance = audio_provenance
         self.report = report
         self._stdin_capture: StdinPcmCapture | None = None
         # Optional host-facing stream. The lab retains its browser lease and UI controls.
@@ -299,6 +303,8 @@ class PrototypeController:
             raise PrototypeError("No generated audio demo is configured")
         if mode == "stdin" and self.audio_input is None:
             raise PrototypeError("Stdin audio is available only from the listen command")
+        if mode == "stdin" and self.audio_provenance not in PROVENANCE:
+            raise PrototypeError("Stdin audio requires an explicit source provenance")
         if self.config.speakers is not None and self.config.speakers.source == "model":
             # A hosted role question would run on the audio path under the controller
             # lock, where Stop and lease expiry cannot reach it; tool-replay has no such
@@ -435,7 +441,13 @@ class PrototypeController:
                     whisper_model=self.config.whisper_model,
                     diarization_library=self.config.diarization_library,
                     diarization_model=self.config.diarization_model,
-                    provenance="live-microphone" if mode in LIVE_MODES else "causal-replay",
+                    provenance=(
+                        self.audio_provenance
+                        if mode == "stdin"
+                        else "live-microphone"
+                        if mode == "microphone"
+                        else "causal-replay"
+                    ),
                     cancelled=stop.is_set,
                     session_budget_ms=self._budget_ms,
                     transcriber=transcriber_factory(
@@ -471,11 +483,15 @@ class PrototypeController:
                     capture.start()
                 accepted = True
                 while accepted and not stop.is_set():
-                    pcm = capture.read(timeout=0.25)
-                    if pcm == b"":
+                    item = capture.read(timeout=0.25)
+                    if item == b"":
                         break  # EOF: a clean stop, flushing the open utterance.
-                    if pcm:
-                        accepted = self._feed(generation, processor, pcm, mode)
+                    if item:
+                        gap, pcm = item
+                        if gap:
+                            accepted = self._gap(generation, processor, gap)
+                        if accepted:
+                            accepted = self._feed(generation, processor, pcm, mode)
                 if accepted and not stop.is_set():
                     processor.finish()
                     with self._lock:
@@ -523,6 +539,8 @@ class PrototypeController:
                         self._error = "Session reached its 1,000-turn limit; start a new session."
                     elif isinstance(error, HostedSpeechError):
                         self._error = "Hosted speech backend failed; the session is incomplete."
+                    elif mode == "stdin":
+                        self._error = "Stdin audio input failed; the session is incomplete."
                     else:
                         self._error = (
                             "Audio stopped. Check microphone permission and local model setup."
@@ -558,6 +576,19 @@ class PrototypeController:
                     self._capture = self._processor = None
                 elif generation + 1 == self._generation and self._phase == "stopping":
                     self._phase = "idle"
+
+    def _gap(self, generation, processor, dropped_bytes) -> bool:
+        """Count dropped stdin audio as elapsed stream time and cut the open utterance."""
+        with self._lock:
+            if generation != self._generation or self._stop.is_set() or self._budget_reached:
+                return False
+            self._received_bytes += dropped_bytes
+            self._received_ms = self._received_bytes // PCM_BYTES_PER_MS
+            if self._budget_ms is not None and self._received_ms >= self._budget_ms:
+                self._budget_reached = True
+                return False
+        processor.mark_gap(dropped_bytes // PCM_BYTES_PER_MS)
+        return True
 
     def _feed(self, generation, processor, pcm, mode) -> bool:
         """Push audio up to the session budget; False once the session accepts no more."""

@@ -182,7 +182,9 @@ class StdinPcmCapture:
     chunks; an odd byte is carried to the next read, and a final odd byte at EOF is
     discarded and counted. Unlike the microphone, a full queue does not fail the
     session: the chunk is dropped and counted as a gap, so buffering stays bounded
-    (at most ``queue_chunks`` chunks plus one partial chunk). EOF ends the input.
+    (at most ``queue_chunks`` chunks plus one partial chunk). The first chunk queued
+    after a drop carries the dropped byte count, so the consumer can mark the
+    discontinuity instead of splicing the audio on either side. EOF ends the input.
     """
 
     def __init__(self, stream, *, queue_chunks: int = 160, report=None):
@@ -190,13 +192,14 @@ class StdinPcmCapture:
             raise CaptureError("Invalid stdin queue bound")
         self._stream = stream
         self._report = report
-        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=queue_chunks)
+        self._queue: queue.Queue[tuple[int, bytes]] = queue.Queue(maxsize=queue_chunks)
         self._reader: threading.Thread | None = None
         self._stopped = threading.Event()
         self._eof = threading.Event()
         self._failure: str | None = None
         self.dropped_bytes = 0
         self.gaps = 0
+        self._unmarked_gap = 0
         self.discarded_tail_bytes = 0
 
     def start(self) -> None:
@@ -208,10 +211,12 @@ class StdinPcmCapture:
     def _offer(self, chunk: bytes, dropping: bool) -> bool:
         """Queue without blocking the reader; returns whether a gap is in progress."""
         try:
-            self._queue.put_nowait(chunk)
+            self._queue.put_nowait((self._unmarked_gap, chunk))
+            self._unmarked_gap = 0
             return False
         except queue.Full:
             self.dropped_bytes += len(chunk)
+            self._unmarked_gap += len(chunk)
             if not dropping:
                 self.gaps += 1
                 if self._report is not None:
@@ -245,8 +250,8 @@ class StdinPcmCapture:
         carry = data = b""
         self._eof.set()
 
-    def read(self, timeout: float = 0.25) -> bytes | None:
-        """Return PCM chunks; None means none yet; b"" means the input ended (EOF)."""
+    def read(self, timeout: float = 0.25) -> tuple[int, bytes] | bytes | None:
+        """Return ``(gap_bytes_dropped_before, pcm)``; None means none yet; b"" means EOF."""
         if self._stopped.is_set():
             raise CaptureError("Stdin capture is not running")
         try:
