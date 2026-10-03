@@ -88,10 +88,47 @@ each request beside the unchanged raw turns; it is off by default (see
 [request forming](tool-api.md#request-forming)).
 
 No attention is fabricated in these commands: local-only audio emits transcript and session
-events. Optional Jev inference requires both `--use-jev --allow-hosted`, with the existing
+events. Optional Jev inference requires both `--use-jev --allow-hosted`, or the equivalent
+`decision` section in the configuration file (below), with the existing
 [secure credential setup](mvp.md#secure-jev-setup-on-macos). The native audio tool remains
 macOS-only; authored transcript replay uses standard Python on other platforms. Hosted
 replay likewise requires `--provider jev --allow-hosted`; `--max-requests` bounds that run.
+
+### Jev decisions from the configuration file
+
+A host that runs `listen` with a fixed argument list, such as the Hailing Station daemon,
+cannot add `--use-jev --allow-hosted`. The owner can give the same consent in the
+configuration file that the host passes with `--config`:
+
+```json
+"decision": {"provider": "jev", "allow_hosted": true}
+```
+
+This is equivalent to `--use-jev --allow-hosted` for `listen`: finalized transcript text
+and bounded context go to Jev, and attention/request events are emitted. Both keys are
+required and exactly typed. `provider` is `"jev"` or `"mock"` (the default when the section
+is absent); `allow_hosted` is a JSON boolean. `"provider": "jev"` without
+`"allow_hosted": true`, a missing or extra key, another provider name, or a non-boolean
+value is refused with a message naming the rule before any capture starts. `"mock"` with
+`"allow_hosted": true` is refused, as `--allow-hosted` alone is.
+
+The flags keep their rules. `--use-jev` without `--allow-hosted` is still refused before the
+file is read, and the file never supplies the missing half. Both flags select Jev even when
+the file names `"mock"`; neither source can switch the other's Jev selection off. With the
+file selecting Jev, a redundant `--allow-hosted` is accepted. The section consents to Jev
+decisions only: hosted speech backends still require `--allow-hosted` on the command line.
+The `prototype` lab ignores the section and keeps its per-session page choice.
+
+The credential lookup is unchanged: `TYPESAFE_API_KEY` from the process environment when
+set, otherwise the login Keychain item with service `rightyo.jev` and account `api-key`.
+The key is read for each Jev request, not cached. When a process the daemon started reads
+the Keychain item, macOS shows its access prompt for `rightyo.jev` on the Mac. **Allow**
+permits that one read, so the prompt returns on the next request; **Always Allow** stops
+the prompts, but it grants the shared `/usr/bin/security` executable persistent access to
+the item (see the caution in [the credential setup](mvp.md#secure-jev-setup-on-macos)).
+Decide which before an unattended run: if nobody answers, the lookup times out and the
+hosted decision fails, ending the session with an error event rather than silently falling
+back to the mock provider.
 
 The foreground consumer refreshes the controller lease and drains events every 50 ms;
 there is no HTTP server or browser requirement. Ctrl-C or SIGTERM cancels capture and

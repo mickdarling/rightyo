@@ -39,8 +39,9 @@ foreground microphone tool:
 ```
 
 Without hosted opt-in it emits transcript/session events only. Add both `--use-jev`
-and `--allow-hosted` to send bounded finalized transcript context to Jev and emit
-attention/request events. Stop with Ctrl-C; restart with a fresh session ID. The stream
+and `--allow-hosted`, or the configuration file's
+`"decision": {"provider": "jev", "allow_hosted": true}`, to send bounded finalized
+transcript context to Jev and emit attention/request events. Stop with Ctrl-C; restart with a fresh session ID. The stream
 contains transcript text: pipe it to a local consumer and avoid logging real conversations.
 See [the tool guide](docs/tool-quickstart.md) for the event contract, Hailing Station handoff,
 limits, and contribution checks. Replies, acknowledgement voices, routing, and tool

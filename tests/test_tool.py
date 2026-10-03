@@ -14,8 +14,8 @@ from unittest.mock import patch
 
 from rightyo.cli import main
 from rightyo.contracts import ContractError, Turn
-from rightyo.prototype import PrototypeController, PrototypeError
-from rightyo.providers import MockProvider, ProviderError
+from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
+from rightyo.providers import JevProvider, MockProvider, ProviderError
 from rightyo.tool import listen, replay
 from rightyo.tool_events import SpeechEvents
 
@@ -407,6 +407,140 @@ class ToolTests(unittest.TestCase):
             with self.assertRaises(ContractError):
                 replay(args, output=output)
         self.assertEqual(output.getvalue(), "")
+
+
+class ConfigDecisionTests(unittest.TestCase):
+    """The configuration's `decision` section; no network, Keychain, or capture."""
+
+    def setUp(self):
+        self.tool = ToolTests("test_explicit_demo_headless_emits_transcripts_only_and_one_terminal")
+        self.tool.setUp()
+        self.addCleanup(self.tool.doCleanups)
+        self.args = self.tool.args
+        self.base = json.loads(self.tool.config.read_text())
+
+    def write(self, decision):
+        self.tool.config.write_text(json.dumps({**self.base, "decision": decision}))
+
+    def run_listen(self):
+        """Run demo `listen`; return the provider_factory calls and what each built."""
+        built = []
+
+        def provider_factory(**options):
+            provider = JevProvider(**options)
+            built.append((options, provider))
+            return provider
+
+        def factory(config, *, event_publisher):
+            return PrototypeController(
+                config,
+                event_publisher=event_publisher,
+                processor_factory=Processor,
+                capture_factory=ToolTests.no_capture,
+                provider_factory=provider_factory,
+            )
+
+        no_process = AssertionError("must not run /usr/bin/security")
+        no_network = AssertionError("must not open a network connection")
+        # The real constructor runs; decisions are answered by the fixture provider so
+        # no credential lookup or request is ever attempted.
+        with (
+            patch("rightyo.credentials.subprocess.Popen", side_effect=no_process),
+            patch("urllib.request.OpenerDirector.open", side_effect=no_network),
+            patch.object(JevProvider, "decide", lambda _self, state: MockProvider().decide(state)),
+        ):
+            output = io.StringIO()
+            self.assertEqual(listen(self.args, output=output, controller_factory=factory), 0)
+        events = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(events[-1]["phase"], "stopped")
+        return built
+
+    def test_config_jev_with_consent_constructs_the_jev_provider(self):
+        self.write({"provider": "jev", "allow_hosted": True})
+        self.assertTrue(PrototypeConfig.load(self.tool.config).hosted_decisions)
+        built = self.run_listen()
+        self.assertEqual(len(built), 1)
+        options, provider = built[0]
+        self.assertIsInstance(provider, JevProvider)
+        self.assertIs(options["allow_hosted"], True)
+
+    def test_config_mock_and_absent_section_keep_the_mock_provider(self):
+        self.assertFalse(PrototypeConfig.load(self.tool.config).hosted_decisions)
+        self.assertEqual(self.run_listen(), [])
+        self.write({"provider": "mock", "allow_hosted": False})
+        self.assertFalse(PrototypeConfig.load(self.tool.config).hosted_decisions)
+        self.assertEqual(self.run_listen(), [])
+
+    def test_config_jev_without_consent_is_refused_before_runtime(self):
+        for decision in (
+            {"provider": "jev", "allow_hosted": False},
+            {"provider": "jev"},
+        ):
+            with self.subTest(decision=decision):
+                self.write(decision)
+                with self.assertRaisesRegex(PrototypeError, "allow_hosted"):
+                    listen(self.args, controller_factory=ToolTests.no_capture)
+        self.assertEqual(Processor.instances, [])
+
+    def test_bad_types_unknown_provider_and_extra_keys_are_refused(self):
+        cases = {
+            "must be an object": (None, ["jev", True], "jev", True),
+            "exactly the keys": (
+                {},
+                {"allow_hosted": True},
+                {"provider": "jev", "allow_hosted": True, "model": "x"},
+            ),
+            "Unknown decision provider": (
+                {"provider": "openai", "allow_hosted": True},
+                {"provider": "Jev", "allow_hosted": True},
+                {"provider": 1, "allow_hosted": True},
+                {"provider": None, "allow_hosted": True},
+            ),
+            "true or false": (
+                {"provider": "jev", "allow_hosted": "true"},
+                {"provider": "jev", "allow_hosted": 1},
+                {"provider": "jev", "allow_hosted": None},
+            ),
+            "applies only to the jev": ({"provider": "mock", "allow_hosted": True},),
+        }
+        for message, decisions in cases.items():
+            for decision in decisions:
+                with self.subTest(decision=decision):
+                    self.write(decision)
+                    with self.assertRaisesRegex(PrototypeError, message):
+                        PrototypeConfig.load(self.tool.config)
+                    with self.assertRaisesRegex(PrototypeError, message):
+                        listen(self.args, controller_factory=ToolTests.no_capture)
+        self.assertEqual(Processor.instances, [])
+
+    def test_cli_flags_keep_their_rules_and_precedence(self):
+        # --use-jev alone is refused before the configuration is read, even if the
+        # file consents; the file never supplies the missing CLI half.
+        self.write({"provider": "jev", "allow_hosted": True})
+        self.args.use_jev, self.args.allow_hosted = True, False
+        with self.assertRaisesRegex(PrototypeError, "both --use-jev and --allow-hosted"):
+            listen(self.args, controller_factory=ToolTests.no_capture)
+        # --allow-hosted alone stays refused when nothing hosted is selected.
+        self.write({"provider": "mock", "allow_hosted": False})
+        self.args.use_jev, self.args.allow_hosted = False, True
+        with self.assertRaisesRegex(PrototypeError, "--allow-hosted requires"):
+            listen(self.args, controller_factory=ToolTests.no_capture)
+        # Both flags select Jev even when the file names the mock provider.
+        self.args.use_jev = self.args.allow_hosted = True
+        self.assertEqual(len(self.run_listen()), 1)
+
+    def test_section_never_consents_to_hosted_speech(self):
+        self.tool.config.write_text(
+            json.dumps(
+                {
+                    **self.base,
+                    "decision": {"provider": "jev", "allow_hosted": True},
+                    "diarizer": {"kind": "hosted-deepgram"},
+                }
+            )
+        )
+        with self.assertRaisesRegex(PrototypeError, "Hosted speech backends require"):
+            listen(self.args, controller_factory=ToolTests.no_capture)
 
 
 if __name__ == "__main__":

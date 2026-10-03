@@ -64,6 +64,12 @@ budget's worth of audio is processed. In replay/demo mode the budget is the exac
 boundary: the replay is trimmed there however slowly it processes, and the wall clock
 does not apply. Demo audio whose length equals the budget exactly ends `cancelled`
 (budget reached) rather than `complete`.
+An optional `"decision": {"provider": "jev", "allow_hosted": true}` is the file form of
+`listen --use-jev --allow-hosted`, for hosts that start `listen` with a fixed argument list.
+Both keys are required and strictly typed; `"provider": "jev"` without
+`"allow_hosted": true` is refused. It covers Jev decisions only, not hosted speech, and the
+lab ignores it. See [the tool guide](tool-quickstart.md#jev-decisions-from-the-configuration-file)
+for the rules and the macOS Keychain prompt.
 Replay accepts mono PCM16 WAV at
 16 kHz, at most three minutes; it feeds real PCM in causal order as quickly as processing
 permits. It is not a wall-clock streaming latency measurement. Playback through speakers is
