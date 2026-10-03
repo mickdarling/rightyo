@@ -421,6 +421,23 @@ class _HostedClient:
         return outcome["response"]
 
     def post(self, url: str, body: bytes, headers: dict[str, str], scheme: str) -> dict[str, Any]:
+        """Payload-free boundary: a failure is re-raised fresh, without the inner frames.
+
+        The frames below hold the utterance (`body`) and the response document; the
+        sanitized message is carried out, `body` is dropped from this frame, and a new
+        error is raised outside the handler, so no retained traceback holds the audio.
+        """
+        message = None
+        try:
+            return self._guarded_post(url, body, headers, scheme)
+        except HostedSpeechError as error:
+            message = str(error)
+        del body
+        raise HostedSpeechError(message) from None
+
+    def _guarded_post(
+        self, url: str, body: bytes, headers: dict[str, str], scheme: str
+    ) -> dict[str, Any]:
         if self.cancelled():
             raise HostedSpeechError(f"{self.label} request was cancelled")
         # Reserve capacity first, before any credential is loaded or header built, so a
@@ -729,6 +746,17 @@ class OpenAICompatibleTranscriber:
     def transcribe(
         self, pcm: bytes, register: Callable[[Any], None] | None = None
     ) -> list[dict[str, Any]]:
+        # Payload-free boundary, as in `_HostedClient.post`: `pcm`, the multipart body
+        # and the response document never survive in a failure's traceback.
+        message = None
+        try:
+            return self._transcribe(pcm)
+        except HostedSpeechError as error:
+            message = str(error)
+        del pcm
+        raise HostedSpeechError(message) from None
+
+    def _transcribe(self, pcm: bytes) -> list[dict[str, Any]]:
         if (
             not isinstance(pcm, bytes)
             or not pcm
@@ -879,6 +907,16 @@ class DeepgramDiarizer:
             del self._buffer[: len(self._buffer) - self.window_bytes]
 
     def segments(self) -> list[dict[str, Any]]:
+        # Payload-free boundary: the audio window and response document stay in the
+        # inner frames, which a re-raised failure does not carry.
+        message = None
+        try:
+            return self._segments()
+        except HostedSpeechError as error:
+            message = str(error)
+        raise HostedSpeechError(message) from None
+
+    def _segments(self) -> list[dict[str, Any]]:
         if self.closed:
             raise HostedSpeechError("Hosted diarizer is closed")
         if not self._buffer:

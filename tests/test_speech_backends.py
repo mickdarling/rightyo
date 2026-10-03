@@ -709,6 +709,44 @@ class HostedTranscriberTests(unittest.TestCase):
         self.assertNotIn(KEY, str(caught.exception))
         self.assertIsNone(caught.exception.__context__)
 
+    def assert_failure_holds_no_audio(self, call):
+        """Call `call`, then walk the failure's traceback BEFORE anything clears it.
+
+        The first entry is this helper's own frame; every frame after it belongs to the
+        code under test and must not hold the sentinel audio in any local.
+        """
+        import traceback
+
+        try:
+            call()
+        except HostedSpeechError as error:
+            held = []
+            for frame, _line in traceback.walk_tb(error.__traceback__.tb_next):
+                held.extend(repr(value) for value in frame.f_locals.values())
+            self.assertFalse(any("SENTINEL-AUDIO" in value for value in held), held)
+            self.assertIsNone(error.__context__)
+            return str(error)
+        self.fail("the hosted call must fail")
+
+    def test_hosted_failures_leave_no_audio_in_tracebacks(self):
+        def sentinel():
+            return b"SENTINEL-AUDIO!!" * 40
+
+        cases = {
+            "cancelled": (dict(payload=b"{}"), dict(cancelled=lambda: True)),
+            "non-2xx": (dict(payload=b"{}", status=500), {}),
+            "malformed JSON": (dict(payload=b"not json"), {}),
+            "inconsistent units": (dict(payload=b'{"text": "x"}'), {}),
+        }
+        for name, (connection, options) in cases.items():
+            patched, _ = patched_connection(**connection)
+            with self.subTest(path=name), patched:
+                transcriber = self.transcriber(**options)
+                self.assert_failure_holds_no_audio(lambda: transcriber.transcribe(sentinel()))
+                diarizer = DeepgramDiarizer(allow_hosted=True, load_key=load_key, **options)
+                diarizer.push(sentinel())
+                self.assert_failure_holds_no_audio(diarizer.segments)
+
     def test_authorization_header_carries_the_bearer_key_at_point_of_use_only(self):
         patched, connections = patched_connection(b'{"text": ""}')
         with patched:
