@@ -345,6 +345,8 @@ class HostedTranscriberTests(unittest.TestCase):
             "https://u:p@x.test/v1",
             ENDPOINT + "?model=x",
             ENDPOINT + "#fragment",
+            ENDPOINT + "?",
+            ENDPOINT + "#",
             5,
         ):
             with self.subTest(endpoint=endpoint), self.assertRaisesRegex(LiveAudioError, "https"):
@@ -570,6 +572,47 @@ class HostedTranscriberTests(unittest.TestCase):
         self.assertTrue(response.fp.raw._sock.shut)
         self.assertTrue(response.closed)
 
+    def test_keychain_lookup_is_cancelled_or_bounded_by_the_hosted_deadline(self):
+        """`post` forwards the cancellation guard and the hosted budget into the lookup."""
+        polls = []
+        spawned = []
+
+        def popen(args, **options):
+            spawned.append(FakeProcess(args, **options))
+            return spawned[-1]
+
+        opener, requests = patched_opener(b"{}")
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("rightyo.credentials.sys.platform", "darwin"),
+            patch("rightyo.credentials.subprocess.Popen", side_effect=popen),
+            patch("rightyo.credentials.time.sleep", lambda _s: polls.append(1)),
+            opener,
+        ):
+            transcriber = self.transcriber(
+                load_key=load_transcriber_api_key, cancelled=lambda: len(polls) >= 2
+            )
+            with self.assertRaisesRegex(HostedSpeechError, "cancelled") as caught:
+                transcriber.transcribe(bytes(640))
+            self.assertIsNone(caught.exception.__context__)
+            self.assertTrue(spawned[0].terminated)
+            self.assertEqual(len(polls), 2)
+            clock = [0.0]
+
+            def monotonic():
+                clock[0] += 20.0
+                return clock[0]
+
+            with patch("rightyo.credentials.time.monotonic", monotonic):
+                slow = self.transcriber(load_key=load_transcriber_api_key, timeout_seconds=30)
+                with self.assertRaisesRegex(HostedSpeechError, "credential is unavailable"):
+                    slow.transcribe(bytes(640))
+            # A 120-second default would have survived three 20-second ticks; the hosted
+            # 30-second budget ended the lookup on the second check.
+            self.assertTrue(spawned[1].terminated)
+        self.assertEqual(requests, [])
+        self.assertNotIn(KEY, "".join(str(process.args) for process in spawned))
+
     def test_transport_receives_only_the_budget_the_credential_lookup_left(self):
         clock = [0.0]
 
@@ -646,7 +689,7 @@ class HostedTranscriberTests(unittest.TestCase):
             {"word": "here", "start": 0.3, "end": 0.5},
             {"word": "I'm", "start": 0.1, "end": 0.3},
         ]
-        for bad_words in (incomplete, misordered, words):
+        for bad_words in (incomplete, words):
             with self.subTest(words=bad_words):
                 units = openai_units(
                     {"text": "I'm here. Are you?", "words": bad_words, "segments": complete},
@@ -655,6 +698,25 @@ class HostedTranscriberTests(unittest.TestCase):
                 self.assertEqual([u["text"] for u in units], [" I'm here.", " Are you?"])
                 with self.assertRaisesRegex(HostedSpeechError, "inconsistent word timing"):
                     openai_units({"text": "I'm here. Are you?", "words": bad_words}, 600)
+        # Words running backwards in time are rejected outright, segments or not.
+        for document in (
+            {"text": "I'm here. Are you?", "words": misordered, "segments": complete},
+            {"text": "here I'm", "words": misordered},
+        ):
+            with self.subTest(document=document):
+                with self.assertRaisesRegex(HostedSpeechError, "inconsistent word timing"):
+                    openai_units(document, 600)
+        backwards_segments = [
+            {"text": "A.", "start": 0.3, "end": 0.5},
+            {"text": "B.", "start": 0.0, "end": 0.2},
+        ]
+        with self.assertRaisesRegex(HostedSpeechError, "inconsistent segments"):
+            openai_units({"text": "A. B.", "segments": backwards_segments}, 600)
+        overlapping = [
+            {"word": "I'm", "start": 0.1, "end": 0.32},
+            {"word": "here", "start": 0.3, "end": 0.5},
+        ]
+        self.assertEqual(len(openai_units({"text": "I'm here", "words": overlapping}, 600)), 2)
         segments = {"text": "A. B.", "segments": [{"text": "A. B.", "start": 0, "end": 0.4}]}
         self.assertEqual(
             openai_units(segments, 300), [{"text": " A. B.", "start_ms": 0, "end_ms": 300}]
@@ -683,7 +745,12 @@ class HostedDiarizerTests(unittest.TestCase):
     def test_hosted_use_requires_explicit_consent_and_valid_settings(self):
         with self.assertRaisesRegex(HostedSpeechError, "consent"):
             DeepgramDiarizer()
-        for endpoint in ("http://api.deepgram.com/v1/listen", DEEPGRAM_ENDPOINT + "?diarize=true"):
+        for endpoint in (
+            "http://api.deepgram.com/v1/listen",
+            DEEPGRAM_ENDPOINT + "?diarize=true",
+            DEEPGRAM_ENDPOINT + "?",
+            DEEPGRAM_ENDPOINT + "#",
+        ):
             with self.subTest(endpoint=endpoint), self.assertRaisesRegex(LiveAudioError, "https"):
                 self.diarizer(endpoint=endpoint)
         with self.assertRaises(LiveAudioError):

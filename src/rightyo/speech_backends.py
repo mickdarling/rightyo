@@ -89,7 +89,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def _https_endpoint(value: Any, label: str) -> str:
     parts = None
-    if isinstance(value, str) and len(value) <= 2048 and value.isascii():
+    # A bare trailing `?` or `#` parses as an empty query/fragment yet would still
+    # corrupt the appended query, so the delimiters themselves are refused.
+    if (
+        isinstance(value, str)
+        and len(value) <= 2048
+        and value.isascii()
+        and not set(value) & set("?#")
+    ):
         try:
             parts = urllib.parse.urlsplit(value)
         except ValueError:
@@ -354,6 +361,18 @@ def _punctuate(words: list[str], text: str) -> list[str] | None:
     return result
 
 
+def _monotonic(units: list[dict[str, Any]]) -> bool:
+    """Units must not run backwards: starts and ends both non-decreasing in order.
+
+    Reordered units would otherwise make a turn's start exclude earlier words or emit
+    turns in decreasing time order; slight overlaps between neighbours are tolerated.
+    """
+    return all(
+        later["start_ms"] >= earlier["start_ms"] and later["end_ms"] >= earlier["end_ms"]
+        for earlier, later in zip(units, units[1:])
+    )
+
+
 def openai_units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]]:
     """Utterance-relative units from a verbose_json transcription object."""
     label = "Hosted transcriber"
@@ -373,6 +392,8 @@ def openai_units(document: dict[str, Any], duration_ms: int) -> list[dict[str, A
                 raise HostedSpeechError(f"{label} returned an invalid response")
             start, end = _interval(word.get("start"), word.get("end"), duration_ms, label)
             units.append({"text": " " + value.strip(), "start_ms": start, "end_ms": end})
+        if not _monotonic(units):
+            raise HostedSpeechError(f"{label} returned inconsistent word timing")
         punctuated = _punctuate([unit["text"].strip() for unit in units], text)
         if punctuated is not None:
             for unit, value in zip(units, punctuated):
@@ -397,8 +418,11 @@ def openai_units(document: dict[str, Any], duration_ms: int) -> list[dict[str, A
             if not value[:1].isspace():
                 value = " " + value
             units.append({"text": value, "start_ms": start, "end_ms": end})
-        # Segments must reproduce the transcript; otherwise the response is inconsistent.
-        if " ".join("".join(unit["text"] for unit in units).split()) != " ".join(text.split()):
+        # Segments must reproduce the transcript in time order; otherwise the response
+        # is inconsistent.
+        if " ".join("".join(unit["text"] for unit in units).split()) != " ".join(
+            text.split()
+        ) or not _monotonic(units):
             raise HostedSpeechError(f"{label} returned inconsistent segments")
         return units
     raise HostedSpeechError(f"{label} returned no timed units")

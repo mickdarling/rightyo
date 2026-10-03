@@ -121,6 +121,10 @@
     stage("diarizer", state.diarizer, "Who is speaking");
     stage("transcriber", state.transcriber, "What was said");
     $("locality-label").textContent = hostedSpeech(state) ? "Audio leaves this Mac · hosted speech configured" : "On this Mac";
+    const transcriber = state.transcriber && typeof state.transcriber === "object" ? state.transcriber : null;
+    $("footer-locality").textContent = transcriber && transcriber.hosted === true
+      ? `Hosted transcription (${String(transcriber.service || transcriber.kind || "hosted")}) · temporary context`
+      : "Local transcription · temporary context";
     connected = true;
     demoAvailable = state.demo_available === true;
     setPhase(state.phase);
