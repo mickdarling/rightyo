@@ -49,6 +49,7 @@ MAX_STALLED_CONNECTS = 4  # abandoned resolver threads the process tolerates bef
 # Helper threads abandoned inside a name lookup, shared by every client so that a
 # session restart cannot reset the bound. They hold no audio.
 _STALLED: list[threading.Thread] = []
+_ACTIVE = [0]  # connect slots reserved by exchanges in flight, process-wide
 _STALLED_LOCK = threading.Lock()
 READ_POLL_SECONDS = 0.05  # how often the waiting loop re-checks cancel/deadline
 READ_ABORT_JOIN_SECONDS = 2  # how long an aborted reader is given to notice the shutdown
@@ -210,6 +211,38 @@ def _stalled_count() -> int:
         return len(_STALLED)
 
 
+class _ConnectSlot:
+    """One reservation against the process-wide bound, taken before any other work.
+
+    Exchanges in flight and resolvers abandoned in a lookup share the bound, and the
+    reservation is made atomically under the lock, so concurrent clients cannot all
+    observe the count below the limit before any of them is registered. A slot is
+    released when the exchange ends, or converted into a stalled entry when its
+    helper thread is abandoned.
+    """
+
+    def __init__(self) -> None:
+        self.open = True
+
+    @classmethod
+    def reserve(cls, label: str) -> _ConnectSlot:
+        with _STALLED_LOCK:
+            _STALLED[:] = [thread for thread in _STALLED if thread.is_alive()]
+            if len(_STALLED) + _ACTIVE[0] >= MAX_STALLED_CONNECTS:
+                raise HostedSpeechError(f"{label} has too many stalled connections; retry later")
+            _ACTIVE[0] += 1
+        return cls()
+
+    def release(self, stalled: threading.Thread | None = None) -> None:
+        if not self.open:
+            return
+        self.open = False
+        with _STALLED_LOCK:
+            _ACTIVE[0] -= 1
+            if stalled is not None:
+                _STALLED.append(stalled)
+
+
 class _HostedClient:
     """One consented endpoint: bounded, sanitized, redirect-free, credential at use only.
 
@@ -277,7 +310,12 @@ class _HostedClient:
         return outcome["content"]
 
     def _wait(
-        self, thread: threading.Thread, state: dict[str, Any], connection: Any, deadline: float
+        self,
+        thread: threading.Thread,
+        state: dict[str, Any],
+        connection: Any,
+        deadline: float,
+        slot: _ConnectSlot,
     ) -> None:
         """Poll cancellation and the deadline while `thread` runs; abandon it on either."""
         while thread.is_alive():
@@ -286,12 +324,12 @@ class _HostedClient:
             if cancelled or remaining <= 0:
                 state["abort"] = True
                 _abort_connection(connection)
-                with _STALLED_LOCK:
-                    _STALLED.append(thread)
+                # The exchange's slot becomes the abandoned thread's stalled entry.
+                slot.release(stalled=thread)
                 raise _ReadCancelled if cancelled else _OpenDeadline
             thread.join(min(READ_POLL_SECONDS, remaining))
 
-    def _connect(self, connection: Any, deadline: float) -> None:
+    def _connect(self, connection: Any, deadline: float, slot: _ConnectSlot) -> None:
         """Phase one: resolve and connect on a helper thread that holds no audio.
 
         A name lookup cannot be interrupted, so on cancellation or the deadline the
@@ -315,7 +353,7 @@ class _HostedClient:
 
         thread = threading.Thread(target=run, name="rightyo-hosted-connect", daemon=True)
         thread.start()
-        self._wait(thread, state, connection, deadline)
+        self._wait(thread, state, connection, deadline, slot)
         if "error" in outcome:
             raise outcome["error"]
 
@@ -326,6 +364,7 @@ class _HostedClient:
         body: bytes,
         headers: dict[str, str],
         deadline: float,
+        slot: _ConnectSlot,
     ) -> Any:
         """Phase two: send the request and wait for the response headers.
 
@@ -372,7 +411,7 @@ class _HostedClient:
         thread = threading.Thread(target=run, name="rightyo-hosted-send", daemon=True)
         thread.start()
         try:
-            self._wait(thread, state, connection, deadline)
+            self._wait(thread, state, connection, deadline, slot)
         except (_ReadCancelled, _OpenDeadline):
             if "response" in outcome:
                 _abort_response(outcome["response"])
@@ -384,6 +423,17 @@ class _HostedClient:
     def post(self, url: str, body: bytes, headers: dict[str, str], scheme: str) -> dict[str, Any]:
         if self.cancelled():
             raise HostedSpeechError(f"{self.label} request was cancelled")
+        # Reserve capacity first, before any credential is loaded or header built, so a
+        # refusal never has a credential anywhere in its frames.
+        slot = _ConnectSlot.reserve(self.label)
+        try:
+            return self._post(url, body, headers, scheme, slot)
+        finally:
+            slot.release()
+
+    def _post(
+        self, url: str, body: bytes, headers: dict[str, str], scheme: str, slot: _ConnectSlot
+    ) -> dict[str, Any]:
         # One wall-clock deadline covers the credential lookup and the whole exchange.
         deadline = time.monotonic() + self.timeout
         key = None
@@ -416,9 +466,6 @@ class _HostedClient:
             "Accept": "application/json",
         }
         del key
-        # Refuse before anything is created while too many earlier resolvers still stall.
-        if _stalled_count() >= MAX_STALLED_CONNECTS:
-            raise HostedSpeechError(f"{self.label} has too many stalled connections; retry later")
         failure = None
         content = b""
         status = None
@@ -435,10 +482,10 @@ class _HostedClient:
         # outlive it; the exchange and the body read run on helper threads that the
         # deadline or cancellation stops waiting for, closing the connection.
         try:
-            self._connect(connection, deadline)
+            self._connect(connection, deadline, slot)
             if self.cancelled():
                 raise _ReadCancelled
-            response = self._send(connection, target, body, request_headers, deadline)
+            response = self._send(connection, target, body, request_headers, deadline, slot)
             status = response.status
             if type(status) is int and 200 <= status <= 299:
                 content = self._read_body(response, deadline)

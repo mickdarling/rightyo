@@ -42,6 +42,12 @@ def load_turns(path: Path) -> list[Turn]:
     turns = [Turn.from_dict(item) for item in raw]
     if len({turn.session_id for turn in turns}) != 1:
         raise ContractError("evaluate one explicit session at a time")
+    # Utterance-scoped labels are unique only by construction in the live processor; a
+    # file could repeat a prefix across utterances, so this provenance never loads.
+    if any(turn.speaker_provenance == "diarization-utterance" for turn in turns):
+        raise ContractError(
+            "utterance-local speaker provenance is produced only by the live processor"
+        )
     return turns
 
 

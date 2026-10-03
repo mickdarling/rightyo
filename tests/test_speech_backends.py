@@ -488,6 +488,40 @@ class ProtocolAndSelectionTests(unittest.TestCase):
         self.assertEqual(Turn.from_dict(stable).speaker_id, "Speaker A")
         self.assertEqual(utterance_scoped_speaker(7, "Speaker A"), "u7 Speaker A")
 
+    def test_replayed_input_never_carries_utterance_local_provenance(self):
+        from rightyo.cli import load_turns
+
+        turn = {
+            "session_id": "replay",
+            "utterance_id": "u1",
+            "revision": 1,
+            "start_ms": 0,
+            "end_ms": 100,
+            "text": "Hi.",
+            "speaker_id": "u1 Speaker A",
+            "finalized": True,
+            "overlap": False,
+            "recognizer_id": "fixture",
+            "provenance": "synthetic",
+            "speaker_provenance": "diarization-utterance",
+        }
+        path = Path(self.directory.name) / "replay.json"
+        path.write_text(json.dumps({"schema_version": 1, "turns": [turn]}))
+        with self.assertRaisesRegex(ContractError, "only by the live processor"):
+            load_turns(path)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "turns": [
+                        turn
+                        | {"speaker_provenance": "diarization-timeline", "speaker_id": "Speaker A"}
+                    ],
+                }
+            )
+        )
+        self.assertEqual(len(load_turns(path)), 1)
+
     def test_per_utterance_labels_never_merge_into_one_participant(self):
         turns = []
         per_utterance = StubDiarizer()
@@ -524,6 +558,15 @@ class ProtocolAndSelectionTests(unittest.TestCase):
             runner.process(turn)
         self.assertEqual(states[-1]["known_participants"], ["u1 Speaker A", "u2 Speaker A"])
         self.assertEqual(len(states[-1]["known_participants"]), 2)
+        # Live-generated turns still publish through the event producer unchanged.
+        events = SpeechEvents()
+        events.start("namespace-test")
+        for turn in turns:
+            events.transcript(turn, now_ms=turn.end_ms)
+        published = [e for e in events.drain() if e["type"] == "transcript"]
+        self.assertEqual(
+            [e["turn"]["speaker_id"] for e in published], ["u1 Speaker A", "u2 Speaker A"]
+        )
 
 
 class HostedTranscriberTests(unittest.TestCase):
@@ -847,12 +890,16 @@ class HostedTranscriberTests(unittest.TestCase):
         # The bound is process-wide: a fresh client (a restarted session) that never
         # stalled anything is refused just the same while those resolvers still hang.
         del client
-        fresh = self.transcriber(timeout_seconds=30)
+        loader = Mock(side_effect=AssertionError("credential loaded before the stall refusal"))
+        fresh = self.transcriber(timeout_seconds=30, load_key=loader)
         with patched:
             with self.assertRaisesRegex(HostedSpeechError, "too many stalled"):
                 fresh.transcribe(bytes(640))
+        # Refused before any credential was loaded or header built.
+        loader.assert_not_called()
         self.assertEqual(len(connections), 4)
         client = fresh._client
+        client.load_key = load_key
         # Once the resolvers return they close without connecting further; the stalled
         # list drains and requests resume.
         released.set()
@@ -867,6 +914,44 @@ class HostedTranscriberTests(unittest.TestCase):
             )
         self.assertEqual(speech_backends._STALLED, [])
         self.assertEqual(len(ok), 1)
+
+    def test_connect_capacity_is_reserved_atomically_across_concurrent_clients(self):
+        self.assertEqual(speech_backends._stalled_count(), 0)
+        late = FakeResponse(b'{"text": ""}')
+        patched, released, connections = self.blocking_connection(late)
+        self.addCleanup(released.set)
+        barrier = threading.Barrier(6)
+        outcomes = []
+
+        def attempt():
+            checks = []
+            client = self.transcriber(
+                timeout_seconds=30,
+                cancelled=lambda: checks.append(1) is None and len(checks) >= 4,
+            )
+            barrier.wait(5)
+            try:
+                client.transcribe(bytes(640))
+                outcomes.append("ok")
+            except HostedSpeechError as error:
+                outcomes.append(str(error))
+
+        with patched:
+            workers = [threading.Thread(target=attempt) for _ in range(6)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(5)
+        self.assertEqual(sum("cancelled" in o for o in outcomes), 4, outcomes)
+        self.assertEqual(sum("too many stalled" in o for o in outcomes), 2, outcomes)
+        # Never more than the bound in flight or stalled, so only four connections exist.
+        self.assertEqual(len(connections), 4)
+        self.assertEqual(speech_backends._stalled_count(), 4)
+        released.set()
+        for thread in list(speech_backends._STALLED):
+            thread.join(2)
+        self.assertEqual(speech_backends._stalled_count(), 0)
+        self.assertEqual(speech_backends._ACTIVE, [0])
 
     def test_deadline_during_connect_returns_at_once(self):
         late = FakeResponse(b'{"text": ""}')

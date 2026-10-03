@@ -102,7 +102,10 @@ by utterance (`u7 Speaker A`, `u8 Speaker A`), so they never compare equal acros
 utterances and a decision provider sees each utterance's voices as distinct
 participants; the `Turn` contract enforces this, so a replayed or imported
 `diarization-utterance` turn whose `speaker_id` lacks the `u<n> ` prefix is rejected
-rather than merged with unrelated voices or matched to a configured role; `authored-fixture` and `unknown` keep their meanings. None is an identity.
+rather than merged with unrelated voices or matched to a configured role, and because
+only the live processor can guarantee that each prefix names one utterance, authored or
+replayed input (`tool-replay`, `evaluate`) never carries this provenance at all: `load_turns`
+rejects it; `authored-fixture` and `unknown` keep their meanings. None is an identity.
 
 Decision evidence contains `label`, `recipient_kind`, `confidence`, `provider`, and
 `model`. A probability is not demonstrated accuracy or authority. A request is
@@ -344,8 +347,9 @@ is noticed within about 50 ms, the connection is shut, and the caller returns at
 name lookup cannot be interrupted, so an abandoned connect thread ends when the resolver
 returns, without holding up the stop; such a thread holds no audio (the request body is
 handed over only after the connection exists), and hosted requests are refused
-process-wide while more than four of them are still alive, whichever sessions abandoned
-them, so stalls cannot accumulate memory across restarts.
+process-wide while exchanges in flight plus such stalled threads reach four, whichever
+sessions own them: the slot is reserved atomically before any credential is loaded, so
+stalls cannot accumulate memory across restarts or through concurrent sessions.
 
 The current native implementation still uses conservative endpointing and completed
 Whisper windows. Persistent ASR, early attention, lower endpoint latency and other
