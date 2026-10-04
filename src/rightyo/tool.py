@@ -24,6 +24,7 @@ from rightyo.providers import (
     MockProvider,
     ModelPriorityProvider,
     ProviderError,
+    replay_request_budget,
     request_former_for,
 )
 from rightyo.tool_events import SpeechEvents, encode_json
@@ -66,7 +67,7 @@ def replay(args, *, output=None) -> int:
         if args.provider == "mock"
         else JevProvider(
             allow_hosted=args.allow_hosted,
-            max_requests=args.max_requests,
+            max_requests=replay_request_budget(args.max_requests),
             timeout_seconds=args.timeout,
             min_confidence=args.min_confidence,
         )

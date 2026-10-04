@@ -20,7 +20,7 @@ from rightyo.contracts import (
 )
 from rightyo.credentials import CredentialError
 from rightyo.pipeline import ReplayRunner
-from rightyo.providers import JevProvider, MockProvider, ProviderError
+from rightyo.providers import JevProvider, MockProvider, ProviderError, replay_request_budget
 
 MAX_INPUT_BYTES = 1048576
 MAX_INPUT_TURNS = 1000
@@ -99,7 +99,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         if args.provider == "mock"
         else JevProvider(
             allow_hosted=args.allow_hosted,
-            max_requests=args.max_requests,
+            max_requests=replay_request_budget(args.max_requests),
             timeout_seconds=args.timeout,
             min_confidence=args.min_confidence,
         )

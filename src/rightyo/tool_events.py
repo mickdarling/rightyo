@@ -395,12 +395,23 @@ class SpeechEvents:
         # A provider that omits the current speaker still fixes that speaker's role.
         return self._roles.setdefault(turn.speaker_id, "unknown")
 
-    def decision(self, event, now_ms):
+    def decision(self, event, now_ms, *, unavailable=None):
+        """Emit one turn's attention evidence and, when attended, its request.
+
+        ``unavailable`` names why a live turn's hosted decision was transiently
+        unavailable (#71). The placeholder decision must be `uncertain`, so it never
+        forms a request, and its evidence carries `decision_status: "unavailable"` and
+        that `reason` beside the unchanged keys.
+        """
         with self._lock:
             if not self._active or not self._attention_enabled:
                 return
             if not isinstance(event, DecisionEvent) or event.turn.session_id != self._session:
                 raise ContractError("decision event belongs to another session")
+            if unavailable is not None:
+                identifier(unavailable, "unavailable reason")
+                if event.decision.label != "uncertain":
+                    raise ContractError("an unavailable decision must be uncertain")
             integer(now_ms, "now_ms")
             self.expire(max(now_ms, event.turn.end_ms))
             key = event.turn.utterance_id
@@ -420,6 +431,10 @@ class SpeechEvents:
                 for name, value in event.public_dict().items()
                 if name in {"label", "recipient_kind", "confidence", "provider", "model"}
             }
+            if unavailable is not None:
+                # Optional keys, like role_status: strict hosts ignore unknown keys.
+                evidence["decision_status"] = "unavailable"
+                evidence["reason"] = unavailable
             stop = False
             if role is not None:
                 evidence["role"] = role
