@@ -66,9 +66,10 @@ retained, including any wake phrase; no request-span extraction is implied.
 
 A normal `stopped` follows already accepted delivery. `cancelled` and `error`
 discard queued content and pending requests. No further request is valid after a
-terminal event. Hosted unavailability and budget exhaustion terminate the headless
-hosted-decision session conservatively; the interactive lab can separately continue
-local transcription. If a pipe closes, the producer cancels. Consumers treat EOF
+terminal event. Repeated or non-transient hosted unavailability and budget exhaustion
+terminate the headless hosted-decision session conservatively (see
+[hosted unavailability](#hosted-unavailability)); the interactive lab can separately
+continue local transcription. If a pipe closes, the producer cancels. Consumers treat EOF
 without a normal terminal event as incomplete and never automatically retry an
 uncertain application action.
 
@@ -82,6 +83,34 @@ processes. The budget is a positive whole number of seconds; the command line
 replaces the file's value. Timestamps are plain integers in stream milliseconds and do not
 wrap. Memory is bounded independently of session length by the rolling retention limits
 below, the per-utterance audio window, and the per-session unique-turn count.
+
+### Hosted unavailability
+
+Live `listen` sessions (microphone or stdin) have no per-session Jev request cap: Jev is
+called once per finalized turn, one request at a time, for as long as the session listens
+([#75](https://github.com/mickdarling/rightyo/issues/75)). The configuration's optional
+`decision.max_requests` sets a cap; reaching it ends the session with
+`reason: "attention-budget-exhausted"`. A demo without a cap keeps its default of 20, and
+`evaluate` and `tool-replay` keep `--max-requests` (default 20, at most 100).
+
+A single transiently unavailable hosted decision, a timeout, connection failure or HTTP
+429, 529 or 5xx, degrades only its own turn
+([#71](https://github.com/mickdarling/rightyo/issues/71)). That turn's `attention` event
+carries `uncertain` evidence with `recipient_kind: "unknown"`, `confidence: 0`, and two
+optional keys, `decision_status: "unavailable"` and `reason` (`timeout`,
+`connection-failed`, `rate-limited` or `server-error`), and never a `request_id`:
+
+```json
+{"label": "uncertain", "recipient_kind": "unknown", "confidence": 0.0, "provider": "jev",
+ "model": "jev-1.13.0", "decision_status": "unavailable", "reason": "timeout"}
+```
+
+The turn stays ordinary context, and the next turn is sent as usual. There is no retry of
+the failed turn. Five such failures in a row end the session with
+`reason: "attention-unavailable"`, as does any other hosted failure at once: an
+authentication or other HTTP 4xx response, a refused redirect, an invalid or oversized
+response, a credential failure, or cancellation. A host that does not know the optional
+keys reads the evidence as an ordinary `uncertain` decision.
 
 ## Turn and request fields
 

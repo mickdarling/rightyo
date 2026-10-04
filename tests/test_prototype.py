@@ -235,6 +235,19 @@ class ControllerTests(unittest.TestCase):
         self.controller.stop()
         self.assertEqual(self.controller.snapshot()["turns"], [])
 
+    def test_demo_keeps_its_bounded_default_and_microphone_is_uncapped(self):
+        # #75: only live modes drop the per-session cap; a demo keeps the old default.
+        self.controller.start({"mode": "demo", "use_jev": True})
+        await_condition(lambda: self.controller.snapshot()["phase"] == "complete")
+        self.assertEqual(self.hosted.call_args.kwargs["max_requests"], 20)
+        self.assertEqual(self.controller.snapshot()["jev_request_limit"], 20)
+        self.controller.stop()
+        await_condition(lambda: self.controller.snapshot()["phase"] == "idle")
+        self.controller.start({"mode": "microphone", "use_jev": True})
+        self.assertIsNone(self.hosted.call_args.kwargs["max_requests"])
+        self.assertIsNone(self.controller.snapshot()["jev_request_limit"])
+        self.controller.stop()
+
     def test_hosted_opt_in_and_budget_preserve_remaining_local_transcripts(self):
         self.controller.start({"mode": "demo", "use_jev": True, "max_requests": 1})
         await_condition(lambda: self.controller.snapshot()["phase"] == "complete")

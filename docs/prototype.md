@@ -67,8 +67,9 @@ does not apply. Demo audio whose length equals the budget exactly ends `cancelle
 An optional `"decision": {"provider": "jev", "allow_hosted": true}` is the file form of
 `listen --use-jev --allow-hosted`, for hosts that start `listen` with a fixed argument list.
 Both keys are required and strictly typed; `"provider": "jev"` without
-`"allow_hosted": true` is refused. It covers Jev decisions only, not hosted speech, and the
-lab ignores it. See [the tool guide](tool-quickstart.md#jev-decisions-from-the-configuration-file)
+`"allow_hosted": true` is refused. An optional positive `max_requests` caps the Jev requests
+of each `listen` session; without it, live microphone and stdin sessions have no request
+cap. It covers Jev decisions only, not hosted speech, and the lab ignores it. See [the tool guide](tool-quickstart.md#jev-decisions-from-the-configuration-file)
 for the rules and the macOS Keychain prompt.
 Replay accepts mono PCM16 WAV at
 16 kHz, at most three minutes; it feeds real PCM in causal order as quickly as processing
@@ -173,9 +174,11 @@ require Stop and another Start. No setting changes system volume.
 **Enable Jev** is initially unchecked. Enabling it before Start explicitly authorizes sending
 the current finalized transcript and bounded recent text to TypeSafe. Credentials use the
 [masked Keychain dialog](mvp.md#secure-jev-setup-on-macos), never the dashboard or its API.
-Local transcription continues if hosted processing fails, reaches its request limit,
-or falls behind enough to fill its bounded decision queue; queued hosted work is then
-cancelled and decisions disabled for this session.
+A single transiently unavailable decision (timeout, connection failure, HTTP 429/529 or
+5xx) marks only that turn `uncertain` with its reason, and the next turn is sent as usual.
+Local transcription continues if hosted processing fails otherwise or five times in a row,
+reaches its request limit, or falls behind enough to fill its bounded decision queue;
+queued hosted work is then cancelled and decisions disabled for this session.
 Attention is then unavailable, rather than fabricated. There are no automatic retries.
 The confidence slider is an experiment setting, not a calibrated accuracy guarantee.
 

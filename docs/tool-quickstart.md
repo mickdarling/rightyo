@@ -106,10 +106,14 @@ configuration file that the host passes with `--config`:
 
 This is equivalent to `--use-jev --allow-hosted` for `listen`: finalized transcript text
 and bounded context go to Jev, and attention/request events are emitted. Both keys are
-required and exactly typed. `provider` is `"jev"` or `"mock"` (the default when the section
+required and exactly typed. An optional `"max_requests"`, a positive whole number, caps the
+Jev requests of each session, ending it with `attention-budget-exhausted` when reached; it
+is accepted only with `"provider": "jev"`. Without it, live microphone and stdin sessions
+have no request cap, since Jev is called once per finalized turn for as long as the session
+listens, and a demo keeps its bounded default of 20. `provider` is `"jev"` or `"mock"` (the default when the section
 is absent); `allow_hosted` is a JSON boolean. `"provider": "jev"` without
-`"allow_hosted": true`, a missing or extra key, another provider name, or a non-boolean
-value is refused with a message naming the rule before any capture starts. `"mock"` with
+`"allow_hosted": true`, a missing or extra key, another provider name, a non-boolean
+value or an invalid `max_requests` is refused with a message naming the rule before any capture starts. `"mock"` with
 `"allow_hosted": true` is refused, as `--allow-hosted` alone is.
 
 The flags keep their rules. `--use-jev` without `--allow-hosted` is still refused before the
@@ -128,7 +132,9 @@ the prompts, but it grants the shared `/usr/bin/security` executable persistent 
 the item (see the caution in [the credential setup](mvp.md#secure-jev-setup-on-macos)).
 Decide which before an unattended run: if nobody answers, the lookup times out and the
 hosted decision fails, ending the session with an error event rather than silently falling
-back to the mock provider.
+back to the mock provider. A credential failure is not treated as transient; see
+[hosted unavailability](tool-api.md#hosted-unavailability) for the failures that degrade
+one turn instead.
 
 The foreground consumer refreshes the controller lease and drains events every 50 ms;
 there is no HTTP server or browser requirement. Ctrl-C or SIGTERM cancels capture and

@@ -21,6 +21,7 @@ from rightyo.contracts import (
     PROVENANCE,
     Addressing,
     ContractError,
+    DecisionEvent,
     RequestForming,
     SpeakerPriority,
     Turn,
@@ -39,7 +40,9 @@ from rightyo.providers import (
     JevProvider,
     MockProvider,
     ProviderError,
+    ProviderUnavailable,
     request_former_for,
+    unavailable_decision,
 )
 from rightyo.speech_backends import (
     HostedSpeechError,
@@ -54,6 +57,15 @@ from rightyo.speech_backends import (
 )
 
 BROWSER_LEASE_SECONDS = 15
+# Jev requests per demo session unless the session or configuration sets a cap. Live
+# microphone and stdin sessions call Jev once per finalized turn and are uncapped by
+# default (#75): the decision worker sends one request at a time, so the speech itself
+# paces them, and the bounded decision queue fails closed if Jev falls behind.
+DEFAULT_REQUEST_LIMIT = 20
+LIVE_MODES = frozenset({"microphone", "stdin"})
+# A transiently unavailable hosted decision (timeout, connection, HTTP 429/529/5xx)
+# degrades only its own turn (#71); this many in a row end the session as before.
+MAX_CONSECUTIVE_DECISION_FAILURES = 5
 PCM_BYTES_PER_MS = 32
 # Advertised on `session` started for stdin input: a separate top-level object, so the
 # strictly validated capability set is unchanged. Turn provenance is host-declared.
@@ -85,9 +97,18 @@ def decision_spec(value: Any) -> bool:
     """
     if not isinstance(value, dict):
         raise DecisionConfigError("The decision section must be an object")
-    if set(value) != {"provider", "allow_hosted"}:
+    if (
+        not {"provider", "allow_hosted"}
+        <= set(value)
+        <= {
+            "provider",
+            "allow_hosted",
+            "max_requests",
+        }
+    ):
         raise DecisionConfigError(
-            "The decision section requires exactly the keys provider and allow_hosted"
+            "The decision section requires exactly the keys provider and allow_hosted, "
+            "with an optional max_requests"
         )
     provider, allow_hosted = value["provider"], value["allow_hosted"]
     if type(provider) is not str or provider not in DECISION_PROVIDERS:
@@ -98,6 +119,14 @@ def decision_spec(value: Any) -> bool:
         raise DecisionConfigError('The jev decision provider requires "allow_hosted": true')
     if provider == "mock" and allow_hosted:
         raise DecisionConfigError('"allow_hosted": true applies only to the jev decision provider')
+    if "max_requests" in value:
+        limit = value["max_requests"]
+        if type(limit) is not int or limit < 1:
+            raise DecisionConfigError(
+                "The decision max_requests value must be a positive whole number"
+            )
+        if provider != "jev":
+            raise DecisionConfigError("max_requests applies only to the jev decision provider")
     return provider == "jev"
 
 
@@ -132,6 +161,9 @@ class PrototypeConfig:
     diarizer: dict[str, Any] = field(default_factory=lambda: diarizer_spec(None))
     # The optional `decision` section: hosted Jev decisions with their consent, for `listen`.
     hosted_decisions: bool = False
+    # The section's optional `max_requests`: a per-session Jev request cap for sessions
+    # that set none themselves (`listen`). None leaves live sessions uncapped (#75).
+    decision_max_requests: int | None = None
 
     @property
     def hosted_speech(self) -> bool:
@@ -150,7 +182,11 @@ class PrototypeConfig:
                 raise ValueError
             transcriber = transcriber_spec(raw.pop("transcriber", None))
             diarizer = diarizer_spec(raw.pop("diarizer", None))
-            hosted_decisions = "decision" in raw and decision_spec(raw.pop("decision"))
+            has_decision = "decision" in raw
+            decision = raw.pop("decision", None)
+            hosted_decisions = has_decision and decision_spec(decision)
+            # Optional per-session cap on live Jev requests; absent means none (#75).
+            decision_requests = decision.get("max_requests") if hosted_decisions else None
             required = {"microphone_helper"}
             if not is_hosted(transcriber):
                 required |= {"whisper_executable", "whisper_model"}
@@ -194,6 +230,7 @@ class PrototypeConfig:
                 transcriber=transcriber,
                 diarizer=diarizer,
                 hosted_decisions=hosted_decisions,
+                decision_max_requests=decision_requests,
             )
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
@@ -259,7 +296,7 @@ class PrototypeController:
         self._decisions: dict[str, dict[str, Any]] = {}
         self._pending = 0
         self._requests = 0
-        self._request_limit = 20
+        self._request_limit: int | None = DEFAULT_REQUEST_LIMIT
         self._received_ms = 0
         self._received_bytes = 0
         self._budget_ms: int | None = None
@@ -325,7 +362,8 @@ class PrototypeController:
         hosted = options.get("use_jev", False)
         retention = options.get("retention_seconds", 300)
         confidence = options.get("confidence", 0.7)
-        budget = options.get("max_requests", 20)
+        explicit_budget = "max_requests" in options
+        budget = options.get("max_requests")
         session = options.get("session_id", "prototype-" + uuid.uuid4().hex)
         try:
             identifier(session, "session_id")
@@ -337,8 +375,7 @@ class PrototypeController:
             or type(hosted) is not bool
             or type(retention) is not int
             or not 60 <= retention <= 600
-            or type(budget) is not int
-            or not 1 <= budget <= 100
+            or (explicit_budget and (type(budget) is not int or not 1 <= budget <= 100))
             or type(confidence) not in {int, float}
             or not math.isfinite(confidence)
             or not 0 <= confidence <= 1
@@ -346,6 +383,11 @@ class PrototypeController:
             raise PrototypeError("Invalid prototype setting")
         if mode == "demo" and self.config.demo_audio is None:
             raise PrototypeError("No generated audio demo is configured")
+        if not explicit_budget:
+            # The page always sends its own cap; `listen` takes the configuration's.
+            budget = self.config.decision_max_requests
+            if budget is None and mode not in LIVE_MODES:
+                budget = DEFAULT_REQUEST_LIMIT
         if mode == "stdin" and self.audio_input is None:
             raise PrototypeError("Stdin audio is available only from the listen command")
         if mode == "stdin" and self.audio_provenance not in PROVENANCE:
@@ -657,6 +699,7 @@ class PrototypeController:
 
     def _decide(self, generation, stop, work, runner, hosted):
         enabled = hosted
+        failures = 0  # consecutive transiently unavailable hosted decisions
         while not stop.is_set():
             try:
                 with self._lock:
@@ -681,14 +724,29 @@ class PrototypeController:
                     if not hosted:
                         runner.process(turn)
                     continue
-                if runner.provider.requests >= self._request_limit:
+                if (
+                    self._request_limit is not None
+                    and runner.provider.requests >= self._request_limit
+                ):
                     with self._lock:
                         if generation == self._generation:
                             self._decision_status = "budget-exhausted"
                             self._tool_attention_error("attention-budget-exhausted")
                     enabled = False
                     continue
-                event = runner.process(turn)
+                unavailable = None
+                try:
+                    event = runner.process(turn)
+                    failures = 0
+                except ProviderUnavailable as failure:
+                    # One transient hosted failure degrades this turn only: an uncertain
+                    # placeholder, never a request, and the session keeps listening.
+                    # Anything else, or too many in a row, ends it as before.
+                    failures += 1
+                    if failures >= MAX_CONSECUTIVE_DECISION_FAILURES:
+                        raise
+                    unavailable = failure.reason
+                    event = DecisionEvent(turn, unavailable_decision(), turn.revision, 0.0, 0.0)
                 with self._lock:
                     if (
                         generation == self._generation
@@ -700,9 +758,18 @@ class PrototypeController:
                         self._decisions[turn.utterance_id] = {
                             **event.public_dict(),
                             "recipient_speaker_id": event.decision.recipient_speaker_id,
+                            **(
+                                {}
+                                if unavailable is None
+                                else {"decision_status": "unavailable", "reason": unavailable}
+                            ),
                         }
                         if self._events is not None:
-                            self._publish("decision", event)
+                            self._publish(
+                                "decision",
+                                event,
+                                **({} if unavailable is None else {"unavailable": unavailable}),
+                            )
             except Exception:
                 enabled = False
                 with self._lock:
@@ -835,13 +902,13 @@ class PrototypeController:
         self._closed.set()
         self.stop()
 
-    def _publish(self, method, value):
+    def _publish(self, method, value, **fields):
         """Run under the controller lock; a broken consumer cancels observation."""
         try:
             options = (
                 {"expect_decision": self._decision_status == "ready"}
                 if method == "transcript"
-                else {}
+                else fields
             )
             getattr(self._events, method)(value, now_ms=self._now_ms(), **options)
         except Exception:
