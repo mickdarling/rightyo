@@ -149,6 +149,16 @@ class TurnMergerTests(unittest.TestCase):
         merger.offer(fragment("stop", 1000, 1300))
         self.assertEqual(self.texts(), ["Stop.", "stop"])
         self.assertFalse(merger.holding)
+        # A stop phrase the recognizer split is emitted as soon as its pieces join, so a
+        # third fragment cannot join it and hide it.
+        self.emitted.clear()
+        merger.offer(fragment("never", 0, 300))
+        merger.offer(fragment("mind", 1000, 1300))
+        self.assertEqual(self.texts(), ["never mind"])
+        self.assertFalse(merger.holding)
+        merger.offer(fragment("okay", 2000, 2300))
+        merger.flush()
+        self.assertEqual(self.texts(), ["never mind", "okay"])
         # A stop phrase inside a longer turn is not a stop phrase and joins as usual.
         self.emitted.clear()
         merger.offer(fragment("please do not", 0, 300))

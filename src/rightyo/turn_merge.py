@@ -98,6 +98,10 @@ class TurnMerger:
             held = self._held
             held["text"] = held["text"] + " " + fragment["text"]
             held["end_ms"] = max(held["end_ms"], fragment["end_ms"])
+            if self.breaks_turn is not None and self.breaks_turn(held["text"]):
+                # The recognizer split the stop phrase itself ("never" + "mind"): emit
+                # the joined phrase now so no later fragment can join and hide it.
+                self.flush()
             return
         self.flush()
         if self.gap_ms and self._joinable(fragment):
