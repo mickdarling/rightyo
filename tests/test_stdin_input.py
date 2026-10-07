@@ -473,18 +473,22 @@ mode, config = sys.argv[1], sys.argv[2]
 
 class Transcriber:
     recognizer_id = "stub-recognizer"
+    calls = 0
 
     def transcribe(self, pcm, register=None):
         duration = len(pcm) // 32
         if mode == "systemic":
             return {"not": "a unit list"}  # A structural failure still ends the session.
-        return [
-            {"text": " reversed", "start_ms": 50, "end_ms": 10},
-            {"text": " negative", "start_ms": -20, "end_ms": 10},
-            {"text": " nan", "start_ms": float("nan"), "end_ms": 10},
-            {"text": " Synthetic tone.", "start_ms": 0, "end_ms": duration},
-            {"text": " beyond", "start_ms": 0, "end_ms": duration + 5000},
-        ]
+        Transcriber.calls += 1
+        if Transcriber.calls % 2:
+            # Odd utterances: a valid word, an invalid one, a valid one. Publishing only
+            # the valid words could invert meaning, so the utterance must be suppressed.
+            return [
+                {"text": " alpha", "start_ms": 0, "end_ms": 100},
+                {"text": " bravo", "start_ms": float("nan"), "end_ms": 200},
+                {"text": " charlie", "start_ms": 300, "end_ms": duration + 5000},
+            ]
+        return [{"text": " Synthetic tone.", "start_ms": 0, "end_ms": duration}]
 
 
 class Diarizer:
@@ -618,7 +622,7 @@ class StdinProcessShutdownTests(unittest.TestCase):
 
     def test_bad_timestamps_then_sigterm_with_stdin_open_exits_cleanly(self):
         process = self.launch("timestamps")
-        process.stdin.write(UTTERANCE)
+        process.stdin.write(UTTERANCE + UTTERANCE)
         process.stdin.flush()
         events = self.wait_for_line("transcript")
         self.assertEqual(events[-1]["type"], "transcript")
@@ -628,24 +632,28 @@ class StdinProcessShutdownTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0)
         self.assertEqual(terminal["phase"], "cancelled")
         transcripts = [e["turn"] for e in events if e["type"] == "transcript"]
+        # The bad first utterance is suppressed whole; the next one is still published.
         self.assertEqual([t["text"] for t in transcripts], ["Synthetic tone."])
         self.assertLessEqual(transcripts[0]["start_ms"], transcripts[0]["end_ms"])
-        self.assertEqual(terminal["skipped_segments"], 4)
-        self.assertIn("skipped 4 recognizer segment(s)", stderr)
-        for word in ("reversed", "negative", "nan", "beyond"):
+        self.assertEqual(terminal["skipped_utterances"], 1)
+        self.assertNotIn("skipped_segments", terminal)
+        self.assertIn("suppressed 1 utterance", stderr)
+        for word in ("alpha", "bravo", "charlie"):
             self.assertNotIn(word, stderr)
+            self.assertNotIn(word, json.dumps(events))
 
     def test_bad_timestamps_then_eof_keeps_listening_and_stops_normally(self):
         process = self.launch("timestamps")
-        process.stdin.write(UTTERANCE + UTTERANCE)
+        process.stdin.write(UTTERANCE * 4)
         process.stdin.close()
         events, terminal, _stderr = self.finish(process, [])
         self.assertEqual(process.returncode, 0)
         self.assertEqual(terminal["phase"], "stopped")
         transcripts = [e["turn"] for e in events if e["type"] == "transcript"]
-        self.assertEqual(len(transcripts), 2)  # The session outlived the first bad batch.
+        self.assertEqual(len(transcripts), 2)  # The session outlived each bad utterance.
+        self.assertEqual({t["text"] for t in transcripts}, {"Synthetic tone."})
         self.assertLess(transcripts[0]["end_ms"], transcripts[1]["start_ms"])
-        self.assertEqual(terminal["skipped_segments"], 8)
+        self.assertEqual(terminal["skipped_utterances"], 2)
 
     def test_systemic_failure_with_stdin_open_reports_error_without_aborting(self):
         process = self.launch("systemic")
@@ -657,6 +665,7 @@ class StdinProcessShutdownTests(unittest.TestCase):
         self.assertEqual(process.returncode, 2)
         self.assertEqual((terminal["phase"], terminal["reason"]), ("error", "audio-unavailable"))
         self.assertNotIn("skipped_segments", terminal)
+        self.assertNotIn("skipped_utterances", terminal)
 
 
 def slow_push(push, delay=0.05):

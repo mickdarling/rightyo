@@ -82,19 +82,27 @@ the descriptor directly, so interpreter shutdown no longer aborts on the stdin b
 ([#74](https://github.com/mickdarling/rightyo/issues/74)). SIGTERM exits 0 with
 `cancelled`, an `error` terminal exits 2.
 
-A whisper.cpp segment with unusable timestamps (negative, reversed, zero-length, or
-outside the utterance), and a recognizer word unit whose timestamps are not integers, are
-negative, reversed, or outside the utterance, is dropped rather than ending the session
-([#78](https://github.com/mickdarling/rightyo/issues/78)). Zero-length word units, such as
-punctuation, are kept. A unit that starts or ends
-earlier than the one before it is merged into that unit, text kept in received order, so
-no word is lost or reordered; whisper.cpp words out of order fall back to the whole
-segment. A whisper.cpp segment that
-overruns the received audio by at most its one second of padding is clamped as before.
-Each affected utterance writes a count-only notice to stderr, and the terminal session
-event of a live session carries an optional `skipped_segments` count when any were
-dropped; it is absent otherwise. A malformed recognizer result structure still ends the
-session with `error`.
+Unusable recognizer timestamps no longer end the session
+([#78](https://github.com/mickdarling/rightyo/issues/78)):
+
+- whisper.cpp only: a segment whose own offsets are unusable (not integers, negative,
+  reversed, zero-length, starting after the received audio, or ending more than its one
+  second of padding past it) is skipped and counted in `skipped_segments`. A segment that
+  overruns by at most that padding is clamped, as before. If a segment's word timings are
+  out of order, its whole text is kept as one unit with the segment's own valid timing.
+- Every backend: the units an utterance produces are then checked together. If any unit
+  has timestamps that are not integers, NaN, negative, reversed, past the utterance, or
+  earlier than the unit before it, the whole utterance is suppressed. No turn is
+  published for it, and it is counted in `skipped_utterances`. Partial text could invert
+  meaning ("do not stop" becoming "do stop"), and merging or sorting units could move text
+  onto the wrong speaker, so nothing is dropped, merged or reordered piecemeal. Zero-length
+  units in order, such as punctuation, are valid.
+
+The session keeps listening, and the next valid utterance is published as usual. Each
+affected utterance writes a count-only notice to stderr, never recognizer text. The
+terminal session event of a live session carries `skipped_segments` and
+`skipped_utterances` only when they are nonzero. A malformed recognizer result structure
+still ends the session with `error`.
 
 Repeatable `--name` flags (for example `--name "Hailing Station" --name computer`) declare
 the forms of address the system answers to for `listen`, `tool-replay` and `prototype`. They

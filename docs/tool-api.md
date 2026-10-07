@@ -28,16 +28,22 @@ The events are:
 
 | Type | Additional fields | Meaning |
 | --- | --- | --- |
-| `session` | `phase`, initial `capabilities`, optional terminal `reason`, optional terminal `skipped_segments` | `started`, `stopped`, `cancelled`, or `error` |
+| `session` | `phase`, initial `capabilities`, optional terminal `reason`, `skipped_segments` and `skipped_utterances` | `started`, `stopped`, `cancelled`, or `error` |
 | `transcript` | `turn` | One immutable finalized transcript turn |
 | `attention` | `utterance_id`, `speech_end_ms`, `decision`, optional `request_id` | `attend`, `ignore`, or `uncertain` evidence |
 | `request` | `request_id`, `turn`, `decision`, `context`, `decision_at_ms`, optional `formed_request` | Complete attended input available for host handling |
 | `override` | `superseded_request_id`, `by_utterance_id`, `role` | An owner's turn supersedes an earlier open non-owner request |
 
-A live session's terminal `session` event carries `skipped_segments`, a positive count of
-recognizer segments or word units dropped for unusable timestamps while the session kept
-listening ([#78](https://github.com/mickdarling/rightyo/issues/78)); it is absent when
-none were dropped, so authored fixtures are unchanged.
+A live session's terminal `session` event can carry two positive counts
+([#78](https://github.com/mickdarling/rightyo/issues/78)), each absent when zero, so
+authored fixtures are unchanged:
+
+- `skipped_segments`: whisper.cpp segments skipped because their own offsets were unusable.
+- `skipped_utterances`: utterances suppressed whole, with no turn published, because a
+  recognizer unit's timestamps were invalid (not integers, NaN, negative, reversed, or
+  past the utterance) or out of order. Zero-length units in order are valid.
+
+The session keeps listening in both cases.
 
 Initial capabilities declare `activation: "finalized-turn"` when decisions are
 available, or `"disabled"` for transcription-only listening, `partials: false`,

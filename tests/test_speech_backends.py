@@ -423,21 +423,34 @@ class ProtocolAndSelectionTests(unittest.TestCase):
             turns.append,
         )
 
-    def test_units_with_unusable_timestamps_are_dropped_and_counted_not_fatal(self):
-        # #78: one bad unit from any backend must not end the live session.
+    def test_any_unusable_or_out_of_order_unit_suppresses_the_whole_utterance(self):
+        # #78: never publish partial text (meaning can invert) or move text in time
+        # (it can land on the wrong speaker); emit nothing for the utterance, count it,
+        # and keep listening.
         duration = 10 * 640 // BYTES_PER_MS
-        good = {"text": " ok", "start_ms": 10, "end_ms": 60}
+        do = {"text": " do", "start_ms": 0, "end_ms": 40}
+        stop = {"text": " stop", "start_ms": 100, "end_ms": 180}
         cases = {
-            "negative start": [{"text": " a", "start_ms": -1, "end_ms": 10}, good],
-            "end past the utterance": [
-                good,
-                {"text": " a", "start_ms": 70, "end_ms": duration + 1},
+            "negative word between valid ones": [
+                do,
+                {"text": " not", "start_ms": -5, "end_ms": 60},
+                stop,
             ],
-            "reversed interval": [{"text": " a", "start_ms": 50, "end_ms": 40}, good],
-            "float timestamps": [{"text": " a", "start_ms": 0.0, "end_ms": 50}, good],
-            "NaN timestamps": [{"text": " a", "start_ms": float("nan"), "end_ms": 50}, good],
-            "boolean timestamps": [{"text": " a", "start_ms": False, "end_ms": 50}, good],
-            "missing timestamps": [{"text": " a"}, good],
+            "reordered unit": [
+                {"text": " later", "start_ms": 100, "end_ms": 150},
+                {"text": " earlier", "start_ms": 20, "end_ms": 60},
+            ],
+            "word ends early": [
+                {"text": " do", "start_ms": 0, "end_ms": 120},
+                {"text": " not", "start_ms": 20, "end_ms": 60},
+                stop,
+            ],
+            "end past the utterance": [do, {"text": " a", "start_ms": 70, "end_ms": duration + 1}],
+            "reversed interval": [{"text": " a", "start_ms": 50, "end_ms": 40}, stop],
+            "float timestamps": [{"text": " a", "start_ms": 0.0, "end_ms": 50}, stop],
+            "NaN timestamps": [{"text": " a", "start_ms": float("nan"), "end_ms": 50}, stop],
+            "boolean timestamps": [{"text": " a", "start_ms": False, "end_ms": 50}, stop],
+            "missing timestamps": [{"text": " a"}, stop],
         }
         for name, units in cases.items():
             with self.subTest(case=name):
@@ -447,58 +460,38 @@ class ProtocolAndSelectionTests(unittest.TestCase):
                     processor.push_pcm16(VOICE)
                 processor.finish()
                 self.assertFalse(processor.failed)
-                self.assertEqual([t.text for t in turns], ["ok"])
-                self.assertLessEqual(turns[0].start_ms, turns[0].end_ms)
-                self.assertEqual(processor.skipped_segments, 1)
-                self.assertEqual(len(reports), 1)
-                self.assertIn("skipped 1 recognizer segment", reports[0])
-                # Diagnostics carry a count only, never recognizer text.
-                self.assertNotIn(" a", reports[0].replace(" a session", ""))
-
-    def test_out_of_order_units_merge_into_the_previous_unit_in_received_order(self):
-        # Dropping an out-of-order unit could invert meaning; sorting would reorder words.
-        cases = {
-            "word ends early": (
-                [
-                    {"text": " do", "start_ms": 0, "end_ms": 120},
-                    {"text": " not", "start_ms": 20, "end_ms": 60},
-                    {"text": " stop", "start_ms": 60, "end_ms": 180},
-                ],
-                [("do not stop", 0, 180)],
-            ),
-            "one wide unit then valid units": (
-                [
-                    {"text": " wide", "start_ms": 0, "end_ms": 180},
-                    {"text": " b", "start_ms": 20, "end_ms": 40},
-                    {"text": " c", "start_ms": 60, "end_ms": 80},
-                    {"text": " d", "start_ms": 180, "end_ms": 190},
-                ],
-                [("wide b c d", 0, 190)],
-            ),
-            "starts earlier": (
-                [
-                    {"text": " ok", "start_ms": 100, "end_ms": 150},
-                    {"text": " a", "start_ms": 0, "end_ms": 50},
-                ],
-                [("ok a", 100, 150)],
-            ),
-        }
-        for name, (units, expected) in cases.items():
-            with self.subTest(case=name):
-                turns = []
-                processor = self.boundary_processor(units, turns)
-                for _ in range(10):
-                    processor.push_pcm16(VOICE)
-                processor.finish()
-                self.assertFalse(processor.failed)
-                self.assertEqual([(t.text, t.start_ms, t.end_ms) for t in turns], expected)
+                self.assertEqual(turns, [])
+                self.assertEqual(processor.skipped_utterances, 1)
                 self.assertEqual(processor.skipped_segments, 0)
-        # The caller's units are never mutated by a merge.
-        self.assertEqual(cases["starts earlier"][0][0]["text"], " ok")
+                self.assertEqual(
+                    reports,
+                    [
+                        "suppressed 1 utterance with invalid or out-of-order recognizer "
+                        "timestamps; the session continues"
+                    ],
+                )
 
-    def test_a_dropped_unit_never_ends_a_session_that_keeps_listening(self):
+    def test_zero_length_units_in_order_are_still_valid(self):
+        units = [
+            {"text": " Hi", "start_ms": 0, "end_ms": 40},
+            {"text": ".", "start_ms": 40, "end_ms": 40},
+        ]
+        turns = []
+        processor = self.boundary_processor(units, turns)
+        for _ in range(10):
+            processor.push_pcm16(VOICE)
+        processor.finish()
+        # Published, not suppressed; a zero-length unit has no speaker overlap of its own.
+        self.assertEqual([t.text for t in turns], ["Hi", "."])
+        self.assertEqual(processor.skipped_utterances, 0)
+
+    def test_a_suppressed_utterance_never_ends_a_session_that_keeps_listening(self):
         replies = [
-            [{"text": " bad", "start_ms": 30, "end_ms": 10}],  # reversed: nothing usable
+            [  # "do not stop" with an invalid middle word: nothing may be published.
+                {"text": " do", "start_ms": 0, "end_ms": 40},
+                {"text": " not", "start_ms": -5, "end_ms": 60},
+                {"text": " stop", "start_ms": 100, "end_ms": 180},
+            ],
             [{"text": " later", "start_ms": 0, "end_ms": 100}],
         ]
         transcriber = StubTranscriber()
@@ -524,7 +517,7 @@ class ProtocolAndSelectionTests(unittest.TestCase):
         self.assertEqual([t.text for t in turns], ["later"])
         self.assertEqual(turns[0].utterance_id, "live-1")
         self.assertGreater(turns[0].start_ms, 0)  # the second utterance's global offset
-        self.assertEqual(processor.skipped_segments, 1)
+        self.assertEqual(processor.skipped_utterances, 1)
 
     def test_malformed_unit_structure_still_fails_closed_at_the_common_boundary(self):
         cases = {

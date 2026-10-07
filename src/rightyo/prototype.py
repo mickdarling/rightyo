@@ -270,7 +270,7 @@ class PrototypeController:
         self.report = report
         self._stdin_capture: StdinPcmCapture | None = None
         # The current session's processor, kept until the next start (like the stdin
-        # capture) so the terminal event can report its skipped recognizer segments.
+        # capture) so the terminal event can report its skipped segments and utterances.
         self._session_processor = None
         # The stream is consumed by one session only. A stopped session's reader may
         # still be blocked in a read it cannot be interrupted from; it discards whatever
@@ -955,13 +955,19 @@ class PrototypeController:
                     "dropped_bytes": capture.dropped_bytes,
                     "discarded_tail_bytes": capture.discarded_tail_bytes,
                 }
-            skipped = getattr(self._session_processor, "skipped_segments", 0)
+            counts = {
+                name: getattr(self._session_processor, name, 0)
+                for name in ("skipped_segments", "skipped_utterances")
+            }
             self._events.end(
                 phase=phase,
                 now_ms=self._now_ms(),
                 reason=reason,
                 input_gaps=gaps,
-                skipped_segments=skipped if type(skipped) is int and skipped > 0 else None,
+                **{
+                    name: value if type(value) is int and value > 0 else None
+                    for name, value in counts.items()
+                },
             )
             self._event_terminal = True
 

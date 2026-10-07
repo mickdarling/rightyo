@@ -525,6 +525,7 @@ class SpeechEvents:
                                 "discarded_tail_bytes": 1,
                             },
                             "skipped_segments": 2**53 - 1,
+                            "skipped_utterances": 2**53 - 1,
                         },
                     )
                 )
@@ -611,13 +612,23 @@ class SpeechEvents:
             raise ContractError("request forming failed")
         return formed
 
-    def end(self, phase="cancelled", now_ms=0, reason=None, input_gaps=None, skipped_segments=None):
+    def end(
+        self,
+        phase="cancelled",
+        now_ms=0,
+        reason=None,
+        input_gaps=None,
+        skipped_segments=None,
+        skipped_utterances=None,
+    ):
         with self._lock:
             if phase not in {"stopped", "cancelled", "error"}:
                 raise ContractError("invalid event terminal phase")
             integer(now_ms, "now_ms")
             if skipped_segments is not None:
                 integer(skipped_segments, "skipped_segments", 1)
+            if skipped_utterances is not None:
+                integer(skipped_utterances, "skipped_utterances", 1)
             if reason is not None:
                 identifier(reason, "reason")
             if input_gaps is not None:
@@ -650,9 +661,13 @@ class SpeechEvents:
                 **({"role_status": self.role_status} if self._priority is not None else {}),
                 # Stdin input only: audio dropped under back-pressure, never buffered unbounded.
                 **({} if input_gaps is None else {"input_gaps": input_gaps}),
-                # Live input only, and only when some were dropped (#78): recognizer
-                # segments skipped for unusable timestamps while the session continued.
+                # Live input only, and only when nonzero (#78): whisper.cpp segments skipped
+                # and whole utterances suppressed for unusable timestamps while the session
+                # kept listening.
                 **({} if skipped_segments is None else {"skipped_segments": skipped_segments}),
+                **(
+                    {} if skipped_utterances is None else {"skipped_utterances": skipped_utterances}
+                ),
             )
 
     def drain(self):
