@@ -83,9 +83,11 @@ the descriptor directly, so interpreter shutdown no longer aborts on the stdin b
 `cancelled`, an `error` terminal exits 2.
 
 A recognizer segment or word unit with unusable timestamps (not an integer, negative,
-reversed, zero-length, outside the utterance, or earlier than the one before it) is dropped
-rather than ending the session
-([#78](https://github.com/mickdarling/rightyo/issues/78)). A whisper.cpp segment that
+reversed, zero-length, or outside the utterance) is dropped rather than ending the session
+([#78](https://github.com/mickdarling/rightyo/issues/78)). A unit that starts or ends
+earlier than the one before it is merged into that unit, text kept in received order, so
+no word is lost or reordered; whisper.cpp words out of order fall back to the whole
+segment. A whisper.cpp segment that
 overruns the received audio by at most its one second of padding is clamped as before.
 Each affected utterance writes a count-only notice to stderr, and the terminal session
 event of a live session carries an optional `skipped_segments` count when any were

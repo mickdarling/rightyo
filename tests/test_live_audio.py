@@ -680,6 +680,19 @@ class ConservativeAlignmentTests(unittest.TestCase):
                     ([{"text": " Kept.", "start_ms": 0, "end_ms": 100}], 1),
                 )
 
+    def test_out_of_order_word_timing_falls_back_to_the_whole_segment(self):
+        # "not" ends before "do" does: word units would let a boundary drop "not".
+        value = document(0, 900, " do not stop")
+        value["transcription"][0]["tokens"] = [
+            {"text": " do", "offsets": {"from": 0, "to": 600}},
+            {"text": " not", "offsets": {"from": 100, "to": 300}},
+            {"text": " stop", "offsets": {"from": 300, "to": 900}},
+        ]
+        self.assertEqual(
+            _counted_units(value, 1000),
+            ([{"text": " do not stop", "start_ms": 0, "end_ms": 900}], 0),
+        )
+
     def test_slight_overrun_is_clamped_to_received_audio(self):
         self.assertEqual(
             _counted_units(document(50, 1150), 200),

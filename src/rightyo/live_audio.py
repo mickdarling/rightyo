@@ -653,6 +653,12 @@ def _counted_units(document: dict[str, Any], duration_ms: int) -> tuple[list[dic
                 words[-1]["end_ms"] = max(words[-1]["end_ms"], right)
         usable &= reconstructed.strip() == text.strip()
         usable &= bool(words) and all(w["start_ms"] <= w["end_ms"] for w in words)
+        # Word intervals must also be in order; otherwise a later unit boundary would
+        # have to drop or merge a word, so keep the whole segment's text in order (#78).
+        usable &= all(
+            a["start_ms"] <= b["start_ms"] and a["end_ms"] <= b["end_ms"]
+            for a, b in zip(words, words[1:])
+        )
         result.extend(words if usable else [fallback])
     return result, skipped
 
@@ -684,31 +690,35 @@ def _checked_units(units: Any, duration_ms: int) -> tuple[list[dict[str, Any]], 
     Units are dicts with `text` (str) and integer `start_ms`/`end_ms` with
     `0 <= start_ms <= end_ms <= duration_ms`, non-decreasing in order. A malformed
     result structure (not a list, too many units, a unit that is not a dict with
-    string text) fails closed. A unit whose timestamps break the contract (not
-    integers, NaN, negative, reversed, past the utterance, or earlier than the unit
-    before it) is dropped and counted instead of ending the session (#78); nothing
-    is clamped or reordered, so the kept units satisfy the contract unchanged.
-    Returns the kept units and the number dropped.
+    string text) fails closed. A unit whose own timestamps break the contract (not
+    integers, NaN, negative, reversed, or past the utterance) is dropped and counted
+    instead of ending the session (#78). A valid unit that starts or ends earlier
+    than the unit before it is merged into that unit: its text is appended in the
+    order received and the end grows to cover it, the start never moves. Dropping it
+    could invert meaning ("do not stop" becoming "do stop"), and sorting would
+    reorder words. Returns the kept units and the number dropped.
     """
     if not isinstance(units, list) or len(units) > 4000:
         raise LiveAudioError("Invalid recognizer result")
-    kept = []
-    previous_start = previous_end = 0
+    kept: list[dict[str, Any]] = []
+    dropped = 0
     for unit in units:
         if not isinstance(unit, dict) or not isinstance(unit.get("text"), str):
             raise LiveAudioError("Invalid recognizer result")
         start, end = unit.get("start_ms"), unit.get("end_ms")
-        if (
-            type(start) is not int
-            or type(end) is not int
-            or not 0 <= start <= end <= duration_ms
-            or start < previous_start
-            or end < previous_end
-        ):
+        if type(start) is not int or type(end) is not int or not 0 <= start <= end <= duration_ms:
+            dropped += 1
+            continue
+        previous = kept[-1] if kept else None
+        if previous is not None and (start < previous["start_ms"] or end < previous["end_ms"]):
+            kept[-1] = {
+                **previous,
+                "text": previous["text"] + unit["text"],
+                "end_ms": max(previous["end_ms"], end),
+            }
             continue
         kept.append(unit)
-        previous_start, previous_end = start, end
-    return kept, len(units) - len(kept)
+    return kept, dropped
 
 
 def _select(value: Any, default: Callable[[LiveConfig], Any], config: LiveConfig, method: str):

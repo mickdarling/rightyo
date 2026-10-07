@@ -519,6 +519,11 @@ class SpeechEvents:
                             "phase": "cancelled",
                             "reason": "x" * 96,
                             "role_status": "unavailable",
+                            "input_gaps": {
+                                "gaps": 1,
+                                "dropped_bytes": 2**53 - 1,
+                                "discarded_tail_bytes": 1,
+                            },
                             "skipped_segments": 2**53 - 1,
                         },
                     )

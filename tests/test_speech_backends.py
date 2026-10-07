@@ -434,10 +434,6 @@ class ProtocolAndSelectionTests(unittest.TestCase):
                 {"text": " a", "start_ms": 70, "end_ms": duration + 1},
             ],
             "reversed interval": [{"text": " a", "start_ms": 50, "end_ms": 40}, good],
-            "reordered units": [
-                {"text": " ok", "start_ms": 100, "end_ms": 150},
-                {"text": " a", "start_ms": 0, "end_ms": 50},
-            ],
             "float timestamps": [{"text": " a", "start_ms": 0.0, "end_ms": 50}, good],
             "NaN timestamps": [{"text": " a", "start_ms": float("nan"), "end_ms": 50}, good],
             "boolean timestamps": [{"text": " a", "start_ms": False, "end_ms": 50}, good],
@@ -458,6 +454,47 @@ class ProtocolAndSelectionTests(unittest.TestCase):
                 self.assertIn("skipped 1 recognizer segment", reports[0])
                 # Diagnostics carry a count only, never recognizer text.
                 self.assertNotIn(" a", reports[0].replace(" a session", ""))
+
+    def test_out_of_order_units_merge_into_the_previous_unit_in_received_order(self):
+        # Dropping an out-of-order unit could invert meaning; sorting would reorder words.
+        cases = {
+            "word ends early": (
+                [
+                    {"text": " do", "start_ms": 0, "end_ms": 120},
+                    {"text": " not", "start_ms": 20, "end_ms": 60},
+                    {"text": " stop", "start_ms": 60, "end_ms": 180},
+                ],
+                [("do not stop", 0, 180)],
+            ),
+            "one wide unit then valid units": (
+                [
+                    {"text": " wide", "start_ms": 0, "end_ms": 180},
+                    {"text": " b", "start_ms": 20, "end_ms": 40},
+                    {"text": " c", "start_ms": 60, "end_ms": 80},
+                    {"text": " d", "start_ms": 180, "end_ms": 190},
+                ],
+                [("wide b c d", 0, 190)],
+            ),
+            "starts earlier": (
+                [
+                    {"text": " ok", "start_ms": 100, "end_ms": 150},
+                    {"text": " a", "start_ms": 0, "end_ms": 50},
+                ],
+                [("ok a", 100, 150)],
+            ),
+        }
+        for name, (units, expected) in cases.items():
+            with self.subTest(case=name):
+                turns = []
+                processor = self.boundary_processor(units, turns)
+                for _ in range(10):
+                    processor.push_pcm16(VOICE)
+                processor.finish()
+                self.assertFalse(processor.failed)
+                self.assertEqual([(t.text, t.start_ms, t.end_ms) for t in turns], expected)
+                self.assertEqual(processor.skipped_segments, 0)
+        # The caller's units are never mutated by a merge.
+        self.assertEqual(cases["starts earlier"][0][0]["text"], " ok")
 
     def test_a_dropped_unit_never_ends_a_session_that_keeps_listening(self):
         replies = [

@@ -8,7 +8,7 @@ import io
 import json
 import math
 import os
-import selectors
+import queue
 import signal
 import subprocess
 import sys
@@ -558,29 +558,58 @@ class StdinProcessShutdownTests(unittest.TestCase):
             env=self.env,
         )
         self.addCleanup(lambda: process.poll() is None and process.kill())
+        # Drain both pipes on threads so no line buffered with another is lost and a
+        # chatty child can never block on a full pipe.
+        self.lines: queue.Queue[bytes | None] = queue.Queue()
+        self.stderr_parts: list[bytes] = []
+
+        def pump_stdout():
+            for line in process.stdout:
+                self.lines.put(line)
+            self.lines.put(None)
+
+        def pump_stderr():
+            self.stderr_parts.append(process.stderr.read())
+
+        self.pumps = [
+            threading.Thread(target=pump_stdout, daemon=True),
+            threading.Thread(target=pump_stderr, daemon=True),
+        ]
+        for pump in self.pumps:
+            pump.start()
         return process
 
-    @staticmethod
-    def wait_for_line(process, kind, timeout=20):
-        """Read stdout event lines until one of ``kind``; return all read so far."""
+    def wait_for_line(self, kind, timeout=20):
+        """Collect stdout events until one of ``kind`` (or an error terminal)."""
         events, deadline = [], time.monotonic() + timeout
-        with selectors.DefaultSelector() as selector:
-            selector.register(process.stdout, selectors.EVENT_READ)
-            while time.monotonic() < deadline:
-                if not selector.select(timeout=0.5):
-                    continue
-                line = process.stdout.readline()
-                if not line:
-                    break
-                events.append(json.loads(line))
-                if events[-1]["type"] == kind or events[-1].get("phase") == "error":
-                    break
+        while time.monotonic() < deadline:
+            try:
+                line = self.lines.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if line is None:
+                self.lines.put(None)
+                break
+            events.append(json.loads(line))
+            if events[-1]["type"] == kind or events[-1].get("phase") == "error":
+                break
         return events
 
-    def finish(self, process, events):
-        stdout, stderr = process.communicate(timeout=30)
-        events = events + [json.loads(line) for line in stdout.splitlines()]
-        stderr = stderr.decode()
+    def finish(self, process, events, *, hold_stdin=False):
+        if hold_stdin:
+            # The host still holds stdin open until the child has fully exited.
+            process.wait(timeout=30)
+        if not process.stdin.closed:
+            process.stdin.close()
+        process.wait(timeout=30)
+        for pump in self.pumps:
+            pump.join(timeout=10)
+        while True:
+            line = self.lines.get(timeout=5)
+            if line is None:
+                break
+            events.append(json.loads(line))
+        stderr = b"".join(self.stderr_parts).decode()
         self.assertNotIn("could not acquire lock", stderr)
         self.assertNotIn("Fatal Python error", stderr)
         terminals = [e for e in events if e["type"] == "session" and e["phase"] != "started"]
@@ -591,11 +620,11 @@ class StdinProcessShutdownTests(unittest.TestCase):
         process = self.launch("timestamps")
         process.stdin.write(UTTERANCE)
         process.stdin.flush()
-        events = self.wait_for_line(process, "transcript")
+        events = self.wait_for_line("transcript")
         self.assertEqual(events[-1]["type"], "transcript")
         # The host still holds stdin open, as Hailing Station does, when it stops RightyO.
         process.send_signal(signal.SIGTERM)
-        events, terminal, stderr = self.finish(process, events)
+        events, terminal, stderr = self.finish(process, events, hold_stdin=True)
         self.assertEqual(process.returncode, 0)
         self.assertEqual(terminal["phase"], "cancelled")
         transcripts = [e["turn"] for e in events if e["type"] == "transcript"]
@@ -622,9 +651,9 @@ class StdinProcessShutdownTests(unittest.TestCase):
         process = self.launch("systemic")
         process.stdin.write(UTTERANCE)
         process.stdin.flush()
-        events = self.wait_for_line(process, "transcript")
+        events = self.wait_for_line("transcript")
         # The session ends on its own while stdin is still open (the 2026-10-04 crash).
-        events, terminal, _stderr = self.finish(process, events)
+        events, terminal, _stderr = self.finish(process, events, hold_stdin=True)
         self.assertEqual(process.returncode, 2)
         self.assertEqual((terminal["phase"], terminal["reason"]), ("error", "audio-unavailable"))
         self.assertNotIn("skipped_segments", terminal)
