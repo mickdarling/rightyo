@@ -17,6 +17,7 @@ from argparse import Namespace
 from dataclasses import replace
 from pathlib import Path
 
+from rightyo.contracts import SpeakerPriority
 from rightyo.live_audio import FRAME_BYTES, LiveAudioError, LiveConfig, LiveProcessor
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
 from rightyo.providers import MockProvider
@@ -136,6 +137,36 @@ class TurnMergerTests(unittest.TestCase):
         self.merger.flush()
         self.assertEqual(self.emitted, [])
 
+    def test_a_stop_phrase_is_never_joined_or_held(self):
+        merger = TurnMerger(2000, 24000, self.emitted.append, SpeakerPriority().is_stop_phrase)
+        merger.offer(fragment("Haili, order a pizza", 0, 900))
+        merger.offer(fragment("never mind", 2400, 2900))
+        # The request is released first and the stop phrase follows as a turn of its own.
+        self.assertEqual(self.texts(), ["Haili, order a pizza", "never mind"])
+        self.assertFalse(merger.holding)
+        self.emitted.clear()
+        merger.offer(fragment("Stop.", 0, 300))
+        merger.offer(fragment("stop", 1000, 1300))
+        self.assertEqual(self.texts(), ["Stop.", "stop"])
+        self.assertFalse(merger.holding)
+        # A stop phrase inside a longer turn is not a stop phrase and joins as usual.
+        self.emitted.clear()
+        merger.offer(fragment("please do not", 0, 300))
+        merger.offer(fragment("stop the music", 1000, 1300))
+        merger.flush()
+        self.assertEqual(self.texts(), ["please do not stop the music"])
+        with self.assertRaises(ValueError):
+            TurnMerger(2000, 24000, self.emitted.append, "stop")
+
+    def test_utterance_local_labels_never_join(self):
+        first = fragment("Haili, what time is", 0, 900, speaker="u1 Speaker A")
+        second = fragment("it?", 1200, 1400, speaker="u2 Speaker A")
+        for item in (first, second):
+            item["speaker_provenance"] = "diarization-utterance"
+            self.merger.offer(item)
+        self.merger.flush()
+        self.assertEqual(self.texts(), ["Haili, what time is", "it?"])
+
     def test_gap_is_validated(self):
         for invalid in (-1, 5001, 1.5, True, "700", None):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
@@ -205,13 +236,13 @@ TEXTS = ("Hailey, what time is", "it?")
 
 
 class LiveProcessorMergeTests(unittest.TestCase):
-    def run_processor(self, pcm, *, gap, switch_ms=None, finish=True):
+    def run_processor(self, pcm, *, gap, switch_ms=None, finish=True, diarizer=None):
         turns = []
         config = LiveConfig(
             "merge-test",
             provenance="causal-replay",
             transcriber=ScriptedTranscriber(TEXTS),
-            diarizer=ScriptedDiarizer(switch_ms),
+            diarizer=diarizer or ScriptedDiarizer(switch_ms),
             turn_merge_gap_ms=gap,
         )
         processor = LiveProcessor(config, turns.append)
@@ -254,6 +285,15 @@ class LiveProcessorMergeTests(unittest.TestCase):
         _, turns = self.run_processor(SPLIT_QUESTION, gap=DEFAULT_TURN_MERGE_GAP_MS, switch_ms=1000)
         self.assertEqual([t.text for t in turns], list(TEXTS))
         self.assertEqual([t.speaker_id for t in turns], ["Speaker A", "Speaker B"])
+
+    def test_utterance_local_diarizer_turns_are_never_joined(self):
+        diarizer = ScriptedDiarizer()
+        diarizer.speaker_provenance = "diarization-utterance"
+        _, turns = self.run_processor(
+            SPLIT_QUESTION, gap=DEFAULT_TURN_MERGE_GAP_MS, diarizer=diarizer
+        )
+        self.assertEqual([t.text for t in turns], list(TEXTS))
+        self.assertEqual([t.speaker_id for t in turns], ["u1 Speaker A", "u2 Speaker A"])
 
     def test_held_turn_waits_only_for_its_gap(self):
         pcm = audio((VOICE, 200), (SILENCE, 1440))
@@ -332,12 +372,21 @@ class DecisionPathTests(unittest.TestCase):
         self.base["addressing"] = {"names": ["Haili"], "variants": {"Haili": ["Hailey"]}}
         self.config = self.root / "config.json"
 
-    def run_listen(self, **extra):
+    def run_listen(self, texts=TEXTS, pcm=None, switch_ms=None, **extra):
+        if pcm is not None:
+            with wave.open(str(self.demo), "wb") as file:
+                file.setnchannels(1)
+                file.setsampwidth(2)
+                file.setframerate(16000)
+                file.writeframes(pcm)
         self.config.write_text(json.dumps({**self.base, **extra}))
         built = []
 
         def processor(config, callback):
-            backends = {"transcriber": ScriptedTranscriber(TEXTS), "diarizer": ScriptedDiarizer()}
+            backends = {
+                "transcriber": ScriptedTranscriber(texts),
+                "diarizer": ScriptedDiarizer(switch_ms),
+            }
             return LiveProcessor(replace(config, **backends), callback)
 
         def factory(config, *, event_publisher):
@@ -386,6 +435,46 @@ class DecisionPathTests(unittest.TestCase):
         events, provider = self.run_listen(turns={"merge_gap_ms": 0})
         self.assertEqual(provider.requests, 2)
         self.assertEqual([e["turn"]["text"] for e in self.of(events, "transcript")], list(TEXTS))
+
+    def test_owner_stop_after_a_pause_still_supersedes_the_request(self):
+        # A participant (Speaker A) asks; the owner (Speaker B) says "Wait.", pauses for
+        # 1.5 s, then "never mind". Joined, "Wait. never mind" would not be a stop phrase.
+        pcm = audio(
+            (VOICE, 200),
+            (SILENCE, 1500),
+            (VOICE, 200),
+            (SILENCE, 1500),
+            (VOICE, 200),
+            (SILENCE, 3000),
+        )
+        events, provider = self.run_listen(
+            texts=("Haili, order a pizza", "Wait.", "never mind"),
+            pcm=pcm,
+            switch_ms=1000,
+            speakers={"owner": ["Speaker B"], "trusted": [], "owner_only": False},
+        )
+        transcripts = [e["turn"] for e in self.of(events, "transcript")]
+        self.assertEqual(
+            [(t["text"], t["speaker_id"]) for t in transcripts],
+            [
+                ("Haili, order a pizza", "Speaker A"),
+                ("Wait.", "Speaker B"),
+                ("never mind", "Speaker B"),
+            ],
+        )
+        self.assertEqual(provider.requests, 3)
+        (request,) = self.of(events, "request")
+        self.assertEqual(request["turn"]["utterance_id"], transcripts[0]["utterance_id"])
+        (override,) = self.of(events, "override")
+        self.assertEqual(override["superseded_request_id"], request["request_id"])
+        self.assertEqual(override["by_utterance_id"], transcripts[2]["utterance_id"])
+
+    def test_without_the_stop_break_the_pause_would_hide_the_stop(self):
+        # Control for the test above: an ordinary second fragment does join.
+        pcm = audio((VOICE, 200), (SILENCE, 1500), (VOICE, 200), (SILENCE, 3000))
+        events, _ = self.run_listen(texts=("Wait.", "never mind me"), pcm=pcm)
+        texts = [e["turn"]["text"] for e in self.of(events, "transcript")]
+        self.assertEqual(texts, ["Wait. never mind me"])
 
     def test_config_section_is_validated(self):
         self.config.write_text(json.dumps(self.base))

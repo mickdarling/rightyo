@@ -5,6 +5,10 @@ arrive as several finalized fragments ("<name>, what time is" + "it?"). This bou
 stage holds the newest fragment for a short gap of stream time. A continuation by the
 same speaker within the gap is joined into it; anything else releases it unchanged.
 
+A fragment for which `breaks_turn` is true (the configured owner stop phrases, which
+are matched against a whole turn) is never joined or held: the held fragment is released
+first and the stop fragment is emitted on its own, so joining never hides a stop.
+
 Only fragments whose speaker label is known, equal, and not overlapping are joined, with
 the same speaker provenance. An unattributed or overlapping fragment is never joined, so
 no speaker attribution is invented. Fragments are plain dictionaries; the caller turns a
@@ -48,8 +52,17 @@ class TurnMerger:
     (cancellation). A joined turn never spans more than `max_span_ms`.
     """
 
-    def __init__(self, gap_ms: int, max_span_ms: int, emit: Callable[[dict[str, Any]], None]):
+    def __init__(
+        self,
+        gap_ms: int,
+        max_span_ms: int,
+        emit: Callable[[dict[str, Any]], None],
+        breaks_turn: Callable[[str], bool] | None = None,
+    ):
         self.gap_ms = merge_gap(gap_ms)
+        if breaks_turn is not None and not callable(breaks_turn):
+            raise ValueError("invalid turn break predicate")
+        self.breaks_turn = breaks_turn
         if type(max_span_ms) is not int or max_span_ms < 1:
             raise ValueError("invalid turn merge span")
         self.max_span_ms = max_span_ms
@@ -76,6 +89,11 @@ class TurnMerger:
         )
 
     def offer(self, fragment: dict[str, Any]) -> None:
+        if self.breaks_turn is not None and self.breaks_turn(fragment["text"]):
+            # A stop phrase must stay a whole turn of its own to be recognized downstream.
+            self.flush()
+            self.emit(dict(fragment))
+            return
         if self._continues(fragment):
             held = self._held
             held["text"] = held["text"] + " " + fragment["text"]

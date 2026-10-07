@@ -564,6 +564,9 @@ class PrototypeController:
                         self.config.diarizer, allow_hosted=self.allow_hosted_speech
                     ),
                     turn_merge_gap_ms=self.config.turn_merge_gap_ms,
+                    # Stop phrases are matched against a whole turn, so joining must
+                    # never absorb one; the defaults apply when roles are off.
+                    turn_break=(self.config.speakers or SpeakerPriority()).is_stop_phrase,
                 ),
                 lambda turn: self._accept(generation, work, memory, turn),
             )

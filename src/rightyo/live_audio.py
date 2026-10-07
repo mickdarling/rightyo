@@ -88,6 +88,9 @@ class LiveConfig:
     # this many stream milliseconds (#73). 0, the library default, emits every turn at
     # once as before; `listen` and the lab pass their configured gap.
     turn_merge_gap_ms: int = 0
+    # Text predicate for a fragment that must stay a turn of its own and is never joined
+    # or held, such as an owner stop phrase matched against a whole turn downstream.
+    turn_break: Callable[[str], bool] | None = None
 
     def __post_init__(self) -> None:
         identifier(self.session_id, "session_id")
@@ -95,6 +98,8 @@ class LiveConfig:
             merge_gap(self.turn_merge_gap_ms)
         except ValueError:
             raise LiveAudioError("Invalid turn merge gap") from None
+        if self.turn_break is not None and not callable(self.turn_break):
+            raise LiveAudioError("Invalid turn break predicate")
         _check_backend(self.transcriber, "transcribe", "transcriber")
         _check_backend(self.diarizer, "push", "diarizer")
         if self.session_budget_ms is not None and (
@@ -726,7 +731,9 @@ class LiveProcessor:
         self._asr_process: subprocess.Popen | None = None
         # A joined turn spans at most two full utterance windows, so a long monologue
         # with short pauses is still decided in bounded time.
-        self._merger = TurnMerger(config.turn_merge_gap_ms, 2 * config.max_utterance_ms, self._emit)
+        self._merger = TurnMerger(
+            config.turn_merge_gap_ms, 2 * config.max_utterance_ms, self._emit, config.turn_break
+        )
 
     @property
     def received_ms(self) -> int:

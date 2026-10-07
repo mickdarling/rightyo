@@ -123,12 +123,14 @@ class Addressing:
     def __post_init__(self) -> None:
         if type(self.names) is not tuple or not 1 <= len(self.names) <= MAX_ADDRESS_NAMES:
             raise ContractError(f"addressing requires between 1 and {MAX_ADDRESS_NAMES} names")
+        # Matching ignores case, spaces and punctuation (`name_key`), so uniqueness does
+        # too: "Righty O" and "RightyO" would be the same name to every matcher.
         seen = set()
         for name in self.names:
-            folded = address_name(name).casefold()
-            if folded in seen:
+            key = name_key(address_name(name))
+            if key in seen:
                 raise ContractError("duplicate address name")
-            seen.add(folded)
+            seen.add(key)
         if type(self.variants) is not tuple:
             raise ContractError("invalid address name variants")
         owners = set()
@@ -144,10 +146,10 @@ class Addressing:
                 raise ContractError(f"each name takes between 1 and {MAX_NAME_VARIANTS} variants")
             total += len(spellings)
             for spelling in spellings:
-                folded = address_name(spelling).casefold()
-                if folded in seen:
+                key = name_key(address_name(spelling))
+                if key in seen:
                     raise ContractError("duplicate address name")
-                seen.add(folded)
+                seen.add(key)
         if total > MAX_TOTAL_NAME_VARIANTS:
             raise ContractError(f"at most {MAX_TOTAL_NAME_VARIANTS} address name variants")
 

@@ -321,6 +321,9 @@ class NameVariantTests(unittest.TestCase):
             {"Haili": ["Friday"]},
             {"Haili": ["Hailey", "hailey"]},
             {"Haili": ["haili"]},
+            {"Haili": ["Hai-li"]},
+            {"Haili": ["Fri day"]},
+            {"Haili": ["Hailey", "hai ley"]},
             {"Haili": [f"v{i}" for i in range(9)]},
             ["Hailey"],
             None,
@@ -332,6 +335,10 @@ class NameVariantTests(unittest.TestCase):
             Addressing.from_dict({"names": list(many), "variants": many})
         with self.assertRaises(ContractError):
             Addressing.from_dict({"names": ["Haili"], "other": {}})
+        # Names that every matcher would treat as one are refused too.
+        for names in (["RightyO", "Righty O"], ["A.I.", "ai"]):
+            with self.subTest(names=names), self.assertRaises(ContractError):
+                Addressing(tuple(names))
 
     def test_name_for_tolerates_case_spacing_and_punctuation(self):
         addressing = self.addressing()
