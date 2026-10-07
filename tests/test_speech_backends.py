@@ -409,33 +409,127 @@ class ProtocolAndSelectionTests(unittest.TestCase):
                 self.assertEqual(turns[0].speaker_id, "Speaker " + expected[number])
                 identifier(turns[0].speaker_id, "speaker_id")
 
-    def test_adapter_units_are_validated_at_the_common_boundary(self):
+    def boundary_processor(self, units, turns, reports=None):
+        transcriber = StubTranscriber()
+        transcriber.transcribe = lambda pcm, register=None, units=units: units
+        return LiveProcessor(
+            LiveConfig(
+                "boundary-test",
+                provenance="causal-replay",
+                transcriber=transcriber,
+                diarizer=StubDiarizer(),
+                report=None if reports is None else reports.append,
+            ),
+            turns.append,
+        )
+
+    def test_any_unusable_or_out_of_order_unit_suppresses_the_whole_utterance(self):
+        # #78: never publish partial text (meaning can invert) or move text in time
+        # (it can land on the wrong speaker); emit nothing for the utterance, count it,
+        # and keep listening.
         duration = 10 * 640 // BYTES_PER_MS
+        do = {"text": " do", "start_ms": 0, "end_ms": 40}
+        stop = {"text": " stop", "start_ms": 100, "end_ms": 180}
         cases = {
-            "negative start": [{"text": " a", "start_ms": -1, "end_ms": 10}],
-            "end past the utterance": [{"text": " a", "start_ms": 0, "end_ms": duration + 1}],
-            "reversed interval": [{"text": " a", "start_ms": 50, "end_ms": 40}],
-            "reordered units": [
-                {"text": " b", "start_ms": 100, "end_ms": 150},
-                {"text": " a", "start_ms": 0, "end_ms": 50},
+            "negative word between valid ones": [
+                do,
+                {"text": " not", "start_ms": -5, "end_ms": 60},
+                stop,
             ],
-            "float timestamps": [{"text": " a", "start_ms": 0.0, "end_ms": 50}],
+            "reordered unit": [
+                {"text": " later", "start_ms": 100, "end_ms": 150},
+                {"text": " earlier", "start_ms": 20, "end_ms": 60},
+            ],
+            "word ends early": [
+                {"text": " do", "start_ms": 0, "end_ms": 120},
+                {"text": " not", "start_ms": 20, "end_ms": 60},
+                stop,
+            ],
+            "end past the utterance": [do, {"text": " a", "start_ms": 70, "end_ms": duration + 1}],
+            "reversed interval": [{"text": " a", "start_ms": 50, "end_ms": 40}, stop],
+            "float timestamps": [{"text": " a", "start_ms": 0.0, "end_ms": 50}, stop],
+            "NaN timestamps": [{"text": " a", "start_ms": float("nan"), "end_ms": 50}, stop],
+            "boolean timestamps": [{"text": " a", "start_ms": False, "end_ms": 50}, stop],
+            "missing timestamps": [{"text": " a"}, stop],
+        }
+        for name, units in cases.items():
+            with self.subTest(case=name):
+                turns, reports = [], []
+                processor = self.boundary_processor(units, turns, reports)
+                for _ in range(10):
+                    processor.push_pcm16(VOICE)
+                processor.finish()
+                self.assertFalse(processor.failed)
+                self.assertEqual(turns, [])
+                self.assertEqual(processor.skipped_utterances, 1)
+                self.assertEqual(processor.skipped_segments, 0)
+                self.assertEqual(
+                    reports,
+                    [
+                        "suppressed 1 utterance with invalid or out-of-order recognizer "
+                        "timestamps; the session continues"
+                    ],
+                )
+
+    def test_zero_length_units_in_order_are_still_valid(self):
+        units = [
+            {"text": " Hi", "start_ms": 0, "end_ms": 40},
+            {"text": ".", "start_ms": 40, "end_ms": 40},
+        ]
+        turns = []
+        processor = self.boundary_processor(units, turns)
+        for _ in range(10):
+            processor.push_pcm16(VOICE)
+        processor.finish()
+        # Published, not suppressed; a zero-length unit has no speaker overlap of its own.
+        self.assertEqual([t.text for t in turns], ["Hi", "."])
+        self.assertEqual(processor.skipped_utterances, 0)
+
+    def test_a_suppressed_utterance_never_ends_a_session_that_keeps_listening(self):
+        replies = [
+            [  # "do not stop" with an invalid middle word: nothing may be published.
+                {"text": " do", "start_ms": 0, "end_ms": 40},
+                {"text": " not", "start_ms": -5, "end_ms": 60},
+                {"text": " stop", "start_ms": 100, "end_ms": 180},
+            ],
+            [{"text": " later", "start_ms": 0, "end_ms": 100}],
+        ]
+        transcriber = StubTranscriber()
+        transcriber.transcribe = lambda pcm, register=None: replies.pop(0)
+        turns = []
+        processor = LiveProcessor(
+            LiveConfig(
+                "continue-test",
+                provenance="causal-replay",
+                transcriber=transcriber,
+                diarizer=StubDiarizer(),
+            ),
+            turns.append,
+        )
+        silence = bytes(640)
+        for _ in range(2):
+            for _ in range(10):
+                processor.push_pcm16(VOICE)
+            for _ in range(72):
+                processor.push_pcm16(silence)
+        processor.finish()
+        self.assertFalse(processor.failed)
+        self.assertEqual([t.text for t in turns], ["later"])
+        self.assertEqual(turns[0].utterance_id, "live-1")
+        self.assertGreater(turns[0].start_ms, 0)  # the second utterance's global offset
+        self.assertEqual(processor.skipped_utterances, 1)
+
+    def test_malformed_unit_structure_still_fails_closed_at_the_common_boundary(self):
+        cases = {
             "not a list": {"text": " a"},
+            "unit not a dict": [" a"],
+            "text not a string": [{"text": 3, "start_ms": 0, "end_ms": 10}],
+            "too many units": [{"text": " a", "start_ms": 0, "end_ms": 0}] * 4001,
         }
         for name, units in cases.items():
             with self.subTest(case=name):
                 turns = []
-                transcriber = StubTranscriber()
-                transcriber.transcribe = lambda pcm, register=None, units=units: units
-                processor = LiveProcessor(
-                    LiveConfig(
-                        "boundary-test",
-                        provenance="causal-replay",
-                        transcriber=transcriber,
-                        diarizer=StubDiarizer(),
-                    ),
-                    turns.append,
-                )
+                processor = self.boundary_processor(units, turns)
                 for _ in range(10):
                     processor.push_pcm16(VOICE)
                 with self.assertRaisesRegex(LiveAudioError, "recognizer") as caught:

@@ -305,6 +305,52 @@ class LiveProcessorMergeTests(unittest.TestCase):
         self.assertEqual([t.text for t in turns], list(TEXTS))
         self.assertEqual([t.speaker_id for t in turns], ["u1 Speaker A", "u2 Speaker A"])
 
+    def test_a_suppressed_utterance_ends_the_held_turn_instead_of_being_bridged(self):
+        # #78: B is suppressed for an invalid timestamp. Joining A and C across it would
+        # publish "Do stop." for "Do not stop.", so A must be released on its own.
+        replies = [
+            lambda start, end: [{"text": " Do", "start_ms": start, "end_ms": end}],
+            lambda start, end: [{"text": " not", "start_ms": -5, "end_ms": end}],
+            lambda start, end: [{"text": " stop.", "start_ms": start, "end_ms": end}],
+        ]
+
+        class Transcriber(ScriptedTranscriber):
+            def transcribe(self, pcm, register=None):
+                voiced = [
+                    index
+                    for index in range(len(pcm) // FRAME_BYTES)
+                    if pcm[index * FRAME_BYTES : (index + 1) * FRAME_BYTES] == VOICE
+                ]
+                return replies.pop(0)(voiced[0] * 20, (voiced[-1] + 1) * 20)
+
+        turns = []
+        processor = LiveProcessor(
+            LiveConfig(
+                "merge-suppressed",
+                provenance="causal-replay",
+                transcriber=Transcriber(()),
+                diarizer=ScriptedDiarizer(),
+                turn_merge_gap_ms=5000,
+            ),
+            turns.append,
+        )
+        self.addCleanup(processor.close)
+        pcm = audio(
+            (VOICE, 200),
+            (SILENCE, 1500),
+            (VOICE, 200),
+            (SILENCE, 1500),
+            (VOICE, 200),
+            (SILENCE, 1500),
+        )
+        for offset in range(0, len(pcm), FRAME_BYTES * 10):
+            processor.push_pcm16(pcm[offset : offset + FRAME_BYTES * 10])
+        processor.finish()
+        self.assertEqual(replies, [])
+        self.assertEqual(processor.skipped_utterances, 1)
+        self.assertEqual([t.text for t in turns], ["Do", "stop."])
+        self.assertEqual([t.utterance_id for t in turns], ["live-1", "live-2"])
+
     def test_held_turn_waits_only_for_its_gap(self):
         pcm = audio((VOICE, 200), (SILENCE, 1440))
         processor, turns = self.run_processor(pcm, gap=DEFAULT_TURN_MERGE_GAP_MS, finish=False)

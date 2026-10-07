@@ -22,6 +22,7 @@ from rightyo.live_audio import (
     LiveConfig,
     LiveProcessor,
     _attribute,
+    _counted_units,
     _Diarizer,
     _NativeStream,
     _units,
@@ -651,11 +652,113 @@ class ConservativeAlignmentTests(unittest.TestCase):
             )
 
     def test_malformed_vendor_result_is_sanitized(self):
-        for bad in ({}, {"transcription": "private transcript"}, document(-1, 20)):
+        for bad in ({}, {"transcription": "private transcript"}, {"transcription": ["x"]}):
             with self.assertRaises(LiveAudioError) as caught:
                 _units(bad, 200)
             self.assertNotIn("private transcript", str(caught.exception))
             self.assertNotIn(json.dumps(bad), str(caught.exception))
+
+    def test_an_unusable_segment_suppresses_the_whole_utterance(self):
+        # #78: publishing the other segments could invert meaning ("Do stop."), and
+        # dropping the last one truncates it; the caller suppresses the utterance.
+        for name, start, end in (
+            ("negative start", -1, 20),
+            ("zero length", 300, 300),
+            ("zero length at the end of the audio", 1000, 1000),
+            ("reversed", 150, 100),
+            ("starts after the received audio", 1001, 1100),
+            ("ends past the padding", 300, 1000 + 1001),
+            ("float offsets", 300.0, 400),
+            ("NaN offsets", float("nan"), 400),
+            ("missing offsets", None, None),
+        ):
+            for position in ("middle", "final"):
+                with self.subTest(case=name, position=position):
+                    bad = {"text": " not", "offsets": {"from": start, "to": end}}
+                    value = document(0, 300, " Do")
+                    tail = {"text": " stop.", "offsets": {"from": 300, "to": 800}}
+                    segments = [bad, tail] if position == "middle" else [tail, bad]
+                    value["transcription"].extend(segments)
+                    self.assertEqual(_counted_units(value, 1000), (None, 1))
+
+    def test_a_zero_length_segment_with_text_suppresses_the_utterance(self):
+        # It cannot be attributed to a speaker, so keeping it would split "Do not stop."
+        # into separately judged "Do" / "not" / "stop." turns.
+        value = document(0, 300, " Do")
+        value["transcription"] += [
+            {"text": " not", "offsets": {"from": 300, "to": 300}},
+            {"text": " stop.", "offsets": {"from": 300, "to": 800}},
+        ]
+        self.assertEqual(_counted_units(value, 1000), (None, 1))
+        # A blank zero-length segment carries no words and is ignored, as before.
+        blank = document(0, 300, " Do")
+        blank["transcription"].append({"text": " ", "offsets": {"from": 300, "to": 300}})
+        self.assertEqual(
+            _counted_units(blank, 1000), ([{"text": " Do", "start_ms": 0, "end_ms": 300}], 0)
+        )
+
+    def test_out_of_order_word_timing_falls_back_to_the_whole_segment(self):
+        # "not" ends before "do" does: word units would let a boundary drop "not".
+        value = document(0, 900, " do not stop")
+        value["transcription"][0]["tokens"] = [
+            {"text": " do", "offsets": {"from": 0, "to": 600}},
+            {"text": " not", "offsets": {"from": 100, "to": 300}},
+            {"text": " stop", "offsets": {"from": 300, "to": 900}},
+        ]
+        self.assertEqual(
+            _counted_units(value, 1000),
+            ([{"text": " do not stop", "start_ms": 0, "end_ms": 900}], 0),
+        )
+
+    def test_slight_overrun_is_clamped_to_received_audio(self):
+        self.assertEqual(
+            _counted_units(document(50, 1150), 200),
+            ([{"text": " Hello.", "start_ms": 50, "end_ms": 200}], 0),
+        )
+
+    def test_whisper_suppresses_a_bad_utterance_and_keeps_listening(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "supplied-local-runtime"
+        path.touch()
+        config = LiveConfig("skip-test", path, path, path, path, provenance="causal-replay")
+        bad = document(0, 60, " Do")
+        bad["transcription"] += [
+            {"text": " not", "offsets": {"from": 60, "to": 60}},  # zero-length segment
+            {"text": " stop.", "offsets": {"from": 60, "to": 160}},
+        ]
+        good = document(0, 160, " Do not stop.")
+        turns, reports = [], []
+        with (
+            patch("rightyo.live_audio._Diarizer", FakeDiarizer),
+            patch("rightyo.live_audio._transcribe", side_effect=[bad, good]),
+        ):
+            processor = LiveProcessor(
+                LiveConfig(**{**config.__dict__, "report": reports.append}), turns.append
+            )
+            for _ in range(2):
+                for _ in range(10):
+                    processor.push_pcm16(VOICE)
+                for _ in range(72):
+                    processor.push_pcm16(SILENCE)
+            processor.finish()
+        self.assertFalse(processor.failed)
+        # Nothing from the suppressed utterance; the next valid one is published whole.
+        self.assertEqual([t.text for t in turns], ["Do not stop."])
+        self.assertGreater(turns[0].start_ms, 1000)  # From the second utterance.
+        self.assertEqual(processor.skipped_segments, 1)
+        self.assertEqual(processor.skipped_utterances, 1)
+        self.assertEqual(
+            reports,
+            [
+                "suppressed 1 utterance with invalid or out-of-order recognizer timestamps "
+                "(1 recognizer segment(s) with unusable timestamps); the session continues"
+            ],
+        )
+
+    def test_reporter_must_be_callable(self):
+        with self.assertRaisesRegex(LiveAudioError, "reporter"):
+            LiveConfig("report-test", transcriber=object, diarizer=object, report="stderr")
 
 
 if __name__ == "__main__":

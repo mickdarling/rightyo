@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import array
 import base64
+import contextlib
 import ctypes
 import inspect
 import json
@@ -77,6 +78,9 @@ class LiveConfig:
     max_utterance_ms: int = 12000
     timeout_seconds: float = 30
     cancelled: Callable[[], bool] | None = None
+    # Optional content-free stderr diagnostics (counts only): skipped segments and
+    # suppressed utterances.
+    report: Callable[[str], None] | None = None
     # Total audio accepted per session, in stream milliseconds. None means no ceiling:
     # memory stays bounded by the utterance window and downstream retention limits.
     session_budget_ms: int | None = None
@@ -108,6 +112,8 @@ class LiveConfig:
             raise LiveAudioError("Invalid session budget")
         if self.cancelled is not None and not callable(self.cancelled):
             raise LiveAudioError("Invalid cancellation guard")
+        if self.report is not None and not callable(self.report):
+            raise LiveAudioError("Invalid diagnostic reporter")
         if self.provenance not in PROVENANCE:
             raise LiveAudioError("Invalid audio provenance")
         if (
@@ -582,17 +588,36 @@ def _transcribe(
             raise LiveAudioError("Local recognizer failed") from None
 
 
-def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]]:
+def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]] | None:
+    """The usable units of one whisper.cpp document, or None; see `_counted_units`."""
+    return _counted_units(document, duration_ms)[0]
+
+
+def _counted_units(
+    document: dict[str, Any], duration_ms: int
+) -> tuple[list[dict[str, Any]] | None, int]:
     """Use complete token-derived word intervals; fall back to whole segments.
 
-    No majority speaker vote, guessed timestamps, dropped text, or splitting
-    a word between speakers. Zero-duration punctuation attaches to its word;
-    words with only zero-duration timestamps remain unassigned.
+    No majority speaker vote, guessed timestamps, or splitting a word between
+    speakers. Zero-duration punctuation attaches to its word; words with only
+    zero-duration timestamps remain unassigned.
+
+    whisper.cpp emits odd offsets on short, noisy or near-silent windows (#78). A
+    nonempty segment whose own offsets are unusable (not integers, negative, reversed,
+    zero-length, starting at or after the end of the received audio, or ending more
+    than the CLI's one second of padding past it) makes the whole utterance unusable:
+    publishing the remaining segments could invert meaning ("do not stop" becoming
+    "do stop"), and a zero-length segment cannot be attributed to a speaker, so it
+    would split the utterance into separately judged turns. Returns
+    `(None, n)` then, with `n` the number of unusable segments, so the caller
+    suppresses the utterance and keeps listening; otherwise `(units, 0)`. A
+    malformed document structure still fails closed.
     """
     segments = document.get("transcription")
     if not isinstance(segments, list) or len(segments) > 1000:
         raise LiveAudioError("Invalid local recognizer result")
     result = []
+    skipped = 0
     for segment in segments:
         if not isinstance(segment, dict):
             raise LiveAudioError("Invalid local recognizer result")
@@ -608,7 +633,8 @@ def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]]:
             or not 0 <= start < end <= duration_ms + 1000
             or start >= duration_ms
         ):
-            raise LiveAudioError("Invalid local recognizer timestamp")
+            skipped += 1
+            continue
         # The pinned CLI rounds final segment offsets into its padded audio.
         # Bound evidence to actually received PCM; never invent future frames.
         end = min(end, duration_ms)
@@ -648,8 +674,14 @@ def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]]:
                 words[-1]["end_ms"] = max(words[-1]["end_ms"], right)
         usable &= reconstructed.strip() == text.strip()
         usable &= bool(words) and all(w["start_ms"] <= w["end_ms"] for w in words)
+        # Word intervals must also be in order; otherwise the common unit check would
+        # suppress the whole utterance, so keep the segment's text as one unit (#78).
+        usable &= all(
+            a["start_ms"] <= b["start_ms"] and a["end_ms"] <= b["end_ms"]
+            for a, b in zip(words, words[1:])
+        )
         result.extend(words if usable else [fallback])
-    return result
+    return (None if skipped else result), skipped
 
 
 class WhisperCppTranscriber:
@@ -661,27 +693,45 @@ class WhisperCppTranscriber:
         if config.whisper_executable is None or config.whisper_model is None:
             raise LiveAudioError("Explicit existing runtimes and models are required")
         self.config = config
+        # Unusable segments, and the utterances they suppressed, this session (see
+        # `_counted_units`); read by `LiveProcessor`.
+        self.skipped_segments = 0
+        self.suppressed_utterances = 0
 
     def transcribe(
         self, pcm: bytes, register: Callable[[subprocess.Popen], None] | None = None
     ) -> list[dict[str, Any]]:
         document = _transcribe(self.config, pcm, register)
-        return _units(document, len(pcm) // BYTES_PER_MS)
+        units, skipped = _counted_units(document, len(pcm) // BYTES_PER_MS)
+        self.skipped_segments += skipped
+        if units is None:
+            # The whole utterance is unusable: publish nothing from it.
+            self.suppressed_utterances += 1
+            return []
+        return units
 
 
-def _check_units(units: Any, duration_ms: int) -> None:
+def _checked_units(units: Any, duration_ms: int) -> list[dict[str, Any]] | None:
     """Enforce the `Transcriber` contract at the common boundary, whatever the backend.
 
     Units are dicts with `text` (str) and integer `start_ms`/`end_ms` with
-    `0 <= start_ms <= end_ms <= duration_ms`, non-decreasing in order. Anything else
-    fails closed like a malformed native document; nothing is clamped or reordered.
+    `0 <= start_ms <= end_ms <= duration_ms` (zero-length units are valid), and
+    non-decreasing in order. A malformed result structure (not a list, too many units,
+    a unit that is not a dict with string text) fails closed and ends the session.
+    If any unit breaks the timestamp contract (not an integer, NaN, negative, reversed,
+    past the utterance, or earlier than the unit before it), returns None: the caller
+    suppresses the whole utterance and keeps listening (#78). Dropping only that unit
+    could invert meaning ("do not stop" becoming "do stop"), and merging or sorting
+    would attribute text to the wrong time span and so possibly the wrong speaker.
+    Nothing is clamped, merged, reordered or partially kept.
     """
     if not isinstance(units, list) or len(units) > 4000:
         raise LiveAudioError("Invalid recognizer result")
-    previous_start = previous_end = 0
     for unit in units:
         if not isinstance(unit, dict) or not isinstance(unit.get("text"), str):
             raise LiveAudioError("Invalid recognizer result")
+    previous_start = previous_end = 0
+    for unit in units:
         start, end = unit.get("start_ms"), unit.get("end_ms")
         if (
             type(start) is not int
@@ -690,8 +740,9 @@ def _check_units(units: Any, duration_ms: int) -> None:
             or start < previous_start
             or end < previous_end
         ):
-            raise LiveAudioError("Invalid recognizer timestamp")
+            return None
         previous_start, previous_end = start, end
+    return units
 
 
 def _select(value: Any, default: Callable[[LiveConfig], Any], config: LiveConfig, method: str):
@@ -728,6 +779,7 @@ class LiveProcessor:
         self._received_ms = 0
         self._counter = 0
         self._utterances = 0
+        self._skipped_utterances = 0
         self._asr_process: subprocess.Popen | None = None
         # A joined turn spans at most two full utterance windows, so a long monologue
         # with short pauses is still decided in bounded time.
@@ -738,6 +790,23 @@ class LiveProcessor:
     @property
     def received_ms(self) -> int:
         return self._received_ms
+
+    @property
+    def skipped_segments(self) -> int:
+        """whisper.cpp segments skipped this session for unusable offsets (see `_units`)."""
+        inner = getattr(self._transcriber, "skipped_segments", 0)
+        return inner if type(inner) is int and inner > 0 else 0
+
+    @property
+    def skipped_utterances(self) -> int:
+        """Utterances suppressed whole this session for invalid or out-of-order timing.
+
+        Counts the common unit check's suppressions plus a transcriber's own (whisper.cpp
+        suppresses an utterance with an unusable segment before the unit check).
+        """
+        inner = getattr(self._transcriber, "suppressed_utterances", 0)
+        inner = inner if type(inner) is int and inner > 0 else 0
+        return self._skipped_utterances + inner
 
     @property
     def buffered_audio_bytes(self) -> int:
@@ -809,6 +878,7 @@ class LiveProcessor:
         offset = self._utterance_start
         self._utterance.clear()
         self._pre_roll.clear()
+        before = (self.skipped_segments, self.skipped_utterances)
         try:
             units = self._transcriber.transcribe(pcm, self._register_asr)
         finally:
@@ -817,7 +887,30 @@ class LiveProcessor:
             raise LiveAudioError("Audio session was stopped")
         provenance = getattr(self._diarizer, "speaker_provenance", "diarization-timeline")
         self._utterances += 1
-        _check_units(units, len(pcm) // BYTES_PER_MS)
+        checked = _checked_units(units, len(pcm) // BYTES_PER_MS)
+        if checked is None:
+            self._skipped_utterances += 1
+        skipped = self.skipped_segments - before[0]
+        suppressed = self.skipped_utterances > before[1]
+        if (skipped or suppressed) and self.config.report is not None:
+            # Content-free: counts only, never recognizer text or timestamps. A failing
+            # diagnostic channel never ends the session.
+            segments = f"{skipped} recognizer segment(s) with unusable timestamps"
+            if suppressed:
+                message = (
+                    "suppressed 1 utterance with invalid or out-of-order recognizer timestamps"
+                )
+                message += f" ({segments})" if skipped else ""
+            else:
+                message = f"skipped {segments}"
+            with contextlib.suppress(Exception):
+                self.config.report(message + "; the session continues")
+        if suppressed:
+            # A held turn must not be joined across the suppressed utterance to a later
+            # one ("Do not stop." published as "Do stop."): release it on its own now.
+            self._merger.flush()
+            return
+        units = checked
         # Units start at or after `offset`; a segment ending by then overlaps none of them,
         # so attribution scans only this utterance's part of the timeline.
         relevant = [segment for segment in timeline if segment["end_ms"] > offset]

@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import array
 import contextlib
 import io
 import json
+import math
 import os
+import queue
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -15,6 +20,7 @@ from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
+import rightyo
 from rightyo.capture import PCM_CHUNK_BYTES, StdinPcmCapture
 from rightyo.contracts import Turn
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
@@ -133,6 +139,38 @@ class StdinCaptureTests(unittest.TestCase):
         capture._reader.join(timeout=5)
         capture.stop()
         self.assertEqual(capture._queue.qsize(), 0)
+
+    def test_descriptor_reader_stops_promptly_and_is_joined_while_the_pipe_stays_open(self):
+        # #74/#78: a reader blocked on an open stdin must not survive stop(), or the
+        # interpreter aborts at shutdown on the stdin buffer lock (exit 134).
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, write_end)
+        with os.fdopen(read_end, "rb") as stream:
+            capture = StdinPcmCapture(stream)
+            capture.start()
+            self.assertFalse(capture._reader.daemon)
+            os.write(write_end, bytes(PCM_CHUNK_BYTES))
+            self.assertEqual(capture.read(timeout=5), bytes(PCM_CHUNK_BYTES))
+            self.assertIsNone(capture.read(timeout=0.05))  # Pipe open, nothing sent.
+            started = time.monotonic()
+            capture.stop()
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertFalse(capture._reader.is_alive())
+            # The reader never touched the BufferedReader, so nothing is lost or held.
+            os.write(write_end, b"later")
+            self.assertEqual(stream.read1(16), b"later")
+
+    def test_descriptor_reader_delivers_audio_then_end_of_input(self):
+        read_end, write_end = os.pipe()
+        with os.fdopen(read_end, "rb") as stream:
+            capture = StdinPcmCapture(stream)
+            capture.start()
+            os.write(write_end, bytes(range(256)) * 50 + b"\x01")  # 12,800 bytes + 1
+            os.close(write_end)
+            chunks = drain(capture)
+            capture.stop()
+        self.assertEqual(b"".join(chunks), bytes(range(256)) * 50)
+        self.assertEqual(capture.discarded_tail_bytes, 1)
 
 
 class StdinListenTests(unittest.TestCase):
@@ -468,6 +506,215 @@ class StdinListenTests(unittest.TestCase):
         self.assertEqual(len(captures), 1)
         self.assertEqual(captures[0]._queue.qsize(), 0)
         self.assertEqual([bytes(p.received) for p in Processor.instances], [b""])
+
+
+# A child `rightyo listen --mode stdin` with model-free stub speech backends patched in.
+# The real LiveProcessor, stdin capture, controller and interpreter shutdown all run.
+CHILD = """
+import sys
+from unittest.mock import patch
+
+import rightyo.prototype as prototype
+from rightyo.cli import main
+
+mode, config = sys.argv[1], sys.argv[2]
+
+
+class Transcriber:
+    recognizer_id = "stub-recognizer"
+    calls = 0
+
+    def transcribe(self, pcm, register=None):
+        duration = len(pcm) // 32
+        if mode == "systemic":
+            return {"not": "a unit list"}  # A structural failure still ends the session.
+        Transcriber.calls += 1
+        if Transcriber.calls % 2:
+            # Odd utterances: a valid word, an invalid one, a valid one. Publishing only
+            # the valid words could invert meaning, so the utterance must be suppressed.
+            return [
+                {"text": " alpha", "start_ms": 0, "end_ms": 100},
+                {"text": " bravo", "start_ms": float("nan"), "end_ms": 200},
+                {"text": " charlie", "start_ms": 300, "end_ms": duration + 5000},
+            ]
+        return [{"text": " Synthetic tone.", "start_ms": 0, "end_ms": duration}]
+
+
+class Diarizer:
+    speaker_provenance = "diarization-timeline"
+
+    def push(self, frame):
+        pass
+
+    def segments(self):
+        return []
+
+    def finish(self):
+        return []
+
+    def close(self):
+        pass
+
+
+with (
+    patch.object(prototype, "transcriber_factory", lambda *a, **k: Transcriber()),
+    patch.object(prototype, "diarizer_factory", lambda *a, **k: Diarizer()),
+):
+    code = main(
+        ["listen", "--config", config, "--mode", "stdin", "--provenance", "synthetic",
+         "--session-id", "stdin-child"]
+    )
+raise SystemExit(code)
+"""
+# One second of a 440 Hz synthetic tone, then two seconds of silence (past the hangover).
+TONE = array.array(
+    "h", (int(8000 * math.sin(2 * math.pi * 440 * n / 16000)) for n in range(16000))
+).tobytes()
+UTTERANCE = TONE + bytes(2 * 16000 * 2)
+
+
+class StdinProcessShutdownTests(unittest.TestCase):
+    """#74/#78 end to end: no abort at interpreter shutdown, one terminal event, exit code."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        asset = root / "asset"
+        asset.touch()
+        self.config = root / "config.json"
+        self.config.write_text(
+            json.dumps(
+                {
+                    key: str(asset)
+                    for key in (
+                        "whisper_executable",
+                        "whisper_model",
+                        "diarization_library",
+                        "diarization_model",
+                        "microphone_helper",
+                    )
+                }
+            )
+        )
+        self.child = root / "child.py"
+        self.child.write_text(CHILD)
+        source = str(Path(rightyo.__file__).resolve().parents[1])
+        self.env = dict(os.environ, PYTHONPATH=source)
+
+    def launch(self, mode):
+        process = subprocess.Popen(
+            [sys.executable, str(self.child), mode, str(self.config)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=self.env,
+        )
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+        # Drain both pipes on threads so no line buffered with another is lost and a
+        # chatty child can never block on a full pipe.
+        self.lines: queue.Queue[bytes | None] = queue.Queue()
+        self.stderr_parts: list[bytes] = []
+
+        def pump_stdout():
+            for line in process.stdout:
+                self.lines.put(line)
+            self.lines.put(None)
+
+        def pump_stderr():
+            self.stderr_parts.append(process.stderr.read())
+
+        self.pumps = [
+            threading.Thread(target=pump_stdout, daemon=True),
+            threading.Thread(target=pump_stderr, daemon=True),
+        ]
+        for pump in self.pumps:
+            pump.start()
+        return process
+
+    def wait_for_line(self, kind, timeout=20):
+        """Collect stdout events until one of ``kind`` (or an error terminal)."""
+        events, deadline = [], time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                line = self.lines.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if line is None:
+                self.lines.put(None)
+                break
+            events.append(json.loads(line))
+            if events[-1]["type"] == kind or events[-1].get("phase") == "error":
+                break
+        return events
+
+    def finish(self, process, events, *, hold_stdin=False):
+        if hold_stdin:
+            # The host still holds stdin open until the child has fully exited.
+            process.wait(timeout=30)
+        if not process.stdin.closed:
+            process.stdin.close()
+        process.wait(timeout=30)
+        for pump in self.pumps:
+            pump.join(timeout=10)
+        while True:
+            line = self.lines.get(timeout=5)
+            if line is None:
+                break
+            events.append(json.loads(line))
+        stderr = b"".join(self.stderr_parts).decode()
+        self.assertNotIn("could not acquire lock", stderr)
+        self.assertNotIn("Fatal Python error", stderr)
+        terminals = [e for e in events if e["type"] == "session" and e["phase"] != "started"]
+        self.assertEqual(len(terminals), 1)
+        return events, terminals[0], stderr
+
+    def test_bad_timestamps_then_sigterm_with_stdin_open_exits_cleanly(self):
+        process = self.launch("timestamps")
+        process.stdin.write(UTTERANCE + UTTERANCE)
+        process.stdin.flush()
+        events = self.wait_for_line("transcript")
+        self.assertEqual(events[-1]["type"], "transcript")
+        # The host still holds stdin open, as Hailing Station does, when it stops RightyO.
+        process.send_signal(signal.SIGTERM)
+        events, terminal, stderr = self.finish(process, events, hold_stdin=True)
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(terminal["phase"], "cancelled")
+        transcripts = [e["turn"] for e in events if e["type"] == "transcript"]
+        # The bad first utterance is suppressed whole; the next one is still published.
+        self.assertEqual([t["text"] for t in transcripts], ["Synthetic tone."])
+        self.assertLessEqual(transcripts[0]["start_ms"], transcripts[0]["end_ms"])
+        self.assertEqual(terminal["skipped_utterances"], 1)
+        self.assertNotIn("skipped_segments", terminal)
+        self.assertIn("suppressed 1 utterance", stderr)
+        for word in ("alpha", "bravo", "charlie"):
+            self.assertNotIn(word, stderr)
+            self.assertNotIn(word, json.dumps(events))
+
+    def test_bad_timestamps_then_eof_keeps_listening_and_stops_normally(self):
+        process = self.launch("timestamps")
+        process.stdin.write(UTTERANCE * 4)
+        process.stdin.close()
+        events, terminal, _stderr = self.finish(process, [])
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(terminal["phase"], "stopped")
+        transcripts = [e["turn"] for e in events if e["type"] == "transcript"]
+        self.assertEqual(len(transcripts), 2)  # The session outlived each bad utterance.
+        self.assertEqual({t["text"] for t in transcripts}, {"Synthetic tone."})
+        self.assertLess(transcripts[0]["end_ms"], transcripts[1]["start_ms"])
+        self.assertEqual(terminal["skipped_utterances"], 2)
+
+    def test_systemic_failure_with_stdin_open_reports_error_without_aborting(self):
+        process = self.launch("systemic")
+        process.stdin.write(UTTERANCE)
+        process.stdin.flush()
+        events = self.wait_for_line("transcript")
+        # The session ends on its own while stdin is still open (the 2026-10-04 crash).
+        events, terminal, _stderr = self.finish(process, events, hold_stdin=True)
+        self.assertEqual(process.returncode, 2)
+        self.assertEqual((terminal["phase"], terminal["reason"]), ("error", "audio-unavailable"))
+        self.assertNotIn("skipped_segments", terminal)
+        self.assertNotIn("skipped_utterances", terminal)
 
 
 def slow_push(push, delay=0.05):
