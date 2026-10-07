@@ -654,8 +654,8 @@ def _counted_units(document: dict[str, Any], duration_ms: int) -> tuple[list[dic
                 words[-1]["end_ms"] = max(words[-1]["end_ms"], right)
         usable &= reconstructed.strip() == text.strip()
         usable &= bool(words) and all(w["start_ms"] <= w["end_ms"] for w in words)
-        # Word intervals must also be in order; otherwise a later unit boundary would
-        # have to drop or merge a word, so keep the whole segment's text in order (#78).
+        # Word intervals must also be in order; otherwise the common unit check would
+        # suppress the whole utterance, so keep the segment's text as one unit (#78).
         usable &= all(
             a["start_ms"] <= b["start_ms"] and a["end_ms"] <= b["end_ms"]
             for a, b in zip(words, words[1:])
