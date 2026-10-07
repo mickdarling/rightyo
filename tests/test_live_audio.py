@@ -22,6 +22,7 @@ from rightyo.live_audio import (
     LiveConfig,
     LiveProcessor,
     _attribute,
+    _counted_units,
     _Diarizer,
     _NativeStream,
     _units,
@@ -651,11 +652,71 @@ class ConservativeAlignmentTests(unittest.TestCase):
             )
 
     def test_malformed_vendor_result_is_sanitized(self):
-        for bad in ({}, {"transcription": "private transcript"}, document(-1, 20)):
+        for bad in ({}, {"transcription": "private transcript"}, {"transcription": ["x"]}):
             with self.assertRaises(LiveAudioError) as caught:
                 _units(bad, 200)
             self.assertNotIn("private transcript", str(caught.exception))
             self.assertNotIn(json.dumps(bad), str(caught.exception))
+
+    def test_unusable_segment_timestamps_are_skipped_and_counted_not_fatal(self):
+        # #78: whisper.cpp emits such segments on short, noisy or near-silent windows.
+        for name, start, end in (
+            ("negative start", -1, 20),
+            ("zero length", 100, 100),
+            ("reversed", 150, 100),
+            ("starts after the received audio", 200, 300),
+            ("ends past the padding", 0, 200 + 1001),
+            ("float offsets", 0.0, 100),
+            ("NaN offsets", float("nan"), 100),
+            ("missing offsets", None, None),
+        ):
+            with self.subTest(case=name):
+                value = document(0, 100, " Kept.")
+                value["transcription"].append(
+                    {"text": " Dropped.", "offsets": {"from": start, "to": end}}
+                )
+                self.assertEqual(
+                    _counted_units(value, 200),
+                    ([{"text": " Kept.", "start_ms": 0, "end_ms": 100}], 1),
+                )
+
+    def test_slight_overrun_is_clamped_to_received_audio(self):
+        self.assertEqual(
+            _counted_units(document(50, 1150), 200),
+            ([{"text": " Hello.", "start_ms": 50, "end_ms": 200}], 0),
+        )
+
+    def test_whisper_transcriber_counts_skipped_segments_across_the_session(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "supplied-local-runtime"
+        path.touch()
+        config = LiveConfig("skip-test", path, path, path, path, provenance="causal-replay")
+        bad = document(0, 100, " Kept.")
+        bad["transcription"].append({"text": " Dropped.", "offsets": {"from": 90, "to": 90}})
+        turns, reports = [], []
+        with (
+            patch("rightyo.live_audio._Diarizer", FakeDiarizer),
+            patch("rightyo.live_audio._transcribe", side_effect=[bad, document(0, 100)]),
+        ):
+            processor = LiveProcessor(
+                LiveConfig(**{**config.__dict__, "report": reports.append}), turns.append
+            )
+            for _ in range(2):
+                for _ in range(10):
+                    processor.push_pcm16(VOICE)
+                for _ in range(72):
+                    processor.push_pcm16(SILENCE)
+            processor.finish()
+        self.assertFalse(processor.failed)
+        self.assertEqual([t.text for t in turns], ["Kept.", "Hello."])
+        self.assertEqual(processor.skipped_segments, 1)
+        self.assertEqual(len(reports), 1)
+        self.assertNotIn("Dropped", reports[0])
+
+    def test_reporter_must_be_callable(self):
+        with self.assertRaisesRegex(LiveAudioError, "reporter"):
+            LiveConfig("report-test", transcriber=object, diarizer=object, report="stderr")
 
 
 if __name__ == "__main__":

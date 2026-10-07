@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import array
 import base64
+import contextlib
 import ctypes
 import inspect
 import json
@@ -76,6 +77,8 @@ class LiveConfig:
     max_utterance_ms: int = 12000
     timeout_seconds: float = 30
     cancelled: Callable[[], bool] | None = None
+    # Optional content-free stderr diagnostics (counts only), e.g. skipped segments.
+    report: Callable[[str], None] | None = None
     # Total audio accepted per session, in stream milliseconds. None means no ceiling:
     # memory stays bounded by the utterance window and downstream retention limits.
     session_budget_ms: int | None = None
@@ -94,6 +97,8 @@ class LiveConfig:
             raise LiveAudioError("Invalid session budget")
         if self.cancelled is not None and not callable(self.cancelled):
             raise LiveAudioError("Invalid cancellation guard")
+        if self.report is not None and not callable(self.report):
+            raise LiveAudioError("Invalid diagnostic reporter")
         if self.provenance not in PROVENANCE:
             raise LiveAudioError("Invalid audio provenance")
         if (
@@ -569,16 +574,29 @@ def _transcribe(
 
 
 def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]]:
+    """The usable units of one whisper.cpp document; see `_counted_units`."""
+    return _counted_units(document, duration_ms)[0]
+
+
+def _counted_units(document: dict[str, Any], duration_ms: int) -> tuple[list[dict[str, Any]], int]:
     """Use complete token-derived word intervals; fall back to whole segments.
 
-    No majority speaker vote, guessed timestamps, dropped text, or splitting
-    a word between speakers. Zero-duration punctuation attaches to its word;
-    words with only zero-duration timestamps remain unassigned.
+    No majority speaker vote, guessed timestamps, or splitting a word between
+    speakers. Zero-duration punctuation attaches to its word; words with only
+    zero-duration timestamps remain unassigned.
+
+    A segment whose own offsets are unusable (not integers, negative, reversed,
+    zero-length, starting at or after the received audio, or ending more than the
+    CLI's one second of padding past it) is skipped and counted rather than ending
+    the live session: whisper.cpp produces such segments on short, noisy or
+    near-silent windows (#78). Returns the units and the number of skipped segments.
+    A malformed document structure still fails closed.
     """
     segments = document.get("transcription")
     if not isinstance(segments, list) or len(segments) > 1000:
         raise LiveAudioError("Invalid local recognizer result")
     result = []
+    skipped = 0
     for segment in segments:
         if not isinstance(segment, dict):
             raise LiveAudioError("Invalid local recognizer result")
@@ -594,7 +612,8 @@ def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]]:
             or not 0 <= start < end <= duration_ms + 1000
             or start >= duration_ms
         ):
-            raise LiveAudioError("Invalid local recognizer timestamp")
+            skipped += 1
+            continue
         # The pinned CLI rounds final segment offsets into its padded audio.
         # Bound evidence to actually received PCM; never invent future frames.
         end = min(end, duration_ms)
@@ -635,7 +654,7 @@ def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]]:
         usable &= reconstructed.strip() == text.strip()
         usable &= bool(words) and all(w["start_ms"] <= w["end_ms"] for w in words)
         result.extend(words if usable else [fallback])
-    return result
+    return result, skipped
 
 
 class WhisperCppTranscriber:
@@ -647,23 +666,33 @@ class WhisperCppTranscriber:
         if config.whisper_executable is None or config.whisper_model is None:
             raise LiveAudioError("Explicit existing runtimes and models are required")
         self.config = config
+        # Segments dropped by `_counted_units` this session; read by `LiveProcessor`.
+        self.skipped_segments = 0
 
     def transcribe(
         self, pcm: bytes, register: Callable[[subprocess.Popen], None] | None = None
     ) -> list[dict[str, Any]]:
         document = _transcribe(self.config, pcm, register)
-        return _units(document, len(pcm) // BYTES_PER_MS)
+        units, skipped = _counted_units(document, len(pcm) // BYTES_PER_MS)
+        self.skipped_segments += skipped
+        return units
 
 
-def _check_units(units: Any, duration_ms: int) -> None:
+def _checked_units(units: Any, duration_ms: int) -> tuple[list[dict[str, Any]], int]:
     """Enforce the `Transcriber` contract at the common boundary, whatever the backend.
 
     Units are dicts with `text` (str) and integer `start_ms`/`end_ms` with
-    `0 <= start_ms <= end_ms <= duration_ms`, non-decreasing in order. Anything else
-    fails closed like a malformed native document; nothing is clamped or reordered.
+    `0 <= start_ms <= end_ms <= duration_ms`, non-decreasing in order. A malformed
+    result structure (not a list, too many units, a unit that is not a dict with
+    string text) fails closed. A unit whose timestamps break the contract (not
+    integers, NaN, negative, reversed, past the utterance, or earlier than the unit
+    before it) is dropped and counted instead of ending the session (#78); nothing
+    is clamped or reordered, so the kept units satisfy the contract unchanged.
+    Returns the kept units and the number dropped.
     """
     if not isinstance(units, list) or len(units) > 4000:
         raise LiveAudioError("Invalid recognizer result")
+    kept = []
     previous_start = previous_end = 0
     for unit in units:
         if not isinstance(unit, dict) or not isinstance(unit.get("text"), str):
@@ -676,8 +705,10 @@ def _check_units(units: Any, duration_ms: int) -> None:
             or start < previous_start
             or end < previous_end
         ):
-            raise LiveAudioError("Invalid recognizer timestamp")
+            continue
+        kept.append(unit)
         previous_start, previous_end = start, end
+    return kept, len(units) - len(kept)
 
 
 def _select(value: Any, default: Callable[[LiveConfig], Any], config: LiveConfig, method: str):
@@ -714,11 +745,19 @@ class LiveProcessor:
         self._received_ms = 0
         self._counter = 0
         self._utterances = 0
+        self._skipped_units = 0
         self._asr_process: subprocess.Popen | None = None
 
     @property
     def received_ms(self) -> int:
         return self._received_ms
+
+    @property
+    def skipped_segments(self) -> int:
+        """Recognizer segments or units dropped this session for unusable timestamps."""
+        inner = getattr(self._transcriber, "skipped_segments", 0)
+        inner = inner if type(inner) is int and inner > 0 else 0
+        return self._skipped_units + inner
 
     @property
     def buffered_audio_bytes(self) -> int:
@@ -777,6 +816,7 @@ class LiveProcessor:
         offset = self._utterance_start
         self._utterance.clear()
         self._pre_roll.clear()
+        before = self.skipped_segments
         try:
             units = self._transcriber.transcribe(pcm, self._register_asr)
         finally:
@@ -785,7 +825,17 @@ class LiveProcessor:
             raise LiveAudioError("Audio session was stopped")
         provenance = getattr(self._diarizer, "speaker_provenance", "diarization-timeline")
         self._utterances += 1
-        _check_units(units, len(pcm) // BYTES_PER_MS)
+        units, dropped = _checked_units(units, len(pcm) // BYTES_PER_MS)
+        self._skipped_units += dropped
+        skipped = self.skipped_segments - before
+        if skipped and self.config.report is not None:
+            # Content-free: a count only, never recognizer text or timestamps. A failing
+            # diagnostic channel never ends the session.
+            with contextlib.suppress(Exception):
+                self.config.report(
+                    f"skipped {skipped} recognizer segment(s) with unusable timestamps; "
+                    "the session continues"
+                )
         # Units start at or after `offset`; a segment ending by then overlaps none of them,
         # so attribution scans only this utterance's part of the timeline.
         relevant = [segment for segment in timeline if segment["end_ms"] > offset]

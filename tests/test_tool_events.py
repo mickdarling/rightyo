@@ -114,6 +114,20 @@ class SpeechEventsTests(unittest.TestCase):
         self.events.end("cancelled", 3000)
         self.assertEqual(self.events.drain(), [])
 
+    def test_terminal_skipped_segments_is_optional_and_validated(self):
+        self.events.end("stopped", 2600)
+        self.assertNotIn("skipped_segments", self.events.drain()[-1])
+        for invalid in (0, -1, 1.0, True, "3"):
+            with self.subTest(value=invalid):
+                events = SpeechEvents()
+                events.start("skip-session")
+                with self.assertRaisesRegex(ContractError, "skipped_segments"):
+                    events.end("stopped", 10, skipped_segments=invalid)
+        events = SpeechEvents()
+        events.start("skip-session")
+        events.end("cancelled", 10, skipped_segments=3)
+        self.assertEqual(events.drain()[-1]["skipped_segments"], 3)
+
     def test_expiry_removes_stale_decisions_queued_text_and_prior_context(self):
         previous = turn("previous", 0, 500, "Old conversation.")
         request = turn()

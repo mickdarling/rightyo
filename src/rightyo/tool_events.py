@@ -515,7 +515,12 @@ class SpeechEvents:
                     self._payload(
                         "session",
                         after + 1,
-                        {"phase": "cancelled", "reason": "x" * 96, "role_status": "unavailable"},
+                        {
+                            "phase": "cancelled",
+                            "reason": "x" * 96,
+                            "role_status": "unavailable",
+                            "skipped_segments": 2**53 - 1,
+                        },
                     )
                 )
                 if self._queue_bytes + burst + reserve > MAX_QUEUE_BYTES:
@@ -601,11 +606,13 @@ class SpeechEvents:
             raise ContractError("request forming failed")
         return formed
 
-    def end(self, phase="cancelled", now_ms=0, reason=None, input_gaps=None):
+    def end(self, phase="cancelled", now_ms=0, reason=None, input_gaps=None, skipped_segments=None):
         with self._lock:
             if phase not in {"stopped", "cancelled", "error"}:
                 raise ContractError("invalid event terminal phase")
             integer(now_ms, "now_ms")
+            if skipped_segments is not None:
+                integer(skipped_segments, "skipped_segments", 1)
             if reason is not None:
                 identifier(reason, "reason")
             if input_gaps is not None:
@@ -638,6 +645,9 @@ class SpeechEvents:
                 **({"role_status": self.role_status} if self._priority is not None else {}),
                 # Stdin input only: audio dropped under back-pressure, never buffered unbounded.
                 **({} if input_gaps is None else {"input_gaps": input_gaps}),
+                # Live input only, and only when some were dropped (#78): recognizer
+                # segments skipped for unusable timestamps while the session continued.
+                **({} if skipped_segments is None else {"skipped_segments": skipped_segments}),
             )
 
     def drain(self):

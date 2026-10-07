@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import queue
+import select
 import signal
 import subprocess
 import tempfile
@@ -15,6 +16,8 @@ PCM_SAMPLE_RATE = 16_000
 PCM_SAMPLE_WIDTH = 2
 PCM_CHANNELS = 1
 PCM_CHUNK_BYTES = 6400
+# How often a descriptor-backed stdin reader rechecks stop while no input arrives.
+STDIN_POLL_SECONDS = 0.1
 
 
 class CaptureError(ValueError):
@@ -185,6 +188,15 @@ class StdinPcmCapture:
     and counted, reading stops, and the queued audio is followed by end of input with
     ``overrun`` set. No audio after a drop is ever delivered, so nothing is spliced
     across a gap. Otherwise EOF ends the input.
+
+    A stream with a file descriptor (stdin) is read with ``select`` and ``os.read`` on
+    that descriptor by a non-daemon thread that rechecks ``stop`` every
+    ``STDIN_POLL_SECONDS`` and is joined by ``stop()``. It never enters the stream's
+    ``BufferedReader``, so no thread holds the stdin buffer lock when the interpreter
+    finalizes (#74, #78: ``could not acquire lock for <stdin>`` aborted with SIGABRT,
+    exit 134, when a session ended while the host still held stdin open). Only a
+    stream without a usable descriptor (a test double) is read through its own
+    ``read1``/``read`` on a daemon thread, as before.
     """
 
     def __init__(self, stream, *, queue_chunks: int = 160, report=None):
@@ -204,8 +216,30 @@ class StdinPcmCapture:
     def start(self) -> None:
         if self._reader is not None or self._stopped.is_set():
             raise CaptureError("Stdin capture cannot be restarted")
-        self._reader = threading.Thread(target=self._receive, daemon=True)
+        descriptor = _descriptor(self._stream)
+        if descriptor is None:
+            read = getattr(self._stream, "read1", None) or self._stream.read
+            self._reader = threading.Thread(target=self._receive, args=(read,), daemon=True)
+        else:
+            self._reader = threading.Thread(
+                target=self._receive, args=(self._polled_reader(descriptor),), daemon=False
+            )
         self._reader.start()
+
+    def _polled_reader(self, descriptor: int):
+        """A read that waits in short polls, returning None once stop is requested."""
+
+        def read(limit: int) -> bytes | None:
+            while not self._stopped.is_set():
+                ready, _, _ = select.select([descriptor], [], [], STDIN_POLL_SECONDS)
+                if ready:
+                    try:
+                        return os.read(descriptor, limit)
+                    except BlockingIOError:
+                        continue  # A host-set O_NONBLOCK descriptor raced empty; poll again.
+            return None
+
+        return read
 
     def _offer(self, data: bytes) -> bool:
         """Queue one chunk without blocking; on a full queue drop ``data`` and overrun."""
@@ -219,13 +253,12 @@ class StdinPcmCapture:
                 self._report("stdin audio overran the processing queue; ending the session")
             return False
 
-    def _receive(self) -> None:
-        read = getattr(self._stream, "read1", None) or self._stream.read
+    def _receive(self, read) -> None:
         carry = b""
         try:
             while not self._stopped.is_set():
                 data = read(PCM_CHUNK_BYTES)
-                if self._stopped.is_set():
+                if data is None or self._stopped.is_set():
                     break
                 if not data:
                     tail = len(carry) % PCM_SAMPLE_WIDTH
@@ -262,13 +295,28 @@ class StdinPcmCapture:
     def stop(self) -> None:
         """Discard pending PCM; a reader blocked on the stream exits at its next read.
 
-        A blocking read cannot be interrupted portably, so the stream belongs to this
-        capture alone: whatever the stopped reader still reads is discarded, never
+        A descriptor-backed reader notices stop within ``STDIN_POLL_SECONDS`` and is
+        joined here, so it has exited before the interpreter can finalize. A test
+        double's blocking read cannot be interrupted portably, so the stream belongs to
+        this capture alone: whatever the stopped reader still reads is discarded, never
         queued, and the controller refuses to start another session on that stream.
         """
         self._stopped.set()
+        reader = self._reader
+        if reader is not None and not reader.daemon and reader is not threading.current_thread():
+            reader.join(timeout=2)
         while True:
             try:
                 self._queue.get_nowait()
             except queue.Empty:
                 break
+
+
+def _descriptor(stream) -> int | None:
+    """The stream's OS file descriptor when it can be polled, otherwise None."""
+    try:
+        descriptor = stream.fileno()
+        select.select([descriptor], [], [], 0)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+    return descriptor if isinstance(descriptor, int) else None

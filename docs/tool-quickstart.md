@@ -76,6 +76,21 @@ No audio after the drop reaches speech recognition or the diarizer, so speech is
 spliced across a gap and speaker labels stay consistent for the session.
 A notice goes to stderr. The terminal session event of every stdin session carries
 `input_gaps` (`gaps`, 0 or 1; `dropped_bytes`; `discarded_tail_bytes`).
+When the host stops a session while it still holds stdin open (SIGTERM, or a session
+that ends on an error), the reader notices within 0.1 s and is joined before exit; it reads
+the descriptor directly, so interpreter shutdown no longer aborts on the stdin buffer lock
+([#74](https://github.com/mickdarling/rightyo/issues/74)). SIGTERM exits 0 with
+`cancelled`, an `error` terminal exits 2.
+
+A recognizer segment or word unit with unusable timestamps (not an integer, negative,
+reversed, zero-length, outside the utterance, or earlier than the one before it) is dropped
+rather than ending the session
+([#78](https://github.com/mickdarling/rightyo/issues/78)). A whisper.cpp segment that
+overruns the received audio by at most its one second of padding is clamped as before.
+Each affected utterance writes a count-only notice to stderr, and the terminal session
+event of a live session carries an optional `skipped_segments` count when any were
+dropped; it is absent otherwise. A malformed recognizer result structure still ends the
+session with `error`.
 
 Repeatable `--name` flags (for example `--name "Hailing Station" --name computer`) declare
 the forms of address the system answers to for `listen`, `tool-replay` and `prototype`. They

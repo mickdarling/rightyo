@@ -269,6 +269,9 @@ class PrototypeController:
         self.audio_provenance = audio_provenance
         self.report = report
         self._stdin_capture: StdinPcmCapture | None = None
+        # The current session's processor, kept until the next start (like the stdin
+        # capture) so the terminal event can report its skipped recognizer segments.
+        self._session_processor = None
         # The stream is consumed by one session only. A stopped session's reader may
         # still be blocked in a read it cannot be interrupted from; it discards whatever
         # it reads, so no later session may share the stream with it.
@@ -471,6 +474,7 @@ class PrototypeController:
             self._request_limit = budget
             self._mode = mode
             self._stdin_capture = None
+            self._session_processor = None
             self._stdin_used = self._stdin_used or mode == "stdin"
             self._error = None
             self._decision_status = "ready" if hosted else "off"
@@ -539,6 +543,7 @@ class PrototypeController:
                         else "causal-replay"
                     ),
                     cancelled=stop.is_set,
+                    report=self.report,
                     session_budget_ms=self._budget_ms,
                     transcriber=transcriber_factory(
                         self.config.transcriber, allow_hosted=self.allow_hosted_speech
@@ -552,7 +557,7 @@ class PrototypeController:
             with self._lock:
                 if generation != self._generation or stop.is_set():
                     return
-                self._processor = processor
+                self._processor = self._session_processor = processor
             if mode == "microphone":
                 capture = self.capture_factory(self.config.microphone_helper)
                 with self._lock:
@@ -950,7 +955,14 @@ class PrototypeController:
                     "dropped_bytes": capture.dropped_bytes,
                     "discarded_tail_bytes": capture.discarded_tail_bytes,
                 }
-            self._events.end(phase=phase, now_ms=self._now_ms(), reason=reason, input_gaps=gaps)
+            skipped = getattr(self._session_processor, "skipped_segments", 0)
+            self._events.end(
+                phase=phase,
+                now_ms=self._now_ms(),
+                reason=reason,
+                input_gaps=gaps,
+                skipped_segments=skipped if type(skipped) is int and skipped > 0 else None,
+            )
             self._event_terminal = True
 
     @property

@@ -28,11 +28,16 @@ The events are:
 
 | Type | Additional fields | Meaning |
 | --- | --- | --- |
-| `session` | `phase`, initial `capabilities`, optional terminal `reason` | `started`, `stopped`, `cancelled`, or `error` |
+| `session` | `phase`, initial `capabilities`, optional terminal `reason`, optional terminal `skipped_segments` | `started`, `stopped`, `cancelled`, or `error` |
 | `transcript` | `turn` | One immutable finalized transcript turn |
 | `attention` | `utterance_id`, `speech_end_ms`, `decision`, optional `request_id` | `attend`, `ignore`, or `uncertain` evidence |
 | `request` | `request_id`, `turn`, `decision`, `context`, `decision_at_ms`, optional `formed_request` | Complete attended input available for host handling |
 | `override` | `superseded_request_id`, `by_utterance_id`, `role` | An owner's turn supersedes an earlier open non-owner request |
+
+A live session's terminal `session` event carries `skipped_segments`, a positive count of
+recognizer segments or word units dropped for unusable timestamps while the session kept
+listening ([#78](https://github.com/mickdarling/rightyo/issues/78)); it is absent when
+none were dropped, so authored fixtures are unchanged.
 
 Initial capabilities declare `activation: "finalized-turn"` when decisions are
 available, or `"disabled"` for transcription-only listening, `partials: false`,
