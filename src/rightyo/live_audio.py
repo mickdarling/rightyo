@@ -910,6 +910,9 @@ class LiveProcessor:
             with contextlib.suppress(Exception):
                 self.config.report(message + "; the session continues")
         if suppressed:
+            # A held turn must not be joined across the suppressed utterance to a later
+            # one ("Do not stop." published as "Do stop."): release it on its own now.
+            self._merger.flush()
             return
         units = checked
         # Units start at or after `offset`; a segment ending by then overlaps none of them,
