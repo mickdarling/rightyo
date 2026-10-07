@@ -658,27 +658,39 @@ class ConservativeAlignmentTests(unittest.TestCase):
             self.assertNotIn("private transcript", str(caught.exception))
             self.assertNotIn(json.dumps(bad), str(caught.exception))
 
-    def test_unusable_segment_timestamps_are_skipped_and_counted_not_fatal(self):
-        # #78: whisper.cpp emits such segments on short, noisy or near-silent windows.
+    def test_an_unusable_segment_suppresses_the_whole_utterance(self):
+        # #78: publishing the other segments could invert meaning ("Do stop."), and
+        # dropping the last one truncates it; the caller suppresses the utterance.
         for name, start, end in (
             ("negative start", -1, 20),
-            ("zero length", 100, 100),
             ("reversed", 150, 100),
-            ("starts after the received audio", 200, 300),
-            ("ends past the padding", 0, 200 + 1001),
-            ("float offsets", 0.0, 100),
-            ("NaN offsets", float("nan"), 100),
+            ("starts after the received audio", 1001, 1100),
+            ("ends past the padding", 300, 1000 + 1001),
+            ("float offsets", 300.0, 400),
+            ("NaN offsets", float("nan"), 400),
             ("missing offsets", None, None),
         ):
-            with self.subTest(case=name):
-                value = document(0, 100, " Kept.")
-                value["transcription"].append(
-                    {"text": " Dropped.", "offsets": {"from": start, "to": end}}
-                )
-                self.assertEqual(
-                    _counted_units(value, 200),
-                    ([{"text": " Kept.", "start_ms": 0, "end_ms": 100}], 1),
-                )
+            for position in ("middle", "final"):
+                with self.subTest(case=name, position=position):
+                    bad = {"text": " not", "offsets": {"from": start, "to": end}}
+                    value = document(0, 300, " Do")
+                    tail = {"text": " stop.", "offsets": {"from": 300, "to": 800}}
+                    segments = [bad, tail] if position == "middle" else [tail, bad]
+                    value["transcription"].extend(segments)
+                    self.assertEqual(_counted_units(value, 1000), (None, 1))
+
+    def test_in_range_zero_length_segment_is_kept_in_order(self):
+        value = document(0, 300, " Do")
+        value["transcription"] += [
+            {"text": " not", "offsets": {"from": 300, "to": 300}},
+            {"text": " stop.", "offsets": {"from": 300, "to": 800}},
+            {"text": " Now", "offsets": {"from": 1000, "to": 1000}},  # at the very end
+        ]
+        units, skipped = _counted_units(value, 1000)
+        self.assertEqual(skipped, 0)
+        self.assertEqual("".join(u["text"] for u in units), " Do not stop. Now")
+        self.assertEqual(units[1], {"text": " not", "start_ms": 300, "end_ms": 300})
+        self.assertEqual(units[3], {"text": " Now", "start_ms": 1000, "end_ms": 1000})
 
     def test_out_of_order_word_timing_falls_back_to_the_whole_segment(self):
         # "not" ends before "do" does: word units would let a boundary drop "not".
@@ -699,18 +711,26 @@ class ConservativeAlignmentTests(unittest.TestCase):
             ([{"text": " Hello.", "start_ms": 50, "end_ms": 200}], 0),
         )
 
-    def test_whisper_transcriber_counts_skipped_segments_across_the_session(self):
+    def test_whisper_suppresses_a_bad_utterance_and_keeps_listening(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         path = Path(directory.name) / "supplied-local-runtime"
         path.touch()
         config = LiveConfig("skip-test", path, path, path, path, provenance="causal-replay")
-        bad = document(0, 100, " Kept.")
-        bad["transcription"].append({"text": " Dropped.", "offsets": {"from": 90, "to": 90}})
+        bad = document(0, 60, " Do")
+        bad["transcription"] += [
+            {"text": " not", "offsets": {"from": -5, "to": 80}},
+            {"text": " stop.", "offsets": {"from": 80, "to": 160}},
+        ]
+        good = document(0, 60, " Do")
+        good["transcription"] += [
+            {"text": " not", "offsets": {"from": 60, "to": 60}},
+            {"text": " stop.", "offsets": {"from": 60, "to": 160}},
+        ]
         turns, reports = [], []
         with (
             patch("rightyo.live_audio._Diarizer", FakeDiarizer),
-            patch("rightyo.live_audio._transcribe", side_effect=[bad, document(0, 100)]),
+            patch("rightyo.live_audio._transcribe", side_effect=[bad, good]),
         ):
             processor = LiveProcessor(
                 LiveConfig(**{**config.__dict__, "report": reports.append}), turns.append
@@ -722,10 +742,20 @@ class ConservativeAlignmentTests(unittest.TestCase):
                     processor.push_pcm16(SILENCE)
             processor.finish()
         self.assertFalse(processor.failed)
-        self.assertEqual([t.text for t in turns], ["Kept.", "Hello."])
+        # Nothing from the bad utterance; the next one keeps every word, in order. (The
+        # zero-length "not" has no speaker overlap, so it is its own unlabelled turn,
+        # as zero-duration whisper words already are.)
+        self.assertEqual(" ".join(t.text for t in turns), "Do not stop.")
+        self.assertGreater(turns[0].start_ms, 1000)  # All from the second utterance.
         self.assertEqual(processor.skipped_segments, 1)
-        self.assertEqual(len(reports), 1)
-        self.assertNotIn("Dropped", reports[0])
+        self.assertEqual(processor.skipped_utterances, 1)
+        self.assertEqual(
+            reports,
+            [
+                "suppressed 1 utterance with invalid or out-of-order recognizer timestamps "
+                "(1 recognizer segment(s) with unusable timestamps); the session continues"
+            ],
+        )
 
     def test_reporter_must_be_callable(self):
         with self.assertRaisesRegex(LiveAudioError, "reporter"):

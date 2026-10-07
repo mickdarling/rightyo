@@ -574,24 +574,30 @@ def _transcribe(
             raise LiveAudioError("Local recognizer failed") from None
 
 
-def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]]:
-    """The usable units of one whisper.cpp document; see `_counted_units`."""
+def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]] | None:
+    """The usable units of one whisper.cpp document, or None; see `_counted_units`."""
     return _counted_units(document, duration_ms)[0]
 
 
-def _counted_units(document: dict[str, Any], duration_ms: int) -> tuple[list[dict[str, Any]], int]:
+def _counted_units(
+    document: dict[str, Any], duration_ms: int
+) -> tuple[list[dict[str, Any]] | None, int]:
     """Use complete token-derived word intervals; fall back to whole segments.
 
     No majority speaker vote, guessed timestamps, or splitting a word between
     speakers. Zero-duration punctuation attaches to its word; words with only
     zero-duration timestamps remain unassigned.
 
-    A segment whose own offsets are unusable (not integers, negative, reversed,
-    zero-length, starting at or after the received audio, or ending more than the
-    CLI's one second of padding past it) is skipped and counted rather than ending
-    the live session: whisper.cpp produces such segments on short, noisy or
-    near-silent windows (#78). Returns the units and the number of skipped segments.
-    A malformed document structure still fails closed.
+    whisper.cpp emits odd offsets on short, noisy or near-silent windows (#78). A
+    zero-length segment with text inside the received audio (`start == end <=
+    duration`) is kept as a zero-length unit, so its words stay in place. Any other
+    segment whose own offsets are unusable (not integers, negative, reversed,
+    starting after the received audio, or ending more than the CLI's one second of
+    padding past it) makes the whole utterance unusable: publishing the remaining
+    segments could invert meaning ("do not stop" becoming "do stop"). Returns
+    `(None, n)` then, with `n` the number of unusable segments, so the caller
+    suppresses the utterance and keeps listening; otherwise `(units, 0)`. A
+    malformed document structure still fails closed.
     """
     segments = document.get("transcription")
     if not isinstance(segments, list) or len(segments) > 1000:
@@ -607,6 +613,10 @@ def _counted_units(document: dict[str, Any], duration_ms: int) -> tuple[list[dic
         if not text.strip():
             continue
         start, end = offsets.get("from"), offsets.get("to")
+        if type(start) is int and type(end) is int and 0 <= start == end <= duration_ms:
+            # In range but zero-length: keep the text in order as a zero-length unit.
+            result.append({"text": text, "start_ms": start, "end_ms": end})
+            continue
         if (
             type(start) is not int
             or type(end) is not int
@@ -661,7 +671,7 @@ def _counted_units(document: dict[str, Any], duration_ms: int) -> tuple[list[dic
             for a, b in zip(words, words[1:])
         )
         result.extend(words if usable else [fallback])
-    return result, skipped
+    return (None if skipped else result), skipped
 
 
 class WhisperCppTranscriber:
@@ -673,8 +683,10 @@ class WhisperCppTranscriber:
         if config.whisper_executable is None or config.whisper_model is None:
             raise LiveAudioError("Explicit existing runtimes and models are required")
         self.config = config
-        # Segments dropped by `_counted_units` this session; read by `LiveProcessor`.
+        # Unusable segments, and the utterances they suppressed, this session (see
+        # `_counted_units`); read by `LiveProcessor`.
         self.skipped_segments = 0
+        self.suppressed_utterances = 0
 
     def transcribe(
         self, pcm: bytes, register: Callable[[subprocess.Popen], None] | None = None
@@ -682,6 +694,10 @@ class WhisperCppTranscriber:
         document = _transcribe(self.config, pcm, register)
         units, skipped = _counted_units(document, len(pcm) // BYTES_PER_MS)
         self.skipped_segments += skipped
+        if units is None:
+            # The whole utterance is unusable: publish nothing from it.
+            self.suppressed_utterances += 1
+            return []
         return units
 
 
@@ -768,8 +784,14 @@ class LiveProcessor:
 
     @property
     def skipped_utterances(self) -> int:
-        """Utterances suppressed whole this session for invalid or out-of-order units."""
-        return self._skipped_utterances
+        """Utterances suppressed whole this session for invalid or out-of-order timing.
+
+        Counts the common unit check's suppressions plus a transcriber's own (whisper.cpp
+        suppresses an utterance with an unusable segment before the unit check).
+        """
+        inner = getattr(self._transcriber, "suppressed_utterances", 0)
+        inner = inner if type(inner) is int and inner > 0 else 0
+        return self._skipped_utterances + inner
 
     @property
     def buffered_audio_bytes(self) -> int:
@@ -828,7 +850,7 @@ class LiveProcessor:
         offset = self._utterance_start
         self._utterance.clear()
         self._pre_roll.clear()
-        before = self.skipped_segments
+        before = (self.skipped_segments, self.skipped_utterances)
         try:
             units = self._transcriber.transcribe(pcm, self._register_asr)
         finally:
@@ -840,20 +862,22 @@ class LiveProcessor:
         checked = _checked_units(units, len(pcm) // BYTES_PER_MS)
         if checked is None:
             self._skipped_utterances += 1
-        skipped = self.skipped_segments - before
-        if (skipped or checked is None) and self.config.report is not None:
+        skipped = self.skipped_segments - before[0]
+        suppressed = self.skipped_utterances > before[1]
+        if (skipped or suppressed) and self.config.report is not None:
             # Content-free: counts only, never recognizer text or timestamps. A failing
             # diagnostic channel never ends the session.
-            with contextlib.suppress(Exception):
-                self.config.report(
-                    (
-                        "suppressed 1 utterance with invalid or out-of-order recognizer timestamps"
-                        if checked is None
-                        else f"skipped {skipped} recognizer segment(s) with unusable timestamps"
-                    )
-                    + "; the session continues"
+            segments = f"{skipped} recognizer segment(s) with unusable timestamps"
+            if suppressed:
+                message = (
+                    "suppressed 1 utterance with invalid or out-of-order recognizer timestamps"
                 )
-        if checked is None:
+                message += f" ({segments})" if skipped else ""
+            else:
+                message = f"skipped {segments}"
+            with contextlib.suppress(Exception):
+                self.config.report(message + "; the session continues")
+        if suppressed:
             return
         units = checked
         # Units start at or after `offset`; a segment ending by then overlaps none of them,
