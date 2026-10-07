@@ -213,11 +213,14 @@ class MockProvider:
     def decide(self, state: dict[str, Any]) -> ProviderDecision:
         current = state["current_turn"]
         text = current["text"].strip().lower()
-        names = (state_addressing(state) or MOCK_DEFAULT_ADDRESSING).names
-        prefixes = tuple(name.lower() + mark for name in names for mark in (",", ":"))
+        addressing = state_addressing(state) or MOCK_DEFAULT_ADDRESSING
+        # A configured name or variant, then a comma or colon, opens the turn. Names hold
+        # neither mark, so the text before the first one is the candidate name.
+        marks = [index for index in (text.find(","), text.find(":")) if index > 0]
+        addressed = bool(marks) and addressing.name_for(text[: min(marks)]) is not None
         recipient, label = "unknown", "uncertain"
         if not current["overlap"] and not state["playback_active"]:
-            if text.startswith(prefixes):
+            if addressed:
                 recipient, label = "system", "attend"
             elif text.startswith("speaker ") and "," in text:
                 recipient, label = "other_human", "ignore"
@@ -229,7 +232,15 @@ def addressing_guidance(addressing: Addressing | None) -> str:
     """Prompt text naming the configured forms of address; empty when none are configured."""
     if addressing is None:
         return ""
-    names = ", ".join(f'"{name}"' for name in addressing.names)
+
+    def described(name: str) -> str:
+        spellings = addressing.spellings(name)
+        if not spellings:
+            return f'"{name}"'
+        heard = ", ".join(f'"{spelling}"' for spelling in spellings)
+        return f'"{name}" (speech recognition may also write it as {heard})'
+
+    names = ", ".join(described(name) for name in addressing.names)
     return (
         f" The system answers to the names: {names}. Speech using one of these names is "
         "evidence of addressing the system, but a name alone is not required; judge the "

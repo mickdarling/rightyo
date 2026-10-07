@@ -31,6 +31,7 @@ from typing import Any, Callable
 
 from .contracts import PROVENANCE, Turn, identifier, utterance_scoped_speaker
 from .providers import Diarizer, Transcriber
+from .turn_merge import TurnMerger, merge_gap
 
 SAMPLE_RATE = 16000
 FRAME_BYTES = 640  # 20 ms of mono signed little-endian PCM16
@@ -87,9 +88,22 @@ class LiveConfig:
     # selects the local whisper.cpp recognizer and Nemotron native stream.
     transcriber: Transcriber | Callable[[LiveConfig], Transcriber] | None = None
     diarizer: Diarizer | Callable[[LiveConfig], Diarizer] | None = None
+    # Join a speaker's next finalized turn into the previous one when it starts within
+    # this many stream milliseconds (#73). 0, the library default, emits every turn at
+    # once as before; `listen` and the lab pass their configured gap.
+    turn_merge_gap_ms: int = 0
+    # Text predicate for a fragment that must stay a turn of its own and is never joined
+    # or held, such as an owner stop phrase matched against a whole turn downstream.
+    turn_break: Callable[[str], bool] | None = None
 
     def __post_init__(self) -> None:
         identifier(self.session_id, "session_id")
+        try:
+            merge_gap(self.turn_merge_gap_ms)
+        except ValueError:
+            raise LiveAudioError("Invalid turn merge gap") from None
+        if self.turn_break is not None and not callable(self.turn_break):
+            raise LiveAudioError("Invalid turn break predicate")
         _check_backend(self.transcriber, "transcribe", "transcriber")
         _check_backend(self.diarizer, "push", "diarizer")
         if self.session_budget_ms is not None and (
@@ -771,6 +785,11 @@ class LiveProcessor:
         self._utterances = 0
         self._skipped_utterances = 0
         self._asr_process: subprocess.Popen | None = None
+        # A joined turn spans at most two full utterance windows, so a long monologue
+        # with short pauses is still decided in bounded time.
+        self._merger = TurnMerger(
+            config.turn_merge_gap_ms, 2 * config.max_utterance_ms, self._emit, config.turn_break
+        )
 
     @property
     def received_ms(self) -> int:
@@ -841,6 +860,19 @@ class LiveProcessor:
                 self._finalize(self._diarizer.segments())
         else:
             self._pre_roll.append(frame)
+        if self._merger.holding:
+            self._merger.due(self._received_ms, self._utterance_start if self._utterance else None)
+
+    def release_pending(self) -> None:
+        """Emit a turn held for a possible continuation now, for example when input stalls."""
+        if self.closed or self.failed:
+            return
+        try:
+            self._merger.flush()
+        except Exception:
+            self.failed = True
+            self.close()
+            raise
 
     def _finalize(self, timeline: list[dict[str, Any]]) -> None:
         if not self._utterance:
@@ -908,22 +940,28 @@ class LiveProcessor:
             text = group["text"].strip()
             if not text:
                 continue
-            self._counter += 1
-            turn = Turn(
-                session_id=self.config.session_id,
-                utterance_id=f"live-{self._counter}",
-                revision=1,
-                start_ms=group["start_ms"],
-                end_ms=group["end_ms"],
-                text=text,
-                speaker_id=group["speaker"],
-                finalized=True,
-                overlap=group["overlap"],
-                recognizer_id=self._transcriber.recognizer_id,
-                provenance=self.config.provenance,
-                speaker_provenance=provenance if timeline else "unknown",
-            )
-            self.on_turn(turn)
+            group["text"] = text
+            group["speaker_provenance"] = provenance if timeline else "unknown"
+            self._merger.offer(group)
+
+    def _emit(self, group: dict[str, Any]) -> None:
+        """Number and emit one finalized (possibly joined) turn; ids follow emission order."""
+        self._counter += 1
+        turn = Turn(
+            session_id=self.config.session_id,
+            utterance_id=f"live-{self._counter}",
+            revision=1,
+            start_ms=group["start_ms"],
+            end_ms=group["end_ms"],
+            text=group["text"],
+            speaker_id=group["speaker"],
+            finalized=True,
+            overlap=group["overlap"],
+            recognizer_id=self._transcriber.recognizer_id,
+            provenance=self.config.provenance,
+            speaker_provenance=group["speaker_provenance"],
+        )
+        self.on_turn(turn)
 
     def finish(self) -> None:
         if self.closed:
@@ -940,6 +978,7 @@ class LiveProcessor:
             # diarizer must not send audio that no turn will use.
             if self._utterance:
                 self._finalize(self._diarizer.finish())
+            self._merger.flush()
         except Exception:
             self.failed = True
             raise
@@ -958,6 +997,9 @@ class LiveProcessor:
         self.closed = True
         if self._asr_process is not None:
             _terminate(self._asr_process)
+        # Cancellation discards a turn still held for a continuation, like the open
+        # utterance; `finish` and `release_pending` emit it instead.
+        self._merger.discard()
         self._partial.clear()
         self._pre_roll.clear()
         self._utterance.clear()

@@ -25,6 +25,9 @@ def utterance_scoped_speaker(utterance: int, label: str) -> str:
 MAX_TEXT_CHARS = 4000
 MAX_ADDRESS_NAMES = 8
 MAX_ADDRESS_NAME_CHARS = 48
+MAX_NAME_VARIANTS = 8
+MAX_TOTAL_NAME_VARIANTS = 32
+_NAME_KEY_SEPARATORS = re.compile(r"[^0-9a-z]+")
 _ADDRESS_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,%d}" % (MAX_ADDRESS_NAME_CHARS - 1))
 # Speaker roles are allowlisted literals that describe precedence inside RightyO. They
 # are configuration or model output, never authentication, and unlock nothing downstream.
@@ -97,40 +100,102 @@ def probability(value: Any) -> float:
     return float(value)
 
 
+def name_key(text: str) -> str:
+    """Casefolded ASCII letters and digits only, so "Righty-O" and "righty o" compare equal."""
+    return _NAME_KEY_SEPARATORS.sub("", text.casefold())
+
+
 @dataclass(frozen=True)
 class Addressing:
     """Names the system answers to, supplied at runtime and never hard-coded.
 
     A name is evidence of addressing, not a requirement or a transcript filter; the
     decision provider still judges the addressee from the complete turn and context.
+
+    `variants` optionally lists, per name, other spellings a speech recognizer is known
+    to produce for it (#72), as `((name, (variant, ...)), ...)`. They are evidence of the
+    same name, never a separate name, and are configuration, not a built-in list.
     """
 
     names: tuple[str, ...]
+    variants: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.names) is not tuple or not 1 <= len(self.names) <= MAX_ADDRESS_NAMES:
             raise ContractError(f"addressing requires between 1 and {MAX_ADDRESS_NAMES} names")
+        # Matching ignores case, spaces and punctuation (`name_key`), so uniqueness does
+        # too: "Righty O" and "RightyO" would be the same name to every matcher.
         seen = set()
         for name in self.names:
-            folded = address_name(name).casefold()
-            if folded in seen:
+            key = name_key(address_name(name))
+            if key in seen:
                 raise ContractError("duplicate address name")
-            seen.add(folded)
+            seen.add(key)
+        if type(self.variants) is not tuple:
+            raise ContractError("invalid address name variants")
+        owners = set()
+        total = 0
+        for entry in self.variants:
+            if type(entry) is not tuple or len(entry) != 2 or type(entry[1]) is not tuple:
+                raise ContractError("invalid address name variants")
+            name, spellings = entry
+            if not isinstance(name, str) or name not in self.names or name in owners:
+                raise ContractError("address name variants must name a configured name once")
+            owners.add(name)
+            if not 1 <= len(spellings) <= MAX_NAME_VARIANTS:
+                raise ContractError(f"each name takes between 1 and {MAX_NAME_VARIANTS} variants")
+            total += len(spellings)
+            for spelling in spellings:
+                key = name_key(address_name(spelling))
+                if key in seen:
+                    raise ContractError("duplicate address name")
+                seen.add(key)
+        if total > MAX_TOTAL_NAME_VARIANTS:
+            raise ContractError(f"at most {MAX_TOTAL_NAME_VARIANTS} address name variants")
 
     @classmethod
-    def from_names(cls, names: Any) -> Addressing:
+    def from_names(cls, names: Any, variants: Any = None) -> Addressing:
         if isinstance(names, (str, bytes)) or not isinstance(names, (list, tuple)):
             raise ContractError("addressing names must be a list")
-        return cls(tuple(names))
+        if variants is None:
+            return cls(tuple(names))
+        if not isinstance(variants, dict) or not all(
+            isinstance(spellings, list) for spellings in variants.values()
+        ):
+            raise ContractError("address name variants must map names to lists")
+        return cls(
+            tuple(names),
+            tuple((name, tuple(spellings)) for name, spellings in variants.items()),
+        )
 
     @classmethod
     def from_dict(cls, raw: Any) -> Addressing:
-        if not isinstance(raw, dict) or set(raw) != {"names"}:
-            raise ContractError("addressing must be an object with only names")
-        return cls.from_names(raw["names"])
+        if not isinstance(raw, dict) or "names" not in raw or set(raw) - {"names", "variants"}:
+            raise ContractError("addressing must be an object with names and optional variants")
+        if "variants" in raw and raw["variants"] is None:
+            raise ContractError("address name variants must map names to lists")
+        return cls.from_names(raw["names"], raw.get("variants"))
+
+    def spellings(self, name: str) -> tuple[str, ...]:
+        """The configured variants of one name, or none."""
+        return next((spellings for owner, spellings in self.variants if owner == name), ())
+
+    def name_for(self, phrase: str) -> str | None:
+        """The configured name a whole phrase spells, by name or variant, ignoring case,
+        spaces and punctuation; None when it spells none of them."""
+        key = name_key(phrase)
+        if not key:
+            return None
+        for name in self.names:
+            if key in {name_key(spelling) for spelling in (name, *self.spellings(name))}:
+                return name
+        return None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"names": list(self.names)}
+        result: dict[str, Any] = {"names": list(self.names)}
+        if self.variants:
+            result["variants"] = {name: list(spellings) for name, spellings in self.variants}
+        return result
 
 
 # A formed request is a convenience rendering of the raw turns for hosts that cannot

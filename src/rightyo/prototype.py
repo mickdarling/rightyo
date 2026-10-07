@@ -55,6 +55,7 @@ from rightyo.speech_backends import (
     transcriber_spec,
     utterance_local_labels,
 )
+from rightyo.turn_merge import DEFAULT_TURN_MERGE_GAP_MS, merge_gap
 
 BROWSER_LEASE_SECONDS = 15
 # Jev requests per demo session unless the session or configuration sets a cap. Live
@@ -164,6 +165,9 @@ class PrototypeConfig:
     # The section's optional `max_requests`: a per-session Jev request cap for sessions
     # that set none themselves (`listen`). None leaves live sessions uncapped (#75).
     decision_max_requests: int | None = None
+    # The optional `turns` section's `merge_gap_ms` (#73): a same-speaker turn starting
+    # within this gap of the previous one is joined before it is emitted or decided.
+    turn_merge_gap_ms: int = DEFAULT_TURN_MERGE_GAP_MS
 
     @property
     def hosted_speech(self) -> bool:
@@ -200,6 +204,7 @@ class PrototypeConfig:
                 "speakers",
                 "session_budget_seconds",
                 "request_former",
+                "turns",
                 *LOCAL_ASSETS,
             }
             if raw.keys() - required - optional:
@@ -214,6 +219,10 @@ class PrototypeConfig:
             forming = raw.pop("request_former", None)
             if forming is not None:
                 forming = RequestForming.from_dict(forming)
+            turns = raw.pop("turns", {})
+            if not isinstance(turns, dict) or set(turns) - {"merge_gap_ms"}:
+                raise ValueError
+            gap = merge_gap(turns.get("merge_gap_ms", DEFAULT_TURN_MERGE_GAP_MS))
             values = {}
             for name, value in raw.items():
                 if not isinstance(value, str) or not value or not Path(value).is_absolute():
@@ -231,6 +240,7 @@ class PrototypeConfig:
                 diarizer=diarizer,
                 hosted_decisions=hosted_decisions,
                 decision_max_requests=decision_requests,
+                turn_merge_gap_ms=gap,
             )
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
@@ -241,6 +251,13 @@ class PrototypeConfig:
             raise PrototypeError(
                 "Prototype requires an existing local asset configuration"
             ) from None
+
+
+def _release_pending(processor) -> None:
+    # Alternative processors need not hold turns back; only call the hook when present.
+    release = getattr(processor, "release_pending", None)
+    if release is not None:
+        release()
 
 
 class PrototypeController:
@@ -551,6 +568,10 @@ class PrototypeController:
                     diarizer=diarizer_factory(
                         self.config.diarizer, allow_hosted=self.allow_hosted_speech
                     ),
+                    turn_merge_gap_ms=self.config.turn_merge_gap_ms,
+                    # Stop phrases are matched against a whole turn, so joining must
+                    # never absorb one; the defaults apply when roles are off.
+                    turn_break=(self.config.speakers or SpeakerPriority()).is_stop_phrase,
                 ),
                 lambda turn: self._accept(generation, work, memory, turn),
             )
@@ -569,6 +590,8 @@ class PrototypeController:
                     pcm = capture.read(timeout=0.25)
                     if pcm:
                         self._feed(generation, processor, pcm, mode)
+                    else:
+                        _release_pending(processor)
             elif mode == "stdin":
                 capture = StdinPcmCapture(self.audio_input, report=self.report)
                 with self._lock:
@@ -586,9 +609,16 @@ class PrototypeController:
                         break
                     if pcm:
                         accepted = self._feed(generation, processor, pcm, mode)
+                    else:
+                        # No audio arrived for a read timeout: stream time cannot reach
+                        # a held turn's merge deadline, so emit it rather than wait.
+                        _release_pending(processor)
                 if accepted and not stop.is_set():
                     if not capture.overrun:
                         processor.finish()
+                    else:
+                        # Turns finalized before the drop stand, including a held one.
+                        _release_pending(processor)
                     with self._lock:
                         # The flush can itself end the session (an attention backlog
                         # records an error terminal and sets stop); never overwrite that.
@@ -695,6 +725,9 @@ class PrototypeController:
             self._phase = "listening" if self._live() else "replaying"
         processor.push_pcm16(pcm)
         if boundary:
+            # The budget discards the open utterance, but a turn already finalized and
+            # held for a possible continuation stands.
+            _release_pending(processor)
             # Publish only after the boundary audio is processed, so the timer cannot
             # stop the session before that final push completes.
             with self._lock:

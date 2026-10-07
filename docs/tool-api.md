@@ -73,6 +73,26 @@ keeps its authored `Rightyo,` prefix when nothing is configured. Without
 configuration the field is absent and the existing `capabilities` set is
 unchanged; no name is built into the tool.
 
+The configuration's `addressing` object may also list `variants`: other spellings a
+speech recognizer is known to produce for a configured name
+([#72](https://github.com/mickdarling/rightyo/issues/72)), for example
+`"addressing": {"names": ["RightyO"], "variants": {"RightyO": ["Righty O", "Right Isle"]}}`.
+Each key must be one of the configured names, each name takes one to eight variants,
+with at most 32 in all, and every variant follows the name rules above. Names and
+variants must all differ from one another ignoring case, spaces and punctuation, the
+same comparison the matching uses, so `Righty O` and `RightyO` cannot both be listed. Variants are advertised
+inside the same `addressing` object on the `started` event, and the decision provider is
+told that speech recognition may write the name that way; they are evidence of the same
+name, never a separate name or a transcript filter. The mock fixture rule compares the
+text before the first comma or colon with each name and variant, ignoring case, spaces
+and punctuation, so `Righty O,` and `righty-o:` match `RightyO`. `--name` flags replace
+the whole object, variants included. No variant list is built into the tool; the
+spellings a recognizer produces depend on the model and the speakers, so collect them
+from your own sessions. A variant that is a common word or another person's name (a
+short given name, for example) raises false attends whenever someone simply says it, so
+prefer variants that are rare in your conversations and review attended requests after
+adding one.
+
 A transcript precedes its decision. For an accepted system-addressed request,
 attention precedes request delivery and both reference the same `request_id`.
 Decisions may arrive after later transcripts. Receivers correlate identities rather
@@ -181,6 +201,54 @@ request. Drain continuously and start a new bounded session when necessary.
 discussion, ignored attention, an attended retrospective request with prior context,
 and normal termination. Producer tests generate and compare this exact fixture;
 the Hailing Station consumer uses the same authored contract fixture.
+
+### Joined turns
+
+The live window finalizes an utterance after a fixed silence, so one spoken sentence can
+arrive as several finalized pieces ([#73](https://github.com/mickdarling/rightyo/issues/73)).
+`listen` and the lab therefore hold each finalized turn for a short gap of stream time
+before emitting it. When the next finalized turn has the same known speaker label, the
+same `speaker_provenance`, no overlap, and starts within the gap of the held turn's end,
+it is joined into the held turn, and the joined turn is emitted and decided once. The
+gap is the configuration's `"turns": {"merge_gap_ms": 2000}`; the default is 2,000 ms,
+the range 0 to 5,000, and 0 turns joining off. A joined turn:
+
+- has one `utterance_id`, assigned when it is emitted, so ids stay unique and in
+  emission order; the pieces are never emitted and have no ids of their own;
+- has `revision` 1, the first piece's `start_ms` and the last piece's `end_ms`, so it
+  covers the pause between them, and the pieces' text joined by single spaces;
+- is never formed around a stop phrase. A piece whose whole text is a stop phrase
+  (the configured `stop_phrases`, or the defaults when no speaker roles are configured)
+  is neither joined nor held: the held turn is emitted first and the stop phrase follows
+  as a turn of its own, so an owner's "never mind" after a pause still supersedes the
+  request it follows;
+- keeps the shared speaker label and provenance. A piece without a speaker label or with
+  overlap is never joined to anything, so no words are attributed to a speaker the
+  diarizer did not name. Utterance-local labels (`diarization-utterance`) never compare
+  equal across utterances, so with that diarizer pieces are not joined.
+
+A joined turn spans at most twice `max_utterance_ms` (24 s by default) and 4,000
+characters; a piece that would exceed either starts a new turn. A role is still fixed
+the first time a speaker is emitted, on the joined turn.
+
+The wait is bounded. The window only finalizes after its 1,440 ms silence hangover, so
+most of the gap has passed by then; a held turn is emitted once stream time passes its
+end plus the gap with no new speech begun, about 560 ms after finalization at the
+defaults. If speech resumes within the gap, the held turn waits for that utterance to
+finalize (at most `max_utterance_ms` plus the hangover) and is then joined or emitted.
+When no audio arrives for a read timeout (250 ms), as when a stdin host pauses its
+stream, the held turn is emitted at once rather than wait for stream time. Stdin hosts
+should therefore send continuous, paced audio (silence included): a delivery gap of
+250 ms or more releases a held turn early, and a continuation after it is not joined.
+End of input, an input overrun and the exact audio boundary of a replay/demo session
+budget emit the held turn. Stop, browser-lease expiry, the wall-clock session budget of
+a live session (microphone, or stdin declared `live-microphone`), and other cancellation
+discard it, like the open
+utterance. The `LiveProcessor` library default (`LiveConfig.turn_merge_gap_ms = 0`)
+emits every turn at once, as before. This fixed gap is a first step towards the
+end-of-turn decision of [#84](https://github.com/mickdarling/rightyo/issues/84), not an
+adaptive model, and it does not by itself rejoin a sentence split inside one utterance
+by a change of speaker label.
 
 ## Speaker roles and owner override
 
