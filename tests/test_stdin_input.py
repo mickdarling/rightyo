@@ -313,6 +313,55 @@ class StdinListenTests(unittest.TestCase):
         )
         self.assertIn("overran", diagnostics)
 
+    def test_overrun_releases_a_turn_held_for_joining_without_finishing(self):
+        calls = []
+
+        def release_pending(processor):
+            calls.append(len(processor.received))
+
+        with patch.object(Processor, "release_pending", release_pending, create=True):
+            code, capture, _events, _ = self._overrun_session(20, 6, 0.05)
+        (processor,) = Processor.instances
+        self.assertEqual(code, 2)
+        self.assertTrue(capture.overrun)
+        self.assertFalse(processor.finished)
+        # Turns finalized before the drop stand, including one held for a continuation.
+        self.assertTrue(calls)
+        self.assertEqual(calls[-1], len(processor.received))
+
+    def test_a_stalled_stdin_read_releases_a_held_turn(self):
+        stream = Gated([bytes(PCM_CHUNK_BYTES)] * 2, gate_at=1)
+        self.addCleanup(stream.release.set)
+        released = threading.Event()
+        calls = []
+
+        def release_pending(processor):
+            calls.append(len(processor.received))
+            if len(processor.received) == PCM_CHUNK_BYTES:
+                released.set()
+
+        output, result = io.StringIO(), {}
+        with patch.object(Processor, "release_pending", release_pending, create=True):
+            thread = threading.Thread(
+                target=lambda: result.setdefault(
+                    "code",
+                    listen(
+                        self.args,
+                        output=output,
+                        controller_factory=self.factory,
+                        audio_input=stream,
+                    ),
+                )
+            )
+            thread.start()
+            self.assertTrue(stream.paused.wait(5))
+            # No audio arrives while the producer is stalled: the 250 ms read timeout
+            # releases the held turn without waiting for stream time.
+            self.assertTrue(released.wait(5))
+            stream.release.set()
+            thread.join(10)
+        self.assertEqual(result.get("code"), 0)
+
     def test_sigterm_after_an_overrun_still_reports_the_overrun(self):
         def terminate_after_overrun(captures):
             deadline = time.monotonic() + 5

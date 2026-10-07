@@ -292,6 +292,123 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(started, [Addressing(("computer",)), Addressing(("Hailing Station",))])
 
 
+VARIANTS = {"Haili": ["Hailey", "Haley", "Hayley", "Ellie"], "RightyO": ["Right Isle"]}
+
+
+class NameVariantTests(unittest.TestCase):
+    """Configured recognizer spellings of a name (#72); none are built into the tool."""
+
+    def addressing(self):
+        return Addressing.from_dict({"names": ["Haili", "RightyO", "Friday"], "variants": VARIANTS})
+
+    def test_variants_round_trip_and_are_omitted_when_absent(self):
+        addressing = self.addressing()
+        self.assertEqual(
+            addressing.to_dict(),
+            {"names": ["Haili", "RightyO", "Friday"], "variants": VARIANTS},
+        )
+        self.assertEqual(Addressing.from_dict(addressing.to_dict()), addressing)
+        self.assertEqual(addressing.spellings("Haili"), tuple(VARIANTS["Haili"]))
+        self.assertEqual(addressing.spellings("Friday"), ())
+        self.assertNotIn("variants", Addressing(("Haili",)).to_dict())
+
+    def test_variants_are_validated(self):
+        for invalid in (
+            {"Nobody": ["Hailey"]},
+            {"Haili": "Hailey"},
+            {"Haili": []},
+            {"Haili": ["bad\nname"]},
+            {"Haili": ["Friday"]},
+            {"Haili": ["Hailey", "hailey"]},
+            {"Haili": ["haili"]},
+            {"Haili": ["Hai-li"]},
+            {"Haili": ["Fri day"]},
+            {"Haili": ["Hailey", "hai ley"]},
+            {"Haili": [f"v{i}" for i in range(9)]},
+            ["Hailey"],
+            None,
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ContractError):
+                Addressing.from_dict({"names": ["Haili", "Friday"], "variants": invalid})
+        many = {f"name{n}": [f"n{n}v{i}" for i in range(5)] for n in range(7)}
+        with self.assertRaises(ContractError):
+            Addressing.from_dict({"names": list(many), "variants": many})
+        with self.assertRaises(ContractError):
+            Addressing.from_dict({"names": ["Haili"], "other": {}})
+        # Names that every matcher would treat as one are refused too.
+        for names in (["RightyO", "Righty O"], ["A.I.", "ai"]):
+            with self.subTest(names=names), self.assertRaises(ContractError):
+                Addressing(tuple(names))
+
+    def test_name_for_tolerates_case_spacing_and_punctuation(self):
+        addressing = self.addressing()
+        for phrase, expected in (
+            ("Haili", "Haili"),
+            ("hayley", "Haili"),
+            ("ELLIE", "Haili"),
+            ("Righty O", "RightyO"),
+            ("righty-o", "RightyO"),
+            ("Right, Isle", "RightyO"),
+            ("friday", "Friday"),
+            ("Hanley", None),
+            ("", None),
+            ("...", None),
+        ):
+            self.assertEqual(addressing.name_for(phrase), expected, phrase)
+
+    def test_mock_rule_accepts_configured_variants(self):
+        runner = ReplayRunner(MockProvider(), addressing=self.addressing())
+        for index, (text, label) in enumerate(
+            (
+                ("Hayley, what time is it?", "attend"),
+                ("Haley: lights off", "attend"),
+                ("Righty O, what time is it?", "attend"),
+                ("Hanley, what time is it?", "uncertain"),
+                ("Ellie what time is it?", "uncertain"),
+            )
+        ):
+            event = runner.process(turn(text, utterance_id=f"variant-{index}"))
+            self.assertEqual(event.decision.label, label, text)
+
+    def test_prompt_lists_variants_beside_their_name(self):
+        state = ReplayRunner(MockProvider(), addressing=self.addressing())._state(turn())
+        request = build_request(state)
+        expected = (
+            'The system answers to the names: "Haili" (speech recognition may also write it as '
+            '"Hailey", "Haley", "Hayley", "Ellie"), "RightyO" (speech recognition may also '
+            'write it as "Right Isle"), "Friday".'
+        )
+        self.assertIn(expected, request["questions"]["attention"]["instructions"])
+        self.assertIn(expected, request["questions"]["recipient"]["criteria"]["system"])
+        self.assertEqual(request["state"]["addressing"]["variants"], VARIANTS)
+
+    def test_prototype_config_accepts_variants(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        asset = root / "asset"
+        asset.touch()
+        base = {
+            key: str(asset)
+            for key in (
+                "whisper_executable",
+                "whisper_model",
+                "diarization_library",
+                "diarization_model",
+                "microphone_helper",
+            )
+        }
+        config = root / "config.json"
+        raw = {"names": ["Haili", "RightyO", "Friday"], "variants": VARIANTS}
+        config.write_text(json.dumps({**base, "addressing": raw}))
+        self.assertEqual(PrototypeConfig.load(config).addressing, self.addressing())
+        config.write_text(
+            json.dumps({**base, "addressing": {"names": ["Haili"], "variants": {"x": ["y"]}}})
+        )
+        with self.assertRaises(PrototypeError):
+            PrototypeConfig.load(config)
+
+
 class _IdleProcessor:
     def push_pcm16(self, _pcm):
         pass

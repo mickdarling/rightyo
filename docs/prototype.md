@@ -36,7 +36,12 @@ Create the ignored `local/prototype.json` with absolute paths to your existing a
 
 `demo_audio` is optional, as is `"addressing": {"names": ["Hailing Station", "computer"]}`,
 the runtime forms of address described in [the tool API](tool-api.md); `--name` flags on
-the command line replace the file's names. An optional `"speakers"` object declares
+the command line replace the file's names. The object may also list recognizer spellings
+of a name, for example `"variants": {"Hailing Station": ["Haling Station"]}`; see
+[name variants](tool-api.md#transport-and-lifecycle). An optional
+`"turns": {"merge_gap_ms": 2000}` sets how long a finalized turn waits for a continuation
+by the same speaker before it is emitted and decided (default 2,000 ms, 0 to 5,000, 0
+off); see [joined turns](tool-api.md#joined-turns). An optional `"speakers"` object declares
 hard-coded speaker roles for the headless tool, for example
 `"speakers": {"owner": ["Speaker A"], "trusted": [], "owner_only": false}`; it may also
 set `"stop_phrases"`. Session speaker labels such as `Speaker A` are anonymous and are
