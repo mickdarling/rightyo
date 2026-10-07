@@ -85,14 +85,16 @@ the descriptor directly, so interpreter shutdown no longer aborts on the stdin b
 Unusable recognizer timestamps no longer end the session
 ([#78](https://github.com/mickdarling/rightyo/issues/78)):
 
-- whisper.cpp only: a zero-length segment inside the received audio is kept as a
-  zero-length unit, so its words stay in place. A segment that overruns by at most the
-  CLI's one second of padding is clamped, as before. If a segment's word timings are out of
-  order, its whole text is kept as one unit with the segment's own valid timing. Any other
-  segment whose own offsets are unusable (not integers, negative, reversed, starting after
-  the received audio, or ending more than that padding past it) suppresses the whole
-  utterance. It is counted in `skipped_segments`, and the utterance in
-  `skipped_utterances`.
+- whisper.cpp only: a segment that overruns by at most the CLI's one second of padding is
+  clamped, as before. If a segment's word timings are out of order, its whole text is kept
+  as one unit with the segment's own valid timing. A segment with text whose own offsets
+  are unusable suppresses the whole utterance. Unusable means not integers, negative,
+  reversed, zero-length, starting at or after the end of the received audio, or ending
+  more than that padding past it. A zero-length segment can't be attributed to a speaker,
+  so keeping it would split the utterance into separately judged turns. The segment is
+  counted in `skipped_segments`, and the utterance in `skipped_utterances`. Zero-length
+  word units inside a valid segment are unchanged
+  ([#95](https://github.com/mickdarling/rightyo/issues/95)).
 - Every backend: the units an utterance produces are then checked together. If any unit
   has timestamps that are not integers, NaN, negative, reversed, past the utterance, or
   earlier than the unit before it, the whole utterance is suppressed. No turn is

@@ -38,10 +38,9 @@ A live session's terminal `session` event can carry two positive counts
 ([#78](https://github.com/mickdarling/rightyo/issues/78)), each absent when zero, so
 authored fixtures are unchanged:
 
-- `skipped_segments`: whisper.cpp segments whose own offsets were unusable (not integers,
-  negative, reversed, starting after the received audio, or past the CLI's one second of
-  padding). Each one suppresses its utterance. A zero-length segment inside the received
-  audio is not counted: it is kept as a zero-length unit.
+- `skipped_segments`: whisper.cpp segments with text whose own offsets were unusable (not
+  integers, negative, reversed, zero-length, starting at or after the end of the received
+  audio, or past the CLI's one second of padding). Each one suppresses its utterance.
 - `skipped_utterances`: utterances suppressed whole, with no turn published, either for
   such a segment or because a recognizer unit's timestamps were invalid (not integers,
   NaN, negative, reversed, or past the utterance) or out of order. Zero-length units in

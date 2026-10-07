@@ -663,6 +663,8 @@ class ConservativeAlignmentTests(unittest.TestCase):
         # dropping the last one truncates it; the caller suppresses the utterance.
         for name, start, end in (
             ("negative start", -1, 20),
+            ("zero length", 300, 300),
+            ("zero length at the end of the audio", 1000, 1000),
             ("reversed", 150, 100),
             ("starts after the received audio", 1001, 1100),
             ("ends past the padding", 300, 1000 + 1001),
@@ -679,18 +681,21 @@ class ConservativeAlignmentTests(unittest.TestCase):
                     value["transcription"].extend(segments)
                     self.assertEqual(_counted_units(value, 1000), (None, 1))
 
-    def test_in_range_zero_length_segment_is_kept_in_order(self):
+    def test_a_zero_length_segment_with_text_suppresses_the_utterance(self):
+        # It cannot be attributed to a speaker, so keeping it would split "Do not stop."
+        # into separately judged "Do" / "not" / "stop." turns.
         value = document(0, 300, " Do")
         value["transcription"] += [
             {"text": " not", "offsets": {"from": 300, "to": 300}},
             {"text": " stop.", "offsets": {"from": 300, "to": 800}},
-            {"text": " Now", "offsets": {"from": 1000, "to": 1000}},  # at the very end
         ]
-        units, skipped = _counted_units(value, 1000)
-        self.assertEqual(skipped, 0)
-        self.assertEqual("".join(u["text"] for u in units), " Do not stop. Now")
-        self.assertEqual(units[1], {"text": " not", "start_ms": 300, "end_ms": 300})
-        self.assertEqual(units[3], {"text": " Now", "start_ms": 1000, "end_ms": 1000})
+        self.assertEqual(_counted_units(value, 1000), (None, 1))
+        # A blank zero-length segment carries no words and is ignored, as before.
+        blank = document(0, 300, " Do")
+        blank["transcription"].append({"text": " ", "offsets": {"from": 300, "to": 300}})
+        self.assertEqual(
+            _counted_units(blank, 1000), ([{"text": " Do", "start_ms": 0, "end_ms": 300}], 0)
+        )
 
     def test_out_of_order_word_timing_falls_back_to_the_whole_segment(self):
         # "not" ends before "do" does: word units would let a boundary drop "not".
@@ -719,14 +724,10 @@ class ConservativeAlignmentTests(unittest.TestCase):
         config = LiveConfig("skip-test", path, path, path, path, provenance="causal-replay")
         bad = document(0, 60, " Do")
         bad["transcription"] += [
-            {"text": " not", "offsets": {"from": -5, "to": 80}},
-            {"text": " stop.", "offsets": {"from": 80, "to": 160}},
-        ]
-        good = document(0, 60, " Do")
-        good["transcription"] += [
-            {"text": " not", "offsets": {"from": 60, "to": 60}},
+            {"text": " not", "offsets": {"from": 60, "to": 60}},  # zero-length segment
             {"text": " stop.", "offsets": {"from": 60, "to": 160}},
         ]
+        good = document(0, 160, " Do not stop.")
         turns, reports = [], []
         with (
             patch("rightyo.live_audio._Diarizer", FakeDiarizer),
@@ -742,11 +743,9 @@ class ConservativeAlignmentTests(unittest.TestCase):
                     processor.push_pcm16(SILENCE)
             processor.finish()
         self.assertFalse(processor.failed)
-        # Nothing from the bad utterance; the next one keeps every word, in order. (The
-        # zero-length "not" has no speaker overlap, so it is its own unlabelled turn,
-        # as zero-duration whisper words already are.)
-        self.assertEqual(" ".join(t.text for t in turns), "Do not stop.")
-        self.assertGreater(turns[0].start_ms, 1000)  # All from the second utterance.
+        # Nothing from the suppressed utterance; the next valid one is published whole.
+        self.assertEqual([t.text for t in turns], ["Do not stop."])
+        self.assertGreater(turns[0].start_ms, 1000)  # From the second utterance.
         self.assertEqual(processor.skipped_segments, 1)
         self.assertEqual(processor.skipped_utterances, 1)
         self.assertEqual(

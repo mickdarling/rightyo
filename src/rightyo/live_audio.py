@@ -603,12 +603,12 @@ def _counted_units(
     zero-duration timestamps remain unassigned.
 
     whisper.cpp emits odd offsets on short, noisy or near-silent windows (#78). A
-    zero-length segment with text inside the received audio (`start == end <=
-    duration`) is kept as a zero-length unit, so its words stay in place. Any other
-    segment whose own offsets are unusable (not integers, negative, reversed,
-    starting after the received audio, or ending more than the CLI's one second of
-    padding past it) makes the whole utterance unusable: publishing the remaining
-    segments could invert meaning ("do not stop" becoming "do stop"). Returns
+    nonempty segment whose own offsets are unusable (not integers, negative, reversed,
+    zero-length, starting at or after the end of the received audio, or ending more
+    than the CLI's one second of padding past it) makes the whole utterance unusable:
+    publishing the remaining segments could invert meaning ("do not stop" becoming
+    "do stop"), and a zero-length segment cannot be attributed to a speaker, so it
+    would split the utterance into separately judged turns. Returns
     `(None, n)` then, with `n` the number of unusable segments, so the caller
     suppresses the utterance and keeps listening; otherwise `(units, 0)`. A
     malformed document structure still fails closed.
@@ -627,10 +627,6 @@ def _counted_units(
         if not text.strip():
             continue
         start, end = offsets.get("from"), offsets.get("to")
-        if type(start) is int and type(end) is int and 0 <= start == end <= duration_ms:
-            # In range but zero-length: keep the text in order as a zero-length unit.
-            result.append({"text": text, "start_ms": start, "end_ms": end})
-            continue
         if (
             type(start) is not int
             or type(end) is not int
