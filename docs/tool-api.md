@@ -201,8 +201,10 @@ the current turn, what was heard right after it:
 the quiet time before the next speech (at most `window_ms`), and `following` who spoke
 next: `none` (quiet through the window), `same_speaker`, `different_speaker`, or
 `unattributed` (no speaker label on either side, or overlap; no speaker is invented). A
-turn released early, by end of input, a stalled source, a suppressed utterance or a stop
-phrase, carries `{"observed": false}`. The decision model is told that a question or
+turn released early, by end of input, a stalled source or a suppressed utterance, carries
+`{"observed": false}`. A turn released because a stop phrase followed it does carry an
+observed gap: the stop phrase is the following speech, so `following` names its speaker
+(for example `same_speaker` when the user cancels their own request). The decision model is told that a question or
 request followed by an unfilled quiet gap is evidence for the assistant, that a
 different speaker starting to talk is evidence for another person, and that speech from an
 unattributed speaker inside the gap is not evidence of an unanswered request (it may be
