@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import signal
 import sys
 import threading
@@ -127,6 +129,43 @@ def _stderr(message: str) -> None:
     print(f"rightyo: {message}", file=sys.stderr, flush=True)
 
 
+MAX_CONTROL_LINE = 256
+
+
+def _read_control(fd: int, controller) -> None:
+    """Forward the host's reply reports to the session until EOF (#124).
+
+    Bounded lines of `{"reply": "started"}` or `{"reply": "ended"}`; anything else is
+    reported on stderr (content-free) and skipped. The reader never ends the session.
+    """
+    try:
+        with os.fdopen(fd, "rb", buffering=0) as source:
+            pending = b""
+            while True:
+                chunk = source.read(MAX_CONTROL_LINE)
+                if not chunk:
+                    return
+                pending += chunk
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    _apply_control(line, controller)
+                if len(pending) > MAX_CONTROL_LINE:
+                    _stderr("control line too long; skipped")
+                    pending = b""
+    except OSError:
+        _stderr("control input unavailable; reply timing off")
+
+
+def _apply_control(line: bytes, controller) -> None:
+    try:
+        message = json.loads(line)
+        if not isinstance(message, dict) or set(message) != {"reply"}:
+            raise ValueError
+        controller.reply(message["reply"])
+    except (ValueError, TypeError, AttributeError, PrototypeError):
+        _stderr("invalid control line; skipped")
+
+
 def listen(args, *, output=None, controller_factory=PrototypeController, audio_input=None) -> int:
     """The command itself authorizes foreground capture; startup/import never does.
 
@@ -139,6 +178,9 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
     provenance = getattr(args, "provenance", None)
     if (args.mode == "stdin") != (provenance is not None):
         raise PrototypeError("--provenance is required with, and only with, --mode stdin")
+    control_fd = getattr(args, "control_fd", None)
+    if control_fd is not None and (args.mode != "stdin" or control_fd < 3):
+        raise PrototypeError("--control-fd needs --mode stdin and a descriptor above 2")
     output = sys.stdout if output is None else output
     addressing = addressing_from_args(args)
     config = PrototypeConfig.load(Path(args.config))
@@ -188,6 +230,10 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
         if args.session_id is not None:
             options["session_id"] = args.session_id
         controller.start(options)
+        if control_fd is not None:
+            threading.Thread(
+                target=_read_control, args=(control_fd, controller), daemon=True
+            ).start()
         while True:
             # Same controller lease, owned by this foreground consumer rather than a page.
             state = controller.snapshot()

@@ -321,6 +321,56 @@ class ConversationEventTests(unittest.TestCase):
         self.assertEqual(self.kinds(events), ["attention"])
 
 
+class ReplyTimingTests(unittest.TestCase):
+    """The window runs from the end of the spoken reply when the host reports it (#124)."""
+
+    def setUp(self):
+        self.events = SpeechEvents()
+        self.events.start(SESSION, now_ms=0, conversation=MODE)
+        self.events.drain()
+
+    def say(self, current, label, **options):
+        self.events.transcript(current, current.end_ms)
+        self.events.decision(decided(current, label, **options), current.end_ms + 100)
+        return [e["type"] for e in self.events.drain() if e["type"] != "transcript"]
+
+    def test_the_window_restarts_when_the_reply_ends(self):
+        self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+        self.events.reply("started", 3000)
+        self.events.reply("ended", 9000)
+        # 10.9 s would have lapsed; the reply ended at 9 s, so the window runs to 19 s.
+        kinds = self.say(turn("t2", 17000, 17900, "And tomorrow?"), "uncertain", attend=0.6)
+        self.assertEqual(kinds, ["attention", "request"])
+
+    def test_a_playing_reply_holds_the_window_open(self):
+        self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+        self.events.reply("started", 2000)
+        # Still playing at 30 s (long render): the conversation has not lapsed.
+        kinds = self.say(turn("t2", 30000, 30900, "Wait, and tomorrow?"), "uncertain", attend=0.6)
+        self.assertEqual(kinds, ["attention", "request"])
+
+    def test_a_reply_that_never_ends_is_bounded(self):
+        self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+        self.events.reply("started", 2000)
+        kinds = self.say(turn("t2", 200000, 200900, "And then?"), "uncertain", attend=0.6)
+        self.assertEqual(kinds, ["conversation", "attention"])
+
+    def test_reports_after_a_lapse_or_without_engagement_change_nothing(self):
+        self.events.reply("ended", 500)
+        kinds = self.say(turn("t0", 1000, 1900, "And?"), "uncertain", attend=0.9)
+        self.assertEqual(kinds, ["attention"])
+        self.say(turn("t1", 2000, 2900, "Haili, what time is it?"), "attend")
+        # The window ended at 12.9 s; a report at 20 s does not revive it.
+        self.events.reply("ended", 20000)
+        kinds = self.say(turn("t2", 21000, 21900, "And then?"), "uncertain", attend=0.6)
+        self.assertEqual(kinds, ["conversation", "attention"])
+
+    def test_reports_are_validated(self):
+        for phase in ("finished", None, 1):
+            with self.subTest(phase=phase), self.assertRaises(ContractError):
+                self.events.reply(phase, 100)
+
+
 class ConversationConfigTests(unittest.TestCase):
     def test_defaults_and_validation(self):
         mode = Conversation()
@@ -375,3 +425,58 @@ class ConversationConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ControlInputTests(unittest.TestCase):
+    """`listen --control-fd`: the host's reply reports over an inherited pipe (#124)."""
+
+    class Recorder:
+        def __init__(self):
+            self.phases = []
+
+        def reply(self, phase):
+            if phase not in {"started", "ended"}:
+                raise PrototypeError("invalid reply phase")
+            self.phases.append(phase)
+
+    def test_reports_are_forwarded_and_junk_is_skipped(self):
+        import contextlib
+        import io
+        import os
+
+        from rightyo.tool import _read_control
+
+        read, write = os.pipe()
+        os.write(
+            write,
+            b'{"reply": "started"}\n'
+            b"not json\n"
+            b'{"reply": "paused"}\n'
+            b'{"reply": "ended", "extra": 1}\n' + b"x" * 300 + b"\n"
+            b'{"reply": "ended"}\n',
+        )
+        os.close(write)
+        recorder = self.Recorder()
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            _read_control(read, recorder)
+        self.assertEqual(recorder.phases, ["started", "ended"])
+        self.assertEqual(errors.getvalue().count("skipped"), 4)
+
+    def test_listen_requires_stdin_mode_and_a_free_descriptor(self):
+        from argparse import Namespace
+
+        from rightyo.tool import listen
+
+        for mode, fd, provenance in (("demo", 3, None), ("stdin", 2, "live-microphone")):
+            args = Namespace(
+                config="unused",
+                mode=mode,
+                provenance=provenance,
+                control_fd=fd,
+                session_id=None,
+                use_jev=False,
+                allow_hosted=False,
+            )
+            with self.subTest(mode=mode, fd=fd), self.assertRaises(PrototypeError):
+                listen(args)

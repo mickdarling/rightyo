@@ -1087,6 +1087,19 @@ class PrototypeController:
         self._closed.set()
         self.stop()
 
+    def reply(self, phase: str) -> None:
+        """Forward the host's report that a spoken reply `started` or `ended` (#124).
+
+        Timed by this session's own stream clock when it arrives; ignored when no session
+        is running. A malformed phase raises before anything is forwarded.
+        """
+        if phase not in {"started", "ended"}:
+            raise PrototypeError("invalid reply phase")
+        with self._lock:
+            if self._stop.is_set() or self._phase not in {"listening", "replaying", "finishing"}:
+                return
+            self._publish("reply", phase)
+
     def _publish(self, method, value, **fields):
         """Run under the controller lock; a broken consumer cancels observation."""
         try:
