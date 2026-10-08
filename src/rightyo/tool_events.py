@@ -142,9 +142,9 @@ class SpeechEvents:
         self._delivered = {}
         # Pending turns withdrawn before their decisions arrived -> the dismissal's fields.
         self._withdrawn = {}
-        # Turns already dismissed, mapped to whether that dismissal was limited (the
-        # stop-phrase fast path with incomparable attribution only stops playback, so the
-        # turn's own decision may still dismiss it fully).
+        # Turns already dismissed, mapped to whether the turn's own decision may still
+        # dismiss it fully: only the stop-phrase fast path limited by incomparable
+        # attribution, not by the speaker's role, which would limit the decision too.
         self._dismissed = {}
         # Cool-downs after `disengage`: speaker label -> (from_ms, until_ms); the key None
         # applies to every speaker (a dismissal whose speaker cannot be compared).
@@ -383,7 +383,7 @@ class SpeechEvents:
                 # once, without waiting for (or depending on) the decision model.
                 plan = self._plan(turn, role, "stop", "stop-phrase", None, loose=False)
                 if plan is not None:
-                    self._dismissed[turn.utterance_id] = plan["limited"]
+                    self._dismissed[turn.utterance_id] = plan["upgradable"]
                     self._emit("dismiss", **self._apply(turn, plan))
 
     @staticmethod
@@ -499,7 +499,9 @@ class SpeechEvents:
         }
         if kind == "disengage" and not limited and self._dismissal.cooldown_ms:
             fields["cooldown_until_ms"] = turn.end_ms + self._dismissal.cooldown_ms
-        return {"fields": fields, "pending": pending, "limited": limited}
+        # Only a limit from incomparable attribution can be lifted by the turn's decision.
+        upgradable = limited and authority == "full"
+        return {"fields": fields, "pending": pending, "limited": limited, "upgradable": upgradable}
 
     def _apply(self, turn, plan):
         """Withdraw what a planned dismissal covers and return its `dismiss` fields."""
@@ -843,7 +845,7 @@ class SpeechEvents:
                     if other_role != "owner" and earlier.end_ms <= turn.end_ms:
                         self._superseded.setdefault(other, key)
             if plan is not None:
-                self._dismissed[key] = plan["limited"]
+                self._dismissed[key] = plan["upgradable"]
                 self._emit("dismiss", **self._apply(turn, plan))
             if attended:
                 self._emit(

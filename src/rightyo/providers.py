@@ -513,11 +513,12 @@ def dismissal_judgement(raw: Any, recipient: str, min_confidence: float) -> tupl
     anonymous label may be the assistant's own playback voice, which the authored
     evaluation showed Jev naming as the recipient of "Friday, stop talking". Dismissals
     aimed at a labelled person are left to the dismissal question itself, which is told
-    about them and sees the post-turn gap. `none` likewise needs `min_confidence`.
+    about them and sees the post-turn gap. `none` likewise needs `min_confidence`. A zero
+    dismissing mass never dismisses, even at a zero threshold.
     """
     choice, confidence, probs = _choice(raw, set(DISMISSAL_LABELS))
     mass = min(1.0, probs["stop"] + probs["disengage"])
-    if mass >= min_confidence:
+    if mass > 0 and mass >= min_confidence:
         label = "stop" if probs["stop"] >= probs["disengage"] else "disengage"
         if recipient == "other_human":
             label = "uncertain"

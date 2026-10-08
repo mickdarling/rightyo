@@ -287,6 +287,16 @@ class ResponseParsingTests(unittest.TestCase):
             dismissal_judgement(choice("stop", spread(stop=1.0)), "speaker_1", 0.7)[0], "stop"
         )
 
+    def test_a_zero_threshold_never_dismisses_on_zero_mass(self):
+        # `--min-confidence 0` is accepted; a confident `none` must stay `none`.
+        self.assertEqual(
+            dismissal_judgement(choice("none", spread(none=1.0)), "system", 0.0)[0], "none"
+        )
+        self.assertEqual(
+            dismissal_judgement(choice("stop", spread(stop=0.6, none=0.4)), "system", 0.0)[0],
+            "stop",
+        )
+
     def test_invalid_dismissal_answers_degrade_to_no_dismissal(self):
         body = build_request(state())
         bad = [
@@ -564,6 +574,16 @@ class DismissEventTests(unittest.TestCase):
         self.assertEqual(self.of(self.events.drain(), "dismiss"), [])
         away = turn("away", 1000, 1500, "Go away.", speaker="Speaker B")
         self.assertEqual(self.of(self.deliver(away, dismissal=("disengage", 1.0)), "dismiss"), [])
+
+    def test_a_participant_stop_phrase_judged_a_dismissal_emits_one_dismiss(self):
+        # The fast path is limited by the participant's role, which would limit the
+        # decision too: the decision does not repeat the playback-only dismissal.
+        owner = SpeakerPriority(owners=("Speaker A",))
+        self.start(priority=ConfiguredPriorityProvider(owner))
+        stop = turn("stop", 0, 500, "Stop.", speaker="Speaker B")
+        dismissals = self.of(self.deliver(stop, dismissal=("stop", 1.0)), "dismiss")
+        self.assertEqual(len(dismissals), 1)
+        self.assertEqual(dismissals[0]["scope"], ["playback"])
 
     def test_cooldown_is_per_speaker_when_labels_compare(self):
         self.start()
