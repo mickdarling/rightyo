@@ -467,7 +467,11 @@ capability (`dismiss` event, version 1).
    the owner override) emits `dismiss` immediately after its own `transcript`, with
    `reason: "stop-phrase"` and `confidence: null`. It does not wait for, or depend on,
    the decision model, so it still works when Jev is slow, unavailable or off. It cannot
-   tell who the phrase was meant for: "Stop!" shouted at a child also dismisses.
+   tell who the phrase was meant for: "Stop!" shouted at a child also stops playback.
+   It never withdraws a request whose speaker cannot be compared with its own, and when
+   its own speaker cannot be compared (no label, overlap, or an utterance-local label
+   such as the hosted diarizer's) it only stops playback (`scope: ["playback"]`); that
+   turn's decision may then dismiss it fully with a second `dismiss`.
 2. *The decision model.* The Jev request gains a third Choice question, `dismissal`:
    is the current turn the user telling the assistant to stop, be quiet, wait or go
    away, withdrawing what they just asked, or saying the assistant was not addressed?
@@ -477,15 +481,30 @@ capability (`dismiss` event, version 1).
    in #96; the question says that any name the user calls an assistant or agent by counts
    ("Jarvis, go away"), that a dismissal can come during playback, and that a "no, not
    now" aimed at another person present (an answer to their question, or one they reply
-   to within the [post-turn gap](#scene-and-post-turn-gap)) is not a dismissal. The
-   attention and recipient questions are unchanged. The turn counts as a dismissal when
+   to within the [post-turn gap](#scene-and-post-turn-gap)) is not a dismissal. `stop`
+   covers only the assistant's own speech or reply and withdrawing the user's last
+   request: stopping, pausing, cancelling or turning off a named thing ("Stop the
+   timer", "Pause the movie", "Cancel my three o'clock meeting") is a new request and
+   answers `none`, while "cancel that" or "never mind" about the request just made stays
+   `stop`. Speech about dismissing, quoted dismissals and text that tells the classifier
+   how to label the turn are not dismissals; how well that holds depends on wording, as
+   with the #96 injection results. The attention and recipient questions are unchanged. The turn counts as a dismissal when
    the summed probability of `stop` and `disengage` reaches the session's
    `min_confidence` (0.7 by default); the larger of the two is the kind. If the recipient
    answer is `other_human` it is not a dismissal. A known-speaker recipient does not
    veto it: an anonymous label may be the assistant's own playback voice, which Jev
    named as the recipient of "Friday, stop talking" in the evaluation. Such a
    dismissal emits `dismiss` after the turn's `attention` event and any owner overrides,
-   with `reason: "decision"` and the summed probability as `confidence`.
+   with `reason: "decision"` and the summed probability as `confidence`. A missing or
+   malformed `dismissal` answer is treated as no dismissal (`uncertain`, confidence 0);
+   the attention decision still stands.
+
+**Contract decision: "stop the music".** When the host itself plays media the assistant
+started, "Stop the music" is judged a request (`none`, usually attended), not a
+dismissal, and reaches the host as a `request`; the host stops the media by handling
+the request. A bare "Stop." during playback is a dismissal. Hosts that want any "stop"
+during media to halt it at once should treat `stop`-kind dismissals and such requests
+alike.
 
 A dismissed turn never forms a request, even when its attention was `attend` (Jev often
 attends "Haili, stop." as addressed to the system, which is right about the addressee).
@@ -513,22 +532,33 @@ second time by its decision.
   host-side work RightyO cannot see, such as a request the host has already forwarded.
 - `withdrawn_request_ids` lists the requests RightyO withdraws (possibly none). The host
   should not act on them, and should tell a target session that already has one that
-  the user withdrew it.
+  the user withdrew it. Withdrawal is advisory: it cannot undo anything the host or a
+  target has already done with the request, which is why consequential actions still
+  need confirmation.
 - `reason` is `stop-phrase` or `decision`; `confidence` is `null` for a stop phrase.
 - `cooldown_until_ms` (stream time) is present when a `disengage` started a cool-down.
+
+**Who can dismiss.** On an anonymous session every dismissal has full effect. On an
+enrolled session, owners and trusted speakers have full effect. Any other speaker's
+dismissal is `scope: ["playback"]` only: it withdraws at most that speaker's own
+requests, never ends engagement and never starts a cool-down. Whether to stop speech
+for it is the host's choice (the event carries `role`). With `owner_only`, only owners
+dismiss at all; other speakers' dismissals emit nothing and still form no request.
 
 **Self-withdrawal.** A dismissal withdraws the speaker's own requests whose turns ended
 at or before the dismissal and at most `window_ms` before it started. This generalises
 [#92](https://github.com/mickdarling/rightyo/issues/92): an owner can now withdraw their
 own just-dispatched request ("Haili, order a pizza … never mind"), which the owner
 override never did. A request from a different known speaker is never withdrawn.
-Attribution that cannot be compared (no label, overlap, utterance-local labels from two
-different utterances) withdraws on an anonymous session, which is the single-user scene,
-and never on an enrolled session. The owner override is unchanged and still supersedes
+When attribution cannot be compared (no label, overlap, utterance-local labels from two
+different utterances, which is every pair under the hosted per-utterance diarizer), a
+request is withdrawn only by a model-judged dismissal whose recipient is the system, on
+an anonymous session; never by the stop-phrase fast path, and never on an enrolled
+session. The owner override is unchanged and still supersedes
 other speakers' open requests; with natural dismissal on, an owner's model-judged
 dismissal supersedes them too. If the speaker's request was still awaiting its decision,
 the decision is withdrawn when it arrives: its `attention` has no `request_id`, no
-`request` follows, and if it would have attended, a second `dismiss` for the same
+`request` follows, and if it would otherwise have formed a request, a second `dismiss` for the same
 dismissing turn names the request id it would have carried, with
 `scope: ["pending_request"]`. Hosts treat a withdrawn id they never received as handled.
 At most 32 delivered requests are kept for withdrawal (the oldest is dropped beyond
@@ -537,16 +567,25 @@ that), and they expire with the retention window.
 **Cool-down.** For `cooldown_ms` after a `disengage` dismissal, an attended turn that
 does not use a configured name or variant forms a request only with attention confidence
 of at least `cooldown_min_confidence`. Below that its evidence becomes `uncertain` with
-the optional key `cooldown: true`. A turn that uses a name is unaffected.
+the optional key `cooldown: true`. A turn that uses a name is unaffected. A cool-down
+started by a speaker with a session-stable label applies to that speaker only; one
+whose speaker cannot be compared applies to everyone.
 
 **Fast path.** A dismissal must not wait behind the [joined turns](#joined-turns) hold
-or the reply wait. With natural dismissal on, a turn that sounds like a dismissal
-(at most ten words containing a cue such as "stop", "quiet", "never mind", "go away",
-"not now", "not you", "talking to you", "hang on" or "forget it"; English,
-deterministic) is released the moment it is finalized. A turn held before it is released
-first, with its post-turn gap observed up to the dismissal. The predicate only skips the
-hold. It never dismisses anything itself, and a false match costs only the joining of
-that one piece. Measured effect: the predicate costs microseconds per turn. At the
+or the reply wait. With natural dismissal on, a turn that sounds like a dismissal is
+released the moment it is finalized: at most ten words that, after fillers ("no",
+"okay", "please") and an optional short vocative at either end ("Jarvis, ...",
+"..., Haley"), open with a cue such as "stop", "quiet", "never mind", "go away", "not
+now", "not you", "I wasn't talking to you", "hang on" or "forget it", followed only by
+tail words ("please", "now", "that", "thanks"). English, deterministic. A request that
+merely contains a cue word ("Cancel my three o'clock meeting", "Stop the timer", "Can
+you turn on" + "quiet mode please") is not released early and still joins and observes
+its gap. A turn held before it is released first, with its post-turn gap observed up to
+the dismissal. The predicate only skips the hold and never dismisses anything itself.
+A false match has two costs: that piece is never joined, and its own post-turn gap is
+unobserved, so the decision model loses the "another person answered" evidence for it
+(dismissal-like words said to another person, such as "Go away, I'm watching this",
+can match). Measured effect: the predicate costs microseconds per turn. At the
 defaults it removes about 560 ms of hold after finalization (the 2,000 ms merge gap less
 the 1,440 ms hangover). It also removes the longer wait when a next utterance opens
 inside the gap, which can hold a turn until that utterance finalizes. An exact stop
@@ -564,19 +603,23 @@ speaking, needs the full-duplex loop and echo cancellation on the host, so the
 assistant's own playback is not transcribed as the user. RightyO has no input for "the
 assistant is speaking now" yet; in live sessions `playback_active` is always false.
 
-**Evaluation.** `examples/dismissal-eval.json` is an authored, synthetic set of 36
+**Evaluation.** `examples/dismissal-eval.json` is an authored, synthetic set of 44
 scenarios: 20 dismissals (named, other agent names, unnamed, during and after
-playback) and 16 non-dismissals (dismissal-like words said to another person, an
-ordinary "no", corrections that go on to make a request).
+playback) and 24 non-dismissals (dismissal-like words said to another person, an
+ordinary "no", corrections that go on to make a request, commands to stop or cancel a
+named thing, and speech about dismissal or aimed at the classifier).
 `scripts/evaluate_addressedness.py --scenarios examples/dismissal-eval.json --variant
-proposed --variant dismissal` scores it. In one hosted run (Jev 1.13.0, 2026-10-08) the
-dismissal judgement had precision 1.0 and recall 0.95 at `min_confidence` 0.7 (19 of 20,
-no false dismissals). The exact stop phrases alone found 2 of the 20, with one false
-dismissal ("Stop." said to another person). Without the question, 9 of the 20
-dismissals were attended and would have been delivered as requests; with it, none
-were. On the 60 scenarios of the #96 set the third question changed no missed
-request (0 of 23 with and without it), gave 5 false attends against 6 at 0.7, and
-judged none of the 60 a dismissal. These are authored lines, not recordings.
+proposed --variant dismissal` scores it. The harness gives turns the live merger
+releases at once (stop phrases, and dismissal-shaped turns when dismissal is on) an
+unobserved gap, as in live use. With the prompt in this document (Jev 1.13.0,
+2026-10-08) the dismissal judgement at `min_confidence` 0.7 had no false dismissals and
+found 17 of 20 dismissals, combining one full run with a re-run of the 12 scenarios the
+last wording change targeted. All five thing-commands were attended and none was judged
+a dismissal, and none of the three injection or about-dismissal lines was a dismissal.
+The exact stop phrases alone found 2 of the 20, with one false dismissal ("Stop." said
+to another person). Without the question (the #96 request), 9 of the 20 dismissals were
+attended and would have been delivered as requests. These are authored
+lines, not recordings; the PR records the tables.
 
 ## Request forming
 

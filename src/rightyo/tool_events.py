@@ -142,10 +142,13 @@ class SpeechEvents:
         self._delivered = {}
         # Pending turns withdrawn before their decisions arrived -> the dismissal's fields.
         self._withdrawn = {}
-        # Turns already dismissed by the stop-phrase fast path at transcript time.
-        self._dismissed = set()
-        # (from_ms, until_ms) after a `disengage` dismissal, or None.
-        self._cooldown = None
+        # Turns already dismissed, mapped to whether that dismissal was limited (the
+        # stop-phrase fast path with incomparable attribution only stops playback, so the
+        # turn's own decision may still dismiss it fully).
+        self._dismissed = {}
+        # Cool-downs after `disengage`: speaker label -> (from_ms, until_ms); the key None
+        # applies to every speaker (a dismissal whose speaker cannot be compared).
+        self._cooldowns = {}
 
     def _payload(self, kind, sequence, fields):
         return {
@@ -241,7 +244,7 @@ class SpeechEvents:
             # The configured stop phrases, or the defaults when roles are off.
             self._stop_rules = SpeakerPriority() if priority is None else priority.priority
             self._dismissed.clear()
-            self._cooldown = None
+            self._cooldowns.clear()
             self.role_status = "off" if priority is None else "ready"
             self._degraded_turn = None
             self._session = session_id
@@ -378,37 +381,54 @@ class SpeechEvents:
             if self._dismissal is not None and self._stop_rules.is_stop_phrase(turn.text):
                 # The deterministic fast path (#98): an exact stop phrase dismisses at
                 # once, without waiting for (or depending on) the decision model.
-                self._dismissed.add(turn.utterance_id)
-                self._emit("dismiss", **self._dismiss(turn, role, "stop", "stop-phrase", None))
+                plan = self._plan(turn, role, "stop", "stop-phrase", None, loose=False)
+                if plan is not None:
+                    self._dismissed[turn.utterance_id] = plan["limited"]
+                    self._emit("dismiss", **self._apply(turn, plan))
 
-    def _withdrawable(self, dismissing, facts):
+    @staticmethod
+    def _comparable(first, second):
+        """Whether two turns' speaker labels can be compared (session-stable, labelled)."""
+        return (
+            first["speaker_id"] is not None
+            and second["speaker_id"] is not None
+            and not first["overlap"]
+            and not second["overlap"]
+            and first["speaker_provenance"] == second["speaker_provenance"]
+            and (
+                first["speaker_provenance"] != "diarization-utterance"
+                or first["speaker_id"].split(" ", 1)[0] == second["speaker_id"].split(" ", 1)[0]
+            )
+        )
+
+    @staticmethod
+    def _cooldown_key(facts):
+        """The per-speaker cool-down key, or None when the label holds for one utterance."""
+        if (
+            facts["speaker_id"] is None
+            or facts["overlap"]
+            or facts["speaker_provenance"] == "diarization-utterance"
+        ):
+            return None
+        return facts["speaker_id"]
+
+    def _withdrawable(self, dismissing, facts, loose):
         """Whether a dismissal may withdraw a request turn: the speaker's own, recent one.
 
         The request must have ended at or before the dismissal and at most `window_ms`
-        before it started. The speakers must be the same label; on an anonymous session
-        (the single-user scene) a request whose attribution cannot be compared (no label,
-        overlap, or utterance-local labels from different utterances) is withdrawn too.
-        A different known speaker's request is never withdrawn.
+        before it started, from the same speaker label. When the labels cannot be compared
+        (no label, overlap, or utterance-local labels from different utterances), it is
+        withdrawn only when `loose`: a model-judged dismissal addressed to the system on an
+        anonymous session. A different known speaker's request is never withdrawn.
         """
+        dismisser = self._facts(dismissing)
         if facts["end_ms"] > dismissing.end_ms:
             return False
         if dismissing.start_ms - facts["end_ms"] > self._dismissal.window_ms:
             return False
-        first, second = dismissing.speaker_id, facts["speaker_id"]
-        comparable = (
-            first is not None
-            and second is not None
-            and not dismissing.overlap
-            and not facts["overlap"]
-            and dismissing.speaker_provenance == facts["speaker_provenance"]
-            and (
-                dismissing.speaker_provenance != "diarization-utterance"
-                or first.split(" ", 1)[0] == second.split(" ", 1)[0]
-            )
-        )
-        if comparable:
-            return first == second
-        return self._priority is None
+        if self._comparable(dismisser, facts):
+            return dismisser["speaker_id"] == facts["speaker_id"]
+        return loose
 
     @staticmethod
     def _facts(turn):
@@ -419,68 +439,104 @@ class SpeechEvents:
             "overlap": turn.overlap,
         }
 
-    def _withdrawal(self, dismissing):
-        """The delivered request ids and pending turn keys a dismissal withdraws."""
+    def _authority(self, role):
+        """What a speaker's dismissal may do: "full", "playback" only, or None (nothing).
+
+        Anonymous sessions: full. Enrolled: owners and trusted speakers have full effect;
+        other speakers only stop playback (and withdraw their own requests); with
+        `owner_only`, only owners dismiss at all.
+        """
+        if self._priority is None:
+            return "full"
+        rules = self._priority.priority
+        if role == "owner":
+            return "full"
+        if rules.owner_only:
+            return None
+        return "full" if role == "trusted" else "playback"
+
+    def _plan(self, turn, role, kind, reason, confidence, *, loose):
+        """What a dismissal does, without changing state; None when it does nothing."""
+        authority = self._authority(role)
+        if authority is None:
+            return None
+        dismisser = self._facts(turn)
+        # Only a model-judged dismissal by a fully trusted speaker withdraws on
+        # incomparable attribution; the fast path never does.
+        loose = loose and authority == "full" and self._priority is None
         delivered = [
             request_id
             for request_id, facts in self._delivered.items()
-            if self._withdrawable(dismissing, facts)
+            if self._withdrawable(turn, facts, loose)
         ]
         pending = [
             key
             for key, (earlier, _context, _size, _role) in self._pending.items()
-            if key != dismissing.utterance_id
+            if key != turn.utterance_id
             and key not in self._withdrawn
-            and self._withdrawable(dismissing, self._facts(earlier))
+            and self._withdrawable(turn, self._facts(earlier), loose)
         ]
-        return delivered, pending
-
-    def _dismiss_fields(self, turn, role, kind, reason, confidence, withdrawn):
+        # The stop-phrase fast path from a speaker whose label cannot be compared only
+        # stops playback; so does any dismissal from a speaker without full authority.
+        limited = authority != "full" or (
+            reason == "stop-phrase" and self._cooldown_key(dismisser) is None
+        )
+        scope = ["playback"] if limited else list(DISMISS_SCOPES[kind])
         fields = {
             "utterance_id": turn.utterance_id,
             "speech_end_ms": turn.end_ms,
             "speaker_id": turn.speaker_id,
             **({} if role is None else {"role": role}),
-            "scope": list(DISMISS_SCOPES[kind]),
-            "withdrawn_request_ids": list(withdrawn),
+            "scope": scope,
+            "withdrawn_request_ids": delivered,
             "reason": reason,
             "confidence": confidence,
         }
-        if kind == "disengage" and self._dismissal.cooldown_ms:
+        if kind == "disengage" and not limited and self._dismissal.cooldown_ms:
             fields["cooldown_until_ms"] = turn.end_ms + self._dismissal.cooldown_ms
-        return fields
+        return {"fields": fields, "pending": pending, "limited": limited}
 
-    def _dismiss(self, turn, role, kind, reason, confidence):
-        """Withdraw what a dismissal covers and return its `dismiss` event fields."""
-        delivered, pending = self._withdrawal(turn)
-        fields = self._dismiss_fields(turn, role, kind, reason, confidence, delivered)
-        for request_id in delivered:
+    def _apply(self, turn, plan):
+        """Withdraw what a planned dismissal covers and return its `dismiss` fields."""
+        fields = plan["fields"]
+        for request_id in fields["withdrawn_request_ids"]:
             del self._delivered[request_id]
             self._open.pop(request_id, None)
-        for key in pending:
-            # Its decision is still to come: if it attends, it is withdrawn then.
+        for key in plan["pending"]:
+            # Its decision is still to come: if it would form a request, it is withdrawn.
             self._withdrawn[key] = {
-                "utterance_id": turn.utterance_id,
-                "speech_end_ms": turn.end_ms,
-                "speaker_id": turn.speaker_id,
-                **({} if role is None else {"role": role}),
+                **{k: fields[k] for k in ("utterance_id", "speech_end_ms", "speaker_id")},
+                **({"role": fields["role"]} if "role" in fields else {}),
                 "scope": ["pending_request"],
-                "reason": reason,
-                "confidence": confidence,
+                "reason": fields["reason"],
+                "confidence": fields["confidence"],
             }
         if "cooldown_until_ms" in fields:
+            key = self._cooldown_key(self._facts(turn))
             until = fields["cooldown_until_ms"]
-            if self._cooldown is None or until > self._cooldown[1]:
-                self._cooldown = (turn.end_ms, until)
+            current = self._cooldowns.get(key)
+            if current is None or until > current[1]:
+                self._cooldowns[key] = (turn.end_ms, until)
         return fields
 
     def _cooled(self, turn, decision):
-        """Whether a cool-down after `disengage` holds this attended turn back (#98)."""
-        if self._cooldown is None or self._dismissal is None:
+        """Whether a cool-down after `disengage` holds this attended turn back (#98).
+
+        A cool-down started by a speaker with a comparable label applies to that speaker
+        only; one whose speaker cannot be compared applies to everyone.
+        """
+        if not self._cooldowns or self._dismissal is None:
             return False
-        start, until = self._cooldown
-        return (
+        keys = [None]
+        speaker = self._cooldown_key(self._facts(turn))
+        if speaker is not None:
+            keys.append(speaker)
+        active = any(
             start <= turn.start_ms < until
+            for start, until in (self._cooldowns[k] for k in keys if k in self._cooldowns)
+        )
+        return (
+            active
             and decision.confidence < self._dismissal.cooldown_min_confidence
             and not mentions_name(self._addressing, turn.text)
         )
@@ -609,7 +665,7 @@ class SpeechEvents:
             if (
                 self._dismissal is not None
                 and event.decision.dismissal in DISMISSING
-                and key not in self._dismissed
+                and self._dismissed.get(key, True)
             ):
                 kind = event.decision.dismissal
             dismissed = kind is not None or key in self._dismissed
@@ -632,20 +688,32 @@ class SpeechEvents:
                 and withdrawn_by is None
             )
             overriding = role == "owner" and (attended or stop or dismissed)
-            dismissal = None
+            plan = None
             if kind is not None:
-                delivered, _pending = self._withdrawal(turn)
-                confidence = event.decision.dismissal_confidence
-                dismissal = self._dismiss_fields(
-                    turn, role, kind, "decision", confidence, delivered
+                plan = self._plan(
+                    turn,
+                    role,
+                    kind,
+                    "decision",
+                    event.decision.dismissal_confidence,
+                    loose=event.decision.recipient == "system",
                 )
+            # A pending turn withdrawn earlier only produces an event when it would have
+            # formed a request.
+            late = (
+                withdrawn_by is not None
+                and would_attend
+                and not dismissed
+                and not stop
+                and superseded_by is None
+            )
             # Dismiss events this decision emits, in order: a late withdrawal of this
             # turn's own request, then this turn's own dismissal.
             extra = []
-            if withdrawn_by is not None and would_attend and superseded_by is None:
+            if late:
                 extra.append({**withdrawn_by, "withdrawn_request_ids": [request_id]})
-            if dismissal is not None:
-                extra.append(dismissal)
+            if plan is not None:
+                extra.append(plan["fields"])
             # Form before any reservation or emission so the burst reserve below counts
             # the exact request bytes, formed string included, and a failing former
             # fails closed before anything of this decision is queued.
@@ -747,7 +815,7 @@ class SpeechEvents:
                     by_utterance_id=superseded_by,
                     role="owner",
                 )
-            if withdrawn_by is not None and would_attend and superseded_by is None:
+            if late:
                 # A dismissal withdrew this turn while its decision was pending (#98).
                 self._emit("dismiss", **extra[0])
             if overriding:
@@ -766,14 +834,9 @@ class SpeechEvents:
                 for other, (earlier, _context, _size, other_role) in self._pending.items():
                     if other_role != "owner" and earlier.end_ms <= turn.end_ms:
                         self._superseded.setdefault(other, key)
-            if kind is not None:
-                self._dismissed.add(key)
-                self._emit(
-                    "dismiss",
-                    **self._dismiss(
-                        turn, role, kind, "decision", event.decision.dismissal_confidence
-                    ),
-                )
+            if plan is not None:
+                self._dismissed[key] = plan["limited"]
+                self._emit("dismiss", **self._apply(turn, plan))
             if attended:
                 self._emit(
                     "request",

@@ -89,6 +89,8 @@ DISMISSAL_CATEGORIES = (
     "dismissal_to_person",
     "ambiguous_no",
     "correction",
+    "thing_command",
+    "dismissal_injection",
 )
 ALL_CATEGORIES = CATEGORIES + DISMISSAL_CATEGORIES
 EXPECTED = ("attend", "not_attend")
@@ -253,7 +255,12 @@ def scenario_state(document: dict[str, Any], scenario: dict[str, Any], variant: 
     # The runner's own context selection, without deciding the context turns.
     runner._history.extend(past)
     gap = None
-    if settings["gaps"]:
+    # Turns the live merger releases at once carry no observed gap: exact stop phrases
+    # always (#89), and dismissal-shaped turns when natural dismissal is on (#98).
+    released = SpeakerPriority().is_stop_phrase(text) or (
+        "dismissal" in settings and dismissal_shaped(text)
+    )
+    if settings["gaps"] and not released:
         following = scenario["next"]
         held = _fragment(current.speaker_id, current.start_ms, current.end_ms)
         heard = None

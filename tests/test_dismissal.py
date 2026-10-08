@@ -221,10 +221,19 @@ class ResponseParsingTests(unittest.TestCase):
         three = build_request(state())
         with self.assertRaises(ContractError):
             parse_response(answer(two, ("stop", spread(stop=1.0))), two, 0.7)
+        missing = answer(three)
+        del missing["answers"]["attention"]
         with self.assertRaises(ContractError):
-            parse_response(answer(three), three, 0.7)
+            parse_response(missing, three, 0.7)
         plain = parse_response(answer(two), two, 0.7)
         self.assertIsNone(plain.dismissal)
+        # A missing dismissal answer degrades to no dismissal; the decision stands.
+        degraded = parse_response(answer(three), three, 0.7)
+        self.assertEqual(degraded.label, "attend")
+        self.assertEqual(
+            (degraded.dismissal, degraded.dismissal_choice, degraded.dismissal_confidence),
+            ("uncertain", "uncertain", 0.0),
+        )
 
     def test_dismissing_mass_decides_and_the_larger_kind_is_kept(self):
         body = build_request(state())
@@ -254,7 +263,7 @@ class ResponseParsingTests(unittest.TestCase):
             dismissal_judgement(choice("stop", spread(stop=1.0)), "speaker_1", 0.7)[0], "stop"
         )
 
-    def test_invalid_dismissal_answers_are_rejected(self):
+    def test_invalid_dismissal_answers_degrade_to_no_dismissal(self):
         body = build_request(state())
         bad = [
             ("leave", {"leave": 1.0}),
@@ -269,8 +278,13 @@ class ResponseParsingTests(unittest.TestCase):
                 "confidence": 1.0,
                 "probabilities": dismissal[1],
             }
-            with self.subTest(dismissal=dismissal), self.assertRaises(ContractError):
-                parse_response(raw, body, 0.7)
+            with self.subTest(dismissal=dismissal):
+                decided = parse_response(raw, body, 0.7)
+                self.assertEqual((decided.label, decided.dismissal), ("attend", "uncertain"))
+                self.assertEqual(decided.dismissal_confidence, 0.0)
+        raw = answer(body)
+        raw["answers"]["dismissal"] = "stop"
+        self.assertEqual(parse_response(raw, body, 0.7).dismissal, "uncertain")
 
     def test_decision_dismissal_fields_are_validated(self):
         base = ("attend", "system", 1.0, {"attend": 1.0, "ignore": 0.0, "uncertain": 0.0})
@@ -440,15 +454,30 @@ class DismissEventTests(unittest.TestCase):
         (dismiss,) = self.of(self.events.drain(), "dismiss")
         self.assertEqual(dismiss["withdrawn_request_ids"], [])
 
-    def test_anonymous_unattributed_request_is_withdrawn_but_not_when_enrolled(self):
+    def test_incomparable_attribution_withdraws_only_on_a_system_addressed_decision(self):
+        # The fast path never withdraws a request whose speaker cannot be compared.
         self.start()
-        (request,) = self.of(
-            self.deliver(turn("request", 0, 1000, "Haili, order a pizza.", speaker=None)), "request"
-        )
-        self.events.transcript(turn("stop", 2000, 2500, "Never mind."), 2500)
+        unlabelled = turn("request", 0, 1000, "Haili, order a pizza.", speaker=None)
+        (request,) = self.of(self.deliver(unlabelled), "request")
+        stop = turn("stop", 2000, 2500, "Never mind.")
+        self.events.transcript(stop, 2500)
         (dismiss,) = self.of(self.events.drain(), "dismiss")
+        self.assertEqual(dismiss["withdrawn_request_ids"], [])
+        # The model path does, when the dismissal is addressed to the system.
+        quiet = turn("quiet", 3000, 3500, "Haili, quiet.")
+        (dismiss,) = self.of(self.deliver(quiet, dismissal=("stop", 0.95)), "dismiss")
         self.assertEqual(dismiss["withdrawn_request_ids"], [request["request_id"]])
-        # Utterance-local labels from different utterances cannot be compared either.
+        # Not when the recipient is anything else.
+        self.start()
+        self.deliver(turn("request", 0, 1000, "Haili, order a pizza.", speaker=None))
+        quiet = turn("quiet", 2000, 2500, "Quiet.")
+        dismiss = self.of(
+            self.deliver(quiet, label="uncertain", recipient="unknown", dismissal=("stop", 0.9)),
+            "dismiss",
+        )[0]
+        self.assertEqual(dismiss["withdrawn_request_ids"], [])
+
+    def test_utterance_local_stop_phrase_only_stops_playback_until_the_decision(self):
         self.start()
         first = turn(
             "a",
@@ -468,15 +497,76 @@ class DismissEventTests(unittest.TestCase):
             provenance="diarization-utterance",
         )
         self.events.transcript(second, 2500)
-        self.assertEqual(
-            self.of(self.events.drain(), "dismiss")[0]["withdrawn_request_ids"],
-            [request["request_id"]],
-        )
-        # On an enrolled session an unattributed request is never withdrawn.
+        (fast,) = self.of(self.events.drain(), "dismiss")
+        self.assertEqual((fast["scope"], fast["withdrawn_request_ids"]), (["playback"], []))
+        # Its own decision, judged a dismissal addressed to the system, completes it.
+        self.events.decision(decision(second, dismissal=("stop", 0.98)), 2600)
+        (full,) = self.of(self.events.drain(), "dismiss")
+        self.assertEqual(full["scope"], ["playback", "pending_request"])
+        self.assertEqual(full["withdrawn_request_ids"], [request["request_id"]])
+        self.assertEqual(full["reason"], "decision")
+
+    def test_enrolled_sessions_never_withdraw_on_incomparable_attribution(self):
         self.start(priority=ConfiguredPriorityProvider(SpeakerPriority(owners=("Speaker A",))))
         self.deliver(turn("request", 0, 1000, "Haili, order a pizza.", speaker=None))
+        quiet = turn("quiet", 2000, 2500, "Haili, quiet.")
+        (dismiss,) = self.of(self.deliver(quiet, dismissal=("stop", 1.0)), "dismiss")
+        self.assertEqual(dismiss["withdrawn_request_ids"], [])
+
+    def test_participants_only_stop_playback_and_owner_only_silences_them(self):
+        owner = SpeakerPriority(owners=("Speaker A",), trusted=("Speaker C",))
+        self.start(priority=ConfiguredPriorityProvider(owner))
+        self.deliver(turn("own", 0, 800, "Haili, order a pizza."))
+        mine = self.of(
+            self.deliver(turn("mine", 1000, 1800, "Haili, play jazz.", speaker="Speaker B")),
+            "request",
+        )[0]
+        away = turn("away", 2000, 2500, "Go away.", speaker="Speaker B")
+        (dismiss,) = self.of(self.deliver(away, dismissal=("disengage", 1.0)), "dismiss")
+        # Playback only, its own request only, no engagement change and no cool-down.
+        self.assertEqual(dismiss["scope"], ["playback"])
+        self.assertEqual(dismiss["withdrawn_request_ids"], [mine["request_id"]])
+        self.assertNotIn("cooldown_until_ms", dismiss)
+        later = turn("later", 3000, 3800, "What time is it?")
+        self.assertEqual(len(self.of(self.deliver(later, confidence=0.8), "request")), 1)
+        # A trusted speaker has full effect.
+        trusted = turn("trusted", 4000, 4500, "Go away.", speaker="Speaker C")
+        (dismiss,) = self.of(self.deliver(trusted, dismissal=("disengage", 1.0)), "dismiss")
+        self.assertIn("engagement", dismiss["scope"])
+        # With owner_only, non-owners dismiss nothing and emit no dismiss event.
+        strict = SpeakerPriority(owners=("Speaker A",), owner_only=True)
+        self.start(priority=ConfiguredPriorityProvider(strict))
+        self.events.transcript(turn("stop", 0, 500, "Stop.", speaker="Speaker B"), 500)
+        self.assertEqual(self.of(self.events.drain(), "dismiss"), [])
+        away = turn("away", 1000, 1500, "Go away.", speaker="Speaker B")
+        self.assertEqual(self.of(self.deliver(away, dismissal=("disengage", 1.0)), "dismiss"), [])
+
+    def test_cooldown_is_per_speaker_when_labels_compare(self):
+        self.start()
+        away = turn("away", 0, 1000, "Go away.")
+        self.deliver(away, dismissal=("disengage", 1.0))
+        other = turn("other", 2000, 3000, "What time is it?", speaker="Speaker B")
+        self.assertEqual(len(self.of(self.deliver(other, confidence=0.8), "request")), 1)
+        same = turn("same", 4000, 5000, "What time is it?")
+        self.assertEqual(self.of(self.deliver(same, confidence=0.8), "request"), [])
+        # A dismissal whose speaker cannot be compared cools everyone.
+        self.start()
+        self.deliver(turn("away", 0, 1000, "Go away.", speaker=None), dismissal=("disengage", 1.0))
+        other = turn("other", 2000, 3000, "What time is it?", speaker="Speaker B")
+        self.assertEqual(self.of(self.deliver(other, confidence=0.8), "request"), [])
+
+    def test_no_late_withdrawal_event_for_a_turn_that_forms_no_request(self):
+        self.start()
+        quiet = turn("quiet", 0, 1000, "Haili, quiet.")
+        self.events.transcript(quiet, 1000)
         self.events.transcript(turn("stop", 2000, 2500, "Never mind."), 2500)
-        self.assertEqual(self.of(self.events.drain(), "dismiss")[0]["withdrawn_request_ids"], [])
+        self.events.drain()
+        # Attended but itself judged a dismissal: no request, so nothing was withdrawn.
+        self.events.decision(decision(quiet, dismissal=("stop", 1.0)), 2600)
+        events = self.events.drain()
+        withdrawn = [i for e in self.of(events, "dismiss") for i in e["withdrawn_request_ids"]]
+        self.assertNotIn("dismissal-test:quiet", withdrawn)
+        self.assertEqual(self.of(events, "request"), [])
 
     def test_owner_withdraws_their_own_request_and_still_overrides_others(self):
         # Generalises #92: the owner's own just-dispatched request is withdrawn.
@@ -621,6 +711,12 @@ class FastPathTests(unittest.TestCase):
             "Shh, quiet.",
             "Please stop, that's enough.",
             "Forget it.",
+            "Quiet please, Haley.",
+            "Okay Haili, go away now.",
+            "Friday, stop talking.",
+            "Computer, cancel that.",
+            "Haili, I wasn't talking to you.",
+            "Hang on a second.",
         ):
             with self.subTest(text=text):
                 self.assertTrue(dismissal_shaped(text))
@@ -630,9 +726,47 @@ class FastPathTests(unittest.TestCase):
             "",
             "I think we should leave around six and stop at the shop on the way home.",
             "No, I had pizza yesterday.",
+            # Requests that merely contain a cue word are never dismissal-shaped.
+            "Remind me to",
+            "cancel my dentist appointment",
+            "Can you turn on",
+            "quiet mode please",
+            "Cancel my three o'clock meeting.",
+            "Stop the timer.",
+            "Stop the music.",
+            "Pause the movie.",
+            "Hold on, what's the weather tomorrow?",
+            "No, not eggs, I meant milk.",
         ):
             with self.subTest(text=text):
                 self.assertFalse(dismissal_shaped(text))
+
+    def test_request_continuations_with_cue_words_still_join(self):
+        for first, second in (
+            ("Remind me to", "cancel my dentist appointment"),
+            ("Can you turn on", "quiet mode please"),
+            ("Haili, could you", "stop the timer"),
+        ):
+            emitted = []
+            merger = TurnMerger(
+                2000, 24000, emitted.append, breaks_turn=dismissal_shaped, reply_wait_ms=1200
+            )
+            merger.offer(fragment(first, 0, 1000))
+            merger.offer(fragment(second, 2500, 3500))
+            merger.due(5500, None)
+            with self.subTest(first=first):
+                self.assertEqual([e["text"] for e in emitted], [f"{first} {second}"])
+                self.assertTrue(emitted[0]["post_turn_gap"]["observed"])
+
+    def test_a_whole_request_with_a_cue_word_keeps_its_observed_gap(self):
+        emitted = []
+        merger = TurnMerger(
+            2000, 24000, emitted.append, breaks_turn=dismissal_shaped, reply_wait_ms=1200
+        )
+        merger.offer(fragment("Cancel my three o'clock meeting.", 0, 1500))
+        self.assertEqual(emitted, [])
+        merger.due(3500, None)
+        self.assertEqual(emitted[0]["post_turn_gap"]["following"], "none")
 
     def test_mentions_name(self):
         self.assertTrue(mentions_name(NAMES, "Okay Hailey, what time is it?"))
@@ -829,7 +963,7 @@ class HarnessTests(unittest.TestCase):
     def test_invalid_answers_are_scored_as_abstentions(self):
         def reply(body, payload):
             raw = answer(body, ("none", spread(none=1.0)))
-            raw["answers"]["attention"]["probabilities"]["attend"] = 0.99
+            raw["answers"]["attention"]["probabilities"]["attend"] = 0.5
             return raw
 
         document = {**self.document, "scenarios": self.document["scenarios"][:1]}
