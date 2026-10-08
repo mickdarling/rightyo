@@ -27,6 +27,9 @@ from rightyo.memory import TranscriptMemory
 from rightyo.providers import ConfiguredPriorityProvider, ProviderError
 
 MAX_EVENT_BYTES = 1200000
+# How long a reply reported as playing can keep a conversation engaged when its end is
+# never reported (#124).
+MAX_REPLY_HOLD_MS = 180000
 MAX_QUEUE_BYTES = 4194304
 MAX_PENDING_BYTES = 1048576
 # The context a role provider sees when a speaker first appears.
@@ -151,7 +154,8 @@ class SpeechEvents:
         # applies to every speaker (a dismissal whose speaker cannot be compared).
         self._cooldowns = {}
         # Conversation mode (#82), off unless configured at start, and the one engaged
-        # speaker: {"key", "speaker_id", "from_ms", "until_ms"}, or None when ambient.
+        # speaker: {"key", "speaker_id", "from_ms", "until_ms"}, plus "replying_since" while
+        # the host reports a reply playing (#124), or None when ambient.
         self._conversation = None
         self._engaged = None
 
@@ -576,20 +580,55 @@ class SpeechEvents:
             and self._cooldown_key(self._facts(turn)) == engaged["key"]
             # Decisions may arrive out of turn order: speech from before the request
             # that engaged is never a follow-up.
-            and engaged["from_ms"] <= turn.start_ms < engaged["until_ms"]
+            and engaged["from_ms"] <= turn.start_ms < self._window_end(engaged)
         )
+
+    @staticmethod
+    def _window_end(engaged):
+        """The engagement window's end: held open while a reply plays, up to a bound."""
+        replying = engaged.get("replying_since")
+        if replying is None:
+            return engaged["until_ms"]
+        return max(engaged["until_ms"], replying + MAX_REPLY_HOLD_MS)
+
+    def reply(self, phase, now_ms):
+        """The host's report that the assistant's spoken reply `started` or `ended` (#124).
+
+        While engaged, a playing reply holds the window open, and its end restarts the
+        window from that moment, so follow-ups are timed from the end of what was spoken,
+        not from the request. Ignored when conversation mode is off or nothing is engaged.
+        Emits nothing.
+        """
+        with self._lock:
+            if phase not in {"started", "ended"}:
+                raise ContractError("invalid reply phase")
+            integer(now_ms, "now_ms")
+            engaged = self._engaged
+            if not self._active or self._conversation is None or engaged is None:
+                return
+            if now_ms >= self._window_end(engaged):
+                # Lapsed already, though no decision has said so yet: a late report never
+                # revives a conversation.
+                return
+            if phase == "started":
+                engaged.setdefault("replying_since", now_ms)
+            else:
+                engaged.pop("replying_since", None)
+                engaged["until_ms"] = max(
+                    engaged["until_ms"], now_ms + self._conversation.window_ms
+                )
 
     def _lapse(self, now_ms):
         """Return to ambient once stream time passes the engagement window (#82)."""
         engaged = self._engaged
-        if engaged is not None and now_ms >= engaged["until_ms"]:
+        if engaged is not None and now_ms >= self._window_end(engaged):
             self._engaged = None
             self._emit(
                 "conversation",
                 state="ambient",
                 reason="timeout",
                 speaker_id=engaged["speaker_id"],
-                at_ms=engaged["until_ms"],
+                at_ms=self._window_end(engaged),
             )
 
     def _disengage(self, turn, reason):

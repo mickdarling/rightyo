@@ -329,6 +329,14 @@ def main(argv: list[str] | None = None) -> int:
         help="required with --mode stdin: where the piped audio came from (no default)",
     )
     listen.add_argument("--session-id", help="host-selected session ID (otherwise generated)")
+    listen.add_argument(
+        "--control-fd",
+        type=int,
+        help=(
+            "with --mode stdin: an inherited file descriptor carrying host JSON lines "
+            '{"reply": "started"} / {"reply": "ended"} (#124)'
+        ),
+    )
     listen.add_argument("--use-jev", action="store_true")
     listen.add_argument("--allow-hosted", action="store_true")
     _add_name_option(listen)

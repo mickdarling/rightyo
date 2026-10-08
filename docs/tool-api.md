@@ -509,8 +509,17 @@ unattributed or overlapping turn, or one with utterance-local labels, never enga
 never counts as a follow-up, so a guest's question to someone else is not pulled in
 ([#113](https://github.com/mickdarling/rightyo/issues/113)).
 
-**Not yet.** RightyO has no input for "a reply was spoken", so only a request engages,
-not a reply. The decision model is not told the conversation is engaged; the follow-up
+**Reply timing** ([#124](https://github.com/mickdarling/rightyo/issues/124)). Follow-ups
+are timed from the end of the assistant's spoken reply when the host reports it. With
+`listen --mode stdin --control-fd N`, the host writes JSON lines `{"reply": "started"}`
+and `{"reply": "ended"}` to inherited descriptor N, and RightyO stamps each with its own
+stream clock on arrival. While engaged, a playing reply holds the window open (bounded
+at 180 s if its end never comes), and its end restarts the window from that moment. A
+report after the window lapsed, or with nothing engaged, changes nothing; malformed lines
+are skipped with a content-free stderr note. Without `--control-fd` the window runs from
+the request, as before.
+
+**Not yet.** Only a request engages, not a reply on its own. The decision model is not told the conversation is engaged; the follow-up
 rule works on its answer instead. Name-less direct requests before any engagement and
 looser name matching are separate work under #82.
 
@@ -686,8 +695,9 @@ at once on any `dismiss`; drop or withdraw the listed requests and anything it h
 flight for this session; on `engagement`, return to ambient; optionally show the
 dismissal in the chat. Barge-in, meaning hearing the user while the assistant is
 speaking, needs the full-duplex loop and echo cancellation on the host, so the
-assistant's own playback is not transcribed as the user. RightyO has no input for "the
-assistant is speaking now" yet; in live sessions `playback_active` is always false.
+assistant's own playback is not transcribed as the user. Only conversation mode's reply
+timing (`listen --control-fd`) hears when the assistant is speaking; the decision's
+`playback_active` is still always false in live sessions.
 
 **Evaluation.** `examples/dismissal-eval.json` is an authored, synthetic set of 44
 scenarios: 20 dismissals (named, other agent names, unnamed, during and after
