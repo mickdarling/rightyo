@@ -411,6 +411,14 @@ class ProviderBudgetAndFailureTests(unittest.TestCase):
                 self.assertEqual(raised.reason, "malformed-response")
         oversized = self.failure(None, b" " * 65537)
         self.assertNotIsInstance(oversized, ProviderUnavailable)
+        # A model version change is not transient: it stays a fatal plain ProviderError.
+        for model in ("jev-1.14.0", None):
+            with self.subTest(model=model):
+                raised = self.failure(None, json.dumps({"model": model, "answers": {}}).encode())
+                self.assertNotIsInstance(raised, ProviderUnavailable)
+                self.assertIn("unexpected model version", str(raised))
+        raised = self.failure(None, json.dumps({"answers": {}}).encode())
+        self.assertNotIsInstance(raised, ProviderUnavailable)
 
     def test_permanent_failures_stay_plain_provider_errors(self):
         for error in (self.http(400), self.http(401), self.http(403), self.http(404)):

@@ -367,7 +367,9 @@ def _choice(raw: Any, options: set[str]) -> tuple[str, float, dict[str, float]]:
     probs = {option: probability(value) for option, value in distribution.items()}
     # Jev may round each probability to two decimals, so a valid answer can sum to 0.99 or
     # 1.01 (#100). Half a step per option is the exact worst case of that rounding; any sum
-    # farther from 1 is malformed. Renormalize so thresholds see a proper distribution.
+    # farther from 1 is malformed. The reported distribution is renormalized. Thresholds keep
+    # Jev's own `confidence`, which its API derives from, but need not equal, the choice's
+    # probability (the documented example pairs 0.88 with confidence 0.81).
     total = sum(probs.values())
     if total <= 0 or abs(total - 1) > CHOICE_ROUNDING_TOLERANCE * len(options):
         raise ContractError("invalid Jev Choice distribution")
@@ -582,6 +584,9 @@ class JevProvider:
             self._refund()
             raise
         raw = self._send(payload)
+        if raw.get("model") != JEV_MODEL:
+            # A version change is not a transient glitch: fail loudly, never degrade (#77).
+            raise ProviderError("Jev returned an unexpected model version")
         decision = None
         try:
             decision = parse_response(raw, request_body, self.min_confidence)

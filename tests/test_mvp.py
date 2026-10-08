@@ -283,6 +283,16 @@ class JevTests(unittest.TestCase):
                 total = sum(attention.values())
                 self.assertAlmostEqual(parsed.probabilities["attend"], attention["attend"] / total)
 
+    def test_thresholds_use_jev_confidence_not_the_choice_probability(self):
+        # The API's documented example pairs a 0.88 choice probability with confidence 0.81.
+        raw = response(self.request)
+        raw["answers"]["attention"].update(
+            confidence=0.81, probabilities={"attend": 0.88, "ignore": 0.12, "uncertain": 0.0}
+        )
+        self.assertEqual(parse_response(raw, self.request, 0.8).label, "attend")
+        parsed = parse_response(raw, self.request, 0.85)
+        self.assertEqual((parsed.label, parsed.confidence), ("uncertain", 0.81))
+
     def test_distributions_beyond_rounding_are_still_rejected(self):
         for probabilities in (
             {"attend": 0.6, "ignore": 0.1, "uncertain": 0.2},  # sums to 0.9

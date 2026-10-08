@@ -146,16 +146,19 @@ The turn stays ordinary context, and the next turn is sent as usual. There is no
 the failed turn. Five such failures in a row, of any of these reasons, end the session
 with `reason: "attention-unavailable"`, as does any other hosted failure at once: an
 authentication or other HTTP 4xx response, a refused redirect, an oversized response, a
-credential failure, or cancellation. A host that does not know the optional keys reads the
-evidence as an ordinary `uncertain` decision. The bounded `evaluate` and `tool-replay`
-commands still fail closed on any hosted failure, including a malformed answer.
+credential failure, an unexpected model version, or cancellation. A host that does not
+know the optional keys reads the evidence as an ordinary `uncertain` decision. The bounded
+`evaluate` and `tool-replay` commands and `scripts/evaluate_addressedness.py` still fail
+closed on a malformed answer.
 
 Jev may round each Choice probability to two decimals, so a valid distribution can sum to
 0.99 or 1.01 ([#100](https://github.com/mickdarling/rightyo/issues/100)). A sum within
-0.005 per option of 1, the worst case of that rounding, is accepted and renormalized
-before thresholds apply; a missing, negative or non-finite probability, a sum farther
-from 1, or a choice that is not the most probable option is malformed. This applies to the
-attention, recipient and speaker-role questions alike.
+0.005 per option of 1, the worst case of that rounding, is accepted, and the reported
+`probabilities` are renormalized. Confidence thresholds use Jev's own `confidence`: the
+API derives it from the distribution, but it need not equal the chosen option's
+probability. A missing, negative or non-finite probability, a sum farther from 1, or a
+choice that is not the most probable option is malformed. This applies to the attention,
+recipient and speaker-role questions alike.
 
 ## Scene and post-turn gap
 
