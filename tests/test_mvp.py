@@ -264,6 +264,43 @@ class JevTests(unittest.TestCase):
             with self.assertRaises(ContractError):
                 parse_response(raw, self.request, 0.7)
 
+    def test_two_decimal_rounding_is_accepted_and_renormalized(self):
+        # Jev may round to two decimals, so a valid distribution sums to 0.99 or 1.01 (#100).
+        for attention, recipient in (
+            ({"attend": 0.66, "ignore": 0.12, "uncertain": 0.21}, {"system": 0.99}),
+            (
+                {"attend": 0.67, "ignore": 0.12, "uncertain": 0.22},
+                {"system": 0.95, "unknown": 0.06},
+            ),
+        ):
+            raw = response(self.request)
+            raw["answers"]["attention"]["probabilities"] = attention
+            raw["answers"]["recipient"]["probabilities"].update(recipient)
+            with self.subTest(total=sum(attention.values())):
+                parsed = parse_response(raw, self.request, 0.0)
+                self.assertEqual(parsed.label, "attend")
+                self.assertAlmostEqual(sum(parsed.probabilities.values()), 1.0, places=9)
+                total = sum(attention.values())
+                self.assertAlmostEqual(parsed.probabilities["attend"], attention["attend"] / total)
+
+    def test_distributions_beyond_rounding_are_still_rejected(self):
+        for probabilities in (
+            {"attend": 0.6, "ignore": 0.1, "uncertain": 0.2},  # sums to 0.9
+            {"attend": 0.7, "ignore": 0.2, "uncertain": 0.2},  # sums to 1.1
+            {"attend": 0.0, "ignore": 0.0, "uncertain": 0.0},
+            {"attend": 0.4, "ignore": 0.6, "uncertain": 0.0},  # choice is not the argmax
+            {"attend": 1.0, "ignore": -0.01, "uncertain": 0.0},
+            {"attend": 1.0, "ignore": float("nan"), "uncertain": 0.0},
+        ):
+            raw = response(self.request)
+            raw["answers"]["attention"]["probabilities"] = probabilities
+            with self.subTest(probabilities=probabilities), self.assertRaises(ContractError):
+                parse_response(raw, self.request, 0.7)
+        raw = response(self.request)
+        raw["answers"]["recipient"]["probabilities"]["system"] = 0.9
+        with self.assertRaises(ContractError):
+            parse_response(raw, self.request, 0.7)
+
     def test_no_hosted_consent_never_accesses_credentials_or_network(self):
         with patch("rightyo.credentials.load_jev_api_key") as key:
             with self.assertRaises(ProviderError):

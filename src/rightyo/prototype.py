@@ -65,8 +65,9 @@ BROWSER_LEASE_SECONDS = 15
 # paces them, and the bounded decision queue fails closed if Jev falls behind.
 DEFAULT_REQUEST_LIMIT = 20
 LIVE_MODES = frozenset({"microphone", "stdin"})
-# A transiently unavailable hosted decision (timeout, connection, HTTP 429/529/5xx)
-# degrades only its own turn (#71); this many in a row end the session as before.
+# A transiently unavailable hosted decision (timeout, connection, HTTP 429/529/5xx, or a
+# malformed answer, #77) degrades only its own turn (#71); this many in a row end the
+# session as before.
 MAX_CONSECUTIVE_DECISION_FAILURES = 5
 # Observed post-turn gaps (#96) waiting for their turn's decision; a bound, not a queue.
 MAX_PENDING_GAPS = 64
