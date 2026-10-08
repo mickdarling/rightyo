@@ -55,7 +55,17 @@ same `diarization-timeline` provenance as observed ones. The risk: a second spea
 first word inside that slack, before the diarizer segments them, is labelled as the
 first speaker. For that reason it is refused together with configured speaker roles
 (`owner`, `trusted`, `owner_only`), and it never applies to utterance-level diarizers.
-Keep the slack small (a few hundred milliseconds). An optional
+Keep the slack small (a few hundred milliseconds). The same object's `tail_join_ms`
+(default 0, off; 0 to 2,000) turns on tail join
+([#129](https://github.com/mickdarling/rightyo/issues/129)), also an inference. Edge
+attribution only reaches words near the speaker's timeline segment, so a longer trailing
+piece can still arrive unlabelled and become a second turn, with a second request and
+acknowledgement. With this set, an unlabelled, non-overlapping turn that starts within
+that many milliseconds of a held labelled turn's end is joined into it and takes its
+speaker and provenance (see [joined turns](tool-api.md#joined-turns)). With merging off,
+a labelled turn is held for at least that long. It carries the same risk as edge
+attribution, a second speaker's short reply inside the window becoming the first
+speaker's, and is refused together with configured speaker roles the same way. An optional
 `"dismissal": {}` object turns on [natural dismissal](tool-api.md#natural-dismissal-and-barge-in)
 (the decision model's dismissal question, the `dismiss` event, self-withdrawal and the
 cool-down), with optional `window_ms`, `cooldown_ms` and `cooldown_min_confidence`; it is

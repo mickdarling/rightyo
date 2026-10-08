@@ -12,9 +12,14 @@ the stop fragment is emitted on its own, so joining never hides a stop and a dis
 never waits for the hold.
 
 Only fragments whose speaker label is known, equal, and not overlapping are joined, with
-the same speaker provenance. An unattributed or overlapping fragment is never joined, so
-the merger invents no speaker attribution itself (opt-in edge attribution in the live
-window may already have inferred a label; see `LiveConfig.edge_attribution_ms`).
+the same speaker provenance. By default an unattributed or overlapping fragment is never
+joined, so the merger invents no speaker attribution itself (opt-in edge attribution in
+the live window may already have inferred a label; see `LiveConfig.edge_attribution_ms`).
+The one exception is opt-in tail join (`tail_join_ms`, #129), an inference: an
+unattributed, non-overlapping fragment that starts within that many milliseconds of a
+held labelled, non-overlapping fragment's end, with the same provenance, is joined into
+it and takes its speaker. Overlap is still never joined, nothing is joined into an
+unattributed held fragment, and a labelled fragment of another speaker is never joined.
 Fragments are plain dictionaries; the caller turns a
 released fragment into a `Turn` and assigns its utterance id at that moment, so ids stay
 unique and in emission order, and a joined turn reports the first fragment's start and
@@ -61,13 +66,26 @@ def merge_gap(value: Any) -> int:
     return value
 
 
+# Tail join (#129) is an inference; keep its window short.
+MAX_TAIL_JOIN_MS = 2000
+
+
+def tail_join(value: Any) -> int:
+    """A validated tail join window in milliseconds: 0 turns tail join off."""
+    if type(value) is not int or not 0 <= value <= MAX_TAIL_JOIN_MS:
+        raise ValueError("invalid tail join window")
+    return value
+
+
 class TurnMerger:
     """Single-owner, synchronous; the caller supplies the stream clock.
 
     `offer` takes each finalized fragment in time order. `due` is called as stream time
     advances and releases the held fragment once no continuation can still arrive.
     `flush` releases it at once (end of input, a stalled source); `discard` drops it
-    (cancellation). A joined turn never spans more than `max_span_ms`.
+    (cancellation). A joined turn never spans more than `max_span_ms`. With `tail_join_ms`
+    above 0, an unattributed tail joins the held labelled fragment (see the module notes),
+    and a labelled fragment is held at least that long so its tail can arrive.
     """
 
     def __init__(
@@ -78,8 +96,10 @@ class TurnMerger:
         breaks_turn: Callable[[str], bool] | None = None,
         reply_wait_ms: int = 0,
         shaped: Callable[[str], bool] = request_shaped,
+        tail_join_ms: int = 0,
     ):
         self.gap_ms = merge_gap(gap_ms)
+        self.tail_join_ms = tail_join(tail_join_ms)
         self.reply_wait_ms = reply_wait(reply_wait_ms)
         if not callable(shaped):
             raise ValueError("invalid request shape predicate")
@@ -105,21 +125,35 @@ class TurnMerger:
         return fragment["speaker"] is not None and not fragment["overlap"]
 
     def _hold_for(self, fragment: dict[str, Any]) -> int:
-        hold = self.gap_ms if self._joinable(fragment) else 0
+        hold = max(self.gap_ms, self.tail_join_ms) if self._joinable(fragment) else 0
         if self.reply_wait_ms and self.shaped(fragment["text"]):
             hold = max(hold, self.reply_wait_ms)
         return hold
 
     def _continues(self, fragment: dict[str, Any]) -> bool:
         held = self._held
+        if held is None or not self._joinable(held):
+            return False
+        if self._joinable(fragment):
+            # The same speaker continuing after a pause.
+            gap = self.gap_ms
+            same = (fragment["speaker"], fragment["speaker_provenance"]) == (
+                held["speaker"],
+                held["speaker_provenance"],
+            )
+        else:
+            # Tail join (#129): an unattributed, non-overlapping tail takes the held
+            # speaker. Overlap is never joined.
+            gap = self.tail_join_ms
+            same = (
+                fragment["speaker"] is None
+                and not fragment["overlap"]
+                and fragment["speaker_provenance"] == held["speaker_provenance"]
+            )
         return (
-            held is not None
-            and self.gap_ms > 0
-            and self._joinable(held)
-            and self._joinable(fragment)
-            and (fragment["speaker"], fragment["speaker_provenance"])
-            == (held["speaker"], held["speaker_provenance"])
-            and fragment["start_ms"] - held["end_ms"] <= self.gap_ms
+            gap > 0
+            and same
+            and fragment["start_ms"] - held["end_ms"] <= gap
             and max(held["end_ms"], fragment["end_ms"]) - held["start_ms"] <= self.max_span_ms
             and len(held["text"]) + 1 + len(fragment["text"]) <= MAX_TEXT_CHARS
         )
