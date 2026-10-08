@@ -645,6 +645,9 @@ class SpeechEvents:
                 # Optional keys too, present only when the dismissal question was asked.
                 evidence["dismissal"] = event.decision.dismissal
                 evidence["dismissal_confidence"] = event.decision.dismissal_confidence
+                if event.decision.dismissal_malformed:
+                    # A degraded answer, as distinct from a genuine `uncertain`.
+                    evidence["dismissal_status"] = "malformed"
             stop = False
             if role is not None:
                 evidence["role"] = role

@@ -448,6 +448,8 @@ class ProviderDecision:
     dismissal: str | None = None
     dismissal_choice: str | None = None
     dismissal_confidence: float | None = None
+    # True when the dismissal answer was missing or malformed and degraded to `uncertain`.
+    dismissal_malformed: bool = False
 
     def __post_init__(self) -> None:
         if self.label not in LABELS:

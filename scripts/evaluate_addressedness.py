@@ -311,6 +311,9 @@ class JevOracle:
                 if type(usage.get(key)) is int:
                     self.usage[key] += usage[key]
         self.last_invalid = None
+        if not isinstance(raw, dict) or raw.get("model") != JEV_MODEL:
+            # Never scored: a different model's answers are not this evaluation (#101).
+            raise ProviderError("Jev returned an unexpected model version")
         try:
             decisions = {t: parse_response(raw, body, t) for t in THRESHOLDS}
         except ContractError:
@@ -371,7 +374,14 @@ def dismissal_baselines(document: dict) -> dict[str, Any]:
     }
 
 
-def evaluate(document: dict, oracle: Any, variants: list[str]) -> dict[str, Any]:
+def evaluate(
+    document: dict, oracle: Any, variants: list[str], *, score_invalid: bool = False
+) -> dict[str, Any]:
+    """Score every scenario; a malformed answer stops the run unless `score_invalid`.
+
+    With `score_invalid`, an answer the live provider would reject is scored as uncertain
+    and counted in `invalid_answers`. A model mismatch always stops the run.
+    """
     scenarios = document["scenarios"]
     report: dict[str, Any] = {
         "scenarios": len(scenarios),
@@ -394,7 +404,10 @@ def evaluate(document: dict, oracle: Any, variants: list[str]) -> dict[str, Any]
                 }
             except ContractError:
                 # An answer the live provider would reject (for example a choice that is
-                # not the most probable option): scored as an abstention, and counted.
+                # not the most probable option): fail closed, or, when asked, score it as
+                # an abstention and count it.
+                if not score_invalid:
+                    raise ProviderError("Jev returned an invalid structured response") from None
                 labels = {t: "uncertain" for t in THRESHOLDS}
                 detail = {
                     "invalid": True,
@@ -488,6 +501,9 @@ def markdown(document: dict, report: dict) -> str:
         ]
         lines.append(f"| **Missed requests** (of {attend_total}) | " + " | ".join(missed) + " |")
         lines.append(f"| **False attends** (of {other_total}) | " + " | ".join(false) + " |")
+        invalid = [str(len(report["variants"][v]["invalid_answers"])) for v in variants]
+        if any(count != "0" for count in invalid):
+            lines.append("| **Invalid answers** (scored uncertain) | " + " | ".join(invalid) + " |")
         lines.append("")
     asked = [v for v in variants if report["variants"][v]["dismissal_asked"]]
     wanted = sum(1 for s in document["scenarios"] if s.get("dismissal") == "dismiss")
@@ -525,6 +541,12 @@ def main(argv: list[str] | None = None) -> int:
         "--scenario", action="append", help="run only these scenario ids (repeatable)"
     )
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--score-invalid-as-abstention",
+        action="store_true",
+        help="score malformed answers as uncertain and count them instead of stopping "
+        "(a model mismatch still stops the run)",
+    )
     args = parser.parse_args(argv)
     document = load_scenarios(args.scenarios)
     variants = args.variant or list(DEFAULT_VARIANTS)
@@ -542,7 +564,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         oracle = MockOracle()
     try:
-        report = evaluate(document, oracle, variants)
+        report = evaluate(
+            document, oracle, variants, score_invalid=args.score_invalid_as_abstention
+        )
     except ProviderError as failure:
         print(f"Hosted evaluation stopped: {failure}", file=sys.stderr)
         return 1

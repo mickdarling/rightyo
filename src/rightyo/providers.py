@@ -481,12 +481,14 @@ def parse_response(raw: Any, request: dict[str, Any], min_confidence: float) -> 
     dismissal = {}
     if "dismissal" in asked:
         # A malformed or missing dismissal answer is no dismissal, not a failed decision.
-        judged = ("uncertain", "uncertain", 0.0)
+        judged, malformed = ("uncertain", "uncertain", 0.0), True
         try:
             judged = dismissal_judgement(answers.get("dismissal"), recipient, min_confidence)
+            malformed = False
         except ContractError:
             pass
         dismissal = dict(zip(("dismissal", "dismissal_choice", "dismissal_confidence"), judged))
+        dismissal["dismissal_malformed"] = malformed
     return ProviderDecision(
         label,
         recipient,

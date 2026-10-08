@@ -37,6 +37,7 @@ from rightyo.providers import (
     JEV_MODEL,
     ConfiguredPriorityProvider,
     MockProvider,
+    ProviderError,
     bounded_request,
     build_request,
     dismissal_judgement,
@@ -234,6 +235,20 @@ class ResponseParsingTests(unittest.TestCase):
             (degraded.dismissal, degraded.dismissal_choice, degraded.dismissal_confidence),
             ("uncertain", "uncertain", 0.0),
         )
+        self.assertTrue(degraded.dismissal_malformed)
+        self.assertFalse(
+            parse_response(
+                answer(three, ("none", spread(none=1.0))), three, 0.7
+            ).dismissal_malformed
+        )
+        # The flag reaches the attention evidence.
+        events = SpeechEvents()
+        events.start("dismissal-test", dismissal=Dismissal())
+        current = turn("t", 0, 900, "Haili, what time is it?")
+        events.transcript(current, 900)
+        events.decision(DecisionEvent(current, degraded, 1, 0.0, 0.0), 1000)
+        (attention,) = [e for e in events.drain() if e["type"] == "attention"]
+        self.assertEqual(attention["decision"]["dismissal_status"], "malformed")
 
     def test_dismissing_mass_decides_and_the_larger_kind_is_kept(self):
         body = build_request(state())
@@ -977,10 +992,64 @@ class HarnessTests(unittest.TestCase):
         document = {**self.document, "scenarios": self.document["scenarios"][:1]}
         oracle = harness.JevOracle(1)
         with patch.object(oracle.provider, "answer", side_effect=reply):
-            report = harness.evaluate(document, oracle, ["dismissal"])
+            report = harness.evaluate(document, oracle, ["dismissal"], score_invalid=True)
         variant = report["variants"]["dismissal"]
         self.assertEqual(variant["invalid_answers"], ["dismissal_named-01"])
         self.assertEqual(variant["answers"][0]["labels"][0.7], "uncertain")
+        self.assertIn(
+            "| **Invalid answers** (scored uncertain) | 1 |", harness.markdown(document, report)
+        )
+
+    def test_invalid_answers_stop_the_run_by_default(self):
+        def reply(body, payload):
+            raw = answer(body, ("none", spread(none=1.0)))
+            raw["answers"]["attention"]["probabilities"]["attend"] = 0.5
+            return raw
+
+        document = {**self.document, "scenarios": self.document["scenarios"][:1]}
+        oracle = harness.JevOracle(1)
+        with (
+            patch.object(oracle.provider, "answer", side_effect=reply),
+            self.assertRaises(ProviderError),
+        ):
+            harness.evaluate(document, oracle, ["dismissal"])
+
+    def test_a_model_mismatch_always_stops_the_run(self):
+        def reply(body, payload):
+            return {**answer(body, ("none", spread(none=1.0))), "model": "jev-9.9.9"}
+
+        document = {**self.document, "scenarios": self.document["scenarios"][:1]}
+        for score_invalid in (False, True):
+            oracle = harness.JevOracle(1)
+            with (
+                self.subTest(score_invalid=score_invalid),
+                patch.object(oracle.provider, "answer", side_effect=reply),
+                self.assertRaises(ProviderError),
+            ):
+                harness.evaluate(document, oracle, ["dismissal"], score_invalid=score_invalid)
+        # The command exits non-zero either way.
+        with (
+            patch("scripts.evaluate_addressedness.JevOracle") as built,
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            built.return_value = oracle
+            oracle.provider.answer = reply
+            code = harness.main(
+                [
+                    "--provider",
+                    "jev",
+                    "--allow-hosted",
+                    "--score-invalid-as-abstention",
+                    "--scenarios",
+                    str(ROOT / "examples" / "dismissal-eval.json"),
+                    "--scenario",
+                    "dismissal_named-01",
+                    "--variant",
+                    "dismissal",
+                ]
+            )
+        self.assertEqual(code, 1)
 
 
 if __name__ == "__main__":

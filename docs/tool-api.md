@@ -149,8 +149,10 @@ with `reason: "attention-unavailable"`, as does any other hosted failure at once
 authentication or other HTTP 4xx response, a refused redirect, an oversized response, a
 credential failure, an unexpected model version, or cancellation. A host that does not
 know the optional keys reads the evidence as an ordinary `uncertain` decision. The bounded
-`evaluate` and `tool-replay` commands still fail closed on a malformed answer;
-`scripts/evaluate_addressedness.py` counts it and scores it as an abstention.
+`evaluate` and `tool-replay` commands and `scripts/evaluate_addressedness.py` still fail
+closed on a malformed answer. The script's `--score-invalid-as-abstention` instead scores
+such an answer as uncertain and counts it in its tables; an answer from an unexpected
+model version always stops it.
 
 Jev may round each Choice probability to two decimals, so a valid distribution can sum to
 0.99 or 1.01 ([#100](https://github.com/mickdarling/rightyo/issues/100)). A sum within
@@ -511,7 +513,8 @@ capability (`dismiss` event, version 1).
    named as the recipient of "Friday, stop talking" in the evaluation. Such a
    dismissal emits `dismiss` after the turn's `attention` event and any owner overrides,
    with `reason: "decision"` and the summed probability as `confidence`. A missing or
-   malformed `dismissal` answer is treated as no dismissal (`uncertain`, confidence 0);
+   malformed `dismissal` answer is treated as no dismissal (`uncertain`, confidence 0),
+   marked in the attention evidence by the optional key `dismissal_status: "malformed"`;
    the attention decision still stands.
 
 **Contract decision: "stop the music".** When the host itself plays media the assistant
