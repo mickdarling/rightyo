@@ -44,13 +44,18 @@ by the same speaker before it is emitted and decided (default 2,000 ms, 0 to 5,0
 off); see [joined turns](tool-api.md#joined-turns). The same object's `reply_wait_ms`
 (default 1,200 ms, 0 to 3,000, 0 off) sets how long a question or request is held to
 observe the [post-turn gap](tool-api.md#scene-and-post-turn-gap). The same object's
-`edge_attribution_ms` (default 0, off; up to 2,000) lets a word the streaming diarizer's
-timeline left unlabelled take the speaker of the labelled words beside it, within that many
-milliseconds. This only happens when that is the utterance's only labelled speaker, the
-word overlaps no one, and every timeline segment touching it is that speaker's; it never
-applies to utterance-level diarizers. The timeline trails the audio and the recognizer's
-word timestamps run slightly past it, so without this a sentence's last word ("bit.",
-"you.") often arrives as a separate unlabelled turn that can't be joined. An optional
+`edge_attribution_ms` (default 0, off; 0 to 2,000 in 20 ms steps) turns on edge
+attribution, an inference rather than an observation. The streaming diarizer's timeline
+trails the audio and the recognizer's word timestamps run slightly past it, so a
+sentence's last word ("bit.", "you.") often arrives as a separate unlabelled turn that
+can't be joined. With this set, an unlabelled word takes the utterance's only labelled
+speaker when it overlaps no one and either touches only that speaker's timeline segments
+or, touching none, lies within that many milliseconds of one. Inferred labels carry the
+same `diarization-timeline` provenance as observed ones. The risk: a second speaker's
+first word inside that slack, before the diarizer segments them, is labelled as the
+first speaker. For that reason it is refused together with configured speaker roles
+(`owner`, `trusted`, `owner_only`), and it never applies to utterance-level diarizers.
+Keep the slack small (a few hundred milliseconds). An optional
 `"dismissal": {}` object turns on [natural dismissal](tool-api.md#natural-dismissal-and-barge-in)
 (the decision model's dismissal question, the `dismiss` event, self-withdrawal and the
 cool-down), with optional `window_ms`, `cooldown_ms` and `cooldown_min_confidence`; it is

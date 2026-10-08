@@ -129,6 +129,29 @@ class EdgeAttributionTests(unittest.TestCase):
         result = run(Units(*WORDS), timeline, 1000)
         self.assertEqual([speaker for _, speaker in result][1], None)
 
+    def test_a_guest_starting_outside_the_slack_is_never_labelled(self):
+        # Owner A until 520 ms; a guest the diarizer hasn't segmented yet from 760 ms.
+        units = Units((" Turn the lights on", 0, 500), (" and unlock the door.", 760, 1000))
+        self.assertEqual(
+            run(units, Timeline((0, 520, 1)), 200),
+            [("Turn the lights on", "Speaker A"), ("and unlock the door.", None)],
+        )
+
+    def test_inside_the_slack_an_unsegmented_word_is_inferred_as_documented(self):
+        # The documented risk: a word inside the slack, touching no segment, is inferred.
+        units = Units((" Turn the lights on", 0, 500), (" please.", 560, 700))
+        self.assertEqual(
+            run(units, Timeline((0, 520, 1)), 200),
+            [("Turn the lights on please.", "Speaker A")],
+        )
+
+    def test_a_word_touching_only_the_labelled_speaker_joins_whatever_the_slack(self):
+        units = Units((" Turn the", 0, 300), (" volume down.", 300, 900))
+        self.assertEqual(
+            run(units, Timeline((0, 500, 1)), 20),
+            [("Turn the volume down.", "Speaker A")],
+        )
+
     def test_the_setting_is_validated(self):
         for value in (-1, 2001, 1.5, "100"):
             with self.subTest(value=value), self.assertRaises(LiveAudioError):
@@ -153,10 +176,43 @@ class EdgeAttributionTests(unittest.TestCase):
             self.assertEqual(PrototypeConfig.load(config).edge_attribution_ms, 0)
             config.write_text(json.dumps(base | {"turns": {"edge_attribution_ms": 1000}}))
             self.assertEqual(PrototypeConfig.load(config).edge_attribution_ms, 1000)
-            for invalid in (-1, 2001, True, "1000"):
+            for invalid in (-1, 2001, 150, True, "1000"):
                 config.write_text(json.dumps(base | {"turns": {"edge_attribution_ms": invalid}}))
                 with self.subTest(invalid=invalid), self.assertRaises(PrototypeError):
                     PrototypeConfig.load(config)
+
+    def test_configured_roles_refuse_it(self):
+        from rightyo.contracts import SpeakerPriority
+        from rightyo.prototype import PrototypeController
+
+        with tempfile.TemporaryDirectory() as directory:
+            asset = Path(directory) / "asset"
+            asset.touch()
+            base = {
+                name: str(asset)
+                for name in (
+                    "whisper_executable",
+                    "whisper_model",
+                    "diarization_library",
+                    "diarization_model",
+                    "microphone_helper",
+                )
+            }
+            config = Path(directory) / "config.json"
+            config.write_text(
+                json.dumps(
+                    base
+                    | {"demo_audio": str(asset), "turns": {"edge_attribution_ms": 200}}
+                    | {"speakers": {"owner": ["Speaker A"]}}
+                )
+            )
+            loaded = PrototypeConfig.load(config)
+            self.assertEqual(loaded.speakers, SpeakerPriority(owners=("Speaker A",)))
+            controller = PrototypeController(loaded)
+            self.addCleanup(controller.close)
+            with self.assertRaises(PrototypeError) as error:
+                controller.start({"mode": "demo"})
+            self.assertIn("speaker roles", str(error.exception))
 
 
 if __name__ == "__main__":

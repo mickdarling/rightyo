@@ -282,7 +282,7 @@ class PrototypeConfig:
             }:
                 raise ValueError
             edges = turns.get("edge_attribution_ms", 0)
-            if type(edges) is not int or not 0 <= edges <= 2000:
+            if type(edges) is not int or not 0 <= edges <= 2000 or edges % 20:
                 raise ValueError
             gap = merge_gap(turns.get("merge_gap_ms", DEFAULT_TURN_MERGE_GAP_MS))
             wait = reply_wait(turns.get("reply_wait_ms", DEFAULT_REPLY_WAIT_MS))
@@ -512,6 +512,17 @@ class PrototypeController:
             raise PrototypeError(
                 "Configured speaker roles require a session-stable diarizer; the selected "
                 "diarizer labels speakers per utterance"
+            )
+        if (
+            roles is not None
+            and (roles.owners or roles.trusted or roles.owner_only)
+            and self.config.edge_attribution_ms
+        ):
+            # An inferred label must never carry a role's authority: a guest's first word
+            # in the slack after the owner's segment would become the owner's.
+            raise PrototypeError(
+                "Edge attribution infers speaker labels; it cannot be combined with "
+                "configured speaker roles"
             )
         budget_seconds = validate_session_budget(self.config.session_budget_seconds)
         with self._lock:
