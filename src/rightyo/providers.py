@@ -260,7 +260,9 @@ GAP_GUIDANCE = (
     "unattributed). A question or request followed by a quiet gap that no other person "
     "filled is evidence that it was addressed to the assistant/system. A different speaker "
     "starting to talk within the gap is evidence that it was addressed to that person "
-    "(other_human). An unobserved gap is no evidence either way."
+    "(other_human). Speech from an unattributed speaker within the gap is not evidence of an "
+    "unanswered request: it may be another person's reply. An unobserved gap is no evidence "
+    "either way."
 )
 
 

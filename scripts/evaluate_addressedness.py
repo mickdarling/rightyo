@@ -59,6 +59,7 @@ CATEGORIES = (
     "media",
     "playback",
     "quoted",
+    "injection",
 )
 EXPECTED = ("attend", "not_attend")
 MAX_SCENARIOS = 100
@@ -351,10 +352,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--provider", choices=("mock", "jev"), default="mock")
     parser.add_argument("--allow-hosted", action="store_true")
     parser.add_argument("--variant", action="append", choices=tuple(VARIANTS))
+    parser.add_argument(
+        "--scenario", action="append", help="run only these scenario ids (repeatable)"
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     document = load_scenarios(args.scenarios)
     variants = args.variant or list(VARIANTS)
+    if args.scenario:
+        chosen = [s for s in document["scenarios"] if s["id"] in set(args.scenario)]
+        if len(chosen) != len(set(args.scenario)):
+            parser.error("unknown --scenario id")
+        document = {**document, "scenarios": chosen}
     if args.provider == "jev":
         if not args.allow_hosted:
             parser.error("--provider jev sends authored text to hosted Jev; add --allow-hosted")

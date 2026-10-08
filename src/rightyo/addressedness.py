@@ -98,7 +98,9 @@ def observe_gap(
     Fragments are the turn merger's dictionaries (`speaker`, `overlap`,
     `speaker_provenance`, `start_ms`, `end_ms`). Speech starting after the window counts as
     silence for the whole window. Without a speaker label on either side, or with overlap,
-    the next speaker is `unattributed`: no different speaker is invented.
+    the next speaker is `unattributed`: no different speaker is invented. Utterance-local
+    labels (`diarization-utterance`, namespaced `u<n> <label>`) compare only within one
+    utterance, so labels from two different utterances are `unattributed` too.
     """
     if following is None or following["start_ms"] - held["end_ms"] > window_ms:
         return post_turn_gap(
@@ -111,6 +113,10 @@ def observe_gap(
         or held["overlap"]
         or following["overlap"]
         or held["speaker_provenance"] != following["speaker_provenance"]
+        or (
+            held["speaker_provenance"] == "diarization-utterance"
+            and _utterance_scope(held["speaker"]) != _utterance_scope(following["speaker"])
+        )
     ):
         who = "unattributed"
     elif held["speaker"] == following["speaker"]:
@@ -120,6 +126,11 @@ def observe_gap(
     return post_turn_gap(
         {"observed": True, "window_ms": window_ms, "silence_ms": silence, "following": who}
     )
+
+
+def _utterance_scope(speaker: str) -> str:
+    """The `u<n>` namespace of an utterance-local label (the whole label if it has none)."""
+    return speaker.split(" ", 1)[0]
 
 
 _WORDS = re.compile(r"[a-z']+")

@@ -114,6 +114,7 @@ class RequestBuildingTests(unittest.TestCase):
         self.assertIn("state.post_turn_gap", text)
         self.assertIn("quiet gap that no other person filled", text)
         self.assertIn("(other_human)", text)
+        self.assertIn("unattributed speaker within the gap is not evidence", text)
         unobserved = self.request(gap=None)
         self.assertEqual(unobserved["state"]["post_turn_gap"], {"observed": False})
         off = self.request(gaps=False)
@@ -210,6 +211,14 @@ class ValidationTests(unittest.TestCase):
             with self.subTest(who=who, silence=silence):
                 gap = observe_gap(held, following, 1200)
                 self.assertEqual((gap["silence_ms"], gap["following"]), (silence, who))
+        # Utterance-local labels compare only within one utterance (#97 review).
+        local = dict(held, speaker="u1 Speaker A", speaker_provenance="diarization-utterance")
+        same_utterance = dict(local, speaker="u1 Speaker B", start_ms=1000, end_ms=1300)
+        next_utterance = dict(local, speaker="u2 Speaker A", start_ms=1000, end_ms=1300)
+        self.assertEqual(observe_gap(local, same_utterance, 1200)["following"], "different_speaker")
+        self.assertEqual(observe_gap(local, next_utterance, 1200)["following"], "unattributed")
+        relabelled = dict(next_utterance, speaker="u2 Speaker B")
+        self.assertEqual(observe_gap(local, relabelled, 1200)["following"], "unattributed")
         unlabelled = fragment("What time is it?", 0, 900, speaker=None)
         other = fragment("Half past", 1300, 1600, speaker="Speaker B")
         self.assertEqual(observe_gap(unlabelled, other, 1200)["following"], "unattributed")
