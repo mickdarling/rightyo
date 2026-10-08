@@ -66,7 +66,7 @@ from rightyo.speech_backends import (
     transcriber_spec,
     utterance_local_labels,
 )
-from rightyo.turn_merge import DEFAULT_TURN_MERGE_GAP_MS, merge_gap
+from rightyo.turn_merge import DEFAULT_TURN_MERGE_GAP_MS, merge_gap, tail_join
 
 BROWSER_LEASE_SECONDS = 15
 # Jev requests per demo session unless the session or configuration sets a cap. Live
@@ -199,6 +199,9 @@ class PrototypeConfig:
     # The `turns` section's `edge_attribution_ms`: labelling a speaker's unlabelled edge
     # words (see `LiveConfig.edge_attribution_ms`); 0, the default, is off.
     edge_attribution_ms: int = 0
+    # The `turns` section's `tail_join_ms` (#129): joining an unlabelled tail into the
+    # held labelled turn (see `LiveConfig.tail_join_ms`); 0, the default, is off.
+    tail_join_ms: int = 0
     # The optional `dismissal` section (#98): natural dismissal and the `dismiss` event.
     # Absent means off; `{}` turns it on with the defaults.
     dismissal: Dismissal | None = None
@@ -279,8 +282,10 @@ class PrototypeConfig:
                 "merge_gap_ms",
                 "reply_wait_ms",
                 "edge_attribution_ms",
+                "tail_join_ms",
             }:
                 raise ValueError
+            tail = tail_join(turns.get("tail_join_ms", 0))
             edges = turns.get("edge_attribution_ms", 0)
             if type(edges) is not int or not 0 <= edges <= 2000 or edges % 20:
                 raise ValueError
@@ -307,6 +312,7 @@ class PrototypeConfig:
                 decision_scene=scene,
                 reply_wait_ms=wait,
                 edge_attribution_ms=edges,
+                tail_join_ms=tail,
                 dismissal=dismissal,
                 end_of_turn=end_of_turn,
                 conversation=conversation,
@@ -524,6 +530,17 @@ class PrototypeController:
                 "Edge attribution infers speaker labels; it cannot be combined with "
                 "configured speaker roles"
             )
+        if (
+            roles is not None
+            and (roles.owners or roles.trusted or roles.owner_only)
+            and self.config.tail_join_ms
+        ):
+            # Likewise for tail join (#129): a guest's short reply right after the owner
+            # would be joined into the owner's turn.
+            raise PrototypeError(
+                "Tail join infers speaker labels; it cannot be combined with "
+                "configured speaker roles"
+            )
         budget_seconds = validate_session_budget(self.config.session_budget_seconds)
         with self._lock:
             if self._phase in {"starting", "listening", "replaying", "finishing", "stopping"}:
@@ -714,6 +731,7 @@ class PrototypeController:
                     ),
                     end_of_turn=end_of_turn.score if end_of_turn is not None else None,
                     edge_attribution_ms=self.config.edge_attribution_ms,
+                    tail_join_ms=self.config.tail_join_ms,
                     end_of_turn_threshold=settings.threshold if settings else 0.5,
                     end_of_turn_silence_ms=settings.silence_ms if settings else 200,
                 ),

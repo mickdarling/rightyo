@@ -342,7 +342,14 @@ the range 0 to 5,000, and 0 turns joining off. A joined turn:
 - keeps the shared speaker label and provenance. A piece without a speaker label or with
   overlap is never joined to anything, so no words are attributed to a speaker the
   diarizer did not name. Utterance-local labels (`diarization-utterance`) never compare
-  equal across utterances, so with that diarizer pieces are not joined.
+  equal across utterances, so with that diarizer pieces are not joined. The exception
+  is opt-in tail join (`"turns": {"tail_join_ms": 400}`, default 0, off; 0 to 2,000;
+  [#129](https://github.com/mickdarling/rightyo/issues/129)). It is an inference: a piece
+  with no speaker label and no overlap, starting within that many milliseconds of a held
+  labelled, non-overlapping turn's end, both with session-stable `diarization-timeline`
+  provenance, is joined into that turn and takes its label. Utterance-local labels are
+  never extended this way. Overlap is still never joined, nothing joins a held turn without a
+  label, and it is refused together with configured speaker roles.
 
 A joined turn spans at most twice `max_utterance_ms` (24 s by default) and 4,000
 characters; a piece that would exceed either starts a new turn. A role is still fixed

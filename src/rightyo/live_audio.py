@@ -32,7 +32,7 @@ from typing import Any, Callable
 from .addressedness import reply_wait
 from .contracts import PROVENANCE, Turn, identifier, utterance_scoped_speaker
 from .providers import Diarizer, Transcriber
-from .turn_merge import TurnMerger, merge_gap
+from .turn_merge import TurnMerger, merge_gap, tail_join
 
 SAMPLE_RATE = 16000
 FRAME_BYTES = 640  # 20 ms of mono signed little-endian PCM16
@@ -119,6 +119,12 @@ class LiveConfig:
     # A second speaker's first word in that slack would be mislabelled, so roles refuse
     # it (see `PrototypeController.start`). Only for `diarization-timeline`.
     edge_attribution_ms: int = 0
+    # Tail join (opt-in, 0 = off; #129). Also an inference: an unlabelled, non-overlapping
+    # turn starting within this many milliseconds of a held labelled turn's end joins it
+    # and takes its speaker (see `TurnMerger`). Edge attribution only reaches words near
+    # the speaker's timeline segment; this catches the rest of a trailing piece. Refused
+    # with roles, like edge attribution.
+    tail_join_ms: int = 0
     end_of_turn_threshold: float = 0.5
     end_of_turn_silence_ms: int = 200
 
@@ -132,6 +138,10 @@ class LiveConfig:
             reply_wait(self.reply_wait_ms)
         except ValueError:
             raise LiveAudioError("Invalid reply wait") from None
+        try:
+            tail_join(self.tail_join_ms)
+        except ValueError:
+            raise LiveAudioError("Invalid tail join window") from None
         if self.on_post_turn_gap is not None and not callable(self.on_post_turn_gap):
             raise LiveAudioError("Invalid post-turn gap observer")
         if self.turn_break is not None and not callable(self.turn_break):
@@ -869,6 +879,7 @@ class LiveProcessor:
             self._emit,
             config.turn_break,
             reply_wait_ms=config.reply_wait_ms,
+            tail_join_ms=config.tail_join_ms,
         )
 
     @property
