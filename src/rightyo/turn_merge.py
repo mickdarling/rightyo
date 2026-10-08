@@ -151,7 +151,9 @@ class TurnMerger:
         A detected utterance that recognition turns into no fragment would otherwise leave
         the window looking quiet; this keeps it as evidence that something followed.
         """
-        if self._held is None or type(start_ms) is not int:
+        if type(start_ms) is not int:
+            raise ValueError("invalid detected speech start")
+        if self._held is None:
             return
         if self._heard_ms is None or start_ms < self._heard_ms:
             self._heard_ms = start_ms
@@ -191,6 +193,10 @@ class TurnMerger:
                 "start_ms": heard,
                 "end_ms": heard,
             }
+        elif following is not None and heard is not None and heard < following["start_ms"]:
+            # The following speech began at its detected onset, before its first retained
+            # token: measure the gap from there, and classify the speaker from the fragment.
+            following = {**following, "start_ms": heard}
         if self.reply_wait_ms and (following is not None or quiet):
             held["post_turn_gap"] = observe_gap(held, following, self._hold_ms)
         self.emit(held)

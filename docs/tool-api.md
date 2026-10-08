@@ -200,7 +200,8 @@ the current turn, what was heard right after it:
 `window_ms` is how long the turn was held after its last word (at most 5,000), `silence_ms`
 the quiet time before the next speech (at most `window_ms`), and `following` who spoke
 next: `none` (quiet through the window), `same_speaker`, `different_speaker`, or
-`unattributed` (no speaker label on either side, or overlap; no speaker is invented). A
+`unattributed` (no speaker label on either side, or overlap, or speech was detected but
+recognition produced no text from it; no speaker is invented). A
 turn released early, by end of input, a stalled source or a suppressed utterance, carries
 `{"observed": false}`. A turn released because a stop phrase followed it does carry an
 observed gap: the stop phrase is the following speech, so `following` names its speaker

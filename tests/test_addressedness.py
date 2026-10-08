@@ -342,7 +342,37 @@ class MergerGapTests(unittest.TestCase):
         merger.heard(1300)
         merger.offer(fragment("Half past.", 1400, 1800, speaker="Speaker B"))
         gap = self.emitted[0]["post_turn_gap"]
-        self.assertEqual((gap["silence_ms"], gap["following"]), (500, "different_speaker"))
+        # The speaker comes from the fragment; the gap ends at the earlier detected onset.
+        self.assertEqual((gap["silence_ms"], gap["following"]), (400, "different_speaker"))
+
+    def test_detected_onset_in_window_measures_a_late_first_token(self):
+        merger = self.merger()
+        merger.offer(fragment("What time is it?", 0, 900))
+        merger.heard(1800)
+        # The first retained token starts at 2,300 ms, after the 2,100 ms window end.
+        merger.offer(fragment("Half past.", 2300, 2700, speaker="Speaker B"))
+        self.assertEqual(
+            self.emitted[0]["post_turn_gap"],
+            {
+                "observed": True,
+                "window_ms": 1200,
+                "silence_ms": 900,
+                "following": "different_speaker",
+            },
+        )
+
+    def test_detected_onset_after_window_keeps_a_quiet_gap(self):
+        merger = self.merger()
+        merger.offer(fragment("What time is it?", 0, 900))
+        merger.heard(2200)
+        merger.offer(fragment("Half past.", 2300, 2700, speaker="Speaker B"))
+        self.assertEqual(self.emitted[0]["post_turn_gap"], QUIET)
+
+    def test_heard_rejects_non_integer_starts(self):
+        merger = self.merger()
+        for invalid in (1.5, None, "1500"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                merger.heard(invalid)
 
     def test_joined_continuation_resets_detected_speech(self):
         merger = self.merger(gap_ms=2000)
