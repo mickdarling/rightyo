@@ -181,13 +181,32 @@ class SmartTurn:
         timeout_seconds: float = 5,
         cancelled: Callable[[], bool] | None = None,
     ):
-        if not Path(python).is_file() or not Path(model).is_file():
+        if (
+            not Path(python).is_file()
+            or not os.access(python, os.X_OK)
+            or not Path(model).is_file()
+        ):
             raise SmartTurnError("Explicit existing Smart Turn runtime and model are required")
         if type(threads) is not int or not 1 <= threads <= 8:
             raise SmartTurnError("Invalid Smart Turn thread count")
         self.timeout = timeout_seconds
         self.cancelled = cancelled if cancelled is not None else (lambda: False)
-        self.process = subprocess.Popen(
+        try:
+            self.process = self._start(python, model, threads)
+        except OSError:
+            # Not executable, wrong architecture, and so on: never a path in the message.
+            raise SmartTurnError("Smart Turn could not start") from None
+        self.buffer = bytearray()
+        try:
+            # Loading the model can take longer than one score.
+            self._receive(max(self.timeout, 30))
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _start(python: str | Path, model: str | Path, threads: int) -> subprocess.Popen:
+        return subprocess.Popen(
             [
                 str(python),
                 "-I",
@@ -202,13 +221,6 @@ class SmartTurn:
             bufsize=0,
             env={"PATH": os.defpath},
         )
-        self.buffer = bytearray()
-        try:
-            # Loading the model can take longer than one score.
-            self._receive(max(self.timeout, 30))
-        except BaseException:
-            self.close()
-            raise
 
     def _receive(self, timeout: float) -> dict:
         deadline = time.monotonic() + timeout
@@ -247,7 +259,10 @@ class SmartTurn:
         try:
             assert self.process.stdin is not None
             request = {"command": "score", "pcm": base64.b64encode(pcm).decode("ascii")}
-            self.process.stdin.write((json.dumps(request) + "\n").encode())
+            data = memoryview((json.dumps(request) + "\n").encode())
+            while data:
+                # Unbuffered: a signal can interrupt a write part-way.
+                data = data[self.process.stdin.write(data) or 0 :]
             probability = self._receive(self.timeout).get("p")
         except SmartTurnError:
             self.close()

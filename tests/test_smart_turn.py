@@ -326,6 +326,19 @@ class SmartTurnClientTests(unittest.TestCase):
     def test_explicit_existing_files_are_required(self):
         with self.assertRaises(SmartTurnError):
             SmartTurn("/nonexistent/python", "/nonexistent/model.onnx")
+        python, model = self.worker("echo '{\"ok\":true}'\n")
+        python.chmod(0o600)
+        with self.assertRaises(SmartTurnError) as error:
+            SmartTurn(python, model)
+        self.assertNotIn(str(python.parent), str(error.exception))
+
+    def test_a_worker_that_cannot_be_executed_is_a_sanitized_error(self):
+        # Executable but not a runnable program (no interpreter line): exec fails.
+        python, model = self.worker("")
+        python.write_bytes(b"\x00\x01not a program")
+        with self.assertRaises(SmartTurnError) as error:
+            SmartTurn(python, model)
+        self.assertEqual(str(error.exception), "Smart Turn could not start")
 
     def test_a_silent_worker_times_out(self):
         python, model = self.worker("echo '{\"ok\":true}'\nsleep 5\n")
