@@ -863,6 +863,9 @@ class LiveProcessor:
             self._utterance_start = frame_start - len(self._pre_roll) * 20
             self._utterance.extend(b"".join(self._pre_roll))
             self._pre_roll.clear()
+            if self._merger.holding:
+                # Followed by detected speech, whether or not it yields text (#96).
+                self._merger.heard(frame_start)
         if self._utterance or voiced:
             self._utterance.extend(frame)
             if voiced:

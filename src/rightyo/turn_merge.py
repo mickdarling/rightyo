@@ -25,8 +25,12 @@ who spoke next, within the time it was held. A request-shaped fragment is held f
 least `reply_wait_ms`, even when it could not be joined (no speaker label, overlap) or
 merging is off; joining still only happens within `gap_ms`. With the defaults the merge
 hold (2,000 ms) is already longer than the reply wait (1,200 ms), so observing the gap
-adds no latency. A fragment released early (end of input, a stalled source, a stop
-phrase, cancellation) has no observed gap.
+adds no latency. A fragment released early (end of input, a stalled source, a
+suppressed utterance) has no observed gap; one released because a stop phrase followed
+it is observed, with the stop phrase as the following speech. Cancellation discards the
+held fragment rather than releasing it. Speech the caller detected after the held
+fragment (`heard`) counts even when recognition produced no text from it: the gap then
+ends there and the next speaker is `unattributed`, never a quiet gap.
 """
 
 from __future__ import annotations
@@ -86,6 +90,8 @@ class TurnMerger:
         self._held: dict[str, Any] | None = None
         # How long past its last word the held fragment is kept: the observation window.
         self._hold_ms = 0
+        # The earliest speech the caller detected after the held fragment, in stream ms.
+        self._heard_ms: int | None = None
 
     @property
     def holding(self) -> bool:
@@ -125,6 +131,8 @@ class TurnMerger:
             held["text"] = held["text"] + " " + fragment["text"]
             held["end_ms"] = max(held["end_ms"], fragment["end_ms"])
             self._hold_ms = self._hold_for(held)
+            # Detected speech up to now belonged to the continuation just joined.
+            self._heard_ms = None
             if self.breaks_turn is not None and self.breaks_turn(held["text"]):
                 # The recognizer split the stop phrase itself ("never" + "mind"): emit
                 # the joined phrase now so no later fragment can join and hide it.
@@ -133,9 +141,20 @@ class TurnMerger:
         self._release(fragment)
         hold = self._hold_for(fragment)
         if hold:
-            self._held, self._hold_ms = dict(fragment), hold
+            self._held, self._hold_ms, self._heard_ms = dict(fragment), hold, None
         else:
             self.emit(dict(fragment))
+
+    def heard(self, start_ms: int) -> None:
+        """Record speech detected at `start_ms` (voice activity), with or without text.
+
+        A detected utterance that recognition turns into no fragment would otherwise leave
+        the window looking quiet; this keeps it as evidence that something followed.
+        """
+        if self._held is None or type(start_ms) is not int:
+            return
+        if self._heard_ms is None or start_ms < self._heard_ms:
+            self._heard_ms = start_ms
 
     def due(self, now_ms: int, open_since_ms: int | None) -> None:
         """Release the held fragment once its gap has passed with no continuation open.
@@ -149,7 +168,8 @@ class TurnMerger:
             return
         deadline = held["end_ms"] + self._hold_ms
         if now_ms >= deadline and (open_since_ms is None or open_since_ms > deadline):
-            # Nothing was heard through the whole window: an observed quiet gap.
+            # No fragment arrived through the whole window: quiet, unless speech was
+            # detected that recognition produced no text from.
             self._release(None, quiet=True)
 
     def flush(self) -> None:
@@ -159,11 +179,22 @@ class TurnMerger:
     def _release(self, following: dict[str, Any] | None, *, quiet: bool = False) -> None:
         """Emit the held fragment, with the gap observed up to `following` when enabled."""
         held, self._held = self._held, None
+        heard, self._heard_ms = self._heard_ms, None
         if held is None:
             return
+        if following is None and quiet and heard is not None:
+            # Detected speech without a fragment: something followed, speaker unknown.
+            following = {
+                "speaker": None,
+                "overlap": False,
+                "speaker_provenance": held["speaker_provenance"],
+                "start_ms": heard,
+                "end_ms": heard,
+            }
         if self.reply_wait_ms and (following is not None or quiet):
             held["post_turn_gap"] = observe_gap(held, following, self._hold_ms)
         self.emit(held)
 
     def discard(self) -> None:
         self._held = None
+        self._heard_ms = None

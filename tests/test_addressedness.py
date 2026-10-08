@@ -15,9 +15,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from test_turn_merge import (
+    FRAME_BYTES,
     SILENCE,
     VOICE,
     DecisionPathTests,
+    ScriptedDiarizer,
+    ScriptedTranscriber,
     audio,
     fragment,
 )
@@ -33,7 +36,7 @@ from rightyo.addressedness import (
     scene_text,
 )
 from rightyo.contracts import Addressing, ContractError, Turn
-from rightyo.live_audio import LiveAudioError, LiveConfig
+from rightyo.live_audio import LiveAudioError, LiveConfig, LiveProcessor
 from rightyo.pipeline import ReplayRunner
 from rightyo.prototype import DecisionConfigError, PrototypeConfig, PrototypeError
 from rightyo.providers import JEV_MODEL, MockProvider, bounded_request, build_request
@@ -315,6 +318,64 @@ class MergerGapTests(unittest.TestCase):
         stopping.offer(fragment("never mind", 1200, 1600))
         self.assertEqual(self.emitted[0]["post_turn_gap"]["following"], "same_speaker")
         self.assertNotIn("post_turn_gap", self.emitted[1])
+
+    def test_detected_speech_without_text_is_not_a_quiet_gap(self):
+        merger = self.merger()
+        merger.offer(fragment("What time is it?", 0, 900))
+        merger.heard(1500)
+        merger.due(2100, None)
+        self.assertEqual(
+            self.emitted[0]["post_turn_gap"],
+            {"observed": True, "window_ms": 1200, "silence_ms": 600, "following": "unattributed"},
+        )
+
+    def test_detected_speech_after_the_window_still_counts_as_quiet(self):
+        merger = self.merger()
+        merger.offer(fragment("What time is it?", 0, 900))
+        merger.heard(2500)
+        merger.due(3000, None)
+        self.assertEqual(self.emitted[0]["post_turn_gap"], QUIET)
+
+    def test_a_fragment_from_detected_speech_is_classified_normally(self):
+        merger = self.merger()
+        merger.offer(fragment("What time is it?", 0, 900))
+        merger.heard(1300)
+        merger.offer(fragment("Half past.", 1400, 1800, speaker="Speaker B"))
+        gap = self.emitted[0]["post_turn_gap"]
+        self.assertEqual((gap["silence_ms"], gap["following"]), (500, "different_speaker"))
+
+    def test_joined_continuation_resets_detected_speech(self):
+        merger = self.merger(gap_ms=2000)
+        merger.offer(fragment("Haili, what time", 0, 900))
+        merger.heard(1500)
+        merger.offer(fragment("is it?", 1500, 1900))
+        merger.due(3900, None)
+        self.assertEqual(self.emitted[0]["text"], "Haili, what time is it?")
+        self.assertEqual(self.emitted[0]["post_turn_gap"]["following"], "none")
+
+    def test_live_voiced_utterance_with_empty_transcription_is_unattributed(self):
+        # VAD opens a second utterance at 1,700 ms, inside the 2,000 ms hold of the first
+        # turn (ends 200 ms); the transcriber returns no units for it.
+        turns, gaps = [], {}
+        config = LiveConfig(
+            "gap-empty-asr",
+            provenance="causal-replay",
+            transcriber=ScriptedTranscriber(["What time is it?"]),
+            diarizer=ScriptedDiarizer(),
+            turn_merge_gap_ms=2000,
+            reply_wait_ms=1200,
+            on_post_turn_gap=lambda utterance_id, gap: gaps.__setitem__(utterance_id, gap),
+        )
+        processor = LiveProcessor(config, turns.append)
+        self.addCleanup(processor.close)
+        pcm = audio((VOICE, 200), (SILENCE, 1500), (VOICE, 200), (SILENCE, 3000))
+        for offset in range(0, len(pcm), FRAME_BYTES * 10):
+            processor.push_pcm16(pcm[offset : offset + FRAME_BYTES * 10])
+        self.assertEqual([turn.text for turn in turns], ["What time is it?"])
+        self.assertEqual(
+            gaps["live-1"],
+            {"observed": True, "window_ms": 2000, "silence_ms": 1500, "following": "unattributed"},
+        )
 
     def test_live_config_validates_the_wait_and_observer(self):
         for invalid in (-20, 3001, 1.5, None):
