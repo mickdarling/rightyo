@@ -13,6 +13,7 @@ from rightyo.contracts import (
     DISMISSING,
     Addressing,
     ContractError,
+    Conversation,
     DecisionEvent,
     Dismissal,
     SpeakerPriority,
@@ -149,6 +150,10 @@ class SpeechEvents:
         # Cool-downs after `disengage`: speaker label -> (from_ms, until_ms); the key None
         # applies to every speaker (a dismissal whose speaker cannot be compared).
         self._cooldowns = {}
+        # Conversation mode (#82), off unless configured at start, and the one engaged
+        # speaker: {"key", "speaker_id", "until_ms"}, or None when ambient.
+        self._conversation = None
+        self._engaged = None
 
     def _payload(self, kind, sequence, fields):
         return {
@@ -202,11 +207,14 @@ class SpeechEvents:
         speech=None,
         audio_input=None,
         dismissal=None,
+        conversation=None,
     ):
         with self._lock:
             identifier(session_id, "session_id")
             if dismissal is not None and not isinstance(dismissal, Dismissal):
                 raise ContractError("invalid dismissal")
+            if conversation is not None and not isinstance(conversation, Conversation):
+                raise ContractError("invalid conversation")
             speech = _speech_summary(speech)
             if audio_input is not None:
                 audio_input = _audio_input(audio_input)
@@ -245,6 +253,8 @@ class SpeechEvents:
             self._stop_rules = SpeakerPriority() if priority is None else priority.priority
             self._dismissed.clear()
             self._cooldowns.clear()
+            self._conversation = conversation
+            self._engaged = None
             self.role_status = "off" if priority is None else "ready"
             self._degraded_turn = None
             self._session = session_id
@@ -274,6 +284,9 @@ class SpeechEvents:
                 # And for natural dismissal (#98): a host that accepts this object must
                 # accept `dismiss` events, which are never emitted without it.
                 **({} if dismissal is None else {"dismissal": dismissal.to_dict()}),
+                # And for conversation mode (#82): a host that accepts this object must
+                # accept `conversation` events, which are never emitted without it.
+                **({} if conversation is None else {"conversation": conversation.to_dict()}),
             )
 
     def expire(self, now_ms):
@@ -385,6 +398,8 @@ class SpeechEvents:
                 if plan is not None:
                     self._dismissed[turn.utterance_id] = plan["upgradable"]
                     self._emit("dismiss", **self._apply(turn, plan))
+                    if not plan["limited"]:
+                        self._disengage(turn, "dismissed")
 
     @staticmethod
     def _comparable(first, second):
@@ -548,6 +563,83 @@ class SpeechEvents:
             and not mentions_name(self._addressing, turn.text)
         )
 
+    def _engaged_with(self, turn):
+        """Whether `turn` is the engaged speaker's, within the engagement window (#82).
+
+        Only a session-stable, unoverlapped speaker label is ever engaged, so an
+        unattributed turn or another speaker's never matches (rightyo#113).
+        """
+        engaged = self._engaged
+        return (
+            engaged is not None
+            and self._cooldown_key(self._facts(turn)) == engaged["key"]
+            and turn.start_ms < engaged["until_ms"]
+        )
+
+    def _lapse(self, now_ms):
+        """Return to ambient once stream time passes the engagement window (#82)."""
+        engaged = self._engaged
+        if engaged is not None and now_ms >= engaged["until_ms"]:
+            self._engaged = None
+            self._emit(
+                "conversation",
+                state="ambient",
+                reason="timeout",
+                speaker_id=engaged["speaker_id"],
+                at_ms=engaged["until_ms"],
+            )
+
+    def _disengage(self, turn, reason):
+        """Return the engaged speaker to ambient because of their own `turn`."""
+        if self._engaged is None or not self._engaged_with(turn):
+            return
+        self._engaged = None
+        self._emit(
+            "conversation",
+            state="ambient",
+            reason=reason,
+            speaker_id=turn.speaker_id,
+            utterance_id=turn.utterance_id,
+            at_ms=turn.end_ms,
+        )
+
+    def _engage(self, turn, request_id):
+        """Engage a request's speaker, or extend their window; one speaker at a time."""
+        key = self._cooldown_key(self._facts(turn))
+        if self._conversation is None or key is None:
+            return
+        until = turn.end_ms + self._conversation.window_ms
+        if self._engaged is not None and self._engaged["key"] == key:
+            # Each exchange extends the window; the state itself does not change.
+            self._engaged["until_ms"] = max(self._engaged["until_ms"], until)
+            return
+        self._engaged = {"key": key, "speaker_id": turn.speaker_id, "until_ms": until}
+        self._emit(
+            "conversation",
+            state="engaged",
+            reason="request",
+            speaker_id=turn.speaker_id,
+            utterance_id=turn.utterance_id,
+            request_id=request_id,
+            at_ms=turn.end_ms,
+            until_ms=until,
+        )
+
+    def _follow_up(self, turn, role, decision, evidence, unavailable):
+        """Whether an engaged speaker's undecided turn forms a request as a follow-up."""
+        conversation = self._conversation
+        if (
+            conversation is None
+            or unavailable is not None
+            or evidence["label"] != "uncertain"
+            or not self._engaged_with(turn)
+            or decision.recipient not in {"system", "unknown"}
+            or decision.probabilities["attend"] < conversation.follow_up_min_probability
+        ):
+            return False
+        # Owner-only mode never lets another speaker's turn become a request.
+        return not (role is not None and self._priority.priority.owner_only and role != "owner")
+
     def _assign_role(self, turn, past):
         """Fix a speaker's role the first time that speaker is emitted in this session."""
         if turn.speaker_id is None:
@@ -680,6 +772,17 @@ class SpeechEvents:
                 kind = event.decision.dismissal
             dismissed = kind is not None or key in self._dismissed
             would_attend = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
+            if self._conversation is not None:
+                # Decisions arrive in turn order, so the window is judged at this turn.
+                self._lapse(turn.start_ms)
+                if not would_attend and self._follow_up(
+                    turn, role, event.decision, evidence, unavailable
+                ):
+                    # An engaged speaker's undecided follow-up (#82): the request evidence
+                    # says so, beside Jev's unchanged recipient and confidence.
+                    evidence["label"] = "attend"
+                    evidence["follow_up"] = True
+                    would_attend = True
             if (
                 would_attend
                 and not dismissed
@@ -737,7 +840,9 @@ class SpeechEvents:
                 # The whole burst plus the owner's own attention/request/terminal must fit
                 # the undrained queue; otherwise fail closed before emitting any override,
                 # never a partial batch.
-                if len(to_supersede) + 3 + len(extra) > self.max_pending - len(self._queue):
+                # Plus one `conversation` event when conversation mode is on (#82).
+                spare = 1 if self._conversation is not None else 0
+                if len(to_supersede) + 3 + len(extra) + spare > self.max_pending - len(self._queue):
                     self._clear_content()
                     self._active = False
                     raise ContractError("speech event consumer backlog exceeded")
@@ -784,6 +889,23 @@ class SpeechEvents:
                                 "context": context,
                                 "decision_at_ms": self._now,
                                 **formed,
+                            },
+                        )
+                    )
+                if spare:
+                    after += 1
+                    reserve += self._size(
+                        self._payload(
+                            "conversation",
+                            after,
+                            {
+                                "state": "engaged",
+                                "reason": "other_human",
+                                "speaker_id": turn.speaker_id,
+                                "utterance_id": key,
+                                "request_id": request_id,
+                                "at_ms": 2**53 - 1,
+                                "until_ms": 2**53 - 1,
                             },
                         )
                     )
@@ -847,6 +969,20 @@ class SpeechEvents:
             if plan is not None:
                 self._dismissed[key] = plan["upgradable"]
                 self._emit("dismiss", **self._apply(turn, plan))
+            if self._conversation is not None and self._engaged_with(turn):
+                # A close ends engagement even if the closing turn itself was attended,
+                # and never re-engages. With the timeout above (emitted before any
+                # reservation), this decision emits at most one more `conversation`
+                # event: a disengaging turn never also engages.
+                if plan is not None and not plan["limited"]:
+                    self._disengage(turn, "dismissed")
+                elif self._conversation.is_closing(turn.text):
+                    self._disengage(turn, "closed")
+                elif evidence["label"] == "ignore" and (
+                    event.decision.recipient == "other_human"
+                    or event.decision.recipient.startswith("speaker_")
+                ):
+                    self._disengage(turn, "other_human")
             if attended:
                 self._emit(
                     "request",
@@ -870,6 +1006,8 @@ class SpeechEvents:
                         self._active = False
                         raise ContractError("open request budget exceeded")
                     self._open[request_id] = turn.end_ms
+                if self._conversation is not None and not self._conversation.is_closing(turn.text):
+                    self._engage(turn, request_id)
 
     def _form_request(self, turn, role, context):
         """The optional ``formed_request`` field, present only when a former is configured.

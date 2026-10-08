@@ -17,6 +17,25 @@ MAX_DISMISSAL_WINDOW_MS = 60000
 DEFAULT_DISMISSAL_COOLDOWN_MS = 30000
 MAX_DISMISSAL_COOLDOWN_MS = 600000
 DEFAULT_COOLDOWN_MIN_CONFIDENCE = 0.9
+# Conversation mode (#82): how long after a request its speaker stays engaged, and the
+# attend probability an engaged speaker's undecided follow-up needs to become a request.
+DEFAULT_CONVERSATION_WINDOW_MS = 20000
+MAX_CONVERSATION_WINDOW_MS = 120000
+DEFAULT_FOLLOW_UP_MIN_PROBABILITY = 0.4
+DEFAULT_CLOSING_PHRASES = (
+    "that's all",
+    "thanks that's all",
+    "thank you that's all",
+    "that'll be all",
+    "that will be all",
+    "that's it for now",
+    "we're done",
+    "all done",
+    "never mind",
+    "nevermind",
+)
+MAX_CLOSING_PHRASES = 16
+CONVERSATION_REASONS = frozenset({"request", "timeout", "other_human", "closed", "dismissed"})
 PROVENANCE = frozenset({"synthetic", "recorded-file", "causal-replay", "live-microphone"})
 SPEAKER_PROVENANCE = frozenset(
     {"authored-fixture", "diarization-timeline", "diarization-utterance", "unknown"}
@@ -365,6 +384,67 @@ class Dismissal:
             "window_ms": self.window_ms,
             "cooldown_ms": self.cooldown_ms,
             "cooldown_min_confidence": self.cooldown_min_confidence,
+        }
+
+
+@dataclass(frozen=True)
+class Conversation:
+    """Conversation mode (#82); absent means off and nothing changes.
+
+    A request engages its speaker for `window_ms` after the request turn ends, and each
+    later request extends it. While engaged, that speaker's turn whose decision is
+    `uncertain` but whose attend probability reaches `follow_up_min_probability`, with a
+    recipient of `system` or `unknown`, forms a request as a follow-up. A confident
+    `ignore`, another recipient, or another speaker never does. The speaker returns to
+    ambient when the window lapses, when Jev confidently judges their turn addressed to
+    another person, on a whole-turn `closing_phrases` match, or on a dismissal.
+    """
+
+    window_ms: int = DEFAULT_CONVERSATION_WINDOW_MS
+    follow_up_min_probability: float = DEFAULT_FOLLOW_UP_MIN_PROBABILITY
+    closing_phrases: tuple[str, ...] = DEFAULT_CLOSING_PHRASES
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.window_ms) is not int
+            or not 1000 <= self.window_ms <= MAX_CONVERSATION_WINDOW_MS
+        ):
+            raise ContractError("invalid conversation window")
+        if probability(self.follow_up_min_probability) <= 0:
+            raise ContractError("invalid follow-up probability")
+        phrases = self.closing_phrases
+        if not isinstance(phrases, tuple) or len(phrases) > MAX_CLOSING_PHRASES:
+            raise ContractError("invalid closing phrases")
+        for phrase in phrases:
+            if not isinstance(phrase, str) or not _STOP_PHRASE.fullmatch(phrase):
+                raise ContractError("invalid closing phrase")
+            if not normalize_phrase(phrase):
+                raise ContractError("invalid closing phrase")
+
+    def is_closing(self, text: str) -> bool:
+        """Whole-utterance match after casefolding and punctuation removal."""
+        words = normalize_phrase(text)
+        return any(words == normalize_phrase(phrase) for phrase in self.closing_phrases)
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> Conversation:
+        allowed = {"window_ms", "follow_up_min_probability", "closing_phrases"}
+        if not isinstance(raw, dict) or set(raw) - allowed:
+            raise ContractError("conversation must be an object with known keys only")
+        values = dict(raw)
+        if "closing_phrases" in values:
+            phrases = values["closing_phrases"]
+            if isinstance(phrases, (str, bytes)) or not isinstance(phrases, (list, tuple)):
+                raise ContractError("closing phrases must be a list")
+            values["closing_phrases"] = tuple(phrases)
+        return cls(**values)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "window_ms": self.window_ms,
+            "follow_up_min_probability": self.follow_up_min_probability,
+            "closing_phrases": list(self.closing_phrases),
         }
 
 

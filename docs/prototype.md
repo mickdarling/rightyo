@@ -47,7 +47,10 @@ observe the [post-turn gap](tool-api.md#scene-and-post-turn-gap). An optional
 `"dismissal": {}` object turns on [natural dismissal](tool-api.md#natural-dismissal-and-barge-in)
 (the decision model's dismissal question, the `dismiss` event, self-withdrawal and the
 cool-down), with optional `window_ms`, `cooldown_ms` and `cooldown_min_confidence`; it is
-off when absent. An optional `"end_of_turn"` object (#117) puts the Smart Turn v3
+off when absent. An optional `"conversation": {}` object turns on
+[conversation mode](tool-api.md#conversation-mode) (#82): engaged follow-ups after a
+request and the `conversation` event, with optional `window_ms`,
+`follow_up_min_probability` and `closing_phrases`; it is off when absent. An optional `"end_of_turn"` object (#117) puts the Smart Turn v3
 end-of-turn model in front of the silence rules:
 `{"enabled": true, "python": "/abs/venv/bin/python", "model": "/abs/smart-turn-v3.2-cpu.onnx"}`
 with optional `threshold` (default 0.5), `silence_ms` (default 200, 20 to 1,000) and
