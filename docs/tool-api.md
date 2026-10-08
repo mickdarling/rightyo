@@ -146,6 +146,66 @@ authentication or other HTTP 4xx response, a refused redirect, an invalid or ove
 response, a credential failure, or cancellation. A host that does not know the optional
 keys reads the evidence as an ordinary `uncertain` decision.
 
+## Scene and post-turn gap
+
+The decision model judges whether speech is addressed to the assistant; a name is
+supporting evidence, not a trigger ([#96](https://github.com/mickdarling/rightyo/issues/96),
+hailing-station #136). Two inputs help it with unnamed requests. Neither is a transcript
+filter, and neither appears in any event.
+
+**Scene.** The configuration's optional `"decision": {..., "scene": "..."}` is
+plain-language text describing the setting and what usually counts as addressing the
+assistant. It is operator data: it is rendered into the decision instructions after the
+rule that transcripts are untrusted data, it is never taken from a transcript, and it is
+not sent as part of the conversation state. It is 1 to 1,000 printable characters, or
+`null` for none. Without the key, `listen` and the lab use the default for the single-user
+assistant pilot:
+
+> One primary user is talking to an AI assistant through a phone or tablet. Most of the
+> user's directed speech that is not clearly aimed at another person present is meant for
+> the assistant, including questions and requests that do not use its name. Other voices
+> may be the assistant's own audio playback, other AI agents or media, rather than people
+> in the room. A question or request that no other person answers is likely meant for the
+> assistant.
+
+Describe your own setting when it differs, for example a shared office or a meeting.
+Listener profiles ([#69](https://github.com/mickdarling/rightyo/issues/69)) are the
+general mechanism; the scene is the minimal first step.
+
+**Post-turn gap.** When people talk to each other, the other person answers; when someone
+asks the room's assistant, the room goes quiet. The decision state therefore carries, for
+the current turn, what was heard right after it:
+
+```json
+"post_turn_gap": {"observed": true, "window_ms": 2000, "silence_ms": 2000, "following": "none"}
+```
+
+`window_ms` is how long the turn was held after its last word (at most 5,000), `silence_ms`
+the quiet time before the next speech (at most `window_ms`), and `following` who spoke
+next: `none` (quiet through the window), `same_speaker`, `different_speaker`, or
+`unattributed` (no speaker label on either side, or overlap; no speaker is invented). A
+turn released early, by end of input, a stalled source, a suppressed utterance or a stop
+phrase, carries `{"observed": false}`. The decision model is told that a question or
+request followed by an unfilled quiet gap is evidence for the assistant, and that a
+different speaker starting to talk is evidence for another person.
+
+The gap is observed during the [joined turns](#joined-turns) hold, so the default adds no
+latency: every held turn reports what followed it within its hold. A turn that reads as a
+question or request (a deterministic English placeholder for the intent of
+[#85](https://github.com/mickdarling/rightyo/issues/85): a question mark, "please", or a
+leading question word, auxiliary or common imperative verb) is held for at least
+`"turns": {"reply_wait_ms": 1200}`, even when merging is off or the turn cannot be joined;
+joining still only uses `merge_gap_ms`. With the defaults (2,000 ms merge gap, 1,200 ms
+reply wait) the window is the merge hold. The reply wait is 0 to 3,000 ms; 0 turns the
+post-turn gap off, and the state then has no `post_turn_gap`. The `LiveProcessor` library
+default (`LiveConfig.reply_wait_ms = 0`) observes nothing. `tool-replay` and `evaluate`
+do not observe gaps yet.
+
+`scripts/evaluate_addressedness.py` compares the attention request before and after #96
+on an authored, synthetic labelled set (`examples/addressedness-eval.json`). It runs the
+mock fixture rule offline by default; hosted Jev runs are manual and need
+`--provider jev --allow-hosted`.
+
 ## Turn and request fields
 
 `turn` uses the existing validated `Turn` contract: `session_id`, `utterance_id`,

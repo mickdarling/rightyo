@@ -96,9 +96,10 @@ class PromptTests(unittest.TestCase):
         request = build_request(self.state(Addressing(NAMES)))
         questions = request["questions"]
         expected = '"Hailing Station", "Station", "computer"'
+        # Names are supporting evidence, never part of the attend criterion (#96).
+        self.assertNotIn("Station", questions["attention"]["criteria"]["attend"])
         for text in (
             questions["recipient"]["criteria"]["system"],
-            questions["attention"]["criteria"]["attend"],
             questions["attention"]["instructions"],
             questions["recipient"]["instructions"],
         ):

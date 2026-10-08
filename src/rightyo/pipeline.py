@@ -11,6 +11,8 @@ from functools import wraps
 from threading import RLock
 from typing import Any, Callable
 
+from rightyo.addressedness import post_turn_gap as checked_gap
+from rightyo.addressedness import scene_text
 from rightyo.contracts import Addressing, ContractError, DecisionEvent, Turn, identifier
 from rightyo.memory import TranscriptMemory
 from rightyo.providers import DecisionProvider
@@ -60,6 +62,8 @@ class ReplayRunner:
         memory: TranscriptMemory | None = None,
         cancelled: Callable[[], bool] | None = None,
         addressing: Addressing | None = None,
+        scene: str | None = None,
+        post_turn_gaps: bool = False,
     ) -> None:
         if not 1 <= max_context_turns <= 32 or not 4000 <= max_context_chars <= 16000:
             raise ContractError("invalid context budget")
@@ -75,6 +79,10 @@ class ReplayRunner:
         if addressing is not None and not isinstance(addressing, Addressing):
             raise ContractError("invalid addressing")
         self.addressing = addressing
+        # Operator-configured setting text (#96); validated, never transcript-derived.
+        self.scene = scene_text(scene)
+        # Whether decision states carry the post-turn gap (#96), observed or not.
+        self.post_turn_gaps = post_turn_gaps is True
         self.cancelled = cancelled or (lambda: False)
         self.provider = provider
         self.memory = memory
@@ -168,7 +176,7 @@ class ReplayRunner:
             "overlap": turn.overlap,
         }
 
-    def _state(self, turn: Turn) -> dict[str, Any]:
+    def _state(self, turn: Turn, gap: dict[str, Any] | None = None) -> dict[str, Any]:
         past: list[Turn] = []
         chars = len(turn.text)
         for previous in reversed(self._history):
@@ -191,9 +199,14 @@ class ReplayRunner:
             "playback_active": self.playback_active,
             # Runtime forms of address are configuration, never a transcript-derived value.
             "addressing": None if self.addressing is None else self.addressing.to_dict(),
+            **({} if self.scene is None else {"scene": self.scene}),
+            **({"post_turn_gap": checked_gap(gap)} if self.post_turn_gaps else {}),
         }
 
-    def process(self, turn: Turn) -> DecisionEvent | None:
+    def process(
+        self, turn: Turn, post_turn_gap: dict[str, Any] | None = None
+    ) -> DecisionEvent | None:
+        """Decide one finalized turn once; `post_turn_gap` is what followed it (#96)."""
         started = time.perf_counter()
         with self._lock:
             if self.cancelled():
@@ -228,7 +241,7 @@ class ReplayRunner:
                 self.partial_turns += 1
                 return None
             epoch = self._epoch
-            state = self._state(turn)
+            state = self._state(turn, post_turn_gap)
         provider_started = time.perf_counter()
         try:
             decision = self.provider.decide(state)

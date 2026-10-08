@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from rightyo.addressedness import DEFAULT_REPLY_WAIT_MS, DEFAULT_SCENE, reply_wait, scene_text
 from rightyo.capture import CaptureError, MacMicrophoneCapture, StdinPcmCapture
 from rightyo.contracts import (
     PROVENANCE,
@@ -67,6 +68,8 @@ LIVE_MODES = frozenset({"microphone", "stdin"})
 # A transiently unavailable hosted decision (timeout, connection, HTTP 429/529/5xx)
 # degrades only its own turn (#71); this many in a row end the session as before.
 MAX_CONSECUTIVE_DECISION_FAILURES = 5
+# Observed post-turn gaps (#96) waiting for their turn's decision; a bound, not a queue.
+MAX_PENDING_GAPS = 64
 PCM_BYTES_PER_MS = 32
 # Advertised on `session` started for stdin input: a separate top-level object, so the
 # strictly validated capability set is unchanged. Turn provenance is host-declared.
@@ -105,11 +108,12 @@ def decision_spec(value: Any) -> bool:
             "provider",
             "allow_hosted",
             "max_requests",
+            "scene",
         }
     ):
         raise DecisionConfigError(
             "The decision section requires exactly the keys provider and allow_hosted, "
-            "with an optional max_requests"
+            "with an optional max_requests and scene"
         )
     provider, allow_hosted = value["provider"], value["allow_hosted"]
     if type(provider) is not str or provider not in DECISION_PROVIDERS:
@@ -128,6 +132,13 @@ def decision_spec(value: Any) -> bool:
             )
         if provider != "jev":
             raise DecisionConfigError("max_requests applies only to the jev decision provider")
+    if "scene" in value:
+        try:
+            scene_text(value["scene"])
+        except ContractError:
+            raise DecisionConfigError(
+                "The decision scene must be null or 1 to 1000 printable characters"
+            ) from None
     return provider == "jev"
 
 
@@ -168,6 +179,12 @@ class PrototypeConfig:
     # The optional `turns` section's `merge_gap_ms` (#73): a same-speaker turn starting
     # within this gap of the previous one is joined before it is emitted or decided.
     turn_merge_gap_ms: int = DEFAULT_TURN_MERGE_GAP_MS
+    # The `decision` section's optional `scene` (#96): the setting text given to the
+    # decision model. Absent means the single-user pilot default; null turns it off.
+    decision_scene: str | None = DEFAULT_SCENE
+    # The `turns` section's `reply_wait_ms` (#96): how long a request-shaped turn is held
+    # to observe the gap after it; 0 turns the post-turn gap signal off.
+    reply_wait_ms: int = DEFAULT_REPLY_WAIT_MS
 
     @property
     def hosted_speech(self) -> bool:
@@ -191,6 +208,9 @@ class PrototypeConfig:
             hosted_decisions = has_decision and decision_spec(decision)
             # Optional per-session cap on live Jev requests; absent means none (#75).
             decision_requests = decision.get("max_requests") if hosted_decisions else None
+            scene = (
+                scene_text(decision.get("scene", DEFAULT_SCENE)) if has_decision else DEFAULT_SCENE
+            )
             required = {"microphone_helper"}
             if not is_hosted(transcriber):
                 required |= {"whisper_executable", "whisper_model"}
@@ -220,9 +240,10 @@ class PrototypeConfig:
             if forming is not None:
                 forming = RequestForming.from_dict(forming)
             turns = raw.pop("turns", {})
-            if not isinstance(turns, dict) or set(turns) - {"merge_gap_ms"}:
+            if not isinstance(turns, dict) or set(turns) - {"merge_gap_ms", "reply_wait_ms"}:
                 raise ValueError
             gap = merge_gap(turns.get("merge_gap_ms", DEFAULT_TURN_MERGE_GAP_MS))
+            wait = reply_wait(turns.get("reply_wait_ms", DEFAULT_REPLY_WAIT_MS))
             values = {}
             for name, value in raw.items():
                 if not isinstance(value, str) or not value or not Path(value).is_absolute():
@@ -241,6 +262,8 @@ class PrototypeConfig:
                 hosted_decisions=hosted_decisions,
                 decision_max_requests=decision_requests,
                 turn_merge_gap_ms=gap,
+                decision_scene=scene,
+                reply_wait_ms=wait,
             )
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
@@ -314,6 +337,8 @@ class PrototypeController:
         self._decision_cancel = threading.Event()
         self._decision_queue: queue.Queue[Turn] = queue.Queue(maxsize=32)
         self._decisions: dict[str, dict[str, Any]] = {}
+        # Post-turn gaps observed by the processor, by utterance id, until decided (#96).
+        self._turn_gaps: dict[str, dict[str, Any]] = {}
         self._pending = 0
         self._requests = 0
         self._request_limit: int | None = DEFAULT_REQUEST_LIMIT
@@ -464,7 +489,12 @@ class PrototypeController:
             except (ProviderError, CredentialError):
                 raise PrototypeError("Hosted decisions could not be initialized") from None
             runner = ReplayRunner(
-                provider, memory=memory, cancelled=cancelled, addressing=self.config.addressing
+                provider,
+                memory=memory,
+                cancelled=cancelled,
+                addressing=self.config.addressing,
+                scene=self.config.decision_scene,
+                post_turn_gaps=self.config.reply_wait_ms > 0,
             )
             # Only configured roles run here: no hosted role question ever executes
             # under the controller lock (model-sourced roles are refused above).
@@ -482,6 +512,7 @@ class PrototypeController:
             self._runner = runner
             self._decision_queue = work = queue.Queue(maxsize=32)
             self._decisions = {}
+            self._turn_gaps = {}
             self._pending = self._requests = self._received_ms = 0
             self._received_bytes = 0
             self._budget_ms = None if budget_seconds is None else budget_seconds * 1000
@@ -542,6 +573,16 @@ class PrototypeController:
                 return
             self._pending += 1
 
+    def _observe_gap(self, generation: int, utterance_id: str, gap: dict[str, Any]) -> None:
+        """Keep a turn's observed post-turn gap until its decision takes it (#96)."""
+        with self._lock:
+            if generation != self._generation or self._stop.is_set():
+                return
+            self._turn_gaps[utterance_id] = gap
+            while len(self._turn_gaps) > MAX_PENDING_GAPS:
+                # Turns that were never queued for a decision leave stale entries.
+                del self._turn_gaps[next(iter(self._turn_gaps))]
+
     def _audio(self, generation, stop, session, work, memory, mode):
         capture = processor = None
         try:
@@ -572,6 +613,10 @@ class PrototypeController:
                     # Stop phrases are matched against a whole turn, so joining must
                     # never absorb one; the defaults apply when roles are off.
                     turn_break=(self.config.speakers or SpeakerPriority()).is_stop_phrase,
+                    reply_wait_ms=self.config.reply_wait_ms,
+                    on_post_turn_gap=lambda utterance_id, gap: self._observe_gap(
+                        generation, utterance_id, gap
+                    ),
                 ),
                 lambda turn: self._accept(generation, work, memory, turn),
             )
@@ -751,6 +796,7 @@ class PrototypeController:
             try:
                 event = None
                 with self._lock:
+                    gap = self._turn_gaps.pop(turn.utterance_id, None)
                     if generation != self._generation or stop.is_set():
                         continue
                     if self._decision_cancel.is_set():
@@ -760,7 +806,7 @@ class PrototypeController:
                         continue
                 if not enabled:
                     if not hosted:
-                        runner.process(turn)
+                        runner.process(turn, gap)
                     continue
                 if (
                     self._request_limit is not None
@@ -774,7 +820,7 @@ class PrototypeController:
                     continue
                 unavailable = None
                 try:
-                    event = runner.process(turn)
+                    event = runner.process(turn, gap)
                     failures = 0
                 except ProviderUnavailable as failure:
                     # One transient hosted failure degrades this turn only: an uncertain
