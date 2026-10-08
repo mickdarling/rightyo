@@ -253,6 +253,14 @@ class ResponseParsingTests(unittest.TestCase):
                 self.assertEqual(decided.dismissal_choice, dismissal[0])
                 self.assertAlmostEqual(decided.dismissal_confidence, mass)
 
+    def test_rounded_dismissal_distribution_within_tolerance_is_accepted(self):
+        # Four options: a two-decimal distribution summing to 0.98 is within 0.005 x 4.
+        body = build_request(state())
+        rounded = spread(stop=0.88, disengage=0.05, none=0.03, uncertain=0.02)
+        decided = parse_response(answer(body, ("stop", rounded)), body, 0.7)
+        self.assertEqual(decided.dismissal, "stop")
+        self.assertAlmostEqual(decided.dismissal_confidence, 0.93 / 0.98)
+
     def test_a_dismissal_said_to_another_human_is_not_trusted(self):
         self.assertEqual(
             dismissal_judgement(choice("stop", spread(stop=1.0)), "other_human", 0.7)[0],

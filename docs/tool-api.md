@@ -149,8 +149,8 @@ with `reason: "attention-unavailable"`, as does any other hosted failure at once
 authentication or other HTTP 4xx response, a refused redirect, an oversized response, a
 credential failure, an unexpected model version, or cancellation. A host that does not
 know the optional keys reads the evidence as an ordinary `uncertain` decision. The bounded
-`evaluate` and `tool-replay` commands and `scripts/evaluate_addressedness.py` still fail
-closed on a malformed answer.
+`evaluate` and `tool-replay` commands still fail closed on a malformed answer;
+`scripts/evaluate_addressedness.py` counts it and scores it as an abstention.
 
 Jev may round each Choice probability to two decimals, so a valid distribution can sum to
 0.99 or 1.01 ([#100](https://github.com/mickdarling/rightyo/issues/100)). A sum within
@@ -159,7 +159,8 @@ Jev may round each Choice probability to two decimals, so a valid distribution c
 API derives it from the distribution, but it need not equal the chosen option's
 probability. A missing, negative or non-finite probability, a sum farther from 1, or a
 choice that is not the most probable option is malformed. This applies to the attention,
-recipient and speaker-role questions alike.
+recipient, speaker-role and [dismissal](#natural-dismissal-and-barge-in) questions alike; a
+malformed dismissal answer counts as no dismissal rather than failing the decision.
 
 ## Scene and post-turn gap
 
