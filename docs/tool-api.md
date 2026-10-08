@@ -476,12 +476,18 @@ events. The object takes three optional keys:
   window without a new event. A request from another speaker moves the engagement to them.
 
 **Follow-ups.** While engaged, a turn from the engaged speaker that started inside the
-window forms a request when all of these hold:
+window (after the request that engaged and before the window ends, whatever order
+decisions arrive in) forms a request when all of these hold:
 - its decision is `uncertain` (a confident `ignore` never is a follow-up);
 - Jev's attend probability is at least `follow_up_min_probability`;
 - its recipient is `system` or `unknown` (never `other_human` or another speaker);
+- it is not a closing phrase;
 - the decision was not a transient unavailability placeholder, and `owner_only` does not
   exclude the speaker.
+
+A follow-up is still subject to stop phrases, dismissals, owner supersession and the
+dismissal cool-down; one the cool-down holds back is reported as `uncertain` with
+`cooldown`, not `follow_up`.
 
 The `attention` and `request` events of a follow-up carry `"label": "attend"` and
 `"follow_up": true` in `decision`, beside Jev's unchanged `recipient_kind` and
@@ -494,8 +500,9 @@ The `attention` and `request` events of a follow-up carry `"label": "attend"` an
   re-engages, even if it was attended.
 - `other_human`: Jev confidently judged the engaged speaker's turn `ignore`, addressed to
   another person.
-- `dismissed`: the engaged speaker's dismissal (a stop phrase or a model-judged
-  dismissal with natural dismissal on) had full effect.
+- `dismissed`: the engaged speaker dismissed (a stop phrase or a model-judged dismissal,
+  with natural dismissal on), even when their dismissal only stops playback: ending
+  their own engagement affects no one else.
 
 **Speakers.** Only a session-stable, unoverlapped speaker label is ever engaged. An
 unattributed or overlapping turn, or one with utterance-local labels, never engages and

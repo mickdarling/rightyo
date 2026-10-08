@@ -151,7 +151,7 @@ class SpeechEvents:
         # applies to every speaker (a dismissal whose speaker cannot be compared).
         self._cooldowns = {}
         # Conversation mode (#82), off unless configured at start, and the one engaged
-        # speaker: {"key", "speaker_id", "until_ms"}, or None when ambient.
+        # speaker: {"key", "speaker_id", "from_ms", "until_ms"}, or None when ambient.
         self._conversation = None
         self._engaged = None
 
@@ -398,8 +398,9 @@ class SpeechEvents:
                 if plan is not None:
                     self._dismissed[turn.utterance_id] = plan["upgradable"]
                     self._emit("dismiss", **self._apply(turn, plan))
-                    if not plan["limited"]:
-                        self._disengage(turn, "dismissed")
+                    # Ending one's own engagement affects no one else, so even a dismissal
+                    # limited to playback ends it.
+                    self._disengage(turn, "dismissed")
 
     @staticmethod
     def _comparable(first, second):
@@ -573,7 +574,9 @@ class SpeechEvents:
         return (
             engaged is not None
             and self._cooldown_key(self._facts(turn)) == engaged["key"]
-            and turn.start_ms < engaged["until_ms"]
+            # Decisions may arrive out of turn order: speech from before the request
+            # that engaged is never a follow-up.
+            and engaged["from_ms"] <= turn.start_ms < engaged["until_ms"]
         )
 
     def _lapse(self, now_ms):
@@ -613,7 +616,12 @@ class SpeechEvents:
             # Each exchange extends the window; the state itself does not change.
             self._engaged["until_ms"] = max(self._engaged["until_ms"], until)
             return
-        self._engaged = {"key": key, "speaker_id": turn.speaker_id, "until_ms": until}
+        self._engaged = {
+            "key": key,
+            "speaker_id": turn.speaker_id,
+            "from_ms": turn.end_ms,
+            "until_ms": until,
+        }
         self._emit(
             "conversation",
             state="engaged",
@@ -635,6 +643,8 @@ class SpeechEvents:
             or not self._engaged_with(turn)
             or decision.recipient not in {"system", "unknown"}
             or decision.probabilities["attend"] < conversation.follow_up_min_probability
+            # A closing phrase ends the conversation; it is never a request of its own.
+            or conversation.is_closing(turn.text)
         ):
             return False
         # Owner-only mode never lets another speaker's turn become a request.
@@ -773,7 +783,7 @@ class SpeechEvents:
             dismissed = kind is not None or key in self._dismissed
             would_attend = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
             if self._conversation is not None:
-                # Decisions arrive in turn order, so the window is judged at this turn.
+                # The window is judged in stream time at each decided turn.
                 self._lapse(turn.start_ms)
                 if not would_attend and self._follow_up(
                     turn, role, event.decision, evidence, unavailable
@@ -792,6 +802,8 @@ class SpeechEvents:
                 # After "go away", an unnamed attend needs more confidence for a while.
                 evidence["label"] = "uncertain"
                 evidence["cooldown"] = True
+                # A follow-up held back is not reported as one.
+                evidence.pop("follow_up", None)
                 would_attend = False
             attended = (
                 would_attend
@@ -974,7 +986,7 @@ class SpeechEvents:
                 # and never re-engages. With the timeout above (emitted before any
                 # reservation), this decision emits at most one more `conversation`
                 # event: a disengaging turn never also engages.
-                if plan is not None and not plan["limited"]:
+                if plan is not None:
                     self._disengage(turn, "dismissed")
                 elif self._conversation.is_closing(turn.text):
                     self._disengage(turn, "closed")

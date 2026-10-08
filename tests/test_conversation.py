@@ -18,9 +18,11 @@ from rightyo.contracts import (
     DecisionEvent,
     Dismissal,
     ProviderDecision,
+    SpeakerPriority,
     Turn,
 )
 from rightyo.prototype import PrototypeConfig, PrototypeError
+from rightyo.providers import ConfiguredPriorityProvider
 from rightyo.tool_events import SpeechEvents
 
 SESSION = "conversation-test"
@@ -229,6 +231,63 @@ class ConversationEventTests(unittest.TestCase):
         # Speaker A is no longer engaged.
         events = self.say(turn("t3", 3000, 3900, "And tomorrow?"), "uncertain", attend=0.6)
         self.assertEqual(self.kinds(events), ["attention"])
+
+    def test_speech_from_before_the_engaging_request_is_never_a_follow_up(self):
+        self.start()
+        musing = turn("t0", 0, 900, "Hmm, I wonder about tomorrow.")
+        request = turn("t1", 1500, 2400, "Haili, what time is it?")
+        self.events.transcript(musing, musing.end_ms)
+        self.events.transcript(request, request.end_ms)
+        # Decisions may arrive out of turn order: the request is decided first.
+        self.events.decision(decided(request, "attend"), 2500)
+        self.events.decision(decided(musing, "uncertain", attend=0.6), 2600)
+        events = [e for e in self.events.drain() if e["type"] != "transcript"]
+        self.assertEqual(self.kinds(events), ["attention", "request", "conversation", "attention"])
+        self.assertEqual(events[3]["decision"]["label"], "uncertain")
+
+    def test_a_participants_playback_only_stop_still_ends_their_own_engagement(self):
+        owner = SpeakerPriority(owners=("Speaker Z",))
+        self.start(dismissal=Dismissal(), priority=ConfiguredPriorityProvider(owner))
+        self.say(turn("t1", 0, 900, "Haili, play some music."), "attend")
+        current = turn("t2", 2000, 2400, "Stop.")
+        self.events.transcript(current, current.end_ms)
+        events = [e for e in self.events.drain() if e["type"] != "transcript"]
+        self.assertEqual(self.kinds(events), ["dismiss", "conversation"])
+        self.assertEqual(events[0]["scope"], ["playback"])
+        self.assertEqual((events[1]["state"], events[1]["reason"]), ("ambient", "dismissed"))
+        events = self.say(turn("t3", 3000, 3900, "And the other one."), "uncertain", attend=0.6)
+        self.assertEqual(self.kinds(events), ["attention"])
+
+    def test_owner_only_never_promotes_another_speaker(self):
+        owner = SpeakerPriority(owners=("Speaker A",), owner_only=True)
+        self.start(priority=ConfiguredPriorityProvider(owner))
+        self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+        events = self.say(turn("t2", 2000, 2900, "And?", "Speaker B"), "uncertain", attend=0.9)
+        self.assertEqual(self.kinds(events), ["attention"])
+        # The owner's own follow-up still forms a request.
+        events = self.say(turn("t3", 3000, 3900, "And tomorrow?"), "uncertain", attend=0.6)
+        self.assertEqual(self.kinds(events), ["attention", "request"])
+
+    def test_a_closing_phrase_is_not_promoted_to_a_request(self):
+        self.start()
+        self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+        events = self.say(turn("t2", 2000, 2600, "Never mind."), "uncertain", attend=0.9)
+        self.assertEqual(self.kinds(events), ["attention", "conversation"])
+        self.assertEqual(events[0]["decision"]["label"], "uncertain")
+        self.assertEqual(events[1]["reason"], "closed")
+
+    def test_a_follow_up_held_back_by_a_cool_down_is_not_reported_as_one(self):
+        self.start(dismissal=Dismissal(cooldown_ms=60000))
+        self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+        # Another speaker's disengage starts a cool-down for everyone without moving
+        # the engagement (their label is not comparable: overlapping speech).
+        self.events._cooldowns[None] = (1000, 61000)
+        events = self.say(
+            turn("t2", 2000, 2900, "And tomorrow?"), "uncertain", attend=0.6, confidence=0.5
+        )
+        self.assertEqual(self.kinds(events), ["attention"])
+        self.assertIs(events[0]["decision"]["cooldown"], True)
+        self.assertNotIn("follow_up", events[0]["decision"])
 
     def test_an_unattributed_request_engages_no_one(self):
         self.start()
