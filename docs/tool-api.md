@@ -34,6 +34,7 @@ The events are:
 | `request` | `request_id`, `turn`, `decision`, `context`, `decision_at_ms`, optional `formed_request` | Complete attended input available for host handling |
 | `override` | `superseded_request_id`, `by_utterance_id`, `role` | An owner's turn supersedes an earlier open non-owner request |
 | `dismiss` | `utterance_id`, `speech_end_ms`, `speaker_id`, optional `role`, `scope`, `withdrawn_request_ids`, `reason`, `confidence`, optional `cooldown_until_ms` | The speaker told the assistant to stop, go away, or that it was not addressed ([natural dismissal](#natural-dismissal-and-barge-in); only when advertised) |
+| `conversation` | `state`, `reason`, `speaker_id`, `at_ms`, optional `utterance_id`, `request_id`, `until_ms` | The conversation became `engaged` with a speaker or returned to `ambient` ([conversation mode](#conversation-mode); only when advertised) |
 
 A live session's terminal `session` event can carry two positive counts
 ([#78](https://github.com/mickdarling/rightyo/issues/78)), each absent when zero, so
@@ -446,6 +447,72 @@ emission order; a later non-owner request that happened to be decided first stay
 [The enrolled fixture](../examples/enrolled-override.jsonl) shows a participant's
 attended request followed by the owner's "Ignore that." override; the shared anonymous
 fixture above is byte-identical to before.
+
+## Conversation mode
+
+Per-turn attention judges every turn on its own. Real use is conversational: once the
+user has addressed the assistant, their next few turns are usually still for it, even
+without the name ("and what about tomorrow?", "make an issue for that"). Conversation
+mode ([#82](https://github.com/mickdarling/rightyo/issues/82)) keeps a small state on top
+of per-turn attention.
+
+**Opt-in.** Off by default, and then nothing in this document changes: no `conversation`
+event, no follow-ups, byte-identical fixtures. Turn it on with the configuration's
+`"conversation": {}` object; `session.started` then advertises it as a top-level
+`conversation` object, and a host that accepts that object must accept `conversation`
+events. The object takes three optional keys:
+
+| Key | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `window_ms` | 20,000 | 1,000 to 120,000 | How long after a request turn ends its speaker stays engaged |
+| `follow_up_min_probability` | 0.4 | above 0, up to 1 | The attend probability an engaged speaker's `uncertain` turn needs to become a follow-up |
+| `closing_phrases` | "that's all", "thanks, that's all", "never mind", and so on | up to 16 | Whole-turn phrases that end the conversation |
+
+**States.**
+- **Ambient**, the default: a turn forms a request only on a confident `attend`, as
+  without conversation mode.
+- **Engaged** with one speaker: entered when that speaker's turn forms a request, for
+  `window_ms` after the turn ends. Each later request from the same speaker extends the
+  window without a new event. A request from another speaker moves the engagement to them.
+
+**Follow-ups.** While engaged, a turn from the engaged speaker that started inside the
+window (after the request that engaged and before the window ends, whatever order
+decisions arrive in) forms a request when all of these hold:
+- its decision is `uncertain` (a confident `ignore` never is a follow-up);
+- Jev's attend probability is at least `follow_up_min_probability`;
+- its recipient is `system` or `unknown` (never `other_human` or another speaker);
+- it is not a closing phrase;
+- the decision was not a transient unavailability placeholder, and `owner_only` does not
+  exclude the speaker.
+
+A follow-up is still subject to stop phrases, dismissals, owner supersession and the
+dismissal cool-down; one the cool-down holds back is reported as `uncertain` with
+`cooldown`, not `follow_up`.
+
+The `attention` and `request` events of a follow-up carry `"label": "attend"` and
+`"follow_up": true` in `decision`, beside Jev's unchanged `recipient_kind` and
+`confidence`.
+
+**Back to ambient**, with the `reason`:
+- `timeout`: the window lapsed. Stream time is judged at each decided turn, so the event
+  is emitted with the next decision after the window, with `at_ms` set to the window end.
+- `closed`: the engaged speaker's whole turn matches a closing phrase. That turn never
+  re-engages, even if it was attended.
+- `other_human`: Jev confidently judged the engaged speaker's turn `ignore`, addressed to
+  another person.
+- `dismissed`: the engaged speaker dismissed (a stop phrase or a model-judged dismissal,
+  with natural dismissal on), even when their dismissal only stops playback: ending
+  their own engagement affects no one else.
+
+**Speakers.** Only a session-stable, unoverlapped speaker label is ever engaged. An
+unattributed or overlapping turn, or one with utterance-local labels, never engages and
+never counts as a follow-up, so a guest's question to someone else is not pulled in
+([#113](https://github.com/mickdarling/rightyo/issues/113)).
+
+**Not yet.** RightyO has no input for "a reply was spoken", so only a request engages,
+not a reply. The decision model is not told the conversation is engaged; the follow-up
+rule works on its answer instead. Name-less direct requests before any engagement and
+looser name matching are separate work under #82.
 
 ## Natural dismissal and barge-in
 

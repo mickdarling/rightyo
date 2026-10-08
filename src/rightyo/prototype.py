@@ -29,6 +29,7 @@ from rightyo.contracts import (
     PROVENANCE,
     Addressing,
     ContractError,
+    Conversation,
     DecisionEvent,
     Dismissal,
     RequestForming,
@@ -201,6 +202,9 @@ class PrototypeConfig:
     # The optional `end_of_turn` section (#117): Smart Turn in front of the silence
     # end-of-turn. Absent or `"enabled": false` means off.
     end_of_turn: EndOfTurn | None = None
+    # The optional `conversation` section (#82): engaged follow-ups after a request and
+    # the `conversation` event. Absent means off; `{}` turns it on with the defaults.
+    conversation: Conversation | None = None
 
     @property
     def hosted_speech(self) -> bool:
@@ -243,6 +247,7 @@ class PrototypeConfig:
                 "turns",
                 "dismissal",
                 "end_of_turn",
+                "conversation",
                 *LOCAL_ASSETS,
             }
             if raw.keys() - required - optional:
@@ -260,6 +265,9 @@ class PrototypeConfig:
             dismissal = raw.pop("dismissal", None)
             if dismissal is not None:
                 dismissal = Dismissal.from_dict(dismissal)
+            conversation = raw.pop("conversation", None)
+            if conversation is not None:
+                conversation = Conversation.from_dict(conversation)
             end_of_turn = raw.pop("end_of_turn", None)
             if end_of_turn is not None:
                 end_of_turn = EndOfTurn.from_dict(end_of_turn)
@@ -290,6 +298,7 @@ class PrototypeConfig:
                 reply_wait_ms=wait,
                 dismissal=dismissal,
                 end_of_turn=end_of_turn,
+                conversation=conversation,
             )
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
@@ -577,6 +586,7 @@ class PrototypeController:
                     speech=speech_summary(self.config.transcriber, self.config.diarizer),
                     audio_input=STDIN_AUDIO_INPUT if mode == "stdin" else None,
                     dismissal=self.config.dismissal,
+                    conversation=self.config.conversation,
                 )
                 self._event_terminal = False
             threading.Thread(
