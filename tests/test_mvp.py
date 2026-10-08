@@ -283,6 +283,26 @@ class JevTests(unittest.TestCase):
                 total = sum(attention.values())
                 self.assertAlmostEqual(parsed.probabilities["attend"], attention["attend"] / total)
 
+    def test_sums_exactly_on_the_rounding_bound_are_accepted(self):
+        # Four options allow 0.02 of slack; 0.98 and 1.02 sit exactly on it, which floating point
+        # would otherwise reject (abs(0.98 - 1) == 0.020000000000000018).
+        from rightyo.providers import _choice
+
+        for probabilities in (
+            {"a": 0.49, "b": 0.49, "c": 0.0, "d": 0.0},
+            {"a": 0.52, "b": 0.5, "c": 0.0, "d": 0.0},
+        ):
+            raw = {
+                "type": "choice",
+                "choice": "a",
+                "confidence": 0.5,
+                "probabilities": probabilities,
+            }
+            with self.subTest(total=sum(probabilities.values())):
+                choice, _, probs = _choice(raw, set(probabilities))
+                self.assertEqual(choice, "a")
+                self.assertAlmostEqual(sum(probs.values()), 1.0, places=9)
+
     def test_thresholds_use_jev_confidence_not_the_choice_probability(self):
         # The API's documented example pairs a 0.88 choice probability with confidence 0.81.
         raw = response(self.request)

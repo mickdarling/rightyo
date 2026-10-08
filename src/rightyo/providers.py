@@ -33,6 +33,8 @@ REPLAY_MAX_REQUESTS = 100
 MOCK_DEFAULT_ADDRESSING = Addressing(("rightyo",))
 # Per-option slack for a Choice distribution rounded to two decimals (#100).
 CHOICE_ROUNDING_TOLERANCE = 0.005
+# Floating-point slack so a sum exactly on the rounding bound (e.g. 0.98 for four options) passes.
+CHOICE_SUM_EPSILON = 1e-9
 
 
 class ProviderError(RuntimeError):
@@ -371,7 +373,7 @@ def _choice(raw: Any, options: set[str]) -> tuple[str, float, dict[str, float]]:
     # Jev's own `confidence`, which its API derives from, but need not equal, the choice's
     # probability (the documented example pairs 0.88 with confidence 0.81).
     total = sum(probs.values())
-    if total <= 0 or abs(total - 1) > CHOICE_ROUNDING_TOLERANCE * len(options):
+    if total <= 0 or abs(total - 1) > CHOICE_ROUNDING_TOLERANCE * len(options) + CHOICE_SUM_EPSILON:
         raise ContractError("invalid Jev Choice distribution")
     probs = {option: value / total for option, value in probs.items()}
     # Rounding and renormalizing preserve order, so the choice must still be the argmax.
