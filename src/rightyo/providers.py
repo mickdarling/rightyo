@@ -31,6 +31,10 @@ MAX_REQUEST_BYTES = 32768
 REPLAY_MAX_REQUESTS = 100
 # The authored fixture prefix used when no runtime addressing is configured.
 MOCK_DEFAULT_ADDRESSING = Addressing(("rightyo",))
+# Per-option slack for a Choice distribution rounded to two decimals (#100).
+CHOICE_ROUNDING_TOLERANCE = 0.005
+# Floating-point slack so a sum exactly on the rounding bound (e.g. 0.98 for four options) passes.
+CHOICE_SUM_EPSILON = 1e-9
 
 
 class ProviderError(RuntimeError):
@@ -38,15 +42,22 @@ class ProviderError(RuntimeError):
 
 
 # Why one hosted call was transiently unavailable; each is an identifier-safe event reason.
-UNAVAILABLE_REASONS = ("timeout", "connection-failed", "rate-limited", "server-error")
+UNAVAILABLE_REASONS = (
+    "timeout",
+    "connection-failed",
+    "rate-limited",
+    "server-error",
+    "malformed-response",
+)
 
 
 class ProviderUnavailable(ProviderError):
-    """A transient hosted failure for one request: timeout, connection, HTTP 429/529 or 5xx.
+    """A transient hosted failure for one request: timeout, connection, HTTP 429/529 or 5xx,
+    or a decision answer that is not valid JSON or violates the Choice contract (#77).
 
-    Nothing was answered, so a live caller may degrade that one turn and keep listening.
-    Authentication, redirects, invalid responses, budgets and cancellation stay plain
-    ``ProviderError``: they are not transient.
+    Nothing usable was answered, so a live caller may degrade that one turn and keep
+    listening. Authentication, redirects, oversized responses, budgets and cancellation stay
+    plain ``ProviderError``: they are not transient.
     """
 
     def __init__(self, message: str, reason: str) -> None:
@@ -356,7 +367,17 @@ def _choice(raw: Any, options: set[str]) -> tuple[str, float, dict[str, float]]:
     if choice not in options or not isinstance(distribution, dict) or set(distribution) != options:
         raise ContractError("invalid Jev Choice options")
     probs = {option: probability(value) for option, value in distribution.items()}
-    if abs(sum(probs.values()) - 1) > 1e-5 or probs[choice] + 1e-9 < max(probs.values()):
+    # Jev may round each probability to two decimals, so a valid answer can sum to 0.99 or
+    # 1.01 (#100). Half a step per option is the exact worst case of that rounding; any sum
+    # farther from 1 is malformed. The reported distribution is renormalized. Thresholds keep
+    # Jev's own `confidence`, which its API derives from, but need not equal, the choice's
+    # probability (the documented example pairs 0.88 with confidence 0.81).
+    total = sum(probs.values())
+    if total <= 0 or abs(total - 1) > CHOICE_ROUNDING_TOLERANCE * len(options) + CHOICE_SUM_EPSILON:
+        raise ContractError("invalid Jev Choice distribution")
+    probs = {option: value / total for option, value in probs.items()}
+    # Rounding and renormalizing preserve order, so the choice must still be the argmax.
+    if probs[choice] + 1e-9 < max(probs.values()):
         raise ContractError("invalid Jev Choice distribution")
     return choice, probability(raw.get("confidence")), probs
 
@@ -565,13 +586,18 @@ class JevProvider:
             self._refund()
             raise
         raw = self._send(payload)
+        if raw.get("model") != JEV_MODEL:
+            # A version change is not a transient glitch: fail loudly, never degrade (#77).
+            raise ProviderError("Jev returned an unexpected model version")
         decision = None
         try:
             decision = parse_response(raw, request_body, self.min_confidence)
         except (ValueError, TypeError, KeyError):
             pass
         if decision is None:
-            raise ProviderError("Jev returned an invalid structured response")
+            raise ProviderUnavailable(
+                "Jev returned an invalid structured response", "malformed-response"
+            )
         return decision
 
     def answer(self, request_body: dict[str, Any], payload: bytes) -> Any:
@@ -657,5 +683,7 @@ class JevProvider:
         except (ValueError, UnicodeError, RecursionError):
             pass
         if not isinstance(raw, dict):
-            raise ProviderError("Jev returned an invalid structured response")
+            raise ProviderUnavailable(
+                "Jev returned an invalid structured response", "malformed-response"
+            )
         return raw

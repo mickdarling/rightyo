@@ -221,12 +221,17 @@ class ProviderTests(unittest.TestCase):
         answers = {k: role_answer("participant") for k in request["questions"]}
         parsed = parse_role_response({"model": JEV_MODEL, "answers": answers}, request, 0.7)
         self.assertEqual(parsed, {"Speaker A": "participant", "Speaker B": "participant"})
+        # Two-decimal rounding that sums to 0.99 is accepted, as for attention (#100).
+        answers["role_0"]["probabilities"] = {"trusted": 0.0, "participant": 0.99, "unknown": 0.0}
+        parsed = parse_role_response({"model": JEV_MODEL, "answers": answers}, request, 0.7)
+        self.assertEqual(parsed["Speaker A"], "participant")
         for mutate in (
             lambda raw: raw.update(model="jev-latest"),
             lambda raw: raw["answers"].pop("role_1"),
             lambda raw: raw["answers"]["role_0"].update(choice="owner"),
             lambda raw: raw["answers"]["role_0"].update(choice="execute"),
             lambda raw: raw["answers"]["role_0"]["probabilities"].update(unknown=0.5),
+            lambda raw: raw["answers"]["role_0"]["probabilities"].update(trusted=0.9),
         ):
             raw = {"model": JEV_MODEL, "answers": {k: role_answer("trusted") for k in answers}}
             mutate(raw)

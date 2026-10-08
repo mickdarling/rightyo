@@ -129,10 +129,13 @@ called once per finalized turn, one request at a time, for as long as the sessio
 
 A single transiently unavailable hosted decision, a timeout, connection failure or HTTP
 429, 529 or 5xx, degrades only its own turn
-([#71](https://github.com/mickdarling/rightyo/issues/71)). That turn's `attention` event
-carries `uncertain` evidence with `recipient_kind: "unknown"`, `confidence: 0`, and two
-optional keys, `decision_status: "unavailable"` and `reason` (`timeout`,
-`connection-failed`, `rate-limited` or `server-error`), and never a `request_id`:
+([#71](https://github.com/mickdarling/rightyo/issues/71)). So does a single malformed
+decision answer: a body that is not JSON, or an answer that violates the documented Choice
+contract ([#77](https://github.com/mickdarling/rightyo/issues/77)). That turn's `attention`
+event carries `uncertain` evidence with `recipient_kind: "unknown"`, `confidence: 0`, and
+two optional keys, `decision_status: "unavailable"` and `reason` (`timeout`,
+`connection-failed`, `rate-limited`, `server-error` or `malformed-response`), and never a
+`request_id`:
 
 ```json
 {"label": "uncertain", "recipient_kind": "unknown", "confidence": 0.0, "provider": "jev",
@@ -140,11 +143,22 @@ optional keys, `decision_status: "unavailable"` and `reason` (`timeout`,
 ```
 
 The turn stays ordinary context, and the next turn is sent as usual. There is no retry of
-the failed turn. Five such failures in a row end the session with
-`reason: "attention-unavailable"`, as does any other hosted failure at once: an
-authentication or other HTTP 4xx response, a refused redirect, an invalid or oversized
-response, a credential failure, or cancellation. A host that does not know the optional
-keys reads the evidence as an ordinary `uncertain` decision.
+the failed turn. Five such failures in a row, of any of these reasons, end the session
+with `reason: "attention-unavailable"`, as does any other hosted failure at once: an
+authentication or other HTTP 4xx response, a refused redirect, an oversized response, a
+credential failure, an unexpected model version, or cancellation. A host that does not
+know the optional keys reads the evidence as an ordinary `uncertain` decision. The bounded
+`evaluate` and `tool-replay` commands and `scripts/evaluate_addressedness.py` still fail
+closed on a malformed answer.
+
+Jev may round each Choice probability to two decimals, so a valid distribution can sum to
+0.99 or 1.01 ([#100](https://github.com/mickdarling/rightyo/issues/100)). A sum within
+0.005 per option of 1, the worst case of that rounding, is accepted, and the reported
+`probabilities` are renormalized. Confidence thresholds use Jev's own `confidence`: the
+API derives it from the distribution, but it need not equal the chosen option's
+probability. A missing, negative or non-finite probability, a sum farther from 1, or a
+choice that is not the most probable option is malformed. This applies to the attention,
+recipient and speaker-role questions alike.
 
 ## Scene and post-turn gap
 

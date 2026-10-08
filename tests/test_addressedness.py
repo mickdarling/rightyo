@@ -39,7 +39,13 @@ from rightyo.contracts import Addressing, ContractError, Turn
 from rightyo.live_audio import LiveAudioError, LiveConfig, LiveProcessor
 from rightyo.pipeline import ReplayRunner
 from rightyo.prototype import DecisionConfigError, PrototypeConfig, PrototypeError
-from rightyo.providers import JEV_MODEL, MockProvider, bounded_request, build_request
+from rightyo.providers import (
+    JEV_MODEL,
+    MockProvider,
+    ProviderUnavailable,
+    bounded_request,
+    build_request,
+)
 from rightyo.turn_merge import TurnMerger
 from scripts import evaluate_addressedness as harness
 
@@ -575,6 +581,18 @@ class HarnessTests(unittest.TestCase):
         labels = report["variants"]["proposed"]["answers"][0]["labels"]
         self.assertEqual(labels, {0.5: "attend", 0.6: "attend", 0.7: "uncertain"})
         self.assertEqual(dict(oracle.usage), {"input_tokens": 20, "output_tokens": 4})
+
+    def test_a_malformed_answer_fails_the_evaluation_closed(self):
+        document = {**self.document, "scenarios": self.document["scenarios"][:2]}
+        oracle = harness.JevOracle(2)
+        malformed = ProviderUnavailable(
+            "Jev returned an invalid structured response", "malformed-response"
+        )
+        with (
+            patch.object(oracle.provider, "answer", side_effect=malformed),
+            self.assertRaises(ProviderUnavailable),
+        ):
+            harness.evaluate(document, oracle, ["proposed"])
 
 
 if __name__ == "__main__":

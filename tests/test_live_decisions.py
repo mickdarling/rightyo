@@ -46,6 +46,10 @@ def transient(reason="timeout"):
     return ProviderUnavailable("Jev connection failed or timed out", reason)
 
 
+def malformed():
+    return ProviderUnavailable("Jev returned an invalid structured response", "malformed-response")
+
+
 class Paced:
     """One PCM chunk per read, each released only after the previous turn's decision."""
 
@@ -252,6 +256,31 @@ class LiveDecisionTests(unittest.TestCase):
             (events[-1]["phase"], events[-1]["reason"]), ("error", "attention-unavailable")
         )
 
+    def test_a_malformed_answer_degrades_its_turn_and_later_turns_still_decide(self):
+        code, events, _built = self.run_listen(3, script=[OK, malformed()], texts=(ATTENDED,))
+        self.assertEqual(code, 0)
+        self.assertEqual(events[-1]["phase"], "stopped")
+        attention = self.of(events, "attention")
+        self.assertEqual(len(attention), 3)
+        self.assertEqual(
+            (attention[1]["decision"]["label"], attention[1]["decision"]["decision_status"]),
+            ("uncertain", "unavailable"),
+        )
+        self.assertEqual(attention[1]["decision"]["reason"], "malformed-response")
+        self.assertEqual(attention[2]["decision"]["label"], "attend")
+        self.assertEqual(
+            [r["turn"]["utterance_id"] for r in self.of(events, "request")], ["live-0", "live-2"]
+        )
+
+    def test_consecutive_malformed_answers_end_the_session(self):
+        limit = MAX_CONSECUTIVE_DECISION_FAILURES
+        code, events, built = self.run_listen(limit + 3, script=[OK, *[malformed()] * limit])
+        self.assertEqual(code, 2)
+        self.assertEqual(built[0].requests, limit + 1)
+        self.assertEqual(
+            (events[-1]["phase"], events[-1]["reason"]), ("error", "attention-unavailable")
+        )
+
     def test_a_permanent_provider_error_still_ends_the_session_at_once(self):
         code, events, built = self.run_listen(
             4, script=[OK, ProviderError("Jev request failed (HTTP 401)")]
@@ -341,10 +370,11 @@ class ProviderBudgetAndFailureTests(unittest.TestCase):
                 key.assert_not_called()
                 network.assert_not_called()
 
-    def failure(self, side_effect):
+    def failure(self, side_effect, body=b""):
         provider = JevProvider(allow_hosted=True, max_requests=5, timeout_seconds=2)
         provider._opener = MagicMock()
         provider._opener.open.side_effect = side_effect
+        provider._opener.open.return_value.__enter__.return_value.read.return_value = body
         with (
             patch("rightyo.credentials.load_jev_api_key", return_value="fictitious-test-key"),
             self.assertRaises(ProviderError) as raised,
@@ -371,6 +401,24 @@ class ProviderBudgetAndFailureTests(unittest.TestCase):
                     raised = self.failure(error)
                     self.assertIsInstance(raised, ProviderUnavailable)
                     self.assertEqual(raised.reason, reason)
+
+    def test_malformed_answers_are_unavailable_but_oversized_ones_stay_permanent(self):
+        valid = {"model": "jev-1.13.0", "answers": {}}
+        for body in (b"not json", b"[]", json.dumps(valid).encode()):
+            with self.subTest(body=body):
+                raised = self.failure(None, body)
+                self.assertIsInstance(raised, ProviderUnavailable)
+                self.assertEqual(raised.reason, "malformed-response")
+        oversized = self.failure(None, b" " * 65537)
+        self.assertNotIsInstance(oversized, ProviderUnavailable)
+        # A model version change is not transient: it stays a fatal plain ProviderError.
+        for model in ("jev-1.14.0", None):
+            with self.subTest(model=model):
+                raised = self.failure(None, json.dumps({"model": model, "answers": {}}).encode())
+                self.assertNotIsInstance(raised, ProviderUnavailable)
+                self.assertIn("unexpected model version", str(raised))
+        raised = self.failure(None, json.dumps({"answers": {}}).encode())
+        self.assertNotIsInstance(raised, ProviderUnavailable)
 
     def test_permanent_failures_stay_plain_provider_errors(self):
         for error in (self.http(400), self.http(401), self.http(403), self.http(404)):
