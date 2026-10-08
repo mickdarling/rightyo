@@ -103,6 +103,16 @@ class LiveConfig:
     # Called with (utterance_id, post_turn_gap) just before `on_turn` for each turn whose
     # gap was observed, so a decision can use it without changing the `Turn` contract.
     on_post_turn_gap: Callable[[str, dict[str, Any]], None] | None = None
+    # Optional end-of-turn model (#117), such as `SmartTurn.score`: called with the open
+    # utterance's PCM once `end_of_turn_silence_ms` of silence follows speech, returning
+    # P(turn complete). At or above `end_of_turn_threshold` the utterance is finalized as
+    # soon as a streaming diarizer's timeline covers its last voiced audio (at once for an
+    # utterance-level diarizer), and its turn is not held for a continuation (its
+    # post-turn gap is unobserved); below it, the hangover and merge hold apply as without
+    # a model. It is asked again at each later pause. None, the default, never asks.
+    end_of_turn: Callable[[bytes], float] | None = None
+    end_of_turn_threshold: float = 0.5
+    end_of_turn_silence_ms: int = 200
 
     def __post_init__(self) -> None:
         identifier(self.session_id, "session_id")
@@ -118,6 +128,14 @@ class LiveConfig:
             raise LiveAudioError("Invalid post-turn gap observer")
         if self.turn_break is not None and not callable(self.turn_break):
             raise LiveAudioError("Invalid turn break predicate")
+        if self.end_of_turn is not None and not callable(self.end_of_turn):
+            raise LiveAudioError("Invalid end-of-turn model")
+        if (
+            type(self.end_of_turn_threshold) not in (int, float)
+            or not math.isfinite(self.end_of_turn_threshold)
+            or not 0 < self.end_of_turn_threshold <= 1
+        ):
+            raise LiveAudioError("Invalid end-of-turn threshold")
         _check_backend(self.transcriber, "transcribe", "transcriber")
         _check_backend(self.diarizer, "push", "diarizer")
         if self.session_budget_ms is not None and (
@@ -140,6 +158,7 @@ class LiveConfig:
             (self.hangover_ms, 1440, 3000),
             (self.pre_roll_ms, 20, 1000),
             (self.max_utterance_ms, 4000, 15000),
+            (self.end_of_turn_silence_ms, 20, 1000),
         ):
             if type(value) is not int or not minimum <= value <= maximum or value % 20:
                 raise LiveAudioError("Invalid utterance window")
@@ -794,6 +813,11 @@ class LiveProcessor:
         self._counter = 0
         self._utterances = 0
         self._skipped_utterances = 0
+        self._end_of_turn = config.end_of_turn
+        # Whether the end-of-turn model was already asked during the current pause, and
+        # whether it judged the turn complete while the diarizer timeline lagged behind.
+        self._end_of_turn_asked = False
+        self._complete = False
         self._asr_process: subprocess.Popen | None = None
         # A joined turn spans at most two full utterance windows, so a long monologue
         # with short pauses is still decided in bounded time.
@@ -870,11 +894,14 @@ class LiveProcessor:
             self._utterance.extend(frame)
             if voiced:
                 self._last_voice_ms = self._received_ms
+                self._end_of_turn_asked = self._complete = False
             if (
                 self._received_ms - self._last_voice_ms >= self.config.hangover_ms
                 or self._received_ms - self._utterance_start >= self.config.max_utterance_ms
             ):
-                self._finalize(self._diarizer.segments())
+                self._finalize(self._diarizer.segments(), complete=self._complete)
+            elif self._complete or self._ask_end_of_turn():
+                self._finalize_when_attributed()
         else:
             self._pre_roll.append(frame)
         if self._merger.holding:
@@ -891,7 +918,70 @@ class LiveProcessor:
             self.close()
             raise
 
-    def _finalize(self, timeline: list[dict[str, Any]]) -> None:
+    def _ask_end_of_turn(self) -> bool:
+        """Whether the end-of-turn model judges the current pause the end of the turn."""
+        silence = self._received_ms - self._last_voice_ms
+        if (
+            self._end_of_turn is None
+            or self._end_of_turn_asked
+            or silence < self.config.end_of_turn_silence_ms
+        ):
+            return False
+        self._end_of_turn_asked = True
+        try:
+            probability = self._end_of_turn(bytes(self._utterance))
+            if type(probability) not in (int, float) or not 0 <= probability <= 1:
+                raise ValueError
+        except Exception:
+            if self.closed:
+                raise LiveAudioError("Audio session was stopped") from None
+            # A failing model never ends the session: the silence rules take over.
+            self._end_of_turn = None
+            self._diagnostic("end-of-turn model unavailable; using silence end-of-turn")
+            return False
+        complete = probability >= self.config.end_of_turn_threshold
+        # Content-free: a probability and stream timing only, never audio or text.
+        self._diagnostic(
+            f"end_of_turn p={probability:.3f} silence_ms={silence}"
+            f" outcome={'complete' if complete else 'wait'}"
+        )
+        return complete
+
+    def _finalize_when_attributed(self) -> None:
+        """Finalize a turn judged complete once its last words can be attributed.
+
+        A streaming diarizer's timeline trails the audio (measured 0.4-1.2 s after speech
+        stops), and words past its end would lose their speaker and split the turn. So the
+        utterance stays open, unchanged, until the timeline reaches its last voiced audio;
+        the hangover still bounds the wait. An utterance-level diarizer labels the whole
+        utterance when it is finalized, so it is finalized at once.
+        """
+        self._complete = True
+        timeline = self._diarizer.segments()
+        if getattr(self._diarizer, "speaker_provenance", "diarization-timeline") == (
+            "diarization-timeline"
+        ) and not any(
+            # A segment spanning the last voiced audio, not merely one ending after it: a
+            # later, disjoint segment says nothing about the words before it.
+            isinstance(segment, dict)
+            and type(segment.get("start_ms")) is int
+            and type(segment.get("end_ms")) is int
+            and segment["start_ms"] < self._last_voice_ms <= segment["end_ms"]
+            for segment in timeline
+        ):
+            return
+        self._diagnostic(
+            f"end_of_turn finalized silence_ms={self._received_ms - self._last_voice_ms}"
+        )
+        self._finalize(timeline, complete=True)
+
+    def _diagnostic(self, message: str) -> None:
+        if self.config.report is not None:
+            with contextlib.suppress(Exception):
+                self.config.report(message)
+
+    def _finalize(self, timeline: list[dict[str, Any]], complete: bool = False) -> None:
+        self._complete = False
         if not self._utterance:
             return
         _check_timeline(timeline, self._received_ms)
@@ -956,13 +1046,13 @@ class LiveProcessor:
                         "overlap": overlap,
                     }
                 )
-        for group in groups:
-            text = group["text"].strip()
-            if not text:
-                continue
-            group["text"] = text
+        kept = [group for group in groups if group["text"].strip()]
+        for index, group in enumerate(kept):
+            group["text"] = group["text"].strip()
             group["speaker_provenance"] = provenance if timeline else "unknown"
-            self._merger.offer(group)
+            # Only the speaker who just paused was judged finished; earlier groups in the
+            # utterance were followed by other speech already.
+            self._merger.offer(group, complete=complete and index == len(kept) - 1)
 
     def _emit(self, group: dict[str, Any]) -> None:
         """Number and emit one finalized (possibly joined) turn; ids follow emission order."""

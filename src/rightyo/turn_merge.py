@@ -122,7 +122,14 @@ class TurnMerger:
             and len(held["text"]) + 1 + len(fragment["text"]) <= MAX_TEXT_CHARS
         )
 
-    def offer(self, fragment: dict[str, Any]) -> None:
+    def offer(self, fragment: dict[str, Any], *, complete: bool = False) -> None:
+        """Take the next finalized fragment.
+
+        `complete` means an end-of-turn model judged the speaker finished (#117): the
+        fragment, or the turn it joins, is emitted at once instead of being held, and its
+        post-turn gap is unobserved. A fragment held before it is still released first,
+        with this one as its following speech.
+        """
         if self.breaks_turn is not None and self.breaks_turn(fragment["text"]):
             # A stop phrase must stay a whole turn of its own to be recognized downstream.
             self._release(fragment)
@@ -135,13 +142,14 @@ class TurnMerger:
             self._hold_ms = self._hold_for(held)
             # Detected speech up to now belonged to the continuation just joined.
             self._heard_ms = None
-            if self.breaks_turn is not None and self.breaks_turn(held["text"]):
+            if complete or (self.breaks_turn is not None and self.breaks_turn(held["text"])):
                 # The recognizer split the stop phrase itself ("never" + "mind"): emit
-                # the joined phrase now so no later fragment can join and hide it.
+                # the joined phrase now so no later fragment can join and hide it. A
+                # turn judged complete is not held for a continuation either.
                 self.flush()
             return
         self._release(fragment)
-        hold = self._hold_for(fragment)
+        hold = 0 if complete else self._hold_for(fragment)
         if hold:
             self._held, self._hold_ms, self._heard_ms = dict(fragment), hold, None
         else:
