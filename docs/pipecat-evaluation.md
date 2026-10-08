@@ -34,7 +34,7 @@ That is well inside the ≤ 300 ms budget. Use a fixed small thread count: the d
 
 ### Harness check: the vendor test set
 
-The same harness, run on the 873 English rows of one shard (1 of 9) of `pipecat-ai/smart-turn-data-v3.1-test`:
+The same harness, run on the 873 English rows of one shard (`data/train-00000-of-00009.parquet`, 1 of 9, sha256 prefix `272d19c7374fade9`) of `pipecat-ai/smart-turn-data-v3.1-test` @ `22b4ec7`:
 
 | Source | Label | n | Correct |
 | --- | --- | --- | --- |
@@ -44,7 +44,7 @@ The same harness, run on the 873 English rows of one shard (1 of 9) of `pipecat-
 | Synthetic | incomplete | 148 | 92.6% |
 | **All English** | | **873** | **95.8%** |
 
-This reproduces the published English figure (94.3% on the full set), so the harness matches the reference `inference.py`.
+This is consistent with the published English figure (94.3% on the full set). It is a sanity check, not proof of equivalence: one shard is not the full set, and outputs were not compared example by example with the reference `inference.py`. The harness follows that code's preprocessing (last 8 s, left padding, Whisper features with `chunk_length=8`, threshold 0.5).
 
 ### Authored clips: 24 requests in Mick's style, 4 TTS voices (synthetic, not live speech)
 
@@ -93,11 +93,11 @@ Each decision is opaque (one probability, no explanation), but the model is full
 
 | Lever | Effect | Cost |
 | --- | --- | --- |
-| Threshold | Trades false dispatches against held requests (table above) | One number; can change live |
+| Threshold | Trades false dispatches against held requests (table above) | One number; could be live-adjustable once integrated |
 | Evaluation point | How much silence the model hears before it is asked; the biggest single effect measured here | One number |
 | Fallback wait | How long to keep waiting after an "incomplete" before dispatching anyway | Today's hangover and merge hold |
 | Transcript guard | Never dispatch when the transcript ends in and / the / to and so on | A small rule after ASR |
-| Fine-tune on the owner's speech | Learns the owner's pauses and phrasing; `train.py`, weights and data are open (#115) | Owner recordings, then minutes to hours on the M4 Max |
+| Fine-tune on the owner's speech | Learns the owner's pauses and phrasing; `train.py`, weights and data are open (#115) | Owner recordings, then (estimated, not measured) minutes to hours on the M4 Max |
 
 ### Proposed integration (follow-up issue)
 
@@ -113,4 +113,4 @@ To be evaluated in order: interruption and barge-in (#98), filler and "thinking"
 
 ## Reproducing
 
-The spike scripts (clip generator, clip and test-set evaluators) are kept outside the repository with the audio. The method above is enough to rebuild them. The reference inference code is `pipecat-ai/smart-turn` `inference.py` @ `4786657`.
+The spike scripts (clip generator, clip and test-set evaluators) are kept outside the repository with the audio for now. A public-safe harness, sentence list, cut points and manifest hashes will be committed with the integration work (#117). The reference inference code is `pipecat-ai/smart-turn` `inference.py` @ `4786657`.
