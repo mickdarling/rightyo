@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .addressedness import reply_wait
 from .contracts import PROVENANCE, Turn, identifier, utterance_scoped_speaker
 from .providers import Diarizer, Transcriber
 from .turn_merge import TurnMerger, merge_gap
@@ -95,6 +96,13 @@ class LiveConfig:
     # Text predicate for a fragment that must stay a turn of its own and is never joined
     # or held, such as an owner stop phrase matched against a whole turn downstream.
     turn_break: Callable[[str], bool] | None = None
+    # Hold a request-shaped turn at least this long after its last word to observe the
+    # post-turn gap (#96); 0, the library default, observes nothing. Joining still uses
+    # only `turn_merge_gap_ms`.
+    reply_wait_ms: int = 0
+    # Called with (utterance_id, post_turn_gap) just before `on_turn` for each turn whose
+    # gap was observed, so a decision can use it without changing the `Turn` contract.
+    on_post_turn_gap: Callable[[str, dict[str, Any]], None] | None = None
 
     def __post_init__(self) -> None:
         identifier(self.session_id, "session_id")
@@ -102,6 +110,12 @@ class LiveConfig:
             merge_gap(self.turn_merge_gap_ms)
         except ValueError:
             raise LiveAudioError("Invalid turn merge gap") from None
+        try:
+            reply_wait(self.reply_wait_ms)
+        except ValueError:
+            raise LiveAudioError("Invalid reply wait") from None
+        if self.on_post_turn_gap is not None and not callable(self.on_post_turn_gap):
+            raise LiveAudioError("Invalid post-turn gap observer")
         if self.turn_break is not None and not callable(self.turn_break):
             raise LiveAudioError("Invalid turn break predicate")
         _check_backend(self.transcriber, "transcribe", "transcriber")
@@ -784,7 +798,11 @@ class LiveProcessor:
         # A joined turn spans at most two full utterance windows, so a long monologue
         # with short pauses is still decided in bounded time.
         self._merger = TurnMerger(
-            config.turn_merge_gap_ms, 2 * config.max_utterance_ms, self._emit, config.turn_break
+            config.turn_merge_gap_ms,
+            2 * config.max_utterance_ms,
+            self._emit,
+            config.turn_break,
+            reply_wait_ms=config.reply_wait_ms,
         )
 
     @property
@@ -845,6 +863,9 @@ class LiveProcessor:
             self._utterance_start = frame_start - len(self._pre_roll) * 20
             self._utterance.extend(b"".join(self._pre_roll))
             self._pre_roll.clear()
+            if self._merger.holding:
+                # Followed by detected speech, whether or not it yields text (#96).
+                self._merger.heard(frame_start)
         if self._utterance or voiced:
             self._utterance.extend(frame)
             if voiced:
@@ -946,6 +967,7 @@ class LiveProcessor:
     def _emit(self, group: dict[str, Any]) -> None:
         """Number and emit one finalized (possibly joined) turn; ids follow emission order."""
         self._counter += 1
+        gap = group.pop("post_turn_gap", None)
         turn = Turn(
             session_id=self.config.session_id,
             utterance_id=f"live-{self._counter}",
@@ -960,6 +982,8 @@ class LiveProcessor:
             provenance=self.config.provenance,
             speaker_provenance=group["speaker_provenance"],
         )
+        if gap is not None and self.config.on_post_turn_gap is not None:
+            self.config.on_post_turn_gap(turn.utterance_id, gap)
         self.on_turn(turn)
 
     def finish(self) -> None:

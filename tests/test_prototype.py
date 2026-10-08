@@ -378,13 +378,13 @@ class ControllerTests(unittest.TestCase):
         resume = threading.Event()
         self.addCleanup(resume.set)
 
-        def blocked_process(turn):
+        def blocked_process(turn, gap=None):
             # The controller has released its precheck lock, but the runner has
             # not checked cancellation or initialized its session yet.
             entered.set()
             if not resume.wait(3):
                 raise AssertionError("Test did not release delayed runner entry")
-            return original_process(turn)
+            return original_process(turn, gap)
 
         with patch.object(runner, "process", side_effect=blocked_process):
             FakeCapture.instances[0].pcm.put(bytes(6400))

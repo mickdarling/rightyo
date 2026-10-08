@@ -41,7 +41,9 @@ of a name, for example `"variants": {"Hailing Station": ["Haling Station"]}`; se
 [name variants](tool-api.md#transport-and-lifecycle). An optional
 `"turns": {"merge_gap_ms": 2000}` sets how long a finalized turn waits for a continuation
 by the same speaker before it is emitted and decided (default 2,000 ms, 0 to 5,000, 0
-off); see [joined turns](tool-api.md#joined-turns). An optional `"speakers"` object declares
+off); see [joined turns](tool-api.md#joined-turns). The same object's `reply_wait_ms`
+(default 1,200 ms, 0 to 3,000, 0 off) sets how long a question or request is held to
+observe the [post-turn gap](tool-api.md#scene-and-post-turn-gap). An optional `"speakers"` object declares
 hard-coded speaker roles for the headless tool, for example
 `"speakers": {"owner": ["Speaker A"], "trusted": [], "owner_only": false}`; it may also
 set `"stop_phrases"`. Session speaker labels such as `Speaker A` are anonymous and are
@@ -74,7 +76,9 @@ An optional `"decision": {"provider": "jev", "allow_hosted": true}` is the file 
 Both keys are required and strictly typed; `"provider": "jev"` without
 `"allow_hosted": true` is refused. An optional positive `max_requests` caps the Jev requests
 of each `listen` session; without it, live microphone and stdin sessions have no request
-cap. It covers Jev decisions only, not hosted speech, and the lab ignores it. See [the tool guide](tool-quickstart.md#jev-decisions-from-the-configuration-file)
+cap. It covers Jev decisions only, not hosted speech, and the lab ignores it. An optional
+`scene` string (1 to 1,000 characters, or `null` for none) replaces the default
+[scene](tool-api.md#scene-and-post-turn-gap) given to the decision model. See [the tool guide](tool-quickstart.md#jev-decisions-from-the-configuration-file)
 for the rules and the macOS Keychain prompt.
 Replay accepts mono PCM16 WAV at
 16 kHz, at most three minutes; it feeds real PCM in causal order as quickly as processing
