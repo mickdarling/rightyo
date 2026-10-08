@@ -385,6 +385,8 @@ def evaluate(document: dict, oracle: Any, variants: list[str]) -> dict[str, Any]
             try:
                 labels, detail = oracle.labels(state, VARIANTS[variant]["builder"])
             except ProviderUnavailable as failure:
+                if failure.reason == "malformed-response":
+                    raise  # An evaluation fails closed on a malformed answer (#77).
                 labels = {t: "uncertain" for t in THRESHOLDS}
                 detail = {
                     "unavailable": failure.reason,

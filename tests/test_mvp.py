@@ -264,6 +264,73 @@ class JevTests(unittest.TestCase):
             with self.assertRaises(ContractError):
                 parse_response(raw, self.request, 0.7)
 
+    def test_two_decimal_rounding_is_accepted_and_renormalized(self):
+        # Jev may round to two decimals, so a valid distribution sums to 0.99 or 1.01 (#100).
+        for attention, recipient in (
+            ({"attend": 0.66, "ignore": 0.12, "uncertain": 0.21}, {"system": 0.99}),
+            (
+                {"attend": 0.67, "ignore": 0.12, "uncertain": 0.22},
+                {"system": 0.95, "unknown": 0.06},
+            ),
+        ):
+            raw = response(self.request)
+            raw["answers"]["attention"]["probabilities"] = attention
+            raw["answers"]["recipient"]["probabilities"].update(recipient)
+            with self.subTest(total=sum(attention.values())):
+                parsed = parse_response(raw, self.request, 0.0)
+                self.assertEqual(parsed.label, "attend")
+                self.assertAlmostEqual(sum(parsed.probabilities.values()), 1.0, places=9)
+                total = sum(attention.values())
+                self.assertAlmostEqual(parsed.probabilities["attend"], attention["attend"] / total)
+
+    def test_sums_exactly_on_the_rounding_bound_are_accepted(self):
+        # Four options allow 0.02 of slack; 0.98 and 1.02 sit exactly on it, which floating point
+        # would otherwise reject (abs(0.98 - 1) == 0.020000000000000018).
+        from rightyo.providers import _choice
+
+        for probabilities in (
+            {"a": 0.49, "b": 0.49, "c": 0.0, "d": 0.0},
+            {"a": 0.52, "b": 0.5, "c": 0.0, "d": 0.0},
+        ):
+            raw = {
+                "type": "choice",
+                "choice": "a",
+                "confidence": 0.5,
+                "probabilities": probabilities,
+            }
+            with self.subTest(total=sum(probabilities.values())):
+                choice, _, probs = _choice(raw, set(probabilities))
+                self.assertEqual(choice, "a")
+                self.assertAlmostEqual(sum(probs.values()), 1.0, places=9)
+
+    def test_thresholds_use_jev_confidence_not_the_choice_probability(self):
+        # The API's documented example pairs a 0.88 choice probability with confidence 0.81.
+        raw = response(self.request)
+        raw["answers"]["attention"].update(
+            confidence=0.81, probabilities={"attend": 0.88, "ignore": 0.12, "uncertain": 0.0}
+        )
+        self.assertEqual(parse_response(raw, self.request, 0.8).label, "attend")
+        parsed = parse_response(raw, self.request, 0.85)
+        self.assertEqual((parsed.label, parsed.confidence), ("uncertain", 0.81))
+
+    def test_distributions_beyond_rounding_are_still_rejected(self):
+        for probabilities in (
+            {"attend": 0.6, "ignore": 0.1, "uncertain": 0.2},  # sums to 0.9
+            {"attend": 0.7, "ignore": 0.2, "uncertain": 0.2},  # sums to 1.1
+            {"attend": 0.0, "ignore": 0.0, "uncertain": 0.0},
+            {"attend": 0.4, "ignore": 0.6, "uncertain": 0.0},  # choice is not the argmax
+            {"attend": 1.0, "ignore": -0.01, "uncertain": 0.0},
+            {"attend": 1.0, "ignore": float("nan"), "uncertain": 0.0},
+        ):
+            raw = response(self.request)
+            raw["answers"]["attention"]["probabilities"] = probabilities
+            with self.subTest(probabilities=probabilities), self.assertRaises(ContractError):
+                parse_response(raw, self.request, 0.7)
+        raw = response(self.request)
+        raw["answers"]["recipient"]["probabilities"]["system"] = 0.9
+        with self.assertRaises(ContractError):
+            parse_response(raw, self.request, 0.7)
+
     def test_no_hosted_consent_never_accesses_credentials_or_network(self):
         with patch("rightyo.credentials.load_jev_api_key") as key:
             with self.assertRaises(ProviderError):
