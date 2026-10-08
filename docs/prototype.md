@@ -43,7 +43,11 @@ of a name, for example `"variants": {"Hailing Station": ["Haling Station"]}`; se
 by the same speaker before it is emitted and decided (default 2,000 ms, 0 to 5,000, 0
 off); see [joined turns](tool-api.md#joined-turns). The same object's `reply_wait_ms`
 (default 1,200 ms, 0 to 3,000, 0 off) sets how long a question or request is held to
-observe the [post-turn gap](tool-api.md#scene-and-post-turn-gap). An optional `"speakers"` object declares
+observe the [post-turn gap](tool-api.md#scene-and-post-turn-gap). An optional
+`"dismissal": {}` object turns on [natural dismissal](tool-api.md#natural-dismissal-and-barge-in)
+(the decision model's dismissal question, the `dismiss` event, self-withdrawal and the
+cool-down), with optional `window_ms`, `cooldown_ms` and `cooldown_min_confidence`; it is
+off when absent. An optional `"speakers"` object declares
 hard-coded speaker roles for the headless tool, for example
 `"speakers": {"owner": ["Speaker A"], "trusted": [], "owner_only": false}`; it may also
 set `"stop_phrases"`. Session speaker labels such as `Speaker A` are anonymous and are

@@ -15,7 +15,7 @@ from rightyo.addressedness import post_turn_gap as checked_gap
 from rightyo.addressedness import scene_text
 from rightyo.contracts import Addressing, ContractError, DecisionEvent, Turn, identifier
 from rightyo.memory import TranscriptMemory
-from rightyo.providers import DecisionProvider
+from rightyo.providers import DecisionProvider, dismissal_hints
 
 
 def _locked(method):
@@ -64,6 +64,7 @@ class ReplayRunner:
         addressing: Addressing | None = None,
         scene: str | None = None,
         post_turn_gaps: bool = False,
+        dismissal_phrases: tuple[str, ...] | None = None,
     ) -> None:
         if not 1 <= max_context_turns <= 32 or not 4000 <= max_context_chars <= 16000:
             raise ContractError("invalid context budget")
@@ -83,6 +84,13 @@ class ReplayRunner:
         self.scene = scene_text(scene)
         # Whether decision states carry the post-turn gap (#96), observed or not.
         self.post_turn_gaps = post_turn_gaps is True
+        # Configured stop phrases sent as hints with the dismissal question (#98); None
+        # asks no dismissal question.
+        self.dismissal_phrases = (
+            None
+            if dismissal_phrases is None
+            else dismissal_hints({"stop_phrases": dismissal_phrases})
+        )
         self.cancelled = cancelled or (lambda: False)
         self.provider = provider
         self.memory = memory
@@ -201,6 +209,11 @@ class ReplayRunner:
             "addressing": None if self.addressing is None else self.addressing.to_dict(),
             **({} if self.scene is None else {"scene": self.scene}),
             **({"post_turn_gap": checked_gap(gap)} if self.post_turn_gaps else {}),
+            **(
+                {}
+                if self.dismissal_phrases is None
+                else {"dismissal": {"stop_phrases": list(self.dismissal_phrases)}}
+            ),
         }
 
     def process(

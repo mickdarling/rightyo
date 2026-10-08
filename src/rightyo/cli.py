@@ -14,6 +14,7 @@ from rightyo.contracts import (
     PROVENANCE,
     Addressing,
     ContractError,
+    Dismissal,
     RequestForming,
     SpeakerPriority,
     Turn,
@@ -183,6 +184,19 @@ def _add_request_former_option(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def dismissal_from_args(args: argparse.Namespace) -> Dismissal | None:
+    """Natural dismissal with the defaults from --dismissal, or none (off by default)."""
+    return Dismissal() if getattr(args, "dismissal", False) else None
+
+
+def _add_dismissal_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--dismissal",
+        action="store_true",
+        help="judge natural dismissals and emit dismiss events (#98; off by default)",
+    )
+
+
 def _add_speaker_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--owner",
@@ -320,6 +334,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_name_option(listen)
     _add_session_budget_option(listen)
     _add_request_former_option(listen)
+    _add_dismissal_option(listen)
     tool_replay = commands.add_parser("tool-replay", help="emit tool JSONL from supplied text")
     tool_replay.add_argument("--input", type=Path, required=True)
     tool_replay.add_argument("--provider", choices=("mock", "jev"), default="mock")
@@ -330,6 +345,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_name_option(tool_replay)
     _add_speaker_options(tool_replay)
     _add_request_former_option(tool_replay)
+    _add_dismissal_option(tool_replay)
     args = parser.parse_args(argv)
     try:
         if args.command in {"listen", "tool-replay"}:

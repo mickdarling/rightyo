@@ -15,6 +15,11 @@ for the assistant, without making a name a trigger:
 `request_shaped` is a small deterministic placeholder for the per-turn intent of #85: it
 only decides which turns are worth holding a little longer to observe the gap. It is not
 an addressedness judgement and never forms a request on its own.
+
+`dismissal_shaped` is its counterpart for natural dismissals (#98): a short turn that
+sounds like "stop", "never mind" or "go away" is released at once instead of waiting for
+the merge or reply-wait hold. It only shortens the wait; whether the turn dismisses the
+assistant is the decision model's judgement (or the exact configured stop phrases).
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .contracts import ContractError
+from .contracts import Addressing, ContractError, normalize_phrase
 
 # The default setting for the single-user assistant pilot (Hailing Station).
 DEFAULT_SCENE = (
@@ -172,3 +177,69 @@ def request_shaped(text: str) -> bool:
     while index < len(words) and words[index] in _FILLERS:
         index += 1
     return index < len(words) and words[index] in _OPENERS
+
+
+# Cue words and phrases of a dismissal, as `normalize_phrase` writes them (apostrophes
+# removed, casefolded). Deliberately generous: a false match only skips the hold.
+_DISMISSAL_CUES = tuple(
+    tuple(cue.split())
+    for cue in (
+        "stop",
+        "quiet",
+        "hush",
+        "shush",
+        "shh",
+        "shhh",
+        "cancel",
+        "nevermind",
+        "never mind",
+        "shut up",
+        "go away",
+        "not now",
+        "not right now",
+        "not you",
+        "talking to you",
+        "hang on",
+        "hold on",
+        "forget it",
+        "leave me alone",
+        "ignore that",
+        "thats all",
+        "thats enough",
+        "no thanks",
+        "no thank you",
+        "no no",
+    )
+)
+# A dismissal is short: "Haili, I wasn't talking to you, sorry" is seven words.
+MAX_DISMISSAL_WORDS = 10
+
+
+def dismissal_shaped(text: str) -> bool:
+    """Whether a short turn sounds like a dismissal (English, deterministic, approximate).
+
+    True for a turn of at most ten words containing a cue such as "stop", "quiet",
+    "never mind", "go away", "not now", "not you", "talking to you", "hang on" or
+    "forget it". It decides only that the turn is released without the merge and reply
+    holds; it never dismisses anything on its own.
+    """
+    words = normalize_phrase(text).split()
+    if not words or len(words) > MAX_DISMISSAL_WORDS:
+        return False
+    for cue in _DISMISSAL_CUES:
+        size = len(cue)
+        if any(tuple(words[i : i + size]) == cue for i in range(len(words) - size + 1)):
+            return True
+    return False
+
+
+def mentions_name(addressing: Addressing | None, text: str) -> bool:
+    """Whether any run of up to four words in `text` spells a configured name or variant."""
+    if addressing is None:
+        return False
+    words = normalize_phrase(text).split()
+    return any(
+        addressing.name_for(" ".join(words[i : i + size])) is not None
+        for size in range(1, 5)
+        for i in range(len(words) - size + 1)
+    )

@@ -1,4 +1,4 @@
-"""Compare attention prompts on the authored addressedness set (#96).
+"""Compare attention prompts on the authored addressedness and dismissal sets (#96, #98).
 
 Offline by default: `--provider mock` runs the deterministic fixture rule and needs no
 credential. Hosted Jev runs are manual only and need both `--provider jev` and
@@ -12,12 +12,23 @@ Variants:
 - `scene`: the #96 request with the default scene, names out of the attend criterion,
   and no post-turn gap (an ablation).
 - `proposed`: the #96 request with the default scene and the post-turn gap.
+- `dismissal`: `proposed` plus the dismissal question of #98, with the default stop
+  phrases as hints. A request is formed only when the turn is attended and not judged a
+  dismissal, as the event producer does.
+
+examples/dismissal-eval.json (#98) adds dismissal scenarios; every scenario may carry
+`dismissal` (`dismiss` or `not_dismiss`, default `not_dismiss`). Dismissal precision and
+recall are reported for the `dismissal` variant, beside the deterministic baselines: the
+exact default stop phrases (the fast fallback) and the `dismissal_shaped` predicate that
+only releases a turn from the merge hold.
 
 Each hosted answer is scored at several `min_confidence` thresholds from the same
 response, so thresholds cost no extra requests. Run with the checkout's src directory on
 PYTHONPATH, for example:
 
     PYTHONPATH=src python scripts/evaluate_addressedness.py --provider mock
+    PYTHONPATH=src python scripts/evaluate_addressedness.py --provider mock \\
+        --scenarios examples/dismissal-eval.json --variant proposed --variant dismissal
     PYTHONPATH=src python scripts/evaluate_addressedness.py --provider jev --allow-hosted \\
         --output /tmp/addressedness-report.json
 """
@@ -26,13 +37,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
-from rightyo.addressedness import DEFAULT_SCENE, observe_gap
-from rightyo.contracts import Addressing, ContractError, Turn
+from rightyo.addressedness import DEFAULT_SCENE, dismissal_shaped, observe_gap
+from rightyo.contracts import (
+    DEFAULT_STOP_PHRASES,
+    DISMISSING,
+    Addressing,
+    ContractError,
+    SpeakerPriority,
+    Turn,
+)
 from rightyo.pipeline import ReplayRunner
 from rightyo.providers import (
     JEV_MODEL,
@@ -61,9 +81,21 @@ CATEGORIES = (
     "quoted",
     "injection",
 )
+# The categories of examples/dismissal-eval.json (#98).
+DISMISSAL_CATEGORIES = (
+    "dismissal_named",
+    "dismissal_other_name",
+    "dismissal_unnamed",
+    "dismissal_to_person",
+    "ambiguous_no",
+    "correction",
+)
+ALL_CATEGORIES = CATEGORIES + DISMISSAL_CATEGORIES
 EXPECTED = ("attend", "not_attend")
+DISMISSAL_EXPECTED = ("dismiss", "not_dismiss")
 MAX_SCENARIOS = 100
 SCENARIO_FIELDS = {"id", "category", "expected", "context", "current", "next", "playback"}
+OPTIONAL_FIELDS = {"dismissal"}
 TURN_MS = 1500
 PAUSE_MS = 900
 
@@ -116,7 +148,14 @@ VARIANTS: dict[str, dict[str, Any]] = {
     "current": {"builder": legacy_build_request, "scene": None, "gaps": False},
     "scene": {"builder": build_request, "scene": DEFAULT_SCENE, "gaps": False},
     "proposed": {"builder": build_request, "scene": DEFAULT_SCENE, "gaps": True},
+    "dismissal": {
+        "builder": build_request,
+        "scene": DEFAULT_SCENE,
+        "gaps": True,
+        "dismissal": DEFAULT_STOP_PHRASES,
+    },
 }
+DEFAULT_VARIANTS = ("current", "scene", "proposed")
 
 
 def _speaker(value: Any) -> str | None:
@@ -141,17 +180,11 @@ def load_scenarios(path: Path) -> dict[str, Any]:
         raise ContractError("invalid scenario list")
     seen = set()
     for scenario in scenarios:
-        if set(scenario) != {
-            "id",
-            "category",
-            "expected",
-            "context",
-            "current",
-            "next",
-            "playback",
-        }:
+        if not SCENARIO_FIELDS <= set(scenario) <= SCENARIO_FIELDS | OPTIONAL_FIELDS:
             raise ContractError("invalid scenario fields")
-        if scenario["id"] in seen or scenario["category"] not in CATEGORIES:
+        if scenario.get("dismissal", "not_dismiss") not in DISMISSAL_EXPECTED:
+            raise ContractError("invalid scenario dismissal expectation")
+        if scenario["id"] in seen or scenario["category"] not in ALL_CATEGORIES:
             raise ContractError("duplicate scenario id or unknown category")
         seen.add(scenario["id"])
         if scenario["expected"] not in EXPECTED or type(scenario["playback"]) is not bool:
@@ -208,6 +241,7 @@ def scenario_state(document: dict[str, Any], scenario: dict[str, Any], variant: 
         playback_active=scenario["playback"],
         scene=settings["scene"],
         post_turn_gaps=settings["gaps"],
+        dismissal_phrases=settings.get("dismissal"),
     )
     start = 0
     past = []
@@ -237,7 +271,10 @@ class MockOracle:
 
     def labels(self, state: dict, builder: Callable) -> tuple[dict[float, str], dict]:
         decision = MockProvider().decide(state)
+        # The fixture rule makes no dismissal judgement.
+        dismissals = {threshold: "none" for threshold in THRESHOLDS}
         return {threshold: decision.label for threshold in THRESHOLDS}, {
+            "dismissals": dismissals,
             "choice": decision.label,
             "confidence": decision.confidence,
             "recipient": decision.recipient,
@@ -258,15 +295,32 @@ class JevOracle:
 
     def labels(self, state: dict, builder: Callable) -> tuple[dict[float, str], dict]:
         body, payload = bounded_request(state, builder)
+        started = time.perf_counter()
         raw = self.provider.answer(body, payload)
+        elapsed = round((time.perf_counter() - started) * 1000, 1)
         usage = raw.get("usage") if isinstance(raw, dict) else None
         if isinstance(usage, dict):
             for key in ("input_tokens", "output_tokens"):
                 if type(usage.get(key)) is int:
                     self.usage[key] += usage[key]
-        labels = {t: parse_response(raw, body, t).label for t in THRESHOLDS}
+        self.last_invalid = None
+        try:
+            decisions = {t: parse_response(raw, body, t) for t in THRESHOLDS}
+        except ContractError:
+            # Kept for the report: choices and probabilities only, no transcript text.
+            self.last_invalid = raw.get("answers")
+            raise
+        labels = {t: decision.label for t, decision in decisions.items()}
         raw_decision = parse_response(raw, body, 0.0)
         return labels, {
+            "elapsed_ms": elapsed,
+            "dismissals": {t: decision.dismissal or "none" for t, decision in decisions.items()},
+            "dismissal_choice": raw_decision.dismissal_choice,
+            "dismissal_confidence": (
+                None
+                if raw_decision.dismissal_confidence is None
+                else round(raw_decision.dismissal_confidence, 4)
+            ),
             "choice": raw_decision.attention_choice,
             "confidence": round(raw_decision.confidence, 4),
             "recipient": raw_decision.recipient,
@@ -274,9 +328,49 @@ class JevOracle:
         }
 
 
+def _rates(expected: list[bool], predicted: list[bool]) -> dict[str, Any]:
+    """Counts, precision and recall of a binary dismissal judgement."""
+    pairs = list(zip(expected, predicted))
+    tp = sum(1 for e, p in pairs if e and p)
+    fp = sum(1 for e, p in pairs if not e and p)
+    fn = sum(1 for e, p in pairs if e and not p)
+    return {
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": len(pairs) - tp - fp - fn,
+        "precision": None if tp + fp == 0 else round(tp / (tp + fp), 3),
+        "recall": None if tp + fn == 0 else round(tp / (tp + fn), 3),
+    }
+
+
+def dismissal_baselines(document: dict) -> dict[str, Any]:
+    """The deterministic baselines, offline: exact stop phrases and the shape predicate."""
+    scenarios = document["scenarios"]
+    expected = [s.get("dismissal", "not_dismiss") == "dismiss" for s in scenarios]
+    rules = SpeakerPriority()
+    phrase = [rules.is_stop_phrase(s["current"][1]) for s in scenarios]
+    shaped = [dismissal_shaped(s["current"][1]) for s in scenarios]
+    return {
+        "stop_phrase": {
+            **_rates(expected, phrase),
+            "false": [s["id"] for s, e, p in zip(scenarios, expected, phrase) if p and not e],
+        },
+        "dismissal_shaped": {
+            **_rates(expected, shaped),
+            "false": [s["id"] for s, e, p in zip(scenarios, expected, shaped) if p and not e],
+            "missed": [s["id"] for s, e, p in zip(scenarios, expected, shaped) if e and not p],
+        },
+    }
+
+
 def evaluate(document: dict, oracle: Any, variants: list[str]) -> dict[str, Any]:
     scenarios = document["scenarios"]
-    report: dict[str, Any] = {"scenarios": len(scenarios), "variants": {}}
+    report: dict[str, Any] = {
+        "scenarios": len(scenarios),
+        "variants": {},
+        "dismissal_baselines": dismissal_baselines(document),
+    }
     for variant in variants:
         rows = []
         for scenario in scenarios:
@@ -285,23 +379,66 @@ def evaluate(document: dict, oracle: Any, variants: list[str]) -> dict[str, Any]
                 labels, detail = oracle.labels(state, VARIANTS[variant]["builder"])
             except ProviderUnavailable as failure:
                 labels = {t: "uncertain" for t in THRESHOLDS}
-                detail = {"unavailable": failure.reason}
+                detail = {
+                    "unavailable": failure.reason,
+                    "dismissals": {t: "uncertain" for t in THRESHOLDS},
+                }
+            except ContractError:
+                # An answer the live provider would reject (for example a choice that is
+                # not the most probable option): scored as an abstention, and counted.
+                labels = {t: "uncertain" for t in THRESHOLDS}
+                detail = {
+                    "invalid": True,
+                    "raw_answers": getattr(oracle, "last_invalid", None),
+                    "dismissals": {t: "uncertain" for t in THRESHOLDS},
+                }
             rows.append({"id": scenario["id"], "labels": labels, **detail})
-        report["variants"][variant] = {"answers": rows, "thresholds": {}}
+        asked = "dismissal" in VARIANTS[variant]
+        elapsed = [row["elapsed_ms"] for row in rows if "elapsed_ms" in row]
+        report["variants"][variant] = {
+            "answers": rows,
+            "invalid_answers": [row["id"] for row in rows if row.get("invalid")],
+            "thresholds": {},
+            "dismissal_asked": asked,
+            "median_elapsed_ms": round(statistics.median(elapsed), 1) if elapsed else None,
+        }
         for threshold in THRESHOLDS:
-            by_category: dict[str, Counter] = {c: Counter() for c in CATEGORIES}
+            by_category: dict[str, Counter] = {c: Counter() for c in ALL_CATEGORIES}
             missed, false_attends = [], []
+            expected_dismissals, judged = [], []
+            false_dismissals, missed_dismissals = [], []
             for scenario, row in zip(scenarios, rows):
                 label = row["labels"][threshold]
+                dismissed = asked and row["dismissals"][threshold] in DISMISSING
                 by_category[scenario["category"]][label] += 1
-                if scenario["expected"] == "attend" and label != "attend":
+                # As the event producer does: a dismissal never forms a request.
+                request = label == "attend" and not dismissed
+                if scenario["expected"] == "attend" and not request:
                     missed.append(scenario["id"])
-                if scenario["expected"] == "not_attend" and label == "attend":
+                if scenario["expected"] == "not_attend" and request:
                     false_attends.append(scenario["id"])
+                wanted = scenario.get("dismissal", "not_dismiss") == "dismiss"
+                expected_dismissals.append(wanted)
+                judged.append(dismissed)
+                if dismissed and not wanted:
+                    false_dismissals.append(scenario["id"])
+                if wanted and not dismissed:
+                    missed_dismissals.append(scenario["id"])
             report["variants"][variant]["thresholds"][str(threshold)] = {
+                **(
+                    {
+                        "dismissal": {
+                            **_rates(expected_dismissals, judged),
+                            "false": false_dismissals,
+                            "missed": missed_dismissals,
+                        }
+                    }
+                    if asked
+                    else {}
+                ),
                 "by_category": {
                     c: {k: by_category[c][k] for k in ("attend", "ignore", "uncertain")}
-                    for c in CATEGORIES
+                    for c in ALL_CATEGORIES
                     if sum(by_category[c].values())
                 },
                 "missed": missed,
@@ -325,7 +462,7 @@ def markdown(document: dict, report: dict) -> str:
         lines.append("")
         lines.append("| Category (n, expected) | " + " | ".join(variants) + " |")
         lines.append("| --- |" + " --- |" * len(variants))
-        for category in CATEGORIES:
+        for category in ALL_CATEGORIES:
             if not totals[category]:
                 continue
             cells = []
@@ -343,6 +480,29 @@ def markdown(document: dict, report: dict) -> str:
         lines.append(f"| **Missed requests** (of {attend_total}) | " + " | ".join(missed) + " |")
         lines.append(f"| **False attends** (of {other_total}) | " + " | ".join(false) + " |")
         lines.append("")
+    asked = [v for v in variants if report["variants"][v]["dismissal_asked"]]
+    wanted = sum(1 for s in document["scenarios"] if s.get("dismissal") == "dismiss")
+    lines.append(f"Dismissal judgement ({wanted} dismissals of {len(document['scenarios'])})")
+    lines.append("")
+    lines.append("| Judgement | TP | FP | FN | TN | Precision | Recall |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+    rows = [
+        (f"{name} (deterministic)", report["dismissal_baselines"][name])
+        for name in ("stop_phrase", "dismissal_shaped")
+    ]
+    for variant in asked:
+        for threshold in THRESHOLDS:
+            rows.append(
+                (
+                    f"{variant} at {threshold}",
+                    report["variants"][variant]["thresholds"][str(threshold)]["dismissal"],
+                )
+            )
+    for name, rates in rows:
+        cells = [rates[k] for k in ("tp", "fp", "fn", "tn", "precision", "recall")]
+        values = " | ".join("n/a" if c is None else str(c) for c in cells)
+        lines.append(f"| {name} | {values} |")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -358,7 +518,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     document = load_scenarios(args.scenarios)
-    variants = args.variant or list(VARIANTS)
+    variants = args.variant or list(DEFAULT_VARIANTS)
     if args.scenario:
         chosen = [s for s in document["scenarios"] if s["id"] in set(args.scenario)]
         if len(chosen) != len(set(args.scenario)):
@@ -384,6 +544,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.output is not None:
         args.output.write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
     print(markdown(document, report))
+    for variant in variants:
+        invalid = report["variants"][variant]["invalid_answers"]
+        if invalid:
+            print(f"Invalid answers, {variant} (scored as uncertain): {', '.join(invalid)}")
+        median = report["variants"][variant]["median_elapsed_ms"]
+        if median is not None:
+            print(f"Median hosted round trip, {variant}: {median} ms")
     print(f"Requests sent: {report['requests']}")
     return 0
 

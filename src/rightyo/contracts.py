@@ -8,6 +8,15 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 LABELS = frozenset({"attend", "ignore", "uncertain"})
+# The dismissal judgement (#98): `stop` and `disengage` dismiss the assistant; `none` is
+# not a dismissal of the assistant; `uncertain` abstains.
+DISMISSAL_LABELS = frozenset({"stop", "disengage", "none", "uncertain"})
+DISMISSING = frozenset({"stop", "disengage"})
+DEFAULT_DISMISSAL_WINDOW_MS = 10000
+MAX_DISMISSAL_WINDOW_MS = 60000
+DEFAULT_DISMISSAL_COOLDOWN_MS = 30000
+MAX_DISMISSAL_COOLDOWN_MS = 600000
+DEFAULT_COOLDOWN_MIN_CONFIDENCE = 0.9
 PROVENANCE = frozenset({"synthetic", "recorded-file", "causal-replay", "live-microphone"})
 SPEAKER_PROVENANCE = frozenset(
     {"authored-fixture", "diarization-timeline", "diarization-utterance", "unknown"}
@@ -319,6 +328,47 @@ class SpeakerPriority:
 
 
 @dataclass(frozen=True)
+class Dismissal:
+    """Natural dismissal and barge-in (#98); absent means off and nothing changes.
+
+    `window_ms` bounds self-withdrawal: a speaker's dismissal withdraws that speaker's
+    own request whose turn ended at most this long before the dismissal started.
+    `cooldown_ms` (0 turns it off) is how long after a `disengage` dismissal an attended
+    turn that uses no configured name needs at least `cooldown_min_confidence` to form a
+    request.
+    """
+
+    window_ms: int = DEFAULT_DISMISSAL_WINDOW_MS
+    cooldown_ms: int = DEFAULT_DISMISSAL_COOLDOWN_MS
+    cooldown_min_confidence: float = DEFAULT_COOLDOWN_MIN_CONFIDENCE
+
+    def __post_init__(self) -> None:
+        if type(self.window_ms) is not int or not 1 <= self.window_ms <= MAX_DISMISSAL_WINDOW_MS:
+            raise ContractError("invalid dismissal window")
+        if (
+            type(self.cooldown_ms) is not int
+            or not 0 <= self.cooldown_ms <= MAX_DISMISSAL_COOLDOWN_MS
+        ):
+            raise ContractError("invalid dismissal cooldown")
+        probability(self.cooldown_min_confidence)
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> Dismissal:
+        allowed = {"window_ms", "cooldown_ms", "cooldown_min_confidence"}
+        if not isinstance(raw, dict) or set(raw) - allowed:
+            raise ContractError("dismissal must be an object with known keys only")
+        return cls(**raw)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "window_ms": self.window_ms,
+            "cooldown_ms": self.cooldown_ms,
+            "cooldown_min_confidence": self.cooldown_min_confidence,
+        }
+
+
+@dataclass(frozen=True)
 class Turn:
     session_id: str
     utterance_id: str
@@ -392,10 +442,24 @@ class ProviderDecision:
     recipient_confidence: float
     recipient_speaker_id: str | None = None
     attention_choice: str | None = None
+    # The dismissal judgement (#98), present only when the question was asked: the
+    # policy-applied label, the raw choice and the probability mass of the dismissing
+    # options (`stop` plus `disengage`).
+    dismissal: str | None = None
+    dismissal_choice: str | None = None
+    dismissal_confidence: float | None = None
 
     def __post_init__(self) -> None:
         if self.label not in LABELS:
             raise ContractError("invalid attention label")
+        dismissal = (self.dismissal, self.dismissal_choice, self.dismissal_confidence)
+        if dismissal != (None, None, None):
+            if (
+                self.dismissal not in DISMISSAL_LABELS
+                or self.dismissal_choice not in DISMISSAL_LABELS
+            ):
+                raise ContractError("invalid dismissal label")
+            probability(self.dismissal_confidence)
         if self.attention_choice is not None and self.attention_choice not in LABELS:
             raise ContractError("invalid raw attention choice")
         identifier(self.recipient, "recipient")
@@ -445,6 +509,10 @@ class DecisionEvent:
             "provider_ms": round(self.provider_ms, 3),
             "total_ms": round(self.total_ms, 3),
         }
+        if self.decision.dismissal is not None:
+            # Present only when the dismissal question was asked (#98).
+            result["dismissal"] = self.decision.dismissal
+            result["dismissal_confidence"] = self.decision.dismissal_confidence
         if include_text:
             result["turn"] = self.turn.to_dict()
             result["recipient"] = self.decision.recipient
