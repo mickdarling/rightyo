@@ -111,6 +111,14 @@ class LiveConfig:
     # post-turn gap is unobserved); below it, the hangover and merge hold apply as without
     # a model. It is asked again at each later pause. None, the default, never asks.
     end_of_turn: Callable[[bytes], float] | None = None
+    # Edge attribution (opt-in, 0 = off). An inference, not an observation: a word the
+    # streaming diarizer's timeline left unlabelled (the recognizer's word timestamps run
+    # slightly past the segment, or the word has zero length) takes the utterance's only
+    # labelled speaker when the word overlaps no one and either touches only that
+    # speaker's segments or, touching none, lies within this many milliseconds of one.
+    # A second speaker's first word in that slack would be mislabelled, so roles refuse
+    # it (see `PrototypeController.start`). Only for `diarization-timeline`.
+    edge_attribution_ms: int = 0
     end_of_turn_threshold: float = 0.5
     end_of_turn_silence_ms: int = 200
 
@@ -159,6 +167,7 @@ class LiveConfig:
             (self.pre_roll_ms, 20, 1000),
             (self.max_utterance_ms, 4000, 15000),
             (self.end_of_turn_silence_ms, 20, 1000),
+            (self.edge_attribution_ms, 0, 2000),
         ):
             if type(value) is not int or not minimum <= value <= maximum or value % 20:
                 raise LiveAudioError("Invalid utterance window")
@@ -515,6 +524,39 @@ def _attribute(start: int, end: int, timeline: list[dict[str, Any]]) -> tuple[st
         return None, overlap
     # Native channels are arrival-ordered and persist for the whole session.
     return "Speaker " + _speaker_label(next(iter(speakers))), overlap
+
+
+def _attribute_edges(
+    attributed: list[list[Any]], timeline: list[dict[str, Any]], gap_ms: int
+) -> None:
+    """Give unlabelled edge words the utterance's only labelled speaker, in place.
+
+    Each entry is `[unit, start, end, speaker, overlap]`. Only when the utterance has
+    exactly one labelled speaker; only for a word that overlaps no one and either touches
+    segments of that speaker alone, or touches no segment and lies within `gap_ms` of one
+    of that speaker's segments (timestamps running just past the segment's edge).
+    """
+    labels = {entry[3] for entry in attributed if entry[3] is not None}
+    if len(labels) != 1:
+        return
+    label = next(iter(labels))
+    own = [
+        (segment["start_ms"], segment["end_ms"])
+        for segment in timeline
+        if "Speaker " + _speaker_label(segment["speaker"]) == label
+    ]
+    for entry in attributed:
+        _, start, end, speaker, overlap = entry
+        if speaker is not None or overlap:
+            continue
+        touching = {
+            "Speaker " + _speaker_label(segment["speaker"])
+            for segment in timeline
+            if segment["start_ms"] <= end and segment["end_ms"] >= start
+        }
+        near = any(max(start - seg_end, seg_start - end, 0) <= gap_ms for seg_start, seg_end in own)
+        if touching == {label} or (not touching and near):
+            entry[3] = label
 
 
 def _speaker_label(number: int) -> str:
@@ -1025,10 +1067,14 @@ class LiveProcessor:
         # Units start at or after `offset`; a segment ending by then overlaps none of them,
         # so attribution scans only this utterance's part of the timeline.
         relevant = [segment for segment in timeline if segment["end_ms"] > offset]
-        groups: list[dict[str, Any]] = []
+        attributed = []
         for unit in units:
             start, end = unit["start_ms"] + offset, unit["end_ms"] + offset
-            speaker, overlap = _attribute(start, end, relevant)
+            attributed.append([unit, start, end, *_attribute(start, end, relevant)])
+        if self.config.edge_attribution_ms and provenance == "diarization-timeline":
+            _attribute_edges(attributed, relevant, self.config.edge_attribution_ms)
+        groups: list[dict[str, Any]] = []
+        for unit, start, end, speaker, overlap in attributed:
             if speaker is not None and provenance == "diarization-utterance":
                 # Per-request labels are namespaced by utterance so that equal labels
                 # from independent requests can never be merged into one participant.

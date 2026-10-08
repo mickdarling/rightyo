@@ -13,7 +13,9 @@ never waits for the hold.
 
 Only fragments whose speaker label is known, equal, and not overlapping are joined, with
 the same speaker provenance. An unattributed or overlapping fragment is never joined, so
-no speaker attribution is invented. Fragments are plain dictionaries; the caller turns a
+the merger invents no speaker attribution itself (opt-in edge attribution in the live
+window may already have inferred a label; see `LiveConfig.edge_attribution_ms`).
+Fragments are plain dictionaries; the caller turns a
 released fragment into a `Turn` and assigns its utterance id at that moment, so ids stay
 unique and in emission order, and a joined turn reports the first fragment's start and
 the last fragment's end.

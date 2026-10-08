@@ -196,6 +196,9 @@ class PrototypeConfig:
     # The `turns` section's `reply_wait_ms` (#96): how long a request-shaped turn is held
     # to observe the gap after it; 0 turns the post-turn gap signal off.
     reply_wait_ms: int = DEFAULT_REPLY_WAIT_MS
+    # The `turns` section's `edge_attribution_ms`: labelling a speaker's unlabelled edge
+    # words (see `LiveConfig.edge_attribution_ms`); 0, the default, is off.
+    edge_attribution_ms: int = 0
     # The optional `dismissal` section (#98): natural dismissal and the `dismiss` event.
     # Absent means off; `{}` turns it on with the defaults.
     dismissal: Dismissal | None = None
@@ -272,7 +275,14 @@ class PrototypeConfig:
             if end_of_turn is not None:
                 end_of_turn = EndOfTurn.from_dict(end_of_turn)
             turns = raw.pop("turns", {})
-            if not isinstance(turns, dict) or set(turns) - {"merge_gap_ms", "reply_wait_ms"}:
+            if not isinstance(turns, dict) or set(turns) - {
+                "merge_gap_ms",
+                "reply_wait_ms",
+                "edge_attribution_ms",
+            }:
+                raise ValueError
+            edges = turns.get("edge_attribution_ms", 0)
+            if type(edges) is not int or not 0 <= edges <= 2000 or edges % 20:
                 raise ValueError
             gap = merge_gap(turns.get("merge_gap_ms", DEFAULT_TURN_MERGE_GAP_MS))
             wait = reply_wait(turns.get("reply_wait_ms", DEFAULT_REPLY_WAIT_MS))
@@ -296,6 +306,7 @@ class PrototypeConfig:
                 turn_merge_gap_ms=gap,
                 decision_scene=scene,
                 reply_wait_ms=wait,
+                edge_attribution_ms=edges,
                 dismissal=dismissal,
                 end_of_turn=end_of_turn,
                 conversation=conversation,
@@ -502,6 +513,17 @@ class PrototypeController:
                 "Configured speaker roles require a session-stable diarizer; the selected "
                 "diarizer labels speakers per utterance"
             )
+        if (
+            roles is not None
+            and (roles.owners or roles.trusted or roles.owner_only)
+            and self.config.edge_attribution_ms
+        ):
+            # An inferred label must never carry a role's authority: a guest's first word
+            # in the slack after the owner's segment would become the owner's.
+            raise PrototypeError(
+                "Edge attribution infers speaker labels; it cannot be combined with "
+                "configured speaker roles"
+            )
         budget_seconds = validate_session_budget(self.config.session_budget_seconds)
         with self._lock:
             if self._phase in {"starting", "listening", "replaying", "finishing", "stopping"}:
@@ -691,6 +713,7 @@ class PrototypeController:
                         generation, utterance_id, gap
                     ),
                     end_of_turn=end_of_turn.score if end_of_turn is not None else None,
+                    edge_attribution_ms=self.config.edge_attribution_ms,
                     end_of_turn_threshold=settings.threshold if settings else 0.5,
                     end_of_turn_silence_ms=settings.silence_ms if settings else 200,
                 ),
