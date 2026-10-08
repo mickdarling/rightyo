@@ -17,9 +17,10 @@ joined, so the merger invents no speaker attribution itself (opt-in edge attribu
 the live window may already have inferred a label; see `LiveConfig.edge_attribution_ms`).
 The one exception is opt-in tail join (`tail_join_ms`, #129), an inference: an
 unattributed, non-overlapping fragment that starts within that many milliseconds of a
-held labelled, non-overlapping fragment's end, with the same provenance, is joined into
-it and takes its speaker. Overlap is still never joined, nothing is joined into an
-unattributed held fragment, and a labelled fragment of another speaker is never joined.
+held labelled, non-overlapping fragment's end, with the same session-stable
+`diarization-timeline` provenance, is joined into it and takes its speaker. Overlap is
+still never joined, nothing is joined into an unattributed held fragment, and a labelled
+fragment of another speaker is never joined.
 Fragments are plain dictionaries; the caller turns a
 released fragment into a `Turn` and assigns its utterance id at that moment, so ids stay
 unique and in emission order, and a joined turn reports the first fragment's start and
@@ -143,12 +144,14 @@ class TurnMerger:
             )
         else:
             # Tail join (#129): an unattributed, non-overlapping tail takes the held
-            # speaker. Overlap is never joined.
+            # speaker. Overlap is never joined. Only session-stable timeline labels are
+            # inferred: an utterance-local label must not reach another utterance's words.
             gap = self.tail_join_ms
             same = (
                 fragment["speaker"] is None
                 and not fragment["overlap"]
                 and fragment["speaker_provenance"] == held["speaker_provenance"]
+                and held["speaker_provenance"] == "diarization-timeline"
             )
         return (
             gap > 0

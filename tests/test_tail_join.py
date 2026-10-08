@@ -47,6 +47,17 @@ class TurnMergerTailJoinTests(unittest.TestCase):
         self.assertEqual(joined["speaker_provenance"], "diarization-timeline")
         self.assertFalse(joined["overlap"])
 
+    def test_an_utterance_local_label_never_takes_a_tail(self):
+        merger = self.merger()
+        held = fragment("Turn the volume", 0, 600, speaker="u1 Speaker A")
+        held["speaker_provenance"] = "diarization-utterance"
+        merger.offer(held)
+        other = tail("down.", 700, 800)
+        other["speaker_provenance"] = "diarization-utterance"
+        merger.offer(other)
+        merger.flush()
+        self.assertEqual(self.texts(), ["Turn the volume", "down."])
+
     def test_the_window_edge_is_inclusive_and_beyond_it_nothing_joins(self):
         merger = self.merger()
         merger.offer(fragment("Turn the volume", 0, 600))
