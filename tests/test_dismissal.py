@@ -38,6 +38,7 @@ from rightyo.providers import (
     ConfiguredPriorityProvider,
     MockProvider,
     ProviderError,
+    ProviderUnavailable,
     bounded_request,
     build_request,
     dismissal_judgement,
@@ -710,6 +711,31 @@ class DismissEventTests(unittest.TestCase):
             [e["type"] for e in self.events.drain()], ["attention", "override", "dismiss"]
         )
 
+    def test_a_request_overlapping_the_dismissal_is_not_withdrawn(self):
+        self.start()
+        # Ends at 2,200 ms, after the dismissal starts at 2,000 ms: concurrent work.
+        self.deliver(turn("request", 0, 2200, "Haili, order a pizza."))
+        self.events.transcript(turn("stop", 2000, 2500, "Never mind."), 2500)
+        (dismiss,) = self.of(self.events.drain(), "dismiss")
+        self.assertEqual(dismiss["withdrawn_request_ids"], [])
+        # Ending exactly when the dismissal starts is still withdrawn.
+        self.start()
+        (request,) = self.of(
+            self.deliver(turn("request", 0, 2000, "Haili, order a pizza.")), "request"
+        )
+        self.events.transcript(turn("stop", 2000, 2500, "Never mind."), 2500)
+        (dismiss,) = self.of(self.events.drain(), "dismiss")
+        self.assertEqual(dismiss["withdrawn_request_ids"], [request["request_id"]])
+
+    def test_cooldown_keys_keep_speaker_provenance_apart(self):
+        self.start()
+        self.deliver(turn("away", 0, 1000, "Go away."), dismissal=("disengage", 1.0))
+        # The same label from another source is another speaker: not cooled.
+        other = turn("other", 2000, 3000, "What time is it?", provenance="diarization-timeline")
+        self.assertEqual(len(self.of(self.deliver(other, confidence=0.8), "request")), 1)
+        same = turn("same", 4000, 5000, "What time is it?")
+        self.assertEqual(self.of(self.deliver(same, confidence=0.8), "request"), [])
+
     def test_withdrawable_requests_are_bounded_and_expire(self):
         self.start(dismissal=Dismissal(window_ms=60000))
         for index in range(40):
@@ -790,6 +816,15 @@ class FastPathTests(unittest.TestCase):
         self.assertEqual(emitted, [])
         merger.due(3500, None)
         self.assertEqual(emitted[0]["post_turn_gap"]["following"], "none")
+
+    def test_mentions_name_finds_long_configured_names(self):
+        long = Addressing.from_names(
+            ["Hailing Station Assistant Number One"],
+            {"Hailing Station Assistant Number One": ["Station Helper Unit Five Alpha Two"]},
+        )
+        self.assertTrue(mentions_name(long, "Okay hailing station assistant number one, hi"))
+        self.assertTrue(mentions_name(long, "station helper unit five alpha two what time is it"))
+        self.assertFalse(mentions_name(long, "hailing station assistant number"))
 
     def test_mentions_name(self):
         self.assertTrue(mentions_name(NAMES, "Okay Hailey, what time is it?"))
@@ -1013,6 +1048,42 @@ class HarnessTests(unittest.TestCase):
             self.assertRaises(ProviderError),
         ):
             harness.evaluate(document, oracle, ["dismissal"])
+
+    def test_non_object_answers_stop_by_default_and_are_counted_under_the_flag(self):
+        failure = ProviderUnavailable(
+            "Jev returned an invalid structured response", "malformed-response"
+        )
+        document = {**self.document, "scenarios": self.document["scenarios"][:1]}
+        oracle = harness.JevOracle(1)
+        with (
+            patch.object(oracle.provider, "answer", side_effect=failure),
+            self.assertRaises(ProviderError),
+        ):
+            harness.evaluate(document, oracle, ["dismissal"])
+        oracle = harness.JevOracle(1)
+        with patch.object(oracle.provider, "answer", side_effect=failure):
+            report = harness.evaluate(document, oracle, ["dismissal"], score_invalid=True)
+        variant = report["variants"]["dismissal"]
+        self.assertEqual(variant["invalid_answers"], ["dismissal_named-01"])
+        self.assertEqual(variant["answers"][0]["labels"][0.7], "uncertain")
+
+    def test_malformed_dismissal_answers_are_malformed_in_an_evaluation(self):
+        def reply(body, payload):
+            raw = answer(body, ("none", spread(none=1.0)))
+            raw["answers"]["dismissal"] = "stop"
+            return raw
+
+        document = {**self.document, "scenarios": self.document["scenarios"][:1]}
+        oracle = harness.JevOracle(1)
+        with (
+            patch.object(oracle.provider, "answer", side_effect=reply),
+            self.assertRaises(ProviderError),
+        ):
+            harness.evaluate(document, oracle, ["dismissal"])
+        oracle = harness.JevOracle(1)
+        with patch.object(oracle.provider, "answer", side_effect=reply):
+            report = harness.evaluate(document, oracle, ["dismissal"], score_invalid=True)
+        self.assertEqual(report["variants"]["dismissal"]["invalid_answers"], ["dismissal_named-01"])
 
     def test_a_model_mismatch_always_stops_the_run(self):
         def reply(body, payload):

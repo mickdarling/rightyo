@@ -403,26 +403,31 @@ class SpeechEvents:
 
     @staticmethod
     def _cooldown_key(facts):
-        """The per-speaker cool-down key, or None when the label holds for one utterance."""
+        """The per-speaker cool-down key, or None when the label holds for one utterance.
+
+        The key carries the speaker provenance: two sources may reuse a label, and labels
+        from different provenances are never the same speaker (`_comparable`).
+        """
         if (
             facts["speaker_id"] is None
             or facts["overlap"]
             or facts["speaker_provenance"] == "diarization-utterance"
         ):
             return None
-        return facts["speaker_id"]
+        return (facts["speaker_provenance"], facts["speaker_id"])
 
     def _withdrawable(self, dismissing, facts, loose):
         """Whether a dismissal may withdraw a request turn: the speaker's own, recent one.
 
-        The request must have ended at or before the dismissal and at most `window_ms`
-        before it started, from the same speaker label. When the labels cannot be compared
+        The request must have ended at or before the dismissal started (a request that
+        overlaps the dismissal is concurrent work, not withdrawn) and at most `window_ms`
+        before it, from the same speaker label. When the labels cannot be compared
         (no label, overlap, or utterance-local labels from different utterances), it is
         withdrawn only when `loose`: a model-judged dismissal addressed to the system on an
         anonymous session. A different known speaker's request is never withdrawn.
         """
         dismisser = self._facts(dismissing)
-        if facts["end_ms"] > dismissing.end_ms:
+        if facts["end_ms"] > dismissing.start_ms:
             return False
         if dismissing.start_ms - facts["end_ms"] > self._dismissal.window_ms:
             return False

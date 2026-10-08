@@ -564,7 +564,8 @@ for it is the host's choice (the event carries `role`). With `owner_only`, only 
 dismiss at all; other speakers' dismissals emit nothing and still form no request.
 
 **Self-withdrawal.** A dismissal withdraws the speaker's own requests whose turns ended
-at or before the dismissal and at most `window_ms` before it started. This generalises
+at or before the dismissal started and at most `window_ms` before it; a request that
+overlaps the dismissal is concurrent work and is not withdrawn. This generalises
 [#92](https://github.com/mickdarling/rightyo/issues/92): an owner can now withdraw their
 own just-dispatched request ("Haili, order a pizza … never mind"), which the owner
 override never did. A request from a different known speaker is never withdrawn.

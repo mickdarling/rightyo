@@ -316,6 +316,9 @@ class JevOracle:
             raise ProviderError("Jev returned an unexpected model version")
         try:
             decisions = {t: parse_response(raw, body, t) for t in THRESHOLDS}
+            if any(decision.dismissal_malformed for decision in decisions.values()):
+                # The live provider degrades it; an evaluation treats it as malformed.
+                raise ContractError("invalid Jev dismissal answer")
         except ContractError:
             # Kept for the report: choices and probabilities only, no transcript text.
             self.last_invalid = raw.get("answers")
@@ -395,13 +398,21 @@ def evaluate(
             try:
                 labels, detail = oracle.labels(state, VARIANTS[variant]["builder"])
             except ProviderUnavailable as failure:
-                if failure.reason == "malformed-response":
-                    raise  # An evaluation fails closed on a malformed answer (#77).
                 labels = {t: "uncertain" for t in THRESHOLDS}
-                detail = {
-                    "unavailable": failure.reason,
-                    "dismissals": {t: "uncertain" for t in THRESHOLDS},
-                }
+                if failure.reason == "malformed-response":
+                    # A non-JSON or non-object answer: fail closed (#77), or count it.
+                    if not score_invalid:
+                        raise
+                    detail = {
+                        "invalid": True,
+                        "raw_answers": None,
+                        "dismissals": {t: "uncertain" for t in THRESHOLDS},
+                    }
+                else:
+                    detail = {
+                        "unavailable": failure.reason,
+                        "dismissals": {t: "uncertain" for t in THRESHOLDS},
+                    }
             except ContractError:
                 # An answer the live provider would reject (for example a choice that is
                 # not the most probable option): fail closed, or, when asked, score it as

@@ -296,12 +296,17 @@ def dismissal_shaped(text: str) -> bool:
 
 
 def mentions_name(addressing: Addressing | None, text: str) -> bool:
-    """Whether any run of up to four words in `text` spells a configured name or variant."""
+    """Whether any run of words in `text` spells a configured name or variant.
+
+    Runs are as long as the longest configured name or variant, so a long name is found.
+    """
     if addressing is None:
         return False
+    spellings = [s for name in addressing.names for s in (name, *addressing.spellings(name))]
+    longest = max(len(normalize_phrase(spelling).split()) for spelling in spellings)
     words = normalize_phrase(text).split()
     return any(
         addressing.name_for(" ".join(words[i : i + size])) is not None
-        for size in range(1, 5)
+        for size in range(1, longest + 1)
         for i in range(len(words) - size + 1)
     )
