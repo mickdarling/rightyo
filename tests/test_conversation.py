@@ -245,6 +245,21 @@ class ConversationEventTests(unittest.TestCase):
         self.assertEqual(self.kinds(events), ["attention", "request", "conversation", "attention"])
         self.assertEqual(events[3]["decision"]["label"], "uncertain")
 
+    def test_an_older_request_decided_late_never_takes_the_engagement(self):
+        self.start()
+        older = turn("t1", 0, 900, "Haili, what time is it?")
+        newer = turn("t2", 2000, 2900, "Haili, the news?", "Speaker B")
+        self.events.transcript(older, older.end_ms)
+        self.events.transcript(newer, newer.end_ms)
+        self.events.decision(decided(newer, "attend"), 3000)
+        self.events.decision(decided(older, "attend"), 3100)
+        events = [e for e in self.events.drain() if e["type"] == "conversation"]
+        self.assertEqual([e["speaker_id"] for e in events], ["Speaker B"])
+        follow = self.say(
+            turn("t3", 4000, 4900, "And tomorrow?", "Speaker B"), "uncertain", attend=0.6
+        )
+        self.assertEqual(self.kinds(follow), ["attention", "request"])
+
     def test_a_participants_playback_only_stop_still_ends_their_own_engagement(self):
         owner = SpeakerPriority(owners=("Speaker Z",))
         self.start(dismissal=Dismissal(), priority=ConfiguredPriorityProvider(owner))

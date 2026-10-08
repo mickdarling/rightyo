@@ -612,6 +612,10 @@ class SpeechEvents:
         if self._conversation is None or key is None:
             return
         until = turn.end_ms + self._conversation.window_ms
+        if self._engaged is not None and turn.end_ms < self._engaged["from_ms"]:
+            # Decided out of order: an older request never takes the engagement from a
+            # newer one (or shortens it).
+            return
         if self._engaged is not None and self._engaged["key"] == key:
             # Each exchange extends the window; the state itself does not change.
             self._engaged["until_ms"] = max(self._engaged["until_ms"], until)
