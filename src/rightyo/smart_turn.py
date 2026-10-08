@@ -261,8 +261,12 @@ class SmartTurn:
             request = {"command": "score", "pcm": base64.b64encode(pcm).decode("ascii")}
             data = memoryview((json.dumps(request) + "\n").encode())
             while data:
-                # Unbuffered: a signal can interrupt a write part-way.
-                data = data[self.process.stdin.write(data) or 0 :]
+                # Unbuffered: a signal can interrupt a write part-way. A blocking pipe never
+                # accepts nothing, so zero or None means it is gone.
+                written = self.process.stdin.write(data)
+                if not written:
+                    raise BrokenPipeError
+                data = data[written:]
             probability = self._receive(self.timeout).get("p")
         except SmartTurnError:
             self.close()
