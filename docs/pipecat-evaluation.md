@@ -99,6 +99,12 @@ Each decision is opaque (one probability, no explanation), but the model is full
 | Transcript guard | Never dispatch when the transcript ends in and / the / to and so on | A small rule after ASR |
 | Fine-tune on the owner's speech | Learns the owner's pauses and phrasing; `train.py`, weights and data are open (#115) | Owner recordings, then (estimated, not measured) minutes to hours on the M4 Max |
 
+### Integration (#117)
+
+Implemented behind the prototype's `end_of_turn` switch (see [prototype](prototype.md)), off by default. One finding from replay changed the design: finalizing 200 ms after speech left the last words outside the streaming diarizer's timeline (it trails the audio by 0.4–1.2 s), so they lost their speaker and split the turn. A turn judged complete therefore waits until the timeline covers its last voiced audio. On an authored replay with the real diarizer, finished requests were emitted 300–740 ms after their last word instead of about 2,000 ms, and turn splitting matched the silence-only run exactly (synthetic voices, not live speech).
+
+The original proposal follows.
+
 ### Proposed integration (follow-up issue)
 
 1. Run Smart Turn when the VAD has seen ~200 ms of silence, on the utterance audio already in the window (no extra capture).

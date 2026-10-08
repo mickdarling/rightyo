@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import json
 import math
@@ -52,6 +53,7 @@ from rightyo.providers import (
     request_former_for,
     unavailable_decision,
 )
+from rightyo.smart_turn import EndOfTurn, SmartTurn, SmartTurnError
 from rightyo.speech_backends import (
     HostedSpeechError,
     describe,
@@ -196,6 +198,9 @@ class PrototypeConfig:
     # The optional `dismissal` section (#98): natural dismissal and the `dismiss` event.
     # Absent means off; `{}` turns it on with the defaults.
     dismissal: Dismissal | None = None
+    # The optional `end_of_turn` section (#117): Smart Turn in front of the silence
+    # end-of-turn. Absent or `"enabled": false` means off.
+    end_of_turn: EndOfTurn | None = None
 
     @property
     def hosted_speech(self) -> bool:
@@ -237,6 +242,7 @@ class PrototypeConfig:
                 "request_former",
                 "turns",
                 "dismissal",
+                "end_of_turn",
                 *LOCAL_ASSETS,
             }
             if raw.keys() - required - optional:
@@ -254,6 +260,9 @@ class PrototypeConfig:
             dismissal = raw.pop("dismissal", None)
             if dismissal is not None:
                 dismissal = Dismissal.from_dict(dismissal)
+            end_of_turn = raw.pop("end_of_turn", None)
+            if end_of_turn is not None:
+                end_of_turn = EndOfTurn.from_dict(end_of_turn)
             turns = raw.pop("turns", {})
             if not isinstance(turns, dict) or set(turns) - {"merge_gap_ms", "reply_wait_ms"}:
                 raise ValueError
@@ -280,8 +289,13 @@ class PrototypeConfig:
                 decision_scene=scene,
                 reply_wait_ms=wait,
                 dismissal=dismissal,
+                end_of_turn=end_of_turn,
             )
             if not all(value.is_file() for value in values.values()):
+                raise ValueError
+            if end_of_turn is not None and not (
+                end_of_turn.python.is_file() and end_of_turn.model.is_file()
+            ):
                 raise ValueError
             return config
         except DecisionConfigError:
@@ -312,9 +326,11 @@ class PrototypeController:
         audio_input=None,
         audio_provenance=None,
         report=None,
+        end_of_turn_factory=SmartTurn,
     ):
         self.config = config
         self.processor_factory = processor_factory
+        self.end_of_turn_factory = end_of_turn_factory
         self.capture_factory = capture_factory
         self.provider_factory = provider_factory
         # Explicit consent for configured hosted speech backends to receive audio.
@@ -612,9 +628,26 @@ class PrototypeController:
                 # Turns that were never queued for a decision leave stale entries.
                 del self._turn_gaps[next(iter(self._turn_gaps))]
 
-    def _audio(self, generation, stop, session, work, memory, mode):
-        capture = processor = None
+    def _end_of_turn_model(self, stop):
+        """Start the configured end-of-turn model, or None; never fails the session (#117)."""
+        settings = self.config.end_of_turn
+        if settings is None:
+            return None
         try:
+            return self.end_of_turn_factory(
+                settings.python, settings.model, threads=settings.threads, cancelled=stop.is_set
+            )
+        except SmartTurnError:
+            if self.report is not None:
+                with contextlib.suppress(Exception):
+                    self.report("end-of-turn model unavailable; using silence end-of-turn")
+            return None
+
+    def _audio(self, generation, stop, session, work, memory, mode):
+        capture = processor = end_of_turn = None
+        try:
+            end_of_turn = self._end_of_turn_model(stop)
+            settings = self.config.end_of_turn
             processor = self.processor_factory(
                 LiveConfig(
                     session_id=session,
@@ -647,6 +680,9 @@ class PrototypeController:
                     on_post_turn_gap=lambda utterance_id, gap: self._observe_gap(
                         generation, utterance_id, gap
                     ),
+                    end_of_turn=end_of_turn.score if end_of_turn is not None else None,
+                    end_of_turn_threshold=settings.threshold if settings else 0.5,
+                    end_of_turn_silence_ms=settings.silence_ms if settings else 200,
                 ),
                 lambda turn: self._accept(generation, work, memory, turn),
             )
@@ -773,6 +809,8 @@ class PrototypeController:
                 capture.stop()
             if processor is not None:
                 processor.close()
+            if end_of_turn is not None:
+                end_of_turn.close()
             with self._lock:
                 if generation == self._generation:
                     self._capture = self._processor = None

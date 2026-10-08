@@ -47,7 +47,19 @@ observe the [post-turn gap](tool-api.md#scene-and-post-turn-gap). An optional
 `"dismissal": {}` object turns on [natural dismissal](tool-api.md#natural-dismissal-and-barge-in)
 (the decision model's dismissal question, the `dismiss` event, self-withdrawal and the
 cool-down), with optional `window_ms`, `cooldown_ms` and `cooldown_min_confidence`; it is
-off when absent. An optional `"speakers"` object declares
+off when absent. An optional `"end_of_turn"` object (#117) puts the Smart Turn v3
+end-of-turn model in front of the silence rules:
+`{"enabled": true, "python": "/abs/venv/bin/python", "model": "/abs/smart-turn-v3.2-cpu.onnx"}`
+with optional `threshold` (default 0.5), `silence_ms` (default 200, 20 to 1,000) and
+`threads` (default 4). It is off when absent or `"enabled": false`. The interpreter must
+have `numpy` and `onnxruntime`; RightyO itself installs neither and downloads no model.
+After `silence_ms` of silence the model scores the open utterance. At or above the
+threshold the turn is finalized once the diarizer timeline covers its last word, and is
+not held for a continuation, so its post-turn gap is unobserved. Below it, the hangover
+and merge hold apply unchanged. Each score is reported on stderr without content
+(`end_of_turn p=… silence_ms=… outcome=complete|wait`, then
+`end_of_turn finalized silence_ms=…`). A model that fails to start or answer falls back to
+the silence rules for the session. An optional `"speakers"` object declares
 hard-coded speaker roles for the headless tool, for example
 `"speakers": {"owner": ["Speaker A"], "trusted": [], "owner_only": false}`; it may also
 set `"stop_phrases"`. Session speaker labels such as `Speaker A` are anonymous and are
