@@ -6,8 +6,10 @@ stage holds the newest fragment for a short gap of stream time. A continuation b
 same speaker within the gap is joined into it; anything else releases it unchanged.
 
 A fragment for which `breaks_turn` is true (the configured owner stop phrases, which
-are matched against a whole turn) is never joined or held: the held fragment is released
-first and the stop fragment is emitted on its own, so joining never hides a stop.
+are matched against a whole turn, and with natural dismissal on (#98) any short
+dismissal-shaped turn) is never joined or held: the held fragment is released first and
+the stop fragment is emitted on its own, so joining never hides a stop and a dismissal
+never waits for the hold.
 
 Only fragments whose speaker label is known, equal, and not overlapping are joined, with
 the same speaker provenance. An unattributed or overlapping fragment is never joined, so

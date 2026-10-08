@@ -16,13 +16,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from rightyo.addressedness import DEFAULT_REPLY_WAIT_MS, DEFAULT_SCENE, reply_wait, scene_text
+from rightyo.addressedness import (
+    DEFAULT_REPLY_WAIT_MS,
+    DEFAULT_SCENE,
+    dismissal_shaped,
+    reply_wait,
+    scene_text,
+)
 from rightyo.capture import CaptureError, MacMicrophoneCapture, StdinPcmCapture
 from rightyo.contracts import (
     PROVENANCE,
     Addressing,
     ContractError,
     DecisionEvent,
+    Dismissal,
     RequestForming,
     SpeakerPriority,
     Turn,
@@ -186,6 +193,9 @@ class PrototypeConfig:
     # The `turns` section's `reply_wait_ms` (#96): how long a request-shaped turn is held
     # to observe the gap after it; 0 turns the post-turn gap signal off.
     reply_wait_ms: int = DEFAULT_REPLY_WAIT_MS
+    # The optional `dismissal` section (#98): natural dismissal and the `dismiss` event.
+    # Absent means off; `{}` turns it on with the defaults.
+    dismissal: Dismissal | None = None
 
     @property
     def hosted_speech(self) -> bool:
@@ -226,6 +236,7 @@ class PrototypeConfig:
                 "session_budget_seconds",
                 "request_former",
                 "turns",
+                "dismissal",
                 *LOCAL_ASSETS,
             }
             if raw.keys() - required - optional:
@@ -240,6 +251,9 @@ class PrototypeConfig:
             forming = raw.pop("request_former", None)
             if forming is not None:
                 forming = RequestForming.from_dict(forming)
+            dismissal = raw.pop("dismissal", None)
+            if dismissal is not None:
+                dismissal = Dismissal.from_dict(dismissal)
             turns = raw.pop("turns", {})
             if not isinstance(turns, dict) or set(turns) - {"merge_gap_ms", "reply_wait_ms"}:
                 raise ValueError
@@ -265,6 +279,7 @@ class PrototypeConfig:
                 turn_merge_gap_ms=gap,
                 decision_scene=scene,
                 reply_wait_ms=wait,
+                dismissal=dismissal,
             )
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
@@ -496,6 +511,11 @@ class PrototypeController:
                 addressing=self.config.addressing,
                 scene=self.config.decision_scene,
                 post_turn_gaps=self.config.reply_wait_ms > 0,
+                dismissal_phrases=(
+                    None
+                    if self.config.dismissal is None
+                    else (self.config.speakers or SpeakerPriority()).stop_phrases
+                ),
             )
             # Only configured roles run here: no hosted role question ever executes
             # under the controller lock (model-sourced roles are refused above).
@@ -540,6 +560,7 @@ class PrototypeController:
                     former=request_former_for(self.config.request_former),
                     speech=speech_summary(self.config.transcriber, self.config.diarizer),
                     audio_input=STDIN_AUDIO_INPUT if mode == "stdin" else None,
+                    dismissal=self.config.dismissal,
                 )
                 self._event_terminal = False
             threading.Thread(
@@ -573,6 +594,13 @@ class PrototypeController:
                 self._tool_attention_error("attention-backlog")
                 return
             self._pending += 1
+
+    def _turn_break(self):
+        """The predicate for turns that are never joined or held (#89, #98)."""
+        stop = (self.config.speakers or SpeakerPriority()).is_stop_phrase
+        if self.config.dismissal is None:
+            return stop
+        return lambda text: stop(text) or dismissal_shaped(text)
 
     def _observe_gap(self, generation: int, utterance_id: str, gap: dict[str, Any]) -> None:
         """Keep a turn's observed post-turn gap until its decision takes it (#96)."""
@@ -612,8 +640,9 @@ class PrototypeController:
                     ),
                     turn_merge_gap_ms=self.config.turn_merge_gap_ms,
                     # Stop phrases are matched against a whole turn, so joining must
-                    # never absorb one; the defaults apply when roles are off.
-                    turn_break=(self.config.speakers or SpeakerPriority()).is_stop_phrase,
+                    # never absorb one; the defaults apply when roles are off. With
+                    # dismissal on (#98), a dismissal-shaped turn is released at once too.
+                    turn_break=self._turn_break(),
                     reply_wait_ms=self.config.reply_wait_ms,
                     on_post_turn_gap=lambda utterance_id, gap: self._observe_gap(
                         generation, utterance_id, gap

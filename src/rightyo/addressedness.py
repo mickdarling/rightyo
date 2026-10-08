@@ -15,6 +15,11 @@ for the assistant, without making a name a trigger:
 `request_shaped` is a small deterministic placeholder for the per-turn intent of #85: it
 only decides which turns are worth holding a little longer to observe the gap. It is not
 an addressedness judgement and never forms a request on its own.
+
+`dismissal_shaped` is its counterpart for natural dismissals (#98): a short turn that
+sounds like "stop", "never mind" or "go away" is released at once instead of waiting for
+the merge or reply-wait hold. It only shortens the wait; whether the turn dismisses the
+assistant is the decision model's judgement (or the exact configured stop phrases).
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .contracts import ContractError
+from .contracts import Addressing, ContractError, normalize_phrase
 
 # The default setting for the single-user assistant pilot (Hailing Station).
 DEFAULT_SCENE = (
@@ -172,3 +177,136 @@ def request_shaped(text: str) -> bool:
     while index < len(words) and words[index] in _FILLERS:
         index += 1
     return index < len(words) and words[index] in _OPENERS
+
+
+# Cue phrases of a dismissal, as `normalize_phrase` writes them (apostrophes removed,
+# casefolded). A turn is dismissal-shaped only when one of them opens it (after fillers
+# and an optional short vocative) and nothing but tail words follow, so a request that
+# merely contains "cancel", "quiet" or "hold on" is never split or released early.
+_DISMISSAL_CUES = tuple(
+    tuple(cue.split())
+    for cue in (
+        "stop",
+        "quiet",
+        "hush",
+        "shush",
+        "shh",
+        "shhh",
+        "cancel",
+        "nevermind",
+        "never mind",
+        "shut up",
+        "go away",
+        "not now",
+        "not right now",
+        "not you",
+        "i wasnt talking to you",
+        "i was not talking to you",
+        "wasnt talking to you",
+        "not talking to you",
+        "hang on",
+        "hold on",
+        "forget it",
+        "leave me alone",
+        "leave it",
+        "ignore that",
+        "thats all",
+        "thats enough",
+        "enough",
+        "no thanks",
+        "no thank you",
+        "no no",
+        "be quiet",
+    )
+)
+# Words that may open a dismissal before its cue.
+_DISMISSAL_LEAD = frozenset("no oh ok okay please just um uh hey so sorry wait".split())
+# Words that may follow the cue: politeness, emphasis and "that", nothing with content.
+_DISMISSAL_TAIL = frozenset(
+    """
+    please now right thanks thank you sorry that it this already enough thats all just a
+    second sec minute moment for then again ok okay no not talking to stop quiet
+    """.split()
+)
+# The longest vocative ("Okay Haili", "hey there Jarvis") dropped before or after the cue.
+_MAX_VOCATIVE_WORDS = 3
+MAX_DISMISSAL_WORDS = 10
+
+
+def _cue_at(words: list[str], index: int) -> int:
+    """The length of the longest cue starting at `index`, or 0."""
+    return max(
+        (len(cue) for cue in _DISMISSAL_CUES if tuple(words[index : index + len(cue)]) == cue),
+        default=0,
+    )
+
+
+def _has_cue(words: list[str]) -> bool:
+    return any(_cue_at(words, index) for index in range(len(words)))
+
+
+def dismissal_shaped(text: str) -> bool:
+    """Whether a short turn sounds like a dismissal (English, deterministic, approximate).
+
+    True for a turn of at most ten words that, after leading fillers ("no", "okay",
+    "please") and an optional comma-delimited vocative of up to three words at either end
+    ("Jarvis, ...", "..., Haley"), opens with a cue such as "stop", "quiet", "never mind",
+    "go away", "not now", "not you", "I wasn't talking to you", "hang on" or "forget it",
+    followed only by tail words ("please", "now", "that", "thanks"). "Stop the timer",
+    "Cancel my meeting" and "Hold on, what's the weather?" are not dismissal-shaped. It
+    decides only that the turn is released without the merge and reply holds; it never
+    dismisses anything on its own.
+    """
+    segments = [normalize_phrase(part).split() for part in text.split(",")]
+    segments = [segment for segment in segments if segment]
+    if not segments or sum(len(segment) for segment in segments) > MAX_DISMISSAL_WORDS:
+        return False
+    # Drop a short vocative segment without a cue at either end ("Jarvis," / ", Haley").
+    if (
+        len(segments) > 1
+        and len(segments[0]) <= _MAX_VOCATIVE_WORDS
+        and not _has_cue(segments[0])
+        and not set(segments[0]) <= _DISMISSAL_LEAD
+    ):
+        segments = segments[1:]
+    if (
+        len(segments) > 1
+        and len(segments[-1]) <= _MAX_VOCATIVE_WORDS
+        and not _has_cue(segments[-1])
+        and not set(segments[-1]) <= _DISMISSAL_TAIL
+    ):
+        segments = segments[:-1]
+    words = [word for segment in segments for word in segment]
+    index = 0
+    while index < len(words) and words[index] in _DISMISSAL_LEAD and not _cue_at(words, index):
+        index += 1
+    size = _cue_at(words, index)
+    if not size:
+        return False
+    index += size
+    while index < len(words):
+        size = _cue_at(words, index)
+        if size:
+            index += size
+        elif words[index] in _DISMISSAL_TAIL:
+            index += 1
+        else:
+            return False
+    return True
+
+
+def mentions_name(addressing: Addressing | None, text: str) -> bool:
+    """Whether any run of words in `text` spells a configured name or variant.
+
+    Runs are as long as the longest configured name or variant, so a long name is found.
+    """
+    if addressing is None:
+        return False
+    spellings = [s for name in addressing.names for s in (name, *addressing.spellings(name))]
+    longest = max(len(normalize_phrase(spelling).split()) for spelling in spellings)
+    words = normalize_phrase(text).split()
+    return any(
+        addressing.name_for(" ".join(words[i : i + size])) is not None
+        for size in range(1, longest + 1)
+        for i in range(len(words) - size + 1)
+    )

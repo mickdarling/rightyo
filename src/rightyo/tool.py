@@ -9,8 +9,14 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TextIO
 
-from rightyo.cli import addressing_from_args, forming_from_args, load_turns, priority_from_args
-from rightyo.contracts import ContractError
+from rightyo.cli import (
+    addressing_from_args,
+    dismissal_from_args,
+    forming_from_args,
+    load_turns,
+    priority_from_args,
+)
+from rightyo.contracts import ContractError, SpeakerPriority
 from rightyo.pipeline import ReplayRunner
 from rightyo.prototype import (
     PrototypeConfig,
@@ -44,6 +50,7 @@ def replay(args, *, output=None) -> int:
     addressing = addressing_from_args(args)
     speakers = priority_from_args(args)
     former = request_former_for(forming_from_args(args))
+    dismissal = dismissal_from_args(args)
     model_roles = speakers is not None and speakers.source == "model"
     if model_roles and args.provider != "jev":
         raise ProviderError("model-assigned speaker roles require the Jev provider")
@@ -79,7 +86,13 @@ def replay(args, *, output=None) -> int:
             if model_roles
             else ConfiguredPriorityProvider(speakers)
         )
-    runner = ReplayRunner(provider, addressing=addressing)
+    runner = ReplayRunner(
+        provider,
+        addressing=addressing,
+        dismissal_phrases=(
+            None if dismissal is None else (speakers or SpeakerPriority()).stop_phrases
+        ),
+    )
     events = SpeechEvents()
     now = 0
     events.start(
@@ -88,6 +101,7 @@ def replay(args, *, output=None) -> int:
         addressing=addressing,
         priority=priority,
         former=former,
+        dismissal=dismissal,
     )
     _emit(events.drain(), output)
     try:
@@ -149,6 +163,10 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
     if forming is not None:
         # The command-line former replaces the configuration file's, like --name.
         config = replace(config, request_former=forming)
+    if dismissal_from_args(args) is not None and config.dismissal is None:
+        # --dismissal turns natural dismissal on with the defaults; a configuration
+        # file's `dismissal` section keeps its own values.
+        config = replace(config, dismissal=dismissal_from_args(args))
     events = SpeechEvents()
     consent = {"allow_hosted_speech": True} if config.hosted_speech else {}
     if args.mode == "stdin":
