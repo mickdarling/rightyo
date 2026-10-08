@@ -423,10 +423,6 @@ class ConversationConfigTests(unittest.TestCase):
                 PrototypeConfig.load(config)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ControlInputTests(unittest.TestCase):
     """`listen --control-fd`: the host's reply reports over an inherited pipe (#124)."""
 
@@ -463,6 +459,25 @@ class ControlInputTests(unittest.TestCase):
         self.assertEqual(recorder.phases, ["started", "ended"])
         self.assertEqual(errors.getvalue().count("skipped"), 4)
 
+    def test_the_tail_of_an_overlong_line_is_never_applied(self):
+        import contextlib
+        import io
+        import os
+
+        from rightyo.tool import _read_control
+
+        read, write = os.pipe()
+        # 600 bytes whose tail is itself valid JSON, then a blank line and a real report.
+        os.write(write, b"x" * 580 + b'{"reply": "ended"}\n\n{"reply": "started"}\n')
+        os.close(write)
+        recorder = self.Recorder()
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            _read_control(read, recorder)
+        self.assertEqual(recorder.phases, ["started"])
+        self.assertEqual(errors.getvalue().count("too long"), 1)
+        self.assertNotIn("invalid", errors.getvalue())
+
     def test_listen_requires_stdin_mode_and_a_free_descriptor(self):
         from argparse import Namespace
 
@@ -480,3 +495,7 @@ class ControlInputTests(unittest.TestCase):
             )
             with self.subTest(mode=mode, fd=fd), self.assertRaises(PrototypeError):
                 listen(args)
+
+
+if __name__ == "__main__":
+    unittest.main()

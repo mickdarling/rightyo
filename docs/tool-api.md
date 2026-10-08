@@ -695,8 +695,9 @@ at once on any `dismiss`; drop or withdraw the listed requests and anything it h
 flight for this session; on `engagement`, return to ambient; optionally show the
 dismissal in the chat. Barge-in, meaning hearing the user while the assistant is
 speaking, needs the full-duplex loop and echo cancellation on the host, so the
-assistant's own playback is not transcribed as the user. RightyO has no input for "the
-assistant is speaking now" yet; in live sessions `playback_active` is always false.
+assistant's own playback is not transcribed as the user. Only conversation mode's reply
+timing (`listen --control-fd`) hears when the assistant is speaking; the decision's
+`playback_active` is still always false in live sessions.
 
 **Evaluation.** `examples/dismissal-eval.json` is an authored, synthetic set of 44
 scenarios: 20 dismissals (named, other agent names, unnamed, during and after

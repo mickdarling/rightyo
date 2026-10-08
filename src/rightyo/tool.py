@@ -140,7 +140,7 @@ def _read_control(fd: int, controller) -> None:
     """
     try:
         with os.fdopen(fd, "rb", buffering=0) as source:
-            pending = b""
+            pending, discarding = b"", False
             while True:
                 chunk = source.read(MAX_CONTROL_LINE)
                 if not chunk:
@@ -148,10 +148,15 @@ def _read_control(fd: int, controller) -> None:
                 pending += chunk
                 while b"\n" in pending:
                     line, pending = pending.split(b"\n", 1)
-                    _apply_control(line, controller)
+                    if discarding:
+                        # The rest of an overlong line is never read as a line of its own.
+                        discarding = False
+                    elif line.strip():
+                        _apply_control(line, controller)
                 if len(pending) > MAX_CONTROL_LINE:
-                    _stderr("control line too long; skipped")
-                    pending = b""
+                    if not discarding:
+                        _stderr("control line too long; skipped")
+                    pending, discarding = b"", True
     except OSError:
         _stderr("control input unavailable; reply timing off")
 

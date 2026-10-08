@@ -1096,7 +1096,12 @@ class PrototypeController:
         if phase not in {"started", "ended"}:
             raise PrototypeError("invalid reply phase")
         with self._lock:
-            if self._stop.is_set() or self._phase not in {"listening", "replaying", "finishing"}:
+            if (
+                self._events is None
+                or self._event_terminal
+                or self._stop.is_set()
+                or self._phase not in {"listening", "replaying", "finishing"}
+            ):
                 return
             self._publish("reply", phase)
 
