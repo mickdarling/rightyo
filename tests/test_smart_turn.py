@@ -182,6 +182,21 @@ class LiveEndOfTurnTests(unittest.TestCase):
         self.assertEqual(len(model.calls), 1)
         self.assertEqual(messages[-1], "end_of_turn finalized silence_ms=800")
 
+    def test_a_later_disjoint_segment_does_not_count_as_coverage(self):
+        class DisjointDiarizer(LaggingDiarizer):
+            def segments(self):
+                # Covers nothing near the last word, but a noise segment ends after it.
+                return [{"start_ms": 0, "end_ms": 100, "speaker": 1}] + (
+                    [{"start_ms": 300, "end_ms": self.pushed_ms, "speaker": 2}]
+                    if self.pushed_ms > 300
+                    else []
+                )
+
+        _, turns = self.run_processor(
+            SPLIT_QUESTION, ScriptedModel(0.9), until_ms=1000, diarizer=DisjointDiarizer(0)
+        )
+        self.assertEqual(turns, [])
+
     def test_an_utterance_level_diarizer_is_not_waited_for(self):
         diarizer = LaggingDiarizer(lag_ms=5000)
         diarizer.speaker_provenance = "diarization-utterance"

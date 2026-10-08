@@ -961,9 +961,12 @@ class LiveProcessor:
         if getattr(self._diarizer, "speaker_provenance", "diarization-timeline") == (
             "diarization-timeline"
         ) and not any(
+            # A segment spanning the last voiced audio, not merely one ending after it: a
+            # later, disjoint segment says nothing about the words before it.
             isinstance(segment, dict)
+            and type(segment.get("start_ms")) is int
             and type(segment.get("end_ms")) is int
-            and segment["end_ms"] >= self._last_voice_ms
+            and segment["start_ms"] < self._last_voice_ms <= segment["end_ms"]
             for segment in timeline
         ):
             return
