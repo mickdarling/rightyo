@@ -1069,8 +1069,6 @@ class SpeechEvents:
                     **formed,
                     **ack,
                 )
-                if ack_note is not None and self._report is not None:
-                    self._report(ack_note)
                 if self._dismissal is not None:
                     if len(self._delivered) >= MAX_WITHDRAWABLE:
                         # Bounded: the oldest delivered request can no longer be withdrawn.
@@ -1086,6 +1084,13 @@ class SpeechEvents:
                     self._open[request_id] = turn.end_ms
                 if self._conversation is not None and not self._conversation.is_closing(turn.text):
                     self._engage(turn, request_id)
+                if ack_note is not None and self._report is not None:
+                    # Best-effort and last: a failed diagnostic write (a closed stderr)
+                    # must never undo or skip the request's state transitions above.
+                    try:
+                        self._report(ack_note)
+                    except Exception:  # noqa: BLE001
+                        pass
 
     def _acknowledge(self, turn, decision, evidence):
         """The optional ``acknowledge`` field and its diagnostic note (#132).

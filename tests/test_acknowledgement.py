@@ -104,6 +104,17 @@ class AcknowledgementEventTests(unittest.TestCase):
         self.assertIs(request["acknowledge"], False)
         self.assertIn("outcome=skip reason=low_confidence", self.notes[0])
 
+    def test_a_failing_note_never_disturbs_delivery(self):
+        def broken(_note):
+            raise BrokenPipeError("stderr closed")
+
+        self.events = SpeechEvents(report=broken)
+        self.start()
+        first = self.say(turn("t1", 0, 900, "What time is it?"), "attend", 0.92)
+        second = self.say(turn("t2", 2000, 2900, "And the weather?"), "attend", 0.6)
+        self.assertIs(first["acknowledge"], True)
+        self.assertIs(second["acknowledge"], False)
+
     def test_a_name_addressed_turn_is_acknowledged_below_the_threshold(self):
         self.start()
         request = self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend", 0.5)
