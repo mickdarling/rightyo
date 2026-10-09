@@ -235,6 +235,37 @@ class EnrolledRolesProviderTests(unittest.TestCase):
         roles.source = Bindings()
         self.assertEqual(roles.role_for(turn("b", 0, 1, "x", "Speaker B")), "trusted")
 
+    def test_a_label_is_judged_a_participant_only_with_enough_speech(self):
+        # Live 2026-10-09: the owner's first short, noisy turn scored 0.36 and the owner was
+        # published as `participant`. Too little speech must leave the label undetermined.
+        embedder = ScriptedEmbedder([unit(0, 0, 1), unit(0, 0, 1)])
+        shadow = ShadowSpeakerId(
+            settings(bind_min_seconds=3.0),
+            report=lambda _line: None,
+            embedder_factory=lambda _settings: embedder,
+            entries=lambda _settings: [dict(entry) for entry in ENTRIES],
+        )
+        shadow.start()
+        roles = EnrolledRoles(OWNER_ID)
+        roles.source = shadow
+        received = 0
+        expected = (("insufficient", "unknown"), ("unknown", "participant"))
+        for index, (state, role) in enumerate(expected):
+            pcm = tone(2.0)
+            shadow.audio(pcm)
+            shadow.turn(
+                turn(f"t{index}", received, received + 2000, "x"),
+                spans=((received, received + 2000),),
+            )
+            received += 2000
+            wait_for(
+                lambda index=index: getattr(shadow._labels.get("Speaker A"), "turns", 0)
+                == index + 1
+            )
+            self.assertEqual(shadow.binding("Speaker A")[0], state)
+            self.assertEqual(roles.role_for(turn("x", 0, 1, "x")), role)
+        shadow.close(drain=True)
+
     def test_the_shadow_identifier_exposes_bindings_without_blocking(self):
         embedder = ScriptedEmbedder([unit(1, 0.1, 0), unit(0, 1, 0)])
         shadow = ShadowSpeakerId(

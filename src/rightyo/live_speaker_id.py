@@ -237,6 +237,11 @@ class ShadowSpeakerId:
         state = self._labels.get(label)
         if state is None:
             return None
+        if state.state == "unknown" and state.seconds < self.settings.bind_min_seconds:
+            # Too little speech to say this is *not* an enrolled voice: one short, noisy turn
+            # of the owner scores low. Only a label with as much evidence as binding needs
+            # may be judged a non-enrolled participant; until then it stays undetermined.
+            return "insufficient", state.identity
         return state.state, state.identity
 
     def _report(self, message: str) -> None:
@@ -443,8 +448,9 @@ class EnrolledRoles(ConfiguredPriorityProvider):
     - a label configured by session label in `speakers`: that role, as before;
     - a label bound to an enrolled identifier: the role `speakers` gives that identifier
       (`owner` or `trusted`), else `participant`;
-    - a label scored and matching no enrolled voice (`unknown` state): `participant`;
-    - a label not yet scored, `tentative`, or with identification off: `unknown`.
+    - a label with at least `bind_min_seconds` of speech matching no enrolled voice: `participant`;
+    - a label not yet scored, with too little speech to judge, `tentative`, or with
+      identification off: `unknown`.
 
     Only session-stable, unoverlapped `diarization-timeline` labels are ever looked up,
     since those are the only ones the identifier scores.
