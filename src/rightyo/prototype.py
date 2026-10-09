@@ -445,6 +445,8 @@ class PrototypeController:
         self._turn_gaps: dict[str, dict[str, Any]] = {}
         # Turns whose speaker label was partly inferred, until published (#137).
         self._inferred_turns: set[str] = set()
+        # Each turn's own-label timeline pieces, until the identifier takes them (#148).
+        self._turn_spans: dict[str, tuple[tuple[int, int], ...]] = {}
         # The session's live identification role provider, or None (#137 step 4b).
         self._enrolled_roles: EnrolledRoles | None = None
         self._pending = 0
@@ -666,6 +668,7 @@ class PrototypeController:
             self._decisions = {}
             self._turn_gaps = {}
             self._inferred_turns = set()
+            self._turn_spans = {}
             self._pending = self._requests = self._received_ms = 0
             self._received_bytes = 0
             self._budget_ms = None if budget_seconds is None else budget_seconds * 1000
@@ -757,6 +760,16 @@ class PrototypeController:
             # Called just before the same turn is accepted, so this holds at most one id.
             self._inferred_turns.add(utterance_id)
 
+    def _observe_spans(
+        self, generation: int, utterance_id: str, spans: tuple[tuple[int, int], ...]
+    ) -> None:
+        """Keep a turn's own-label timeline pieces until the identifier takes them (#148)."""
+        with self._lock:
+            if generation != self._generation or self._stop.is_set():
+                return
+            # Called just before the same turn is accepted, so this holds at most one id.
+            self._turn_spans[utterance_id] = spans
+
     def _end_of_turn_model(self, stop):
         """Start the configured end-of-turn model, or None; never fails the session (#117)."""
         settings = self.config.end_of_turn
@@ -804,13 +817,15 @@ class PrototypeController:
 
     def _turn(self, generation, work, memory, shadow, turn: Turn) -> None:
         with self._lock:
-            # Read before `_accept` consumes it: inferred-label turns are never voiceprint
-            # evidence (#137), in shadow mode or with roles.
+            # Read before `_accept` consumes it. The identifier embeds only the turn's
+            # own-label timeline pieces (#148), so an inferred-label word's audio is never
+            # voiceprint evidence (#137), in shadow mode or with roles.
             inferred = turn.utterance_id in self._inferred_turns
+            spans = self._turn_spans.pop(turn.utterance_id, None)
         self._accept(generation, work, memory, turn)
         if shadow is not None:
             # After the turn is accepted and published; it never raises or blocks.
-            shadow.turn(turn, **({"inferred": True} if inferred else {}))
+            shadow.turn(turn, inferred=inferred, spans=spans)
 
     def _audio(self, generation, stop, session, work, memory, mode):
         capture = processor = end_of_turn = shadow = None
@@ -852,6 +867,14 @@ class PrototypeController:
                     ),
                     on_inferred=lambda utterance_id: self._observe_inferred(
                         generation, utterance_id
+                    ),
+                    # Only with an identifier to use them (#148); None computes nothing.
+                    on_labelled_spans=(
+                        None
+                        if shadow is None
+                        else lambda utterance_id, spans: self._observe_spans(
+                            generation, utterance_id, spans
+                        )
                     ),
                     end_of_turn=end_of_turn.score if end_of_turn is not None else None,
                     edge_attribution_ms=self.config.edge_attribution_ms,

@@ -23,8 +23,9 @@ still never joined, nothing is joined into an unattributed held fragment, and a 
 fragment of another speaker is never joined. A turn formed by a tail join, or joining a
 fragment marked `inferred` (edge-attributed words), is marked `"inferred": True`; the key
 is absent otherwise. Live identification roles (#137) use it to withhold owner authority.
-Fragments are plain dictionaries; the caller turns a
-released fragment into a `Turn` and assigns its utterance id at that moment, so ids stay
+A fragment's optional `labelled_spans` (its own-label timeline audio, #148) are joined as
+their concatenation. Fragments are plain dictionaries; the caller turns a released
+fragment into a `Turn` and assigns its utterance id at that moment, so ids stay
 unique and in emission order, and a joined turn reports the first fragment's start and
 the last fragment's end.
 
@@ -182,6 +183,12 @@ class TurnMerger:
                 # A tail join, or a piece with edge-attributed words: the joined turn's
                 # label is partly inferred, which roles must know (#137). Absent otherwise.
                 held["inferred"] = True
+            if "labelled_spans" in held or "labelled_spans" in fragment:
+                # Each piece's own-label timeline audio (#148); a tail has none.
+                held["labelled_spans"] = [
+                    *held.get("labelled_spans", ()),
+                    *fragment.get("labelled_spans", ()),
+                ]
             held["text"] = held["text"] + " " + fragment["text"]
             held["end_ms"] = max(held["end_ms"], fragment["end_ms"])
             self._hold_ms = self._hold_for(held)

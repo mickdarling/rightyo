@@ -2,12 +2,16 @@
 
 When the `speaker_id` section sets `"live": true`, a live session runs this alongside the
 processor. For each finalized turn with a session speaker label from the diarization
-timeline, it takes that turn's audio span from a bounded in-memory ring of the session's
-PCM, embeds it the way `rightyo enroll verify` does (silence trimmed, 3 s windows,
-renormalised mean), and accumulates a duration-weighted mean per session label. The
-accumulated vector is scored against the enrolled voiceprints made with the same model,
-and each label gets a shadow binding state: `bound` to an enrolled identifier, `tentative`
-or `unknown`.
+timeline, it takes only the pieces of the turn's span that the timeline gave that label
+and no other speaker (#148) from a bounded in-memory ring of the session's PCM, joins
+them, embeds them the way `rightyo enroll verify` does (silence trimmed, 3 s windows,
+renormalised mean), and accumulates a duration-weighted mean per session label. A turn
+without such pieces is counted, never scored. So the audio of inferred-label words (edge
+attribution, tail join), of overlap, and of another voice the timeline marks inside the
+span is never voiceprint evidence, while a turn with inferred words can still contribute
+its own labelled audio. The accumulated vector is scored against the enrolled voiceprints
+made with the same model, and each label gets a shadow binding state: `bound` to an
+enrolled identifier, `tentative` or `unknown`.
 
 In shadow mode nothing here changes turns, roles, requests, attention or events: the
 result is a content-free stderr note per scored turn (labels, enrolled identifiers,
@@ -148,6 +152,32 @@ def _samples(pcm: bytes) -> array:
     return values
 
 
+def _pieces(spans: Any, start_ms: int, end_ms: int) -> list[tuple[int, int]]:
+    """Valid `(start_ms, end_ms)` pieces clipped to `[start_ms, end_ms)`, sorted and merged.
+
+    Anything malformed is dropped, so a bad value can only make a turn unsegmented.
+    """
+    if not isinstance(spans, (list, tuple)):
+        return []
+    clipped = []
+    for piece in spans:
+        if (
+            isinstance(piece, (list, tuple))
+            and len(piece) == 2
+            and all(type(value) is int for value in piece)
+        ):
+            start, end = max(piece[0], start_ms), min(piece[1], end_ms)
+            if end > start:
+                clipped.append((start, end))
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(clipped):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def _default_embedder(settings: SpeakerIdConfig):
     return SpeakerEmbedder(settings.python, settings.model, threads=settings.threads)
 
@@ -173,7 +203,7 @@ class ShadowSpeakerId:
         self._report_to = report
         self._embedder_factory = embedder_factory
         self._entries = entries
-        self._queue: queue.Queue[tuple[str, int, bytes]] = queue.Queue(maxsize=queue_size)
+        self._queue: queue.Queue[tuple[str, int, int, bytes]] = queue.Queue(maxsize=queue_size)
         self._ring = PcmRing(ring_ms)
         self._labels: dict[str, LabelState] = {}
         self._stop = threading.Event()  # discard pending work and exit
@@ -184,6 +214,8 @@ class ShadowSpeakerId:
         self._thread = threading.Thread(target=self._run, name="rightyo-speaker-id", daemon=True)
         self.offered = self.scored = self.short = self.overlap = 0
         self.dropped = self.clipped = self.inferred = 0
+        self.unsegmented = 0  # turns without own-label timeline pieces (#148)
+        self.labelled_ms = 0  # own-label timeline audio taken from the ring (#148)
 
     @property
     def active(self) -> bool:
@@ -220,12 +252,18 @@ class ShadowSpeakerId:
             with contextlib.suppress(Exception):
                 self._ring.append(pcm)
 
-    def turn(self, turn, *, inferred: bool = False) -> None:
+    def turn(self, turn, *, inferred: bool = False, spans=None) -> None:
         """Queue one finalized turn for scoring; never blocks, never raises.
 
+        `spans` are the `(start_ms, end_ms)` stream-time pieces of the turn's span that the
+        diarizer timeline gave the turn's own label and no other speaker (#148). Only that
+        audio is embedded. A turn without them (None, or none inside its span) is counted
+        as unsegmented and never scored: its whole span may hold another voice.
+
         A turn with inferred-label words (edge attribution or a tail join, #137) is
-        counted, never scored: its audio may be another speaker's, and accumulating it
-        could bind that speaker's label to the wrong enrolled identity.
+        counted as inferred and scored on its labelled pieces only. The inferred words lie
+        outside the label's timeline segments, so their audio, which may be another
+        speaker's, is never accumulated into the label.
         """
         try:
             if (
@@ -237,17 +275,29 @@ class ShadowSpeakerId:
             self.offered += 1
             if inferred:
                 self.inferred += 1
-                return
             if turn.overlap:
                 # Two voices at once would blur the label's evidence.
                 self.overlap += 1
                 return
-            pcm, clipped = self._ring.span(turn.start_ms, turn.end_ms)
+            pieces = _pieces(spans, turn.start_ms, turn.end_ms)
+            if not pieces:
+                self.unsegmented += 1
+                return
+            labelled_ms = sum(end - start for start, end in pieces)
+            self.labelled_ms += labelled_ms
+            parts, clipped = [], False
+            for start, end in pieces:
+                part, cut = self._ring.span(start, end)
+                parts.append(part)
+                clipped |= cut
             self.clipped += clipped
+            pcm = b"".join(parts)
             if not pcm:
                 return
             try:
-                self._queue.put_nowait((turn.speaker_id, turn.end_ms - turn.start_ms, pcm))
+                self._queue.put_nowait(
+                    (turn.speaker_id, turn.end_ms - turn.start_ms, labelled_ms, pcm)
+                )
             except queue.Full:
                 self.dropped += 1
                 if self.dropped == 1:
@@ -298,7 +348,15 @@ class ShadowSpeakerId:
                 with contextlib.suppress(Exception):
                     embedder.close()
 
-    def _score(self, embedder, prints: dict[str, list[float]], label: str, turn_ms: int, pcm):
+    def _score(
+        self,
+        embedder,
+        prints: dict[str, list[float]],
+        label: str,
+        turn_ms: int,
+        labelled_ms: int,
+        pcm: bytes,
+    ):
         samples = speech(_samples(pcm))
         seconds = len(samples) / SAMPLE_RATE
         if seconds < self.settings.min_turn_seconds:
@@ -322,7 +380,7 @@ class ShadowSpeakerId:
         # Report after the bookkeeping, best-effort: a failing channel changes nothing.
         self._report(
             f"speaker_id label={_quoted(label)} turn_ms={turn_ms}"
-            f" speech_ms={round(seconds * 1000)}"
+            f" labelled_ms={labelled_ms} speech_ms={round(seconds * 1000)}"
             f" turn_score={turn_scores[state.identity]:.3f} acc_score={state.score:.3f}"
             f" acc_s={state.seconds:.1f} state={state.state} id={state.identity}"
         )
@@ -371,6 +429,7 @@ class ShadowSpeakerId:
             f"speaker_id summary offered={self.offered} scored={self.scored}"
             f" short={self.short} overlap={self.overlap} dropped={self.dropped}"
             f" clipped={self.clipped} inferred={self.inferred}"
+            f" unsegmented={self.unsegmented} labelled_ms={self.labelled_ms}"
         )
 
 

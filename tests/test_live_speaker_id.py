@@ -22,12 +22,23 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from rightyo.contracts import Turn
-from rightyo.live_speaker_id import LabelState, PcmRing, ShadowSpeakerId, bind
+from test_edge_attribution import SPEECH, Timeline, Units
+from test_turn_merge import fragment
+
+from rightyo.contracts import SpeakerPriority, Turn
+from rightyo.live_audio import (
+    FRAME_BYTES,
+    LiveAudioError,
+    LiveConfig,
+    LiveProcessor,
+    _labelled_spans,
+)
+from rightyo.live_speaker_id import EnrolledRoles, LabelState, PcmRing, ShadowSpeakerId, bind
 from rightyo.prototype import PrototypeConfig, PrototypeController
 from rightyo.speaker_id import SpeakerIdConfig
 from rightyo.tool import listen
 from rightyo.tool_events import SpeechEvents
+from rightyo.turn_merge import TurnMerger
 
 RATE = 16000
 MODEL = {"id": "synthetic/stand-in", "revision": "0" * 40, "sha256": "a" * 64}
@@ -103,6 +114,9 @@ ENTRIES = [
 ]
 
 
+WHOLE = object()  # `Harness.speak`: the turn's whole span is labelled
+
+
 class Harness:
     def __init__(self, embedder, *, config=None, entries=ENTRIES, queue_size=4, ring_ms=60000):
         self.lines: list[str] = []
@@ -122,13 +136,20 @@ class Harness:
             raise self.embedder
         return self.embedder
 
-    def speak(self, seconds, speaker="Speaker A", **options):
-        """Feed `seconds` of tone and offer it as one finalized turn."""
+    def speak(self, seconds, speaker="Speaker A", *, spans=WHOLE, inferred=False, **options):
+        """Feed `seconds` of tone and offer it as one finalized turn.
+
+        By default the whole span is the label's own timeline audio (#148).
+        """
         start = self.received_ms
         pcm = tone(seconds)
         self.shadow.audio(pcm)
         self.received_ms += len(pcm) // 32
-        self.shadow.turn(turn(start, self.received_ms, speaker, **options))
+        if spans is WHOLE:
+            spans = ((start, self.received_ms),)
+        self.shadow.turn(
+            turn(start, self.received_ms, speaker, **options), inferred=inferred, spans=spans
+        )
 
     def notes(self):
         return [line for line in self.lines if line.startswith("speaker_id label=")]
@@ -247,7 +268,7 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual(embedder.calls, 0)
         self.assertIn(
             "speaker_id summary offered=2 scored=0 short=1 overlap=1 dropped=0 clipped=0"
-            " inferred=0",
+            " inferred=0 unsegmented=0 labelled_ms=600",
             harness.lines,
         )
 
@@ -327,12 +348,21 @@ class ShadowTests(unittest.TestCase):
         self.assertNotIn(PRIVATE_TEXT, log)
         self.assertNotIn("/", log)
         self.assertNotIn("synthetic", log)  # neither model ids nor paths
-        allowed = {"turn_ms", "speech_ms", "turn_score", "acc_score", "acc_s", "state", "id"}
+        allowed = {
+            "turn_ms",
+            "labelled_ms",
+            "speech_ms",
+            "turn_score",
+            "acc_score",
+            "acc_s",
+            "state",
+            "id",
+        }
         for line in harness.notes():
             self.assertIn(' label="Speaker A" ', line)
             fields = Harness.fields(line)
             self.assertEqual(set(fields) - {"label"}, allowed)
-            for name in ("turn_ms", "speech_ms", "turn_score", "acc_score", "acc_s"):
+            for name in ("turn_ms", "labelled_ms", "speech_ms", "turn_score", "acc_score", "acc_s"):
                 float(fields[name])
 
     def test_a_failure_mid_update_keeps_the_label_and_the_closing_lines(self):
@@ -360,7 +390,7 @@ class ShadowTests(unittest.TestCase):
                 'speaker_id final label="Speaker B" turns=0 acc_score=- acc_s=0.0'
                 " state=unknown id=-",
                 "speaker_id summary offered=1 scored=0 short=0 overlap=0 dropped=0 clipped=0"
-                " inferred=0",
+                " inferred=0 unsegmented=0 labelled_ms=0",
             ],
         )
         self.assertEqual(Harness.fields(harness.lines[-2])["label"], "Speaker B")
@@ -378,10 +408,287 @@ class ShadowTests(unittest.TestCase):
         )
         shadow.start()
         shadow.audio(tone(2.0))
-        shadow.turn(turn(0, 2000))
+        shadow.turn(turn(0, 2000), spans=((0, 2000),))
         shadow.close(drain=True)
         self.assertEqual(shadow.scored, 1)
         self.assertEqual(shadow._labels["Speaker A"].turns, 1)
+
+
+OWNER_F0, GUEST_F0 = 400.0, 140.0
+
+
+class ToneEmbedder:
+    """Keyed on audio content: each 20 ms frame is the owner's tone or the guest's.
+
+    The embedding is the frame-weighted mix of the owner's and guest's voiceprints, so any
+    owner audio in a guest label's evidence moves it toward `owner`. Counts every frame it
+    was shown, by voice.
+    """
+
+    def __init__(self):
+        self.model = dict(MODEL)
+        self.calls = 0
+        self.frames = {"owner": 0, "guest": 0}
+        self.closed = False
+
+    def embed(self, pcm: bytes) -> list[float]:
+        self.calls += 1
+        samples = array("h")
+        samples.frombytes(pcm)
+        mix = {"owner": 0, "guest": 0}
+        for index in range(0, len(samples) - 319, 320):
+            frame = samples[index : index + 320]
+            crossings = sum((a < 0) != (b < 0) for a, b in zip(frame, frame[1:]))
+            # 140 Hz crosses zero about 6 times in 20 ms; 400 Hz about 16 times.
+            mix["owner" if crossings > 10 else "guest"] += 1
+        for voice, count in mix.items():
+            self.frames[voice] += count
+        return unit(mix["owner"], mix["guest"], 0)
+
+    def close(self):
+        self.closed = True
+
+
+class SegmentScoringTests(unittest.TestCase):
+    """Only the label's own diarization pieces of a turn are embedded (#148)."""
+
+    def shadow(self, embedder, **overrides):
+        lines: list[str] = []
+        shadow = ShadowSpeakerId(
+            settings(**overrides),
+            report=lines.append,
+            embedder_factory=lambda _settings: embedder,
+            entries=lambda _settings: [dict(entry) for entry in ENTRIES],
+        )
+        shadow.start()
+        return shadow, lines
+
+    def test_a_guest_turn_with_an_owner_tail_embeds_only_guest_pieces(self):
+        embedder = ToneEmbedder()
+        shadow, lines = self.shadow(embedder, bind_min_seconds=1.0)
+        received = 0
+        for index in range(4):
+            # 2 s of the guest, then the owner's 1 s tail joined under the guest's label.
+            shadow.audio(tone(2.0, GUEST_F0) + tone(1.0, OWNER_F0))
+            current = turn(received, received + 3000, "Speaker B")
+            shadow.turn(current, inferred=True, spans=((received, received + 2000),))
+            received += 3000
+        shadow.close(drain=True)
+        self.assertEqual(embedder.frames["owner"], 0)
+        self.assertGreater(embedder.frames["guest"], 0)
+        self.assertEqual((shadow.offered, shadow.inferred, shadow.scored), (4, 4, 4))
+        self.assertEqual(shadow.labelled_ms, 8000)
+        state = shadow._labels["Speaker B"]
+        self.assertEqual((state.state, state.identity), ("bound", "guest"))
+        self.assertLess(state.scores["owner"], 0.01)
+        roles = EnrolledRoles(SpeakerPriority(owners=("owner",)))
+        roles.source = shadow
+        self.assertEqual(roles.role_for(turn(0, 1, "Speaker B")), "participant")
+        notes = [Harness.fields(line) for line in lines if line.startswith("speaker_id label=")]
+        self.assertEqual({note["turn_ms"] for note in notes}, {"3000"})
+        self.assertEqual({note["labelled_ms"] for note in notes}, {"2000"})
+        self.assertTrue(lines[-1].endswith(" inferred=4 unsegmented=0 labelled_ms=8000"))
+
+    def test_the_same_turn_scored_whole_would_have_moved_toward_owner(self):
+        """Control: the tone embedder does see owner audio when it is in the pieces."""
+        embedder = ToneEmbedder()
+        shadow, _ = self.shadow(embedder)
+        shadow.audio(tone(2.0, GUEST_F0) + tone(1.0, OWNER_F0))
+        shadow.turn(turn(0, 3000, "Speaker B"), spans=((0, 3000),))
+        shadow.close(drain=True)
+        self.assertGreater(embedder.frames["owner"], 0)
+        self.assertGreater(shadow._labels["Speaker B"].scores["owner"], 0.3)
+
+    def test_an_owner_turn_with_an_inferred_guest_tail_still_binds_the_owner(self):
+        embedder = ToneEmbedder()
+        shadow, _ = self.shadow(embedder)  # default bind_min_seconds: 3 s
+        received = 0
+        for _ in range(2):
+            shadow.audio(tone(2.0, OWNER_F0) + tone(1.0, GUEST_F0))
+            current = turn(received, received + 3000, "Speaker A")
+            shadow.turn(current, inferred=True, spans=((received, received + 2000),))
+            received += 3000
+        shadow.close(drain=True)
+        self.assertEqual(embedder.frames["guest"], 0)
+        state = shadow._labels["Speaker A"]
+        self.assertEqual((state.turns, state.seconds), (2, 4.0))
+        self.assertEqual(shadow.binding("Speaker A"), ("bound", "owner"))
+
+    def test_pieces_are_joined_and_another_voice_between_them_is_left_out(self):
+        embedder = ToneEmbedder()
+        shadow, lines = self.shadow(embedder)
+        # Owner 0-1.5 s, a guest backchannel 1.5-2 s the recognizer dropped, owner 2-3.5 s.
+        shadow.audio(tone(1.5, OWNER_F0) + tone(0.5, GUEST_F0) + tone(1.5, OWNER_F0))
+        shadow.turn(turn(0, 3500), spans=((0, 1500), (2000, 3500)))
+        shadow.close(drain=True)
+        self.assertEqual(embedder.frames["guest"], 0)
+        self.assertEqual(shadow.scored, 1)
+        self.assertEqual(shadow._labels["Speaker A"].seconds, 3.0)
+        note = Harness.fields([line for line in lines if "label=" in line][0])
+        self.assertEqual((note["turn_ms"], note["labelled_ms"]), ("3500", "3000"))
+
+    def test_min_turn_seconds_applies_to_the_summed_labelled_speech(self):
+        embedder = ToneEmbedder()
+        shadow, _ = self.shadow(embedder, min_turn_seconds=1.0)
+        shadow.audio(tone(4.0, OWNER_F0))
+        # A 4 s turn with only 0.8 s of it labelled: too short to score.
+        shadow.turn(turn(0, 4000), spans=((0, 400), (3600, 4000)))
+        # Two 0.6 s pieces sum to 1.2 s: scored.
+        shadow.audio(tone(4.0, OWNER_F0))
+        shadow.turn(turn(4000, 8000), spans=((4000, 4600), (7400, 8000)))
+        shadow.close(drain=True)
+        self.assertEqual((shadow.short, shadow.scored), (1, 1))
+        self.assertEqual(shadow.labelled_ms, 2000)
+
+    def test_a_turn_without_pieces_is_skipped_and_counted(self):
+        embedder = ToneEmbedder()
+        shadow, lines = self.shadow(embedder)
+        shadow.audio(tone(8.0, OWNER_F0))
+        shadow.turn(turn(0, 2000))  # no pieces were reported
+        shadow.turn(turn(2000, 4000), spans=())  # the timeline gave the label none
+        shadow.turn(turn(4000, 6000), spans=((0, 1000), (6500, 7000)))  # none inside
+        shadow.turn(turn(6000, 8000), inferred=True, spans=[("bad", 1), (7000, 7000)])
+        shadow.close(drain=True)
+        self.assertEqual(embedder.calls, 0)
+        self.assertEqual((shadow.offered, shadow.unsegmented, shadow.scored), (4, 4, 0))
+        self.assertIn(
+            "speaker_id summary offered=4 scored=0 short=0 overlap=0 dropped=0 clipped=0"
+            " inferred=1 unsegmented=4 labelled_ms=0",
+            lines,
+        )
+
+    def test_pieces_outside_the_turn_are_clipped_to_it(self):
+        embedder = ToneEmbedder()
+        shadow, _ = self.shadow(embedder)
+        shadow.audio(tone(1.0, GUEST_F0) + tone(2.0, OWNER_F0) + tone(1.0, GUEST_F0))
+        # Overlapping, unordered pieces reaching past both ends of the 1-3 s turn.
+        shadow.turn(turn(1000, 3000), spans=((2500, 4000), (0, 2000), (1500, 2600)))
+        shadow.close(drain=True)
+        self.assertEqual(embedder.frames["guest"], 0)
+        self.assertEqual(shadow.labelled_ms, 2000)
+
+
+class LabelledSpanTests(unittest.TestCase):
+    """The live window reports each turn's own-label, unoverlapped timeline pieces."""
+
+    def test_pieces_exclude_other_speakers_overlap_and_unlabelled_audio(self):
+        timeline = [
+            {"start_ms": 0, "end_ms": 1000, "speaker": 1},
+            {"start_ms": 400, "end_ms": 600, "speaker": 2},  # overlaps A
+            {"start_ms": 1200, "end_ms": 1500, "speaker": 1},  # after an unlabelled gap
+            {"start_ms": 1400, "end_ms": 1800, "speaker": 2},
+            {"start_ms": 1500, "end_ms": 1700, "speaker": 1},  # inside B: overlap only
+        ]
+        self.assertEqual(
+            _labelled_spans("Speaker A", 100, 1900, timeline),
+            [(100, 400), (600, 1000), (1200, 1400)],
+        )
+        self.assertEqual(_labelled_spans("Speaker B", 0, 2000, timeline), [(1700, 1800)])
+        self.assertEqual(_labelled_spans("Speaker C", 0, 2000, timeline), [])
+        self.assertEqual(_labelled_spans(None, 0, 2000, timeline), [])
+        self.assertEqual(_labelled_spans("Speaker A", 500, 500, timeline), [])
+        # Touching segments of the same label merge into one piece.
+        touching = [
+            {"start_ms": 0, "end_ms": 500, "speaker": 1},
+            {"start_ms": 500, "end_ms": 900, "speaker": 1},
+        ]
+        self.assertEqual(_labelled_spans("Speaker A", 0, 1000, touching), [(0, 900)])
+
+    def run_live(self, units, timeline, **options):
+        turns, spans, inferred = [], {}, []
+        config = LiveConfig(
+            "span-test",
+            provenance="causal-replay",
+            transcriber=units,
+            diarizer=timeline,
+            on_inferred=inferred.append,
+            on_labelled_spans=lambda utterance, pieces: spans.__setitem__(utterance, pieces),
+            **options,
+        )
+        processor = LiveProcessor(config, turns.append)
+        for offset in range(0, len(SPEECH), FRAME_BYTES * 10):
+            processor.push_pcm16(SPEECH[offset : offset + FRAME_BYTES * 10])
+        processor.finish()
+        return turns, spans, inferred
+
+    def test_edge_attributed_words_are_outside_the_pieces(self):
+        units = Units((" Turn the volume", 0, 600), (" down", 600, 800), (" a bit.", 850, 1000))
+        turns, spans, inferred = self.run_live(
+            units, Timeline((0, 700, 1)), edge_attribution_ms=300
+        )
+        self.assertEqual(
+            [(t.speaker_id, t.start_ms, t.end_ms) for t in turns], [("Speaker A", 0, 1000)]
+        )
+        self.assertEqual(inferred, [turns[0].utterance_id])
+        self.assertEqual(spans, {turns[0].utterance_id: ((0, 700),)})
+
+    def test_an_untranscribed_voice_inside_the_turn_is_left_out(self):
+        units = Units((" Turn the volume", 0, 400), (" down.", 600, 1000))
+        turns, spans, _ = self.run_live(units, Timeline((0, 1000, 1), (420, 580, 2)))
+        self.assertEqual([t.speaker_id for t in turns], ["Speaker A"])
+        self.assertEqual(spans, {turns[0].utterance_id: ((0, 420), (580, 1000))})
+
+    def test_each_turn_gets_its_own_pieces_and_unlabelled_turns_none(self):
+        units = Units((" Hello", 0, 300), (" there.", 400, 700), (" Hm.", 800, 950))
+        turns, spans, _ = self.run_live(units, Timeline((0, 350, 1), (380, 720, 2)))
+        self.assertEqual([t.speaker_id for t in turns], ["Speaker A", "Speaker B", None])
+        self.assertEqual([spans[t.utterance_id] for t in turns], [((0, 300),), ((400, 700),), ()])
+
+    def test_without_an_observer_nothing_is_computed_or_reported(self):
+        units = Units(
+            (" Turn the volume", 0, 600),
+        )
+        turns = []
+        config = LiveConfig(
+            "span-test",
+            provenance="causal-replay",
+            transcriber=units,
+            diarizer=Timeline((0, 700, 1)),
+        )
+        processor = LiveProcessor(config, turns.append)
+        with patch("rightyo.live_audio._labelled_spans") as computed:
+            for offset in range(0, len(SPEECH), FRAME_BYTES * 10):
+                processor.push_pcm16(SPEECH[offset : offset + FRAME_BYTES * 10])
+            processor.finish()
+        computed.assert_not_called()
+        self.assertEqual(len(turns), 1)
+
+    def test_utterance_local_labels_get_no_pieces(self):
+        units = Units(
+            (" Turn the volume", 0, 600),
+        )
+        turns, spans, _ = self.run_live(
+            units, Timeline((0, 700, 1), provenance="diarization-utterance")
+        )
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(spans, {})
+
+    def test_an_invalid_observer_is_refused(self):
+        with self.assertRaises(LiveAudioError):
+            LiveConfig("x", transcriber=Units(), diarizer=Timeline(), on_labelled_spans="no")
+
+    def test_joined_fragments_carry_the_union_of_their_pieces(self):
+        emitted = []
+        merger = TurnMerger(2000, 24000, emitted.append, tail_join_ms=400)
+        held = fragment("Turn the volume", 0, 600)
+        held["labelled_spans"] = [(0, 600)]
+        tail = fragment("down a bit.", 900, 1100, speaker=None)
+        tail["labelled_spans"] = []
+        merger.offer(held)
+        merger.offer(tail)
+        more = fragment("Thanks.", 1500, 1800)
+        more["labelled_spans"] = [(1500, 1750)]
+        merger.offer(more)
+        merger.flush()
+        self.assertEqual(len(emitted), 1)
+        self.assertTrue(emitted[0]["inferred"])
+        self.assertEqual(emitted[0]["labelled_spans"], [(0, 600), (1500, 1750)])
+        plain = []
+        merger = TurnMerger(2000, 24000, plain.append)
+        merger.offer(fragment("Turn the volume", 0, 600))
+        merger.offer(fragment("down.", 1000, 1200))
+        merger.flush()
+        self.assertNotIn("labelled_spans", plain[0])
 
 
 class TurnEveryTwoSeconds:
@@ -397,6 +704,9 @@ class TurnEveryTwoSeconds:
         while self.received_ms - self.emitted_ms >= 2000:
             self.count += 1
             start, self.emitted_ms = self.emitted_ms, self.emitted_ms + 2000
+            if self.config.on_labelled_spans is not None:
+                # The whole turn is its label's own timeline audio (#148).
+                self.config.on_labelled_spans(f"live-{self.count}", ((start, self.emitted_ms),))
             self.on_turn(
                 Turn(
                     self.config.session_id,
@@ -489,6 +799,31 @@ class ControllerTests(unittest.TestCase):
         self.assertTrue(embedder.closed)
         self.assertNotIn(PRIVATE_TEXT, "\n".join(lines))
         self.assertEqual(created[0]._ring._buffer, bytearray())
+
+    def test_labelled_pieces_are_requested_only_with_an_identifier(self):
+        configs = []
+
+        def processor(config, on_turn):
+            configs.append(config)
+            return TurnEveryTwoSeconds(config, on_turn)
+
+        live = replace(self.base, speaker_id=SpeakerIdConfig(self.asset, self.asset, live=True))
+        for config, factory in (
+            (self.base, MagicMock()),
+            (live, MagicMock(side_effect=RuntimeError("synthetic"))),
+        ):
+            controller = PrototypeController(
+                config,
+                processor_factory=processor,
+                capture_factory=MagicMock(),
+                provider_factory=MagicMock(),
+                report=lambda _line: None,
+                speaker_id_factory=factory,
+            )
+            self.addCleanup(controller.close)
+            controller.start({"mode": "demo"})
+            wait_for(lambda c=controller: c.snapshot(heartbeat=False)["phase"] == "complete", 5)
+        self.assertEqual([config.on_labelled_spans for config in configs], [None, None])
 
     def test_without_a_diagnostic_channel_no_worker_starts(self):
         factory = MagicMock()

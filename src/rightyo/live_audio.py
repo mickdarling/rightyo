@@ -107,6 +107,12 @@ class LiveConfig:
     # was partly inferred (edge attribution or tail join), so roles can withhold owner
     # authority from it (#137) without changing the `Turn` contract.
     on_inferred: Callable[[str], None] | None = None
+    # Called with (utterance_id, spans) just before `on_turn` for each `diarization-timeline`
+    # turn, where `spans` are the `(start_ms, end_ms)` stream-time pieces of the turn's span
+    # that the diarizer timeline gave the turn's own label and no other speaker (#148), so
+    # live speaker identification embeds only that audio; empty when there are none. None,
+    # the default, computes nothing. Internal plumbing: the `Turn` contract is unchanged.
+    on_labelled_spans: Callable[[str, tuple[tuple[int, int], ...]], None] | None = None
     # Optional end-of-turn model (#117), such as `SmartTurn.score`: called with the open
     # utterance's PCM once `end_of_turn_silence_ms` of silence follows speech, returning
     # P(turn complete). At or above `end_of_turn_threshold` the utterance is finalized as
@@ -152,6 +158,8 @@ class LiveConfig:
             raise LiveAudioError("Invalid post-turn gap observer")
         if self.on_inferred is not None and not callable(self.on_inferred):
             raise LiveAudioError("Invalid inferred-label observer")
+        if self.on_labelled_spans is not None and not callable(self.on_labelled_spans):
+            raise LiveAudioError("Invalid labelled-span observer")
         if self.turn_break is not None and not callable(self.turn_break):
             raise LiveAudioError("Invalid turn break predicate")
         if self.end_of_turn is not None and not callable(self.end_of_turn):
@@ -580,6 +588,40 @@ def _attribute_edges(
             entry[3] = label
             inferred.add(index)
     return inferred
+
+
+def _labelled_spans(
+    label: str | None, start: int, end: int, timeline: list[dict[str, Any]]
+) -> list[tuple[int, int]]:
+    """The pieces of `[start, end)` the timeline gives `label` and no other speaker (#148).
+
+    Clipped to the span, merged where they touch, in time order. Audio the timeline leaves
+    unlabelled (such as an edge-attributed or tail-joined word) or gives to another speaker,
+    including any overlap with this label, is never included.
+    """
+    if label is None or end <= start:
+        return []
+    own: list[tuple[int, int]] = []
+    others: list[tuple[int, int]] = []
+    for segment in timeline:
+        left, right = max(start, segment["start_ms"]), min(end, segment["end_ms"])
+        if right > left:
+            mine = "Speaker " + _speaker_label(segment["speaker"]) == label
+            (own if mine else others).append((left, right))
+    if not own:
+        return []
+    edges = sorted({edge for piece in own + others for edge in piece})
+    spans: list[tuple[int, int]] = []
+    for left, right in zip(edges, edges[1:]):
+        if not any(a <= left and right <= b for a, b in own):
+            continue
+        if any(a < right and b > left for a, b in others):
+            continue
+        if spans and spans[-1][1] == left:
+            spans[-1] = (spans[-1][0], right)
+        else:
+            spans.append((left, right))
+    return spans
 
 
 def _speaker_label(number: int) -> str:
@@ -1124,6 +1166,16 @@ class LiveProcessor:
         for index, group in enumerate(kept):
             group["text"] = group["text"].strip()
             group["speaker_provenance"] = provenance if timeline else "unknown"
+            if self.config.on_labelled_spans is not None and provenance == "diarization-timeline":
+                # Only the label's own, unoverlapped timeline audio (#148); joined turns
+                # carry the union of their fragments' pieces (see `TurnMerger`).
+                group["labelled_spans"] = (
+                    []
+                    if group["overlap"]
+                    else _labelled_spans(
+                        group["speaker"], group["start_ms"], group["end_ms"], relevant
+                    )
+                )
             # Only the speaker who just paused was judged finished; earlier groups in the
             # utterance were followed by other speech already.
             self._merger.offer(group, complete=complete and index == len(kept) - 1)
@@ -1133,6 +1185,7 @@ class LiveProcessor:
         self._counter += 1
         gap = group.pop("post_turn_gap", None)
         inferred = group.pop("inferred", False) is True
+        spans = group.pop("labelled_spans", None)
         turn = Turn(
             session_id=self.config.session_id,
             utterance_id=f"live-{self._counter}",
@@ -1151,6 +1204,8 @@ class LiveProcessor:
             self.config.on_post_turn_gap(turn.utterance_id, gap)
         if inferred and self.config.on_inferred is not None:
             self.config.on_inferred(turn.utterance_id)
+        if spans is not None and self.config.on_labelled_spans is not None:
+            self.config.on_labelled_spans(turn.utterance_id, tuple(spans))
         self.on_turn(turn)
 
     def finish(self) -> None:
