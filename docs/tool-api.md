@@ -31,7 +31,7 @@ The events are:
 | `session` | `phase`, initial `capabilities`, optional terminal `reason`, `skipped_segments` and `skipped_utterances` | `started`, `stopped`, `cancelled`, or `error` |
 | `transcript` | `turn` | One immutable finalized transcript turn |
 | `attention` | `utterance_id`, `speech_end_ms`, `decision`, optional `request_id` | `attend`, `ignore`, or `uncertain` evidence |
-| `request` | `request_id`, `turn`, `decision`, `context`, `decision_at_ms`, optional `formed_request` | Complete attended input available for host handling |
+| `request` | `request_id`, `turn`, `decision`, `context`, `decision_at_ms`, optional `formed_request`, optional `acknowledge` | Complete attended input available for host handling |
 | `override` | `superseded_request_id`, `by_utterance_id`, `role` | An owner's turn supersedes an earlier open non-owner request |
 | `dismiss` | `utterance_id`, `speech_end_ms`, `speaker_id`, optional `role`, `scope`, `withdrawn_request_ids`, `reason`, `confidence`, optional `cooldown_until_ms` | The speaker told the assistant to stop, go away, or that it was not addressed ([natural dismissal](#natural-dismissal-and-barge-in); only when advertised) |
 | `conversation` | `state`, `reason`, `speaker_id`, `at_ms`, optional `utterance_id`, `request_id`, `until_ms` | The conversation became `engaged` with a speaker or returned to `ambient` ([conversation mode](#conversation-mode); only when advertised) |
@@ -529,6 +529,45 @@ the request, as before.
 **Not yet.** Only a request engages, not a reply on its own. The decision model is not told the conversation is engaged; the follow-up
 rule works on its answer instead. Name-less direct requests before any engagement and
 looser name matching are separate work under #82.
+
+## Acknowledgement gating
+
+The host plays an instant acknowledgement clip for an attended request
+([#105](https://github.com/mickdarling/rightyo/issues/105)). Played for every request, it
+also answers turns the receiving agent rightly leaves alone, such as a low-confidence
+follow-up "Okay, great.", leaving an acknowledgement with no reply after it. Gating
+([#132](https://github.com/mickdarling/rightyo/issues/132)) marks which requests should be
+acknowledged.
+
+**Opt-in.** Off by default, and then nothing in this document changes: no `acknowledge`
+field, byte-identical fixtures, and a host acknowledges every request as before. Turn it
+on with the configuration's `"acknowledgement": {}` object; `session.started` then
+advertises it as a top-level `acknowledgement` object,
+`{"version": 1, "min_confidence": 0.7}`, and every `request` carries a boolean
+`acknowledge`. A host that accepts that object plays its acknowledgement only for a request
+whose `acknowledge` is true. The object takes one optional key:
+
+| Key | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `min_confidence` | 0.7 | 0 to 1 | The attend confidence an unnamed request needs to be acknowledged; 0 acknowledges every request |
+
+A request is acknowledged when either holds:
+- its turn uses a configured name or variant (see [forms of address](#transport-and-lifecycle));
+- its attend confidence is at least `min_confidence`. For a direct `attend` that is the
+  decision's `confidence`. For a [follow-up](#conversation-mode) it is Jev's attend
+  probability, because a follow-up's `confidence` belongs to the `uncertain` choice it
+  was promoted from.
+
+Below the threshold the request is still formed and delivered, so the agent still decides
+whether to reply; only the acknowledgement is withheld. Each decision is also noted on
+stderr for tuning, with labels and numbers only, never transcript text or identifiers:
+`ack outcome=skip reason=low_confidence attend_confidence=0.45 min=0.70 follow_up=true`
+(reasons `named`, `confident`, `low_confidence`).
+
+**Not yet.** One acknowledgement per spoken request when it is split into several requests
+([#122](https://github.com/mickdarling/rightyo/issues/122)), and no acknowledgement for
+continuation fragments while a turn is still open
+([#84](https://github.com/mickdarling/rightyo/issues/84)), are separate work.
 
 ## Natural dismissal and barge-in
 

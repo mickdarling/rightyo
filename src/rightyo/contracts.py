@@ -35,6 +35,9 @@ DEFAULT_CLOSING_PHRASES = (
     "nevermind",
 )
 MAX_CLOSING_PHRASES = 16
+# Acknowledgement gating (#132): the attend confidence a request needs for the host to
+# play its instant acknowledgement (#105) when the turn uses no configured name.
+DEFAULT_ACK_MIN_CONFIDENCE = 0.7
 CONVERSATION_REASONS = frozenset({"request", "timeout", "other_human", "closed", "dismissed"})
 PROVENANCE = frozenset({"synthetic", "recorded-file", "causal-replay", "live-microphone"})
 SPEAKER_PROVENANCE = frozenset(
@@ -446,6 +449,31 @@ class Conversation:
             "follow_up_min_probability": self.follow_up_min_probability,
             "closing_phrases": list(self.closing_phrases),
         }
+
+
+@dataclass(frozen=True)
+class Acknowledgement:
+    """Instant-acknowledgement gating (#132); absent means off and nothing changes.
+
+    With it on, every `request` event carries `acknowledge`: true when the turn uses a
+    configured name or its attend confidence reaches `min_confidence`, false otherwise.
+    The request is formed either way; only the host's instant acknowledgement (#105)
+    is withheld, so a reply stays the receiving agent's decision.
+    """
+
+    min_confidence: float = DEFAULT_ACK_MIN_CONFIDENCE
+
+    def __post_init__(self) -> None:
+        probability(self.min_confidence)
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> Acknowledgement:
+        if not isinstance(raw, dict) or set(raw) - {"min_confidence"}:
+            raise ContractError("acknowledgement must be an object with known keys only")
+        return cls(**raw)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"version": 1, "min_confidence": self.min_confidence}
 
 
 @dataclass(frozen=True)

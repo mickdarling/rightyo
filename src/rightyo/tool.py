@@ -214,7 +214,8 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
         # --dismissal turns natural dismissal on with the defaults; a configuration
         # file's `dismissal` section keeps its own values.
         config = replace(config, dismissal=dismissal_from_args(args))
-    events = SpeechEvents()
+    # Stdout carries the events; acknowledgement-gating notes (#132) go to stderr.
+    events = SpeechEvents(report=_stderr)
     consent = {"allow_hosted_speech": True} if config.hosted_speech else {}
     if args.mode == "stdin":
         consent["audio_input"] = sys.stdin.buffer if audio_input is None else audio_input

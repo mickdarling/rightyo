@@ -27,6 +27,7 @@ from rightyo.addressedness import (
 from rightyo.capture import CaptureError, MacMicrophoneCapture, StdinPcmCapture
 from rightyo.contracts import (
     PROVENANCE,
+    Acknowledgement,
     Addressing,
     ContractError,
     Conversation,
@@ -211,6 +212,10 @@ class PrototypeConfig:
     # The optional `conversation` section (#82): engaged follow-ups after a request and
     # the `conversation` event. Absent means off; `{}` turns it on with the defaults.
     conversation: Conversation | None = None
+    # The optional `acknowledgement` section (#132): gate the host's instant
+    # acknowledgement on confidence or a name. Absent means off (every request is
+    # acknowledged, as before); `{}` turns it on with the default threshold.
+    acknowledgement: Acknowledgement | None = None
 
     @property
     def hosted_speech(self) -> bool:
@@ -254,6 +259,7 @@ class PrototypeConfig:
                 "dismissal",
                 "end_of_turn",
                 "conversation",
+                "acknowledgement",
                 *LOCAL_ASSETS,
             }
             if raw.keys() - required - optional:
@@ -274,6 +280,9 @@ class PrototypeConfig:
             conversation = raw.pop("conversation", None)
             if conversation is not None:
                 conversation = Conversation.from_dict(conversation)
+            acknowledgement = raw.pop("acknowledgement", None)
+            if acknowledgement is not None:
+                acknowledgement = Acknowledgement.from_dict(acknowledgement)
             end_of_turn = raw.pop("end_of_turn", None)
             if end_of_turn is not None:
                 end_of_turn = EndOfTurn.from_dict(end_of_turn)
@@ -316,6 +325,7 @@ class PrototypeConfig:
                 dismissal=dismissal,
                 end_of_turn=end_of_turn,
                 conversation=conversation,
+                acknowledgement=acknowledgement,
             )
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
@@ -626,6 +636,7 @@ class PrototypeController:
                     audio_input=STDIN_AUDIO_INPUT if mode == "stdin" else None,
                     dismissal=self.config.dismissal,
                     conversation=self.config.conversation,
+                    acknowledgement=self.config.acknowledgement,
                 )
                 self._event_terminal = False
             threading.Thread(
