@@ -11,6 +11,7 @@ from threading import RLock
 from rightyo.addressedness import mentions_name
 from rightyo.contracts import (
     DISMISSING,
+    Acknowledgement,
     Addressing,
     ContractError,
     Conversation,
@@ -96,7 +97,7 @@ class SpeechEvents:
     releases pending plaintext; a normal end preserves already queued delivery.
     """
 
-    def __init__(self, *, retention_ms=300000, max_pending=128):
+    def __init__(self, *, retention_ms=300000, max_pending=128, report=None):
         # At least five: one open request plus the owner's transcript, attention and
         # request, with a terminal slot, so the static and dynamic override bounds agree.
         integer(max_pending, "max_pending", 5)
@@ -104,6 +105,9 @@ class SpeechEvents:
             raise ContractError("invalid event queue budget")
         self.retention_ms = retention_ms
         self.max_pending = max_pending
+        # Optional content-free diagnostics (labels and numbers only, never text or ids).
+        self._report = report
+        self._acknowledgement = None
         # Open non-owner requests are bounded below the queue capacity, with headroom for
         # the owner's transcript, attention and request, so one owner decision's burst of
         # overrides can never overflow the queue; exceeding the bound fails closed.
@@ -212,9 +216,12 @@ class SpeechEvents:
         audio_input=None,
         dismissal=None,
         conversation=None,
+        acknowledgement=None,
     ):
         with self._lock:
             identifier(session_id, "session_id")
+            if acknowledgement is not None and not isinstance(acknowledgement, Acknowledgement):
+                raise ContractError("invalid acknowledgement")
             if dismissal is not None and not isinstance(dismissal, Dismissal):
                 raise ContractError("invalid dismissal")
             if conversation is not None and not isinstance(conversation, Conversation):
@@ -258,6 +265,7 @@ class SpeechEvents:
             self._dismissed.clear()
             self._cooldowns.clear()
             self._conversation = conversation
+            self._acknowledgement = acknowledgement
             self._engaged = None
             self.role_status = "off" if priority is None else "ready"
             self._degraded_turn = None
@@ -291,6 +299,14 @@ class SpeechEvents:
                 # And for conversation mode (#82): a host that accepts this object must
                 # accept `conversation` events, which are never emitted without it.
                 **({} if conversation is None else {"conversation": conversation.to_dict()}),
+                # And for acknowledgement gating (#132): a host that accepts this object
+                # plays its instant acknowledgement only for a request whose
+                # `acknowledge` is true; the field is never emitted without it.
+                **(
+                    {}
+                    if acknowledgement is None
+                    else {"acknowledgement": acknowledgement.to_dict()}
+                ),
             )
 
     def expire(self, now_ms):
@@ -886,6 +902,9 @@ class SpeechEvents:
             # the exact request bytes, formed string included, and a failing former
             # fails closed before anything of this decision is queued.
             formed = self._form_request(turn, role, context) if attended else {}
+            ack, ack_note = (
+                self._acknowledge(turn, event.decision, evidence) if attended else ({}, None)
+            )
             to_supersede = []
             if overriding:
                 # Earlier is decided by turn time (end_ms at or before the owner's), not by
@@ -944,6 +963,7 @@ class SpeechEvents:
                                 "context": context,
                                 "decision_at_ms": self._now,
                                 **formed,
+                                **ack,
                             },
                         )
                     )
@@ -1047,6 +1067,7 @@ class SpeechEvents:
                     context=context,
                     decision_at_ms=self._now,
                     **formed,
+                    **ack,
                 )
                 if self._dismissal is not None:
                     if len(self._delivered) >= MAX_WITHDRAWABLE:
@@ -1063,6 +1084,39 @@ class SpeechEvents:
                     self._open[request_id] = turn.end_ms
                 if self._conversation is not None and not self._conversation.is_closing(turn.text):
                     self._engage(turn, request_id)
+                if ack_note is not None and self._report is not None:
+                    # Best-effort and last: a failed diagnostic write (a closed stderr)
+                    # must never undo or skip the request's state transitions above.
+                    try:
+                        self._report(ack_note)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+    def _acknowledge(self, turn, decision, evidence):
+        """The optional ``acknowledge`` field and its diagnostic note (#132).
+
+        Both are absent unless acknowledgement gating is configured.
+
+        A request is acknowledged when its turn uses a configured name or its attend
+        confidence reaches the threshold. That confidence is the decision's own for a
+        direct `attend`, and Jev's attend probability for a follow-up, whose
+        `confidence` belongs to the `uncertain` choice it was promoted from.
+        """
+        gate = self._acknowledgement
+        if gate is None:
+            return {}, None
+        follow_up = evidence.get("follow_up") is True
+        score = decision.probabilities["attend"] if follow_up else decision.confidence
+        named = mentions_name(self._addressing, turn.text)
+        acknowledge = named or score >= gate.min_confidence
+        reason = "named" if named else "confident" if acknowledge else "low_confidence"
+        # The diagnostic note is content-free: labels and numbers, never text or ids.
+        note = (
+            f"ack outcome={'ack' if acknowledge else 'skip'} reason={reason}"
+            f" attend_confidence={score:.2f} min={gate.min_confidence:.2f}"
+            f" follow_up={'true' if follow_up else 'false'}"
+        )
+        return {"acknowledge": acknowledge}, note
 
     def _form_request(self, turn, role, context):
         """The optional ``formed_request`` field, present only when a former is configured.

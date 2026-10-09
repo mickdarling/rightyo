@@ -72,7 +72,11 @@ cool-down), with optional `window_ms`, `cooldown_ms` and `cooldown_min_confidenc
 off when absent. An optional `"conversation": {}` object turns on
 [conversation mode](tool-api.md#conversation-mode) (#82): engaged follow-ups after a
 request and the `conversation` event, with optional `window_ms`,
-`follow_up_min_probability` and `closing_phrases`; it is off when absent. An optional `"end_of_turn"` object (#117) puts the Smart Turn v3
+`follow_up_min_probability` and `closing_phrases`; it is off when absent. An optional
+`"acknowledgement": {}` object turns on [acknowledgement gating](tool-api.md#acknowledgement-gating)
+(#132): each request carries `acknowledge`, true only when the turn uses a configured name
+or its attend confidence reaches `min_confidence` (default 0.7, 0 to 1), so the host skips
+the instant acknowledgement for unlikely replies; it is off when absent. An optional `"end_of_turn"` object (#117) puts the Smart Turn v3
 end-of-turn model in front of the silence rules:
 `{"enabled": true, "python": "/abs/venv/bin/python", "model": "/abs/smart-turn-v3.2-cpu.onnx"}`
 with optional `threshold` (default 0.5), `silence_ms` (default 200, 20 to 1,000) and
