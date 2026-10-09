@@ -162,6 +162,10 @@ class SpeechEvents:
         # the host reports a reply playing (#124), or None when ambient.
         self._conversation = None
         self._engaged = None
+        # One acknowledgement per spoken request (#122), with acknowledgement gating on:
+        # the last acknowledged request's un-answered acknowledgement,
+        # {"until_ms", "heard_end"}, or None. See `_hold_ack` and `reply`.
+        self._pending_ack = None
 
     def _payload(self, kind, sequence, fields):
         return {
@@ -266,6 +270,7 @@ class SpeechEvents:
             self._cooldowns.clear()
             self._conversation = conversation
             self._acknowledgement = acknowledgement
+            self._pending_ack = None
             self._engaged = None
             self.role_status = "off" if priority is None else "ready"
             self._degraded_turn = None
@@ -613,12 +618,17 @@ class SpeechEvents:
         While engaged, a playing reply holds the window open, and its end restarts the
         window from that moment, so follow-ups are timed from the end of what was spoken,
         not from the request. Ignored when conversation mode is off or nothing is engaged.
+
+        With acknowledgement gating on, a reply that starts after an acknowledgement's own
+        clip has ended answers it (#122), so the next request may be acknowledged again.
         Emits nothing.
         """
         with self._lock:
             if phase not in {"started", "ended"}:
                 raise ContractError("invalid reply phase")
             integer(now_ms, "now_ms")
+            if self._active and self._pending_ack is not None:
+                self._answer_ack(phase)
             engaged = self._engaged
             if not self._active or self._conversation is None or engaged is None:
                 return
@@ -633,6 +643,28 @@ class SpeechEvents:
                 engaged["until_ms"] = max(
                     engaged["until_ms"], now_ms + self._conversation.window_ms
                 )
+
+    def _answer_ack(self, phase):
+        """Track the pending acknowledgement through the host's playback reports (#122).
+
+        The host reports every playback, the acknowledgement clip included, so the first
+        `started` after an acknowledgement is usually that clip. A `started` clears the
+        pending acknowledgement only after an `ended` has been heard: clip, then answer.
+        When the reports run together (a host collapsing a burst to its last phase, or one
+        continuous playback), the answer is not told apart and the window decides instead.
+        """
+        if phase == "ended":
+            self._pending_ack["heard_end"] = True
+        elif self._pending_ack["heard_end"]:
+            self._pending_ack = None
+
+    def _hold_ack(self, turn):
+        """Hold an emitted acknowledgement as pending until answered or the window ends."""
+        window = self._acknowledgement.dedup_window_ms
+        if window > 0:
+            # Only reached with nothing pending or a lapsed hold (an acknowledged turn
+            # never starts inside a pending window), so this never shortens a hold.
+            self._pending_ack = {"until_ms": turn.end_ms + window, "heard_end": False}
 
     def _lapse(self, now_ms):
         """Return to ambient once stream time passes the engagement window (#82)."""
@@ -1084,6 +1116,8 @@ class SpeechEvents:
                     self._open[request_id] = turn.end_ms
                 if self._conversation is not None and not self._conversation.is_closing(turn.text):
                     self._engage(turn, request_id)
+                if ack.get("acknowledge") is True:
+                    self._hold_ack(turn)
                 if ack_note is not None and self._report is not None:
                     # Best-effort and last: a failed diagnostic write (a closed stderr)
                     # must never undo or skip the request's state transitions above.
@@ -1100,7 +1134,8 @@ class SpeechEvents:
         A request is acknowledged when its turn uses a configured name or its attend
         confidence reaches the threshold. That confidence is the decision's own for a
         direct `attend`, and Jev's attend probability for a follow-up, whose
-        `confidence` belongs to the `uncertain` choice it was promoted from.
+        `confidence` belongs to the `uncertain` choice it was promoted from. Either way it
+        is not acknowledged while an earlier acknowledgement is still pending (#122).
         """
         gate = self._acknowledgement
         if gate is None:
@@ -1110,6 +1145,12 @@ class SpeechEvents:
         named = mentions_name(self._addressing, turn.text)
         acknowledge = named or score >= gate.min_confidence
         reason = "named" if named else "confident" if acknowledge else "low_confidence"
+        pending = self._pending_ack
+        if acknowledge and pending is not None and turn.start_ms < pending["until_ms"]:
+            # One acknowledgement per spoken request (#122): a fragment or quick follow-up
+            # of a request still awaiting its answer is delivered without another one.
+            acknowledge = False
+            reason = "pending_ack"
         # The diagnostic note is content-free: labels and numbers, never text or ids.
         note = (
             f"ack outcome={'ack' if acknowledge else 'skip'} reason={reason}"

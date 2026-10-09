@@ -543,13 +543,14 @@ acknowledged.
 field, byte-identical fixtures, and a host acknowledges every request as before. Turn it
 on with the configuration's `"acknowledgement": {}` object; `session.started` then
 advertises it as a top-level `acknowledgement` object,
-`{"version": 1, "min_confidence": 0.7}`, and every `request` carries a boolean
-`acknowledge`. A host that accepts that object plays its acknowledgement only for a request
-whose `acknowledge` is true. The object takes one optional key:
+`{"version": 1, "min_confidence": 0.7, "dedup_window_ms": 8000}`, and every `request`
+carries a boolean `acknowledge`. A host that accepts that object plays its acknowledgement
+only for a request whose `acknowledge` is true. The object takes two optional keys:
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
 | `min_confidence` | 0.7 | 0 to 1 | The attend confidence an unnamed request needs to be acknowledged; 0 acknowledges every request |
+| `dedup_window_ms` | 8000 | 0 to 60,000 | How long after an acknowledged request a later one goes unacknowledged unless its answer has started (below); 0 turns this off |
 
 A request is acknowledged when either holds:
 - its turn uses a configured name or variant (see [forms of address](#transport-and-lifecycle));
@@ -562,11 +563,28 @@ Below the threshold the request is still formed and delivered, so the agent stil
 whether to reply; only the acknowledgement is withheld. Each decision is also noted on
 stderr for tuning, with labels and numbers only, never transcript text or identifiers:
 `ack outcome=skip reason=low_confidence attend_confidence=0.45 min=0.70 follow_up=true`
-(reasons `named`, `confident`, `low_confidence`).
+(reasons `named`, `confident`, `low_confidence`, `pending_ack`).
 
-**Not yet.** One acknowledgement per spoken request when it is split into several requests
-([#122](https://github.com/mickdarling/rightyo/issues/122)), and no acknowledgement for
-continuation fragments while a turn is still open
+**One acknowledgement per spoken request**
+([#122](https://github.com/mickdarling/rightyo/issues/122)). One spoken request is
+sometimes submitted as several requests (fragments, or a follow-up seconds later), and
+each would otherwise be acknowledged. After a request is emitted with `acknowledge: true`,
+its acknowledgement is pending, and a later request whose turn starts within
+`dedup_window_ms` of that request's end, in stream time, gets `acknowledge: false` with
+reason `pending_ack`, even when named or confident. It is still delivered. The pending
+acknowledgement ends when:
+- the window passes, so the next request is acknowledged again; or
+- with [reply timing](#conversation-mode) (`listen --control-fd`), the answer starts to
+  play: a `{"reply": "started"}` after a `{"reply": "ended"}`. The host reports its
+  acknowledgement clip's own playback too, so the first `started` alone ends nothing.
+  This works with conversation mode off.
+
+A request held back this way does not extend the window. When reports run together
+(one continuous playback, or a host forwarding only the last phase of a burst), the
+answer cannot be told apart from the clip, and the window decides.
+
+**Not yet.** Skipping the acknowledgement when the answer is expected within about 1.5 s
+(#122), and no acknowledgement for continuation fragments while a turn is still open
 ([#84](https://github.com/mickdarling/rightyo/issues/84)), are separate work.
 
 ## Natural dismissal and barge-in

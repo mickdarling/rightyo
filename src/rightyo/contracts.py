@@ -38,6 +38,10 @@ MAX_CLOSING_PHRASES = 16
 # Acknowledgement gating (#132): the attend confidence a request needs for the host to
 # play its instant acknowledgement (#105) when the turn uses no configured name.
 DEFAULT_ACK_MIN_CONFIDENCE = 0.7
+# One acknowledgement per spoken request (#122): how long, in stream time from the end of
+# an acknowledged request's turn, a later request goes unacknowledged; 0 turns it off.
+DEFAULT_ACK_DEDUP_WINDOW_MS = 8000
+MAX_ACK_DEDUP_WINDOW_MS = 60000
 CONVERSATION_REASONS = frozenset({"request", "timeout", "other_human", "closed", "dismissed"})
 PROVENANCE = frozenset({"synthetic", "recorded-file", "causal-replay", "live-microphone"})
 SPEAKER_PROVENANCE = frozenset(
@@ -459,21 +463,38 @@ class Acknowledgement:
     configured name or its attend confidence reaches `min_confidence`, false otherwise.
     The request is formed either way; only the host's instant acknowledgement (#105)
     is withheld, so a reply stays the receiving agent's decision.
+
+    One acknowledgement per spoken request (#122): after an acknowledged request, a later
+    request whose turn starts within `dedup_window_ms` of that request's end is not
+    acknowledged, unless the host has reported the answer starting to play in between.
+    0 turns this off.
     """
 
     min_confidence: float = DEFAULT_ACK_MIN_CONFIDENCE
+    dedup_window_ms: int = DEFAULT_ACK_DEDUP_WINDOW_MS
 
     def __post_init__(self) -> None:
         probability(self.min_confidence)
+        if (
+            type(self.dedup_window_ms) is not int
+            or not 0 <= self.dedup_window_ms <= MAX_ACK_DEDUP_WINDOW_MS
+        ):
+            raise ContractError("invalid acknowledgement dedup window")
 
     @classmethod
     def from_dict(cls, raw: Any) -> Acknowledgement:
-        if not isinstance(raw, dict) or set(raw) - {"min_confidence"}:
+        if not isinstance(raw, dict) or set(raw) - {"min_confidence", "dedup_window_ms"}:
             raise ContractError("acknowledgement must be an object with known keys only")
         return cls(**raw)
 
     def to_dict(self) -> dict[str, Any]:
-        return {"version": 1, "min_confidence": self.min_confidence}
+        # An added key, not a new version: hosts treat the object's presence as the
+        # capability and ignore keys they do not know.
+        return {
+            "version": 1,
+            "min_confidence": self.min_confidence,
+            "dedup_window_ms": self.dedup_window_ms,
+        }
 
 
 @dataclass(frozen=True)
