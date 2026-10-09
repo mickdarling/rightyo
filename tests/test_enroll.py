@@ -14,6 +14,7 @@ import functools
 import io
 import json
 import math
+import os
 import stat
 import tempfile
 import unittest
@@ -114,7 +115,7 @@ class FakeCapture:
 
     def __init__(self, helper):
         self.helper = helper
-        self.pcm = tone(150, 26).tobytes()
+        self.pcm = tone(150, 36).tobytes()
         self.started = self.stopped = False
 
     def start(self):
@@ -366,7 +367,7 @@ class VerifyTests(EnrollTestCase):
             "--id",
             "alex",
             "--record",
-            "25",
+            "35",
             "--config",
             str(self.config),
             capture_factory=factory,
@@ -374,7 +375,7 @@ class VerifyTests(EnrollTestCase):
         self.assertEqual(code, 0, errors)
         self.assertTrue(captures[0].started and captures[0].stopped)
         self.assertEqual(captures[0].helper, self.asset)
-        self.assertAlmostEqual(result["speech_seconds"], 25, delta=0.1)
+        self.assertAlmostEqual(result["speech_seconds"], 35, delta=0.1)
         self.assertEqual(sorted(p.name for p in self.store.iterdir()), ["alex.json"])
 
 
@@ -450,6 +451,28 @@ class StorePrivacyTests(EnrollTestCase):
         self.assertEqual([item["id"] for item in result["enrolled"]], ["alex"])
         self.assertEqual(result["unreadable_entries"], 2)
         self.assertNotIn("Bad Name", output)
+
+    def test_a_non_finite_duration_is_counted_not_fatal(self):
+        self.assertEqual(self.add("alex", self.wav("a.wav", tone(120, 35)))[0], 0)
+        good = json.loads((self.store / "alex.json").read_text())
+        for name, value in (("nan", "NaN"), ("inf", "Infinity")):
+            seconds = json.dumps(good["speech_seconds"])
+            text = json.dumps({**good, "id": name}).replace(
+                f'"speech_seconds": {seconds}', f'"speech_seconds": {value}'
+            )
+            (self.store / f"{name}.json").write_text(text)
+        code, result, _, _ = self.enroll("list", "--store", str(self.store))
+        self.assertEqual(code, 0)
+        self.assertEqual([item["id"] for item in result["enrolled"]], ["alex"])
+        self.assertEqual(result["unreadable_entries"], 2)
+
+    def test_delete_removes_a_dangling_voiceprint_link(self):
+        self.assertEqual(self.add("alex", self.wav("a.wav", tone(120, 35)))[0], 0)
+        dangling = self.store / "ghost.json"
+        dangling.symlink_to(self.root / "missing-target.json")
+        code, _, _, _ = self.enroll("delete", "--id", "ghost", "--store", str(self.store))
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.lexists(dangling))
 
     def test_output_carries_no_audio_embeddings_or_paths(self):
         audio = self.wav("secret-name.wav", tone(120, 35))

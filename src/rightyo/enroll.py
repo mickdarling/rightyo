@@ -211,7 +211,8 @@ def _entry(document: Any, identifier: str) -> dict[str, Any]:
         raise ValueError
     if not isinstance(document["created_at"], str) or type(document["windows"]) is not int:
         raise ValueError
-    if type(document["speech_seconds"]) not in (int, float):
+    seconds = document["speech_seconds"]
+    if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0:
         raise ValueError
     return document
 
@@ -304,7 +305,8 @@ class Store:
 
     def delete(self, identifier: str) -> bool:
         target = self._file(identifier)
-        if not self._check() or not target.exists():
+        # lexists: a dangling `<id>.json` link is still removed, not reported as absent.
+        if not self._check() or not os.path.lexists(target):
             return False
         try:
             target.unlink()

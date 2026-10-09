@@ -301,11 +301,13 @@ def _add_enroll_parser(commands) -> None:
             help="record this many seconds from the microphone into memory only",
         )
 
-    add = actions.add_parser("add", help="enroll a speaker from 20 s or more of speech")
+    add = actions.add_parser(
+        "add", help="enroll a speaker from 20 s or more of speech (record 30 s or more)"
+    )
     add.add_argument("--id", required=True, help="identifier: lowercase letters, digits, - or _")
     add.add_argument("--name", help="display name (default: the identifier)")
     add.add_argument("--replace", action="store_true", help="replace an existing voiceprint")
-    source(add, 20, 120)
+    source(add, 30, 120)
     common(add, config_required=True)
     listing = actions.add_parser("list", help="list enrolled speakers")
     common(listing, config_required=False)
