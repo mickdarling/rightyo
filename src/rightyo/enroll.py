@@ -50,6 +50,7 @@ RELATIVE_FLOOR = 10 ** (-35 / 10)  # a frame is speech within 35 dB of the loude
 ABSOLUTE_FLOOR = 1e-6 * 32768**2  # and above -60 dBFS
 MAX_ENTRY_BYTES = 65536
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+TEMPORARY = re.compile(r"\.[a-z0-9][a-z0-9_-]{0,31}\.json\.tmp-[0-9]+")
 
 
 class EnrollError(ValueError):
@@ -279,7 +280,7 @@ class Store:
                 if len(content) > MAX_ENTRY_BYTES:
                     raise ValueError
                 entries.append(_entry(json.loads(content), child.stem))
-            except (OSError, ValueError, RecursionError, EnrollError):
+            except (OSError, ValueError, OverflowError, RecursionError, EnrollError):
                 unreadable += 1
         return entries, unreadable
 
@@ -303,11 +304,41 @@ class Store:
             temporary.unlink(missing_ok=True)
             raise EnrollError("The voiceprint could not be stored") from None
 
+    def _ours(self, child: Path) -> bool:
+        """Whether a file is a RightyO voiceprint or one of our temporary files.
+
+        Deletion never trusts the directory alone: a mistaken `--store` (a home or project
+        directory) must not lose unrelated files. A voiceprint is a small JSON object
+        carrying our schema keys; a dangling link named like one is ours to remove.
+        """
+        name = child.name
+        if TEMPORARY.fullmatch(name):
+            return True
+        if not (child.suffix == ".json" and IDENTIFIER.fullmatch(child.stem)):
+            return False
+        if child.is_symlink():
+            return not child.exists()
+        try:
+            with open(
+                child, "rb", opener=lambda path, flags: os.open(path, flags | os.O_NOFOLLOW)
+            ) as source:
+                content = source.read(MAX_ENTRY_BYTES + 1)
+            document = json.loads(content) if len(content) <= MAX_ENTRY_BYTES else None
+        except (OSError, ValueError, RecursionError):
+            return False
+        return (
+            isinstance(document, dict)
+            and document.get("schema_version") == SCHEMA_VERSION
+            and {"id", "model", "embedding"} <= set(document)
+        )
+
     def delete(self, identifier: str) -> bool:
         target = self._file(identifier)
         # lexists: a dangling `<id>.json` link is still removed, not reported as absent.
         if not self._check() or not os.path.lexists(target):
             return False
+        if not self._ours(target):
+            raise EnrollError("That file is not a RightyO voiceprint; nothing was deleted")
         try:
             target.unlink()
         except OSError:
@@ -321,11 +352,10 @@ class Store:
         removed = []
         try:
             for child in sorted(self.path.iterdir()):
-                if child.suffix == ".json" or child.name.startswith("."):
-                    if child.is_file() or child.is_symlink():
-                        if child.suffix == ".json" and IDENTIFIER.fullmatch(child.stem):
-                            removed.append(child.stem)
-                        child.unlink()
+                if (child.is_file() or child.is_symlink()) and self._ours(child):
+                    if child.suffix == ".json":
+                        removed.append(child.stem)
+                    child.unlink()
             if not any(self.path.iterdir()):
                 self.path.rmdir()
         except OSError:

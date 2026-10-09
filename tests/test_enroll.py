@@ -466,6 +466,40 @@ class StorePrivacyTests(EnrollTestCase):
         self.assertEqual([item["id"] for item in result["enrolled"]], ["alex"])
         self.assertEqual(result["unreadable_entries"], 2)
 
+    def test_delete_all_never_touches_files_that_are_not_voiceprints(self):
+        # A mistaken --store (a home or project directory) must lose nothing unrelated.
+        self.assertEqual(self.add("alex", self.wav("a.wav", tone(120, 35)))[0], 0)
+        bystanders = {
+            ".bashrc": "export PATH=x\n",
+            ".env": "TOKEN=x\n",
+            "package.json": '{"name": "x"}',
+            "notes.json": "{not json",
+        }
+        for name, text in bystanders.items():
+            (self.store / name).write_text(text)
+        code, result, _, _ = self.enroll("delete", "--all", "--store", str(self.store))
+        self.assertEqual(code, 0)
+        self.assertEqual(result["deleted"], ["alex"])
+        self.assertEqual(sorted(p.name for p in self.store.iterdir()), sorted(bystanders))
+
+    def test_delete_one_refuses_a_file_that_is_not_a_voiceprint(self):
+        self.store.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (self.store / "package.json").write_text('{"name": "x"}')
+        code, _, _, _ = self.enroll("delete", "--id", "package", "--store", str(self.store))
+        self.assertNotEqual(code, 0)
+        self.assertTrue((self.store / "package.json").exists())
+
+    def test_an_overflowing_embedding_number_is_counted_not_fatal(self):
+        self.assertEqual(self.add("alex", self.wav("a.wav", tone(120, 35)))[0], 0)
+        good = json.loads((self.store / "alex.json").read_text())
+        huge = json.dumps({**good, "id": "huge"}).replace(
+            "[" + json.dumps(good["embedding"][0]), "[1" + "0" * 400, 1
+        )
+        (self.store / "huge.json").write_text(huge)
+        code, result, _, _ = self.enroll("list", "--store", str(self.store))
+        self.assertEqual(code, 0)
+        self.assertEqual(result["unreadable_entries"], 1)
+
     def test_delete_removes_a_dangling_voiceprint_link(self):
         self.assertEqual(self.add("alex", self.wav("a.wav", tone(120, 35)))[0], 0)
         dangling = self.store / "ghost.json"
