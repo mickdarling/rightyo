@@ -583,6 +583,15 @@ class ConfigurationTests(EnrollTestCase):
         self.write_config(section | {"bind_threshold": 0.7, "tentative_threshold": 0.5})
         self.assertEqual(PrototypeConfig.load(self.config).speaker_id.bind_threshold, 0.7)
 
+    def test_live_shadow_identification_is_off_by_default(self):
+        section = {"python": str(self.asset), "model": str(self.asset)}
+        self.write_config(section)
+        loaded = PrototypeConfig.load(self.config).speaker_id
+        self.assertEqual((loaded.live, loaded.bind_min_seconds), (False, 3.0))
+        self.write_config(section | {"live": True, "bind_min_seconds": 5})
+        loaded = PrototypeConfig.load(self.config).speaker_id
+        self.assertEqual((loaded.live, loaded.bind_min_seconds), (True, 5.0))
+
     def test_invalid_sections_are_refused(self):
         section = {"python": str(self.asset), "model": str(self.asset)}
         for invalid in (
@@ -598,6 +607,12 @@ class ConfigurationTests(EnrollTestCase):
             section | {"min_turn_seconds": 10**400},
             section | {"min_turn_seconds": 0.1},
             section | {"threads": 0},
+            section | {"live": "true"},
+            section | {"live": 1},
+            section | {"bind_min_seconds": 0.4},
+            section | {"bind_min_seconds": 121},
+            section | {"bind_min_seconds": "3"},
+            section | {"bind_min_seconds": 10**400},
             section | {"enabled": "yes"},
             section | {"unknown": 1},
             {"model": str(self.asset)},

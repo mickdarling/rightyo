@@ -640,7 +640,7 @@ class CommandLineAndConfigTests(unittest.TestCase):
     def test_listen_applies_the_file_section_and_the_flag_replaces_it(self):
         loaded = []
 
-        def factory(config, *, event_publisher):
+        def factory(config, *, event_publisher, report=None):
             loaded.append(config.request_former)
             oracle = _LocalDecider()
             return PrototypeController(

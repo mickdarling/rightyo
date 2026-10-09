@@ -44,6 +44,7 @@ from rightyo.live_audio import (
     LiveConfig,
     LiveProcessor,
 )
+from rightyo.live_speaker_id import ShadowSpeakerId
 from rightyo.memory import MemorySessionLimitError, TranscriptMemory
 from rightyo.pipeline import ReplayRunner
 from rightyo.providers import (
@@ -219,7 +220,8 @@ class PrototypeConfig:
     acknowledgement: Acknowledgement | None = None
     # The optional `speaker_id` section (#137 step 3): the local speaker-embedding model
     # and enrollment store used by `rightyo enroll`. Absent or `"enabled": false` means
-    # off. Live identification (step 4) does not read it yet.
+    # off. With `"live": true`, live sessions also run shadow identification (step 4a):
+    # per-label scores on stderr, with no change to turns, roles or events.
     speaker_id: SpeakerIdConfig | None = None
 
     @property
@@ -377,10 +379,12 @@ class PrototypeController:
         audio_provenance=None,
         report=None,
         end_of_turn_factory=SmartTurn,
+        speaker_id_factory=ShadowSpeakerId,
     ):
         self.config = config
         self.processor_factory = processor_factory
         self.end_of_turn_factory = end_of_turn_factory
+        self.speaker_id_factory = speaker_id_factory
         self.capture_factory = capture_factory
         self.provider_factory = provider_factory
         # Explicit consent for configured hosted speech backends to receive audio.
@@ -717,10 +721,41 @@ class PrototypeController:
                     self.report("end-of-turn model unavailable; using silence end-of-turn")
             return None
 
+    def _shadow_speaker_id(self):
+        """Start shadow speaker identification (#137 step 4a), or None.
+
+        Only with a `speaker_id` section that sets `"live": true`, and only with a
+        diagnostic channel (`listen`'s stderr), since its scores are its only output. Its
+        worker thread loads the model and voiceprints, so nothing here waits on them, and a
+        failure only ever switches shadow identification off: the session never depends
+        on it.
+        """
+        settings = self.config.speaker_id
+        if settings is None or not settings.live or self.report is None:
+            return None
+        try:
+            shadow = self.speaker_id_factory(settings, report=self.report)
+            shadow.start()
+            return shadow
+        except Exception:
+            if self.report is not None:
+                with contextlib.suppress(Exception):
+                    self.report(
+                        "speaker_id unavailable; shadow identification off for this session"
+                    )
+            return None
+
+    def _turn(self, generation, work, memory, shadow, turn: Turn) -> None:
+        self._accept(generation, work, memory, turn)
+        if shadow is not None:
+            # After the turn is accepted and published; it never raises or blocks.
+            shadow.turn(turn)
+
     def _audio(self, generation, stop, session, work, memory, mode):
-        capture = processor = end_of_turn = None
+        capture = processor = end_of_turn = shadow = None
         try:
             end_of_turn = self._end_of_turn_model(stop)
+            shadow = self._shadow_speaker_id()
             settings = self.config.end_of_turn
             processor = self.processor_factory(
                 LiveConfig(
@@ -760,7 +795,7 @@ class PrototypeController:
                     end_of_turn_threshold=settings.threshold if settings else 0.5,
                     end_of_turn_silence_ms=settings.silence_ms if settings else 200,
                 ),
-                lambda turn: self._accept(generation, work, memory, turn),
+                lambda turn: self._turn(generation, work, memory, shadow, turn),
             )
             with self._lock:
                 if generation != self._generation or stop.is_set():
@@ -776,7 +811,7 @@ class PrototypeController:
                 while not stop.is_set():
                     pcm = capture.read(timeout=0.25)
                     if pcm:
-                        self._feed(generation, processor, pcm, mode)
+                        self._feed(generation, processor, pcm, mode, shadow)
                     else:
                         _release_pending(processor)
             elif mode == "stdin":
@@ -795,7 +830,7 @@ class PrototypeController:
                         # before the drop stand, and the session ends as an error.
                         break
                     if pcm:
-                        accepted = self._feed(generation, processor, pcm, mode)
+                        accepted = self._feed(generation, processor, pcm, mode, shadow)
                     else:
                         # No audio arrived for a read timeout: stream time cannot reach
                         # a held turn's merge deadline, so emit it rather than wait.
@@ -827,7 +862,7 @@ class PrototypeController:
                         pcm = audio.readframes(3200)
                         if not pcm:
                             break
-                        accepted = self._feed(generation, processor, pcm, mode)
+                        accepted = self._feed(generation, processor, pcm, mode, shadow)
                         if not accepted:
                             break
                 # A session budget ends like any other cancellation: the timer stops it
@@ -887,13 +922,18 @@ class PrototypeController:
                 processor.close()
             if end_of_turn is not None:
                 end_of_turn.close()
+            if shadow is not None:
+                # A replay or stdin stream that ended normally scores its last turns; a
+                # stopped or failed session discards them.
+                with contextlib.suppress(Exception):
+                    shadow.close(drain=not stop.is_set())
             with self._lock:
                 if generation == self._generation:
                     self._capture = self._processor = None
                 elif generation + 1 == self._generation and self._phase == "stopping":
                     self._phase = "idle"
 
-    def _feed(self, generation, processor, pcm, mode) -> bool:
+    def _feed(self, generation, processor, pcm, mode, shadow=None) -> bool:
         """Push audio up to the session budget; False once the session accepts no more."""
         boundary = False
         with self._lock:
@@ -912,6 +952,9 @@ class PrototypeController:
             if self._audio_started is None:
                 self._audio_started = time.monotonic()
             self._phase = "listening" if self._live() else "replaying"
+        if shadow is not None:
+            # Before the processor, so a turn it finalizes on this chunk finds its audio.
+            shadow.audio(pcm)
         processor.push_pcm16(pcm)
         if boundary:
             # The budget discards the open utterance, but a turn already finalized and

@@ -8,8 +8,9 @@ machine, never inside a Git checkout. Audio is read or recorded into memory, emb
 and discarded; it is never written. Output and errors carry identifiers, display names,
 durations and scores only: no audio, embeddings, transcript text or local paths.
 
-Live identification (step 4) is not wired yet; `verify` scores a supplied clip against
-the enrolled voiceprints so a user can sanity-check enrollment locally.
+`verify` scores a supplied clip against the enrolled voiceprints so a user can
+sanity-check enrollment locally. Live sessions score turns the same way, in shadow mode
+only (`rightyo.live_speaker_id`, step 4a).
 """
 
 from __future__ import annotations

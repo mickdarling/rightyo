@@ -445,7 +445,7 @@ class DecisionPathTests(unittest.TestCase):
             }
             return LiveProcessor(replace(config, **backends), callback)
 
-        def factory(config, *, event_publisher):
+        def factory(config, *, event_publisher, report=None):
             return PrototypeController(
                 config,
                 event_publisher=event_publisher,

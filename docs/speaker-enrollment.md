@@ -2,9 +2,11 @@
 
 `rightyo enroll` builds a voiceprint for each person you want RightyO to recognise, and keeps
 it only on your machine. This is step 3 of
-[#137](https://github.com/mickdarling/rightyo/issues/137). **Live identification is not wired
-yet** (step 4): enrolling changes nothing in `listen` or the lab today. `enroll verify` lets
-you check locally that enrollment separates the people you enrolled.
+[#137](https://github.com/mickdarling/rightyo/issues/137). `enroll verify` lets you check
+locally that enrollment separates the people you enrolled. Live sessions can run
+identification in **shadow mode** only (step 4a, [below](#shadow-identification-in-live-sessions)):
+it logs scores and changes nothing else. Turns, roles, requests and events stay exactly as
+without enrollment until a later step applies roles.
 
 ## Privacy
 
@@ -68,14 +70,16 @@ Add a `speaker_id` section to your local configuration (for example the gitignor
 Optional keys: `store` (an absolute directory, default
 `~/Library/Application Support/RightyO/enrollment`), `bind_threshold` (default 0.60),
 `tentative_threshold` (default 0.45, below the bind threshold), `min_turn_seconds` (default
-1.0, 0.5 to 10), `threads` (1 to 8, default 4) and `enabled` (default true). The section is
-off when absent or `"enabled": false`.
+1.0, 0.5 to 10), `threads` (1 to 8, default 4), `live` (default false; see
+[shadow identification](#shadow-identification-in-live-sessions)), `bind_min_seconds`
+(default 3.0, 0.5 to 120) and `enabled` (default true). The section is off when absent or
+`"enabled": false`.
 
 The thresholds come from the evaluation's per-turn scores on synthetic voices. They are
-starting points: recalibrate them on your own enrollment with `verify`. Step 4 binds on a
-running per-label average, where non-target scores rise with more audio, so it will
-recalibrate them for accumulated scores
-([#141](https://github.com/mickdarling/rightyo/issues/141)).
+starting points: recalibrate them on your own enrollment with `verify`. Live shadow
+identification binds on a running per-label average, where non-target scores rise with more
+audio, so the thresholds will be recalibrated for accumulated scores from the shadow-mode
+logs ([#141](https://github.com/mickdarling/rightyo/issues/141)).
 
 ## Enroll, list, verify and delete
 
@@ -123,3 +127,74 @@ afconvert -f WAVE -d LEI16@16000 -c 1 input.m4a /private/tmp/enroll.wav
 
 To remove everything without RightyO, delete the directory:
 `rm -rf ~/Library/Application\ Support/RightyO/enrollment`.
+
+## Shadow identification in live sessions
+
+Step 4a of #137 runs identification alongside a `listen` session, in any mode (microphone,
+demo or stdin), without acting on it. Its only output is lines on `listen`'s stderr (each
+prefixed `rightyo: `), so the web lab, which has no such channel, doesn't run it. Turn it on with `"live": true` in the `speaker_id` section:
+
+```json
+"speaker_id": {
+  "python": "/Users/you/Library/Caches/rightyo/smart-turn/venv/bin/python",
+  "model": "/Users/you/Library/Caches/rightyo/wespeaker/voxceleb_resnet34_LM.onnx",
+  "live": true
+}
+```
+
+What it does:
+
+- Each finalized turn with a session speaker label from the diarizer timeline (`Speaker A`)
+  is scored. RightyO keeps the last 60 s of the session's audio in memory to cut the turn's
+  span from; nothing is written, and the buffer is cleared when the session ends.
+- The span is embedded the way `verify` does it: silence trimmed, 3 s windows, renormalised
+  mean. Turns with less than `min_turn_seconds` of speech, or with overlapping speakers, are
+  counted, not scored.
+- Each label accumulates a duration-weighted mean of its turn embeddings, renormalised, and
+  that mean is scored against every voiceprint enrolled with the same model file.
+- A label is `bound` to an enrolled identifier once its accumulated score reaches
+  `bind_threshold` with at least `bind_min_seconds` of speech, and then stays bound until
+  that score falls below `tentative_threshold`. Otherwise it is `tentative` at or above
+  `tentative_threshold`, else `unknown`.
+- Embedding runs on its own thread behind a small queue, never on the audio thread. When it
+  falls behind, turns are dropped and counted. If the model fails, RightyO says so once and
+  turns shadow identification off for the session; the session itself carries on.
+- Nothing else changes: no roles are applied, `session.started` still advertises the same
+  `speakers`, and no event gains a field. Edge attribution and tail join stay available.
+
+Each scored turn adds one stderr line, for example:
+
+```text
+speaker_id label="Speaker A" turn_ms=2140 speech_ms=1880 turn_score=0.712 acc_score=0.781 acc_s=8.4 state=bound id=owner
+```
+
+| Field | Meaning |
+| --- | --- |
+| `label` | The session speaker label (changes every session), always in double quotes |
+| `turn_ms` | The turn's span; `speech_ms` is the speech left after trimming silence |
+| `turn_score` | Cosine score of this turn alone against `id` |
+| `acc_score` | Cosine score of the label's accumulated mean against `id` |
+| `acc_s` | Seconds of speech accumulated for the label |
+| `state` | `bound`, `tentative` or `unknown` |
+| `id` | The bound identifier, or else the closest enrolled one |
+
+The session also logs `speaker_id start enrolled=N` at start, and at the end one
+`speaker_id final label=…` line per label and a `speaker_id summary` line counting offered,
+scored, short, overlapping, dropped and clipped turns (clipped: part of the span was
+already outside the 60 s buffer). When a session ends, turns still queued are scored if the
+stream ended normally, but that is best effort: `listen` stops the session moments after
+the end of input, so the last turn or two may be discarded rather than scored. A stopped or
+failed session discards them.
+
+Every line is `speaker_id`, an optional word naming the line (`start`, `final`, `summary`),
+then `key=value` pairs. The label is the only value that can contain a space, and it is
+always double-quoted (labels never contain quotes), so `shlex.split` parses a line into
+words and each `key=value` word splits at its first `=`. The `final` line prints `-` for a
+value it does not have. Other notes, such as the model being unavailable, are plain
+sentences.
+
+Lines carry labels, enrolled identifiers, durations and
+scores only: never audio, embeddings, transcript text or paths. They are calibration data:
+the bind and tentative thresholds will be recalibrated for accumulated scores from these
+logs (#141). Like `verify` scores, keep them local and only summarise them in public
+issues.

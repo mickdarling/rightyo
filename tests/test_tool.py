@@ -113,7 +113,7 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(sum(e["type"] == "transcript" for e in events), 40)
         self.assertFalse(any(e["type"] in {"attention", "request"} for e in events))
 
-    def factory(self, config, *, event_publisher):
+    def factory(self, config, *, event_publisher, report=None):
         return PrototypeController(
             config,
             event_publisher=event_publisher,
@@ -158,7 +158,7 @@ class ToolTests(unittest.TestCase):
             audio.setframerate(16000)
             audio.writeframes(bytes(10 * 6400))
 
-        def factory(config, *, event_publisher):
+        def factory(config, *, event_publisher, report=None):
             controller = self.factory(config, event_publisher=SpeechEvents(max_pending=5))
             original_start = controller.start
 
@@ -224,7 +224,7 @@ class ToolTests(unittest.TestCase):
                 provider = Provider()
                 self.args.use_jev = self.args.allow_hosted = True
 
-                def factory(config, *, event_publisher):
+                def factory(config, *, event_publisher, report=None):
                     controller = PrototypeController(
                         config,
                         event_publisher=event_publisher,
@@ -258,7 +258,7 @@ class ToolTests(unittest.TestCase):
 
         controllers = []
 
-        def factory(config, *, event_publisher):
+        def factory(config, *, event_publisher, report=None):
             controller = self.factory(config, event_publisher=event_publisher)
             controllers.append(controller)
             return controller
@@ -300,7 +300,7 @@ class ToolTests(unittest.TestCase):
                 if self.index == 1 and not entered.wait(1):
                     raise AssertionError("Fake provider did not begin")
 
-        def factory(config, *, event_publisher):
+        def factory(config, *, event_publisher, report=None):
             controller = PrototypeController(
                 config,
                 event_publisher=event_publisher,
@@ -327,7 +327,7 @@ class ToolTests(unittest.TestCase):
     def test_keyboard_interruption_emits_cancelled_and_clears(self):
         controllers = []
 
-        def factory(config, *, event_publisher):
+        def factory(config, *, event_publisher, report=None):
             controller = self.factory(config, event_publisher=event_publisher)
             controllers.append(controller)
             controller.snapshot = lambda: (_ for _ in ()).throw(KeyboardInterrupt())
@@ -372,7 +372,7 @@ class ToolTests(unittest.TestCase):
         self.config.write_text(json.dumps({**raw, "session_budget_seconds": 60}))
         loaded = []
 
-        def factory(config, *, event_publisher):
+        def factory(config, *, event_publisher, report=None):
             loaded.append(config.session_budget_seconds)
             return self.factory(config, event_publisher=event_publisher)
 
@@ -431,7 +431,7 @@ class ConfigDecisionTests(unittest.TestCase):
             built.append((options, provider))
             return provider
 
-        def factory(config, *, event_publisher):
+        def factory(config, *, event_publisher, report=None):
             return PrototypeController(
                 config,
                 event_publisher=event_publisher,

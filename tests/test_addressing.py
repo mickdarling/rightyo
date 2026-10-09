@@ -266,7 +266,7 @@ class CommandLineTests(unittest.TestCase):
         )
         started = []
 
-        def factory(loaded, *, event_publisher):
+        def factory(loaded, *, event_publisher, report=None):
             started.append(loaded.addressing)
             return PrototypeController(
                 loaded,
