@@ -130,9 +130,9 @@ To remove everything without RightyO, delete the directory:
 
 ## Shadow identification in live sessions
 
-Step 4a of #137 runs identification alongside a `listen` session without acting on it; its
-only output is lines on `listen`'s stderr, so the web lab, which has no such channel, doesn't
-run it. Turn it on with `"live": true` in the `speaker_id` section:
+Step 4a of #137 runs identification alongside a `listen` session, in any mode (microphone,
+demo or stdin), without acting on it. Its only output is lines on `listen`'s stderr (each
+prefixed `rightyo: `), so the web lab, which has no such channel, doesn't run it. Turn it on with `"live": true` in the `speaker_id` section:
 
 ```json
 "speaker_id": {
@@ -165,12 +165,12 @@ What it does:
 Each scored turn adds one stderr line, for example:
 
 ```text
-speaker_id label=Speaker A turn_ms=2140 speech_ms=1880 turn_score=0.712 acc_score=0.781 acc_s=8.4 state=bound id=owner
+speaker_id label="Speaker A" turn_ms=2140 speech_ms=1880 turn_score=0.712 acc_score=0.781 acc_s=8.4 state=bound id=owner
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `label` | The session speaker label (changes every session) |
+| `label` | The session speaker label (changes every session), always in double quotes |
 | `turn_ms` | The turn's span; `speech_ms` is the speech left after trimming silence |
 | `turn_score` | Cosine score of this turn alone against `id` |
 | `acc_score` | Cosine score of the label's accumulated mean against `id` |
@@ -178,10 +178,22 @@ speaker_id label=Speaker A turn_ms=2140 speech_ms=1880 turn_score=0.712 acc_scor
 | `state` | `bound`, `tentative` or `unknown` |
 | `id` | The bound identifier, or else the closest enrolled one |
 
-The session also logs `speaker_id live shadow on: enrolled=N` at start, and at the end one
+The session also logs `speaker_id start enrolled=N` at start, and at the end one
 `speaker_id final label=…` line per label and a `speaker_id summary` line counting offered,
 scored, short, overlapping, dropped and clipped turns (clipped: part of the span was
-already outside the 60 s buffer). Lines carry labels, enrolled identifiers, durations and
+already outside the 60 s buffer). When a session ends, turns still queued are scored if the
+stream ended normally, but that is best effort: `listen` stops the session moments after
+the end of input, so the last turn or two may be discarded rather than scored. A stopped or
+failed session discards them.
+
+Every line is `speaker_id`, an optional word naming the line (`start`, `final`, `summary`),
+then `key=value` pairs. The label is the only value that can contain a space, and it is
+always double-quoted (labels never contain quotes), so `shlex.split` parses a line into
+words and each `key=value` word splits at its first `=`. The `final` line prints `-` for a
+value it does not have. Other notes, such as the model being unavailable, are plain
+sentences.
+
+Lines carry labels, enrolled identifiers, durations and
 scores only: never audio, embeddings, transcript text or paths. They are calibration data:
 the bind and tentative thresholds will be recalibrated for accumulated scores from these
 logs (#141). Like `verify` scores, keep them local and only summarise them in public

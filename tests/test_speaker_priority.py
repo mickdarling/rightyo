@@ -941,7 +941,7 @@ class CommandLineAndPrototypeTests(unittest.TestCase):
     def test_live_refuses_model_sourced_roles_before_capture_and_applies_configured(self):
         started = []
 
-        def factory(loaded, *, event_publisher):
+        def factory(loaded, *, event_publisher, report=None):
             def processor(config, callback):
                 started.append(config.session_id)
                 return _Processor(config, callback)

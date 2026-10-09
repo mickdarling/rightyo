@@ -93,7 +93,7 @@ and merge hold apply unchanged. Each score is reported on stderr without content
 the silence rules for the session. An optional `"speaker_id"` object (#137) configures the
 local voiceprint model and store for [speaker enrollment](speaker-enrollment.md). With
 `"live": true` it also runs [shadow identification](speaker-enrollment.md#shadow-identification-in-live-sessions)
-in `listen` sessions: per-label scores on stderr (`speaker_id label=… state=… id=…`), with no
+in `listen` sessions in every mode: per-label scores on stderr (`speaker_id label="…" state=… id=…`), with no
 change to turns, roles, requests or events. An optional `"speakers"` object declares
 hard-coded speaker roles for the headless tool, for example
 `"speakers": {"owner": ["Speaker A"], "trusted": [], "owner_only": false}`; it may also

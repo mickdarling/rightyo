@@ -7,22 +7,26 @@ No model, microphone, recorded voice or enrollment store is used.
 
 from __future__ import annotations
 
+import io
 import json
 import math
+import shlex
 import tempfile
 import threading
 import time
 import unittest
 import wave
+from argparse import Namespace
 from array import array
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from rightyo.contracts import Turn
 from rightyo.live_speaker_id import LabelState, PcmRing, ShadowSpeakerId, bind
 from rightyo.prototype import PrototypeConfig, PrototypeController
 from rightyo.speaker_id import SpeakerIdConfig
+from rightyo.tool import listen
 from rightyo.tool_events import SpeechEvents
 
 RATE = 16000
@@ -131,10 +135,11 @@ class Harness:
 
     @staticmethod
     def fields(line):
-        label = line.split("label=", 1)[1].split(" turn_ms=")[0]
-        rest = line.split(" turn_ms=", 1)[1]
-        values = dict(item.split("=", 1) for item in ("turn_ms=" + rest).split())
-        return {"label": label, **values}
+        """Every note is `key=value` pairs after its prefix, parseable with shlex."""
+        words = shlex.split(line)
+        if words[0] != "speaker_id":
+            raise AssertionError("not a speaker_id note")
+        return dict(word.split("=", 1) for word in words[1:] if "=" in word)
 
 
 def wait_for(condition, timeout=3.0):
@@ -221,9 +226,9 @@ class ShadowTests(unittest.TestCase):
         expected = unit(*[a + b for a, b in zip(unit(1, 0.2, 0), unit(1, 0.1, 0))])[0]
         self.assertEqual(fields[2]["acc_score"], f"{expected:.3f}")
         self.assertEqual(fields[2]["turn_score"], f"{unit(1, 0.1, 0)[0]:.3f}")
-        self.assertIn("speaker_id live shadow on: enrolled=2", harness.lines)
+        self.assertIn("speaker_id start enrolled=2", harness.lines)
         self.assertIn(
-            "speaker_id final label=Speaker A turns=2 acc_score="
+            'speaker_id final label="Speaker A" turns=2 acc_score='
             f"{expected:.3f} acc_s=4.0 state=bound id=owner",
             harness.lines,
         )
@@ -289,7 +294,7 @@ class ShadowTests(unittest.TestCase):
         embedder = ScriptedEmbedder(gate=gate)
         harness = Harness(embedder, queue_size=1)
         harness.shadow.start()
-        wait_for(lambda: any("shadow on" in line for line in harness.lines))
+        wait_for(lambda: any("speaker_id start" in line for line in harness.lines))
         started = time.monotonic()
         harness.speak(2.0)
         wait_for(lambda: embedder.calls == 1)  # the worker is now blocked in embed
@@ -323,10 +328,40 @@ class ShadowTests(unittest.TestCase):
         self.assertNotIn("synthetic", log)  # neither model ids nor paths
         allowed = {"turn_ms", "speech_ms", "turn_score", "acc_score", "acc_s", "state", "id"}
         for line in harness.notes():
+            self.assertIn(' label="Speaker A" ', line)
             fields = Harness.fields(line)
             self.assertEqual(set(fields) - {"label"}, allowed)
             for name in ("turn_ms", "speech_ms", "turn_score", "acc_score", "acc_s"):
                 float(fields[name])
+
+    def test_a_failure_mid_update_keeps_the_label_and_the_closing_lines(self):
+        # Opposite unit vectors with equal weight leave a zero mean: normalising fails.
+        embedder = ScriptedEmbedder([unit(1, 0, 0), unit(-1, 0, 0)])
+        harness = Harness(embedder)
+        harness.shadow.start()
+        harness.speak(2.0)
+        harness.speak(2.0)
+        wait_for(lambda: not harness.shadow.active)
+        harness.shadow.close(drain=True)
+        state = harness.shadow._labels["Speaker A"]
+        self.assertEqual((state.turns, state.seconds), (1, 2.0))  # the failed turn left no trace
+        self.assertTrue(harness.lines[-2].startswith('speaker_id final label="Speaker A" turns=1'))
+        self.assertTrue(harness.lines[-1].startswith("speaker_id summary offered=2 scored=1"))
+
+    def test_closing_lines_print_even_for_a_label_without_a_score(self):
+        harness = Harness(ScriptedEmbedder())
+        harness.shadow.offered = 1
+        harness.shadow._labels["Speaker B"] = LabelState()
+        harness.shadow.close()
+        self.assertEqual(
+            harness.lines[-2:],
+            [
+                'speaker_id final label="Speaker B" turns=0 acc_score=- acc_s=0.0'
+                " state=unknown id=-",
+                "speaker_id summary offered=1 scored=0 short=0 overlap=0 dropped=0 clipped=0",
+            ],
+        )
+        self.assertEqual(Harness.fields(harness.lines[-2])["label"], "Speaker B")
 
     def test_a_failing_report_channel_changes_nothing(self):
         def broken(_message):
@@ -478,6 +513,78 @@ class ControllerTests(unittest.TestCase):
         events, lines = self.session(live, factory)
         self.assertEqual(events, baseline)
         self.assertIn("speaker_id unavailable; shadow identification off for this session", lines)
+
+
+class ListenTests(unittest.TestCase):
+    """`rightyo listen` wires stderr notes in every mode, so shadow ID runs in demo too."""
+
+    def test_demo_listen_writes_shadow_notes_to_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            asset = root / "asset"
+            asset.touch()
+            demo = root / "generated-tone.wav"
+            with wave.open(str(demo), "wb") as audio:
+                audio.setnchannels(1)
+                audio.setsampwidth(2)
+                audio.setframerate(RATE)
+                audio.writeframes(tone(4.0))
+            config = root / "config.json"
+            local = (
+                "whisper_executable",
+                "whisper_model",
+                "diarization_library",
+                "diarization_model",
+                "microphone_helper",
+            )
+            config.write_text(
+                json.dumps(
+                    {
+                        **{key: str(asset) for key in local},
+                        "demo_audio": str(demo),
+                        "speaker_id": {"python": str(asset), "model": str(asset), "live": True},
+                    }
+                )
+            )
+            embedder = ScriptedEmbedder()
+
+            def shadow(settings, *, report):
+                return ShadowSpeakerId(
+                    settings,
+                    report=report,
+                    embedder_factory=lambda _settings: embedder,
+                    entries=lambda _settings: ENTRIES,
+                )
+
+            def factory(loaded, *, event_publisher, report=None):
+                return PrototypeController(
+                    loaded,
+                    event_publisher=event_publisher,
+                    report=report,
+                    processor_factory=TurnEveryTwoSeconds,
+                    capture_factory=MagicMock(side_effect=AssertionError("no microphone")),
+                    provider_factory=MagicMock(side_effect=AssertionError("no hosted")),
+                    speaker_id_factory=shadow,
+                )
+
+            args = Namespace(
+                config=config,
+                mode="demo",
+                session_id="listen-shadow",
+                use_jev=False,
+                allow_hosted=False,
+            )
+            output = io.StringIO()
+            with patch("sys.stderr", io.StringIO()) as errors:
+                self.assertEqual(listen(args, output=output, controller_factory=factory), 0)
+                # `listen` returns once the session completes; the worker closes after.
+                wait_for(lambda: "speaker_id summary" in errors.getvalue(), 5)
+            log = errors.getvalue()
+            self.assertIn("rightyo: speaker_id start enrolled=2", log)
+            notes = [line for line in log.splitlines() if "speaker_id label=" in line]
+            self.assertGreaterEqual(len(notes), 1)
+            self.assertNotIn(PRIVATE_TEXT, log)
+            self.assertIn(PRIVATE_TEXT, output.getvalue())  # the transcript still went out
 
 
 if __name__ == "__main__":

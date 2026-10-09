@@ -28,7 +28,7 @@ import queue
 import sys
 import threading
 from array import array
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from rightyo.enroll import MAX_VERIFY_SECONDS, Store, cosine, normalize, speech, voiceprint
@@ -121,6 +121,19 @@ def bind(state: LabelState, scores: dict[str, float], settings: SpeakerIdConfig)
     else:
         state.state = "unknown"
     state.identity, state.score = best, score
+
+
+def _quoted(label: str) -> str:
+    """A session label in double quotes: labels may hold spaces but never quotes.
+
+    Session labels are contract identifiers (`[A-Za-z0-9_. -]`), so every note stays
+    `key=value` parseable with `shlex.split`; all other values never hold spaces.
+    """
+    return '"' + label.replace('"', "") + '"'
+
+
+def _number(value: float | None, spec: str) -> str:
+    return "-" if value is None else format(value, spec)
 
 
 def _samples(pcm: bytes) -> array:
@@ -236,7 +249,7 @@ class ShadowSpeakerId:
                 self._off.set()
                 self._report("speaker_id live: no voiceprint enrolled with this model; shadow off")
                 return
-            self._report(f"speaker_id live shadow on: enrolled={len(prints)}")
+            self._report(f"speaker_id start enrolled={len(prints)}")
             while not self._stop.is_set():
                 try:
                     item = self._queue.get(timeout=0.05)
@@ -271,13 +284,18 @@ class ShadowSpeakerId:
         if not comparable:
             raise ValueError("no comparable voiceprint")
         turn_scores = {key: cosine(vector, value) for key, value in comparable.items()}
-        state = self._labels.setdefault(label, LabelState())
+        # Update a copy and commit it only once complete, so a failure part-way never
+        # leaves a label half-updated (or created without a score).
+        previous = self._labels.get(label)
+        state = LabelState() if previous is None else replace(previous)
         mean = state.add(vector, seconds)
         bind(state, {key: cosine(mean, value) for key, value in comparable.items()}, self.settings)
+        self._labels[label] = state
         self.scored += 1
         # Report after the bookkeeping, best-effort: a failing channel changes nothing.
         self._report(
-            f"speaker_id label={label} turn_ms={turn_ms} speech_ms={round(seconds * 1000)}"
+            f"speaker_id label={_quoted(label)} turn_ms={turn_ms}"
+            f" speech_ms={round(seconds * 1000)}"
             f" turn_score={turn_scores[state.identity]:.3f} acc_score={state.score:.3f}"
             f" acc_s={state.seconds:.1f} state={state.state} id={state.identity}"
         )
@@ -309,16 +327,21 @@ class ShadowSpeakerId:
                     embedder.close()
             self._thread.join(2)
         self._ring.clear()
-        if self.offered:
-            for label in sorted(self._labels):
+        if not self.offered:
+            return
+        # Each line is formatted on its own and best-effort, so one bad value never costs
+        # the others (and the summary always follows).
+        for label in sorted(dict(self._labels)):
+            with contextlib.suppress(Exception):
                 state = self._labels[label]
                 self._report(
-                    f"speaker_id final label={label} turns={state.turns}"
-                    f" acc_score={state.score:.3f} acc_s={state.seconds:.1f}"
-                    f" state={state.state} id={state.identity}"
+                    f"speaker_id final label={_quoted(label)} turns={state.turns}"
+                    f" acc_score={_number(state.score, '.3f')}"
+                    f" acc_s={_number(state.seconds, '.1f')}"
+                    f" state={state.state} id={state.identity or '-'}"
                 )
-            self._report(
-                f"speaker_id summary offered={self.offered} scored={self.scored}"
-                f" short={self.short} overlap={self.overlap} dropped={self.dropped}"
-                f" clipped={self.clipped}"
-            )
+        self._report(
+            f"speaker_id summary offered={self.offered} scored={self.scored}"
+            f" short={self.short} overlap={self.overlap} dropped={self.dropped}"
+            f" clipped={self.clipped}"
+        )

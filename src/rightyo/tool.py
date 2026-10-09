@@ -217,10 +217,12 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
     # Stdout carries the events; acknowledgement-gating notes (#132) go to stderr.
     events = SpeechEvents(report=_stderr)
     consent = {"allow_hosted_speech": True} if config.hosted_speech else {}
+    # Content-free session notes (end-of-turn scores, capture, shadow speaker
+    # identification) go to stderr in every mode.
+    consent["report"] = _stderr
     if args.mode == "stdin":
         consent["audio_input"] = sys.stdin.buffer if audio_input is None else audio_input
         consent["audio_provenance"] = provenance
-        consent["report"] = _stderr
     controller = controller_factory(config, event_publisher=events, **consent)
     # Signal handlers are installed only by this explicit foreground operation.
     previous = None
