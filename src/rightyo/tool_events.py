@@ -546,6 +546,22 @@ class SpeechEvents:
             return None
         return "full" if role == "trusted" else "playback"
 
+    def _current_role(self, turn, role):
+        """A turn's emitted owner or trusted role, re-checked against the binding now.
+
+        With live identification (#137), a label whose binding no longer gives it that
+        role is treated as `unknown` for policy (owner-only, follow-ups, authority and the
+        owner's supersession exemption). Never blocks; never upgrades a role; the
+        published role is unchanged.
+        """
+        if not self._per_turn or role not in {"owner", "trusted"}:
+            return role
+        try:
+            now = self._priority.role_for(turn)
+        except Exception:  # noqa: BLE001 - identification never fails the session
+            now = "unknown"
+        return role if now == role else "unknown"
+
     def _authority_role(self, key, role):
         """The role a turn exercises authority with: an inferred label never grants one.
 
@@ -938,24 +954,17 @@ class SpeechEvents:
                     # A degraded answer, as distinct from a genuine `uncertain`.
                     evidence["dismissal_status"] = "malformed"
             stop = False
-            authority = self._authority_role(key, role)
-            if self._per_turn and authority in {"owner", "trusted"}:
-                # Re-checked at decision time, without waiting (#137): a label whose
-                # binding no longer gives it this role exercises no authority now. The
-                # published role is unchanged, so the host's fingerprints still match.
-                try:
-                    current = self._priority.role_for(turn)
-                except Exception:  # noqa: BLE001 - identification never fails the session
-                    current = "unknown"
-                if current != authority:
-                    authority = "unknown"
+            # The published role stays as emitted (the host fingerprints it); policy uses
+            # the role re-checked now (#137), and authority also drops inferred labels.
+            current = self._current_role(turn, role)
+            authority = self._authority_role(key, current)
             if role is not None:
                 evidence["role"] = role
                 if key == self._degraded_turn:
                     # The stream shows where model lookups degraded, not only the object.
                     evidence["role_status"] = self.role_status
                 rules = self._priority.priority
-                if rules.owner_only and role != "owner" and evidence["label"] == "attend":
+                if rules.owner_only and current != "owner" and evidence["label"] == "attend":
                     # Owner-only mode: other speakers remain context, never a request.
                     evidence["label"] = "ignore"
                 stop = authority == "owner" and rules.is_stop_phrase(turn.text)
@@ -977,7 +986,7 @@ class SpeechEvents:
                 # The window is judged in stream time at each decided turn.
                 self._lapse(turn.start_ms)
                 if not would_attend and self._follow_up(
-                    turn, role, event.decision, evidence, unavailable
+                    turn, current, event.decision, evidence, unavailable
                 ):
                     # An engaged speaker's undecided follow-up (#82): the request evidence
                     # says so, beside Jev's unchanged recipient and confidence.
@@ -1173,7 +1182,8 @@ class SpeechEvents:
                     self._delivered.pop(superseded, None)
                 for other, (earlier, _context, _size, other_role) in self._pending.items():
                     if (
-                        self._authority_role(other, other_role) != "owner"
+                        self._authority_role(other, self._current_role(earlier, other_role))
+                        != "owner"
                         and earlier.end_ms <= turn.end_ms
                     ):
                         self._superseded.setdefault(other, key)

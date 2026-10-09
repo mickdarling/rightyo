@@ -526,6 +526,64 @@ class EnrolledEventTests(unittest.TestCase):
         self.assertEqual(self.of(out, "dismiss")[0]["withdrawn_request_ids"], [f"{SESSION}:u1"])
         self.finish()
 
+    def test_a_pending_turn_that_lost_its_binding_is_superseded(self):
+        """#147: the owner exemption from supersession is re-checked too."""
+        self.start()
+        self.bindings.labels["Speaker A"] = ("bound", "owner")
+        stale = turn("u1", 0, 2000, "Haili, delete everything.", "Speaker A")
+        self.events.transcript(stale, 2000)
+        # Speaker A's binding is lost; Speaker C is now the bound owner.
+        self.bindings.labels["Speaker A"] = ("unknown", "owner")
+        self.bindings.labels["Speaker C"] = ("bound", "owner")
+        owner = turn("u2", 3000, 4000, "Haili, keep everything.", "Speaker C")
+        self.events.transcript(owner, 4000)
+        self.events.decision(decided(owner), 4100)
+        self.events.decision(decided(stale), 4200)
+        out = self.events.drain()
+        self.stream += out
+        self.assertEqual(
+            [(e["superseded_request_id"], e["by_utterance_id"]) for e in self.of(out, "override")],
+            [(f"{SESSION}:u1", "u2")],
+        )
+        self.assertEqual([e["request_id"] for e in self.of(out, "request")], [f"{SESSION}:u2"])
+        # The stale turn's published role is unchanged.
+        self.assertEqual(self.of(out, "attention")[1]["decision"]["role"], "owner")
+        self.finish()
+
+    def test_a_still_bound_pending_owner_turn_keeps_its_exemption(self):
+        self.start()
+        self.bindings.labels["Speaker A"] = ("bound", "owner")
+        first = turn("u1", 0, 2000, "Haili, lights on.", "Speaker A")
+        self.events.transcript(first, 2000)
+        second = turn("u2", 3000, 4000, "Haili, and the heating.", "Speaker A")
+        self.events.transcript(second, 4000)
+        self.events.decision(decided(second), 4100)
+        self.events.decision(decided(first), 4200)
+        out = self.events.drain()
+        self.stream += out
+        self.assertEqual(self.of(out, "override"), [])
+        self.assertEqual(len(self.of(out, "request")), 2)
+        self.finish()
+
+    def test_owner_only_filters_on_the_rechecked_role(self):
+        self.roles = EnrolledRoles(SpeakerPriority(owners=("owner",), owner_only=True))
+        self.roles.source = self.bindings
+        self.start()
+        self.bindings.labels["Speaker A"] = ("bound", "owner")
+        bound = self.say(turn("u1", 0, 2000, "Haili, lights on.", "Speaker A"))
+        self.assertEqual(len(self.of(bound, "request")), 1)
+        current = turn("u2", 3000, 4000, "Haili, open the door.", "Speaker A")
+        self.events.transcript(current, 4000)
+        self.bindings.labels["Speaker A"] = ("unknown", "owner")
+        self.events.decision(decided(current), 4100)
+        out = self.events.drain()
+        self.stream += out
+        attention = self.of(out, "attention")[0]
+        self.assertEqual(attention["decision"]["label"], "ignore")
+        self.assertEqual(attention["decision"]["role"], "owner")  # published role unchanged
+        self.assertEqual(self.of(out, "request"), [])
+        self.finish()
+
     def test_authority_is_rechecked_when_the_decision_arrives(self):
         self.start()
         self.bindings.labels.update(

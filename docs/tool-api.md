@@ -510,8 +510,10 @@ differences:
   field marks it.
 - **Authority is re-checked when the decision arrives.** If the label's binding no longer
   gives the turn its owner or trusted role by then (it fell below `tentative_threshold`),
-  the turn emits no `override` and acts with no authority. The role it was published with
-  is unchanged.
+  the turn is treated as `unknown` for policy: it emits no `override` and acts with no
+  authority, `owner_only` holds back its `attend`, and as a still-pending turn it loses
+  the owner's exemption from a bound owner's supersession. The role it was published with
+  is unchanged on every event.
 
 Logs stay content-free: the identifier's stderr lines carry labels, enrolled identifiers,
 durations and scores only.
