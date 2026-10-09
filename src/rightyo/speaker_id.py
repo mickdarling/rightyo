@@ -147,8 +147,11 @@ class SpeakerIdConfig:
     optional `store` (absolute directory, default
     `~/Library/Application Support/RightyO/enrollment`), `bind_threshold` (default 0.60),
     `tentative_threshold` (default 0.45, below the bind threshold), `min_turn_seconds`
-    (0.5-10, default 1.0), `threads` (1-8, default 4) and `enabled` (default true).
-    Live identification (#137 step 4) does not use it yet; `rightyo enroll` does.
+    (0.5-10, default 1.0), `threads` (1-8, default 4), `live` (default false),
+    `bind_min_seconds` (0.5-120, default 3.0) and `enabled` (default true). `rightyo
+    enroll` uses it; with `live` true, live sessions also run shadow identification
+    (#137 step 4a, `rightyo.live_speaker_id`): scores are logged, nothing else changes.
+    A label binds only once `bind_min_seconds` of its speech has been accumulated.
     """
 
     python: Path
@@ -158,6 +161,8 @@ class SpeakerIdConfig:
     tentative_threshold: float = 0.45
     min_turn_seconds: float = 1.0
     threads: int = 4
+    live: bool = False
+    bind_min_seconds: float = 3.0
 
     @classmethod
     def from_dict(cls, value: Any) -> SpeakerIdConfig | None:
@@ -170,6 +175,8 @@ class SpeakerIdConfig:
             "tentative_threshold",
             "min_turn_seconds",
             "threads",
+            "live",
+            "bind_min_seconds",
         }
         if not isinstance(value, dict) or set(value) - keys:
             raise ValueError("invalid speaker_id section")
@@ -188,6 +195,8 @@ class SpeakerIdConfig:
         tentative = value.get("tentative_threshold", 0.45)
         min_turn = value.get("min_turn_seconds", 1.0)
         threads = value.get("threads", 4)
+        live = value.get("live", False)
+        bind_min = value.get("bind_min_seconds", 3.0)
         if (
             not _bounded(bind, 0.0, 1.0)
             or not _bounded(tentative, 0.0, 1.0)
@@ -195,6 +204,8 @@ class SpeakerIdConfig:
             or not _bounded(min_turn, 0.5, 10.0)
             or type(threads) is not int
             or not 1 <= threads <= 8
+            or type(live) is not bool
+            or not _bounded(bind_min, 0.5, 120.0)
         ):
             raise ValueError("invalid speaker_id section")
         return cls(
@@ -205,6 +216,8 @@ class SpeakerIdConfig:
             float(tentative),
             float(min_turn),
             threads,
+            live,
+            float(bind_min),
         )
 
     def band(self, score: float) -> str:
