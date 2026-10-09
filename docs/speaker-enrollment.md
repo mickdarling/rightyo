@@ -230,6 +230,7 @@ Step 4b of #137 acts on the bindings. It is off unless the `speaker_id` section 
 - With roles on, identification also runs in the web lab, which has no stderr channel; its
   lines are then simply not written.
 - Edge attribution and tail join stay available: a turn with inferred-label words keeps
-  its role for attention but never overrides or cancels anyone else's request.
+  its role for attention but withdraws nothing: it never overrides, cancels or withdraws
+  any request, its own speaker's included, and its dismissal only stops playback.
 - The optional `enrolled_follow_up_min_probability` (above 0, up to 1) lowers the
   conversation-mode follow-up bar for an engaged owner or trusted speaker.

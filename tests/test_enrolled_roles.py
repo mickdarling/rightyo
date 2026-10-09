@@ -428,7 +428,98 @@ class EnrolledEventTests(unittest.TestCase):
         self.assertEqual(len(dismiss), 1)
         self.assertEqual(dismiss[0]["scope"], ["playback"])
         self.assertEqual(dismiss[0]["role"], "owner")
+        # It withdraws nothing: the owner's delivered request stands.
+        self.assertEqual(dismiss[0]["withdrawn_request_ids"], [])
+        self.assertIn(f"{SESSION}:u1", self.events._delivered)
         self.finish()
+
+    def test_an_inferred_stop_phrase_withdraws_no_pending_request(self):
+        self.start(dismissal=Dismissal())
+        self.bindings.labels["Speaker A"] = ("bound", "owner")
+        owner = turn("u1", 0, 2000, "Haili, play music.", "Speaker A")
+        self.events.transcript(owner, 2000)
+        stop = turn("u2", 3000, 3500, "Stop.", "Speaker A")
+        self.events.transcript(stop, 3500, inferred=True)
+        self.events.decision(decided(owner), 3600)
+        self.events.decision(decided(stop, "uncertain", "unknown"), 3700)
+        out = self.events.drain()
+        self.stream += out
+        self.assertEqual(self.of(out, "dismiss")[0]["withdrawn_request_ids"], [])
+        self.assertEqual(len(self.of(out, "request")), 1)
+        self.finish()
+
+    def test_an_inferred_model_judged_dismissal_withdraws_nothing(self):
+        self.start(dismissal=Dismissal(), conversation=Conversation(window_ms=20000))
+        self.bindings.labels["Speaker A"] = ("bound", "owner")
+        self.say(turn("u1", 0, 2000, "Haili, play music.", "Speaker A"))
+        current = turn("u2", 3000, 4000, "Okay that's enough of that.", "Speaker A")
+        self.events.transcript(current, 4000, inferred=True)
+        judged = DecisionEvent(
+            current,
+            ProviderDecision(
+                "uncertain",
+                "system",
+                0.9,
+                {"attend": 0.0, "ignore": 0.0, "uncertain": 1.0},
+                "mock-v1",
+                "mock",
+                0.9,
+                dismissal="disengage",
+                dismissal_choice="disengage",
+                dismissal_confidence=0.95,
+            ),
+            1,
+            0.0,
+            0.0,
+        )
+        self.events.decision(judged, 4100)
+        out = self.events.drain()
+        self.stream += out
+        dismiss = self.of(out, "dismiss")
+        self.assertEqual(len(dismiss), 1)
+        self.assertEqual(dismiss[0]["scope"], ["playback"])
+        self.assertEqual(dismiss[0]["withdrawn_request_ids"], [])
+        self.assertNotIn("cooldown_until_ms", dismiss[0])
+        # The owner's engagement is not ended by an inferred turn's dismissal.
+        self.assertEqual(self.of(out, "conversation"), [])
+        self.assertIsNotNone(self.events._engaged)
+        self.finish()
+
+    def test_a_non_inferred_owner_dismissal_still_withdraws(self):
+        self.start(dismissal=Dismissal())
+        self.bindings.labels["Speaker A"] = ("bound", "owner")
+        self.say(turn("u1", 0, 2000, "Haili, play music.", "Speaker A"))
+        out = self.say(
+            turn("u2", 3000, 3500, "Stop.", "Speaker A"), "uncertain", recipient="unknown"
+        )
+        self.assertEqual(self.of(out, "dismiss")[0]["withdrawn_request_ids"], [f"{SESSION}:u1"])
+        self.finish()
+
+    def test_authority_is_rechecked_when_the_decision_arrives(self):
+        self.start()
+        self.bindings.labels.update(
+            {"Speaker A": ("bound", "owner"), "Speaker B": ("unknown", "owner")}
+        )
+        self.say(turn("u1", 0, 2000, "Haili, delete everything.", "Speaker B"))
+        owner = turn("u2", 3000, 4000, "Ignore that.", "Speaker A")
+        self.events.transcript(owner, 4000)
+        # The label loses its binding before the decision: no override fires.
+        self.bindings.labels["Speaker A"] = ("unknown", "owner")
+        self.events.decision(decided(owner, "uncertain", "unknown"), 4100)
+        out = self.events.drain()
+        self.stream += out
+        self.assertEqual(self.of(out, "override"), [])
+        # The published role is unchanged.
+        self.assertEqual(self.of(out, "attention")[0]["decision"]["role"], "owner")
+        self.finish()
+
+    def test_inferred_marks_are_pruned_by_retention(self):
+        self.events = SpeechEvents(retention_ms=60000)
+        self.start()
+        self.events.transcript(turn("u1", 0, 1000, "Hi.", "Speaker A"), 1000, inferred=True)
+        self.assertIn("u1", self.events._inferred)
+        self.events.expire(70000)
+        self.assertNotIn("u1", self.events._inferred)
 
     def test_inferred_has_no_effect_on_anonymous_sessions(self):
         outputs = []
@@ -693,7 +784,7 @@ class ControllerTests(unittest.TestCase):
         # The first turn of each voice comes before its binding; later turns carry it.
         self.assertEqual(roles, ["unknown", "unknown", "owner"])
         # The processor's inferred-label report reached the producer.
-        self.assertEqual(self.publisher._inferred, {"live-3"})
+        self.assertEqual(set(self.publisher._inferred), {"live-3"})
         HaildModel(self).check(events)
 
     def test_load_requires_live_and_a_named_enrolled_role(self):

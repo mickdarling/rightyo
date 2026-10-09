@@ -499,11 +499,16 @@ differences:
 - **Inferred labels keep their role but carry no authority.** Edge attribution and tail
   join may run alongside these roles. A turn with any inferred-label words (an
   edge-attributed word or a tail join) keeps its speaker's role for attention, follow-ups
-  and engagement, but acts as `unknown` for authority: it emits no `override`, its stop
-  phrase supersedes nothing, its dismissal only stops playback, it supersedes no pending
-  decision, and its own request stays open to a later owner override. Only a turn without
-  inferred words exercises owner authority. The inference is internal; no event field
-  marks it.
+  and engagement, but has no authority and withdraws nothing: it emits no `override`, its
+  stop phrase supersedes nothing, its dismissal only stops playback with an empty
+  `withdrawn_request_ids` (not even its own speaker's requests, delivered or pending) and
+  does not end that speaker's engagement, it supersedes no pending decision, and its own
+  request stays open to a later owner override. Only a turn without inferred words
+  exercises owner authority. The inference is internal; no event field marks it.
+- **Authority is re-checked when the decision arrives.** If the label's binding no longer
+  gives the turn its owner or trusted role by then (it fell below `tentative_threshold`),
+  the turn emits no `override` and acts with no authority. The role it was published with
+  is unchanged.
 
 Logs stay content-free: the identifier's stderr lines carry labels, enrolled identifiers,
 durations and scores only.

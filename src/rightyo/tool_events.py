@@ -135,7 +135,8 @@ class SpeechEvents:
         self._per_turn = False
         # Turns whose speaker label was partly inferred (edge attribution or tail join):
         # they keep their role for attention and precedence, never for owner authority.
-        self._inferred = set()
+        # Utterance id -> turn end, pruned by retention like the other per-turn state.
+        self._inferred = {}
         self._open = {}
         # Pending non-owner turns an owner superseded before their decisions arrived,
         # mapped to the owner's utterance: their late decisions never emit a request.
@@ -352,6 +353,9 @@ class SpeechEvents:
             for key in list(self._withdrawn):
                 if key not in self._pending:
                     del self._withdrawn[key]
+            for key, end_ms in list(self._inferred.items()):
+                if end_ms <= cutoff:
+                    del self._inferred[key]
             for key in list(self._superseded):
                 if key not in self._pending:
                     del self._superseded[key]
@@ -395,7 +399,8 @@ class SpeechEvents:
 
         An inferred turn (edge-attributed words or a tail join) keeps its role for
         attention and precedence, but never exercises owner or trusted authority:
-        no override, no owner stop phrase and only a limited dismissal.
+        no override, no owner stop phrase, and a playback-only dismissal that withdraws
+        nothing and leaves the speaker's engagement in place.
         """
         with self._lock:
             if not self._active:
@@ -432,7 +437,7 @@ class SpeechEvents:
                 else self._assign_role(turn, context["turns"])
             )
             if inferred and role is not None:
-                self._inferred.add(turn.utterance_id)
+                self._inferred[turn.utterance_id] = turn.end_ms
             self._memory.append(turn, role=role)
             self._seen[turn.utterance_id] = digest
             if turn.end_ms <= self._now - self.retention_ms:
@@ -462,8 +467,10 @@ class SpeechEvents:
                     self._dismissed[turn.utterance_id] = plan["upgradable"]
                     self._emit("dismiss", **self._apply(turn, plan))
                     # Ending one's own engagement affects no one else, so even a dismissal
-                    # limited to playback ends it.
-                    self._disengage(turn, "dismissed")
+                    # limited to playback ends it; an inferred label's dismissal may not
+                    # be the engaged speaker's own (#137), so it leaves it.
+                    if turn.utterance_id not in self._inferred:
+                        self._disengage(turn, "dismissed")
 
     @staticmethod
     def _comparable(first, second):
@@ -542,8 +549,9 @@ class SpeechEvents:
     def _authority_role(self, key, role):
         """The role a turn exercises authority with: an inferred label never grants one.
 
-        A turn with inferred-label words (#137) acts as `unknown` for overrides, owner stop
-        phrases, dismissal authority and owner supersession, whatever role it carries.
+        A turn with inferred-label words (#137) has no override, owner stop phrase,
+        dismissal authority or owner supersession, whatever role it carries, and its
+        dismissal withdraws nothing (see `_plan`).
         """
         if key in self._inferred and role in {"owner", "trusted"}:
             return "unknown"
@@ -562,15 +570,19 @@ class SpeechEvents:
         # Only a model-judged dismissal by a fully trusted speaker withdraws on
         # incomparable attribution; the fast path never does.
         loose = loose and authority == "full" and self._priority is None
+        # A turn with inferred-label words (#137) may be another voice under the
+        # speaker's label: it withdraws nothing, delivered or pending.
+        inferred = turn.utterance_id in self._inferred
         delivered = [
             request_id
             for request_id, facts in self._delivered.items()
-            if self._withdrawable(turn, facts, loose)
+            if not inferred and self._withdrawable(turn, facts, loose)
         ]
         pending = [
             key
             for key, (earlier, _context, _size, _role) in self._pending.items()
-            if key != turn.utterance_id
+            if not inferred
+            and key != turn.utterance_id
             and key not in self._withdrawn
             and self._withdrawable(turn, self._facts(earlier), loose)
         ]
@@ -927,6 +939,16 @@ class SpeechEvents:
                     evidence["dismissal_status"] = "malformed"
             stop = False
             authority = self._authority_role(key, role)
+            if self._per_turn and authority in {"owner", "trusted"}:
+                # Re-checked at decision time, without waiting (#137): a label whose
+                # binding no longer gives it this role exercises no authority now. The
+                # published role is unchanged, so the host's fingerprints still match.
+                try:
+                    current = self._priority.role_for(turn)
+                except Exception:  # noqa: BLE001 - identification never fails the session
+                    current = "unknown"
+                if current != authority:
+                    authority = "unknown"
             if role is not None:
                 evidence["role"] = role
                 if key == self._degraded_turn:
@@ -1164,7 +1186,8 @@ class SpeechEvents:
                 # reservation), this decision emits at most one more `conversation`
                 # event: a disengaging turn never also engages.
                 if plan is not None:
-                    self._disengage(turn, "dismissed")
+                    if key not in self._inferred:
+                        self._disengage(turn, "dismissed")
                 elif self._conversation.is_closing(turn.text):
                     self._disengage(turn, "closed")
                 elif evidence["label"] == "ignore" and (
