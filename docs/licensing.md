@@ -14,6 +14,31 @@ The [official Whisper README](https://github.com/openai/whisper#license) states 
 
 Audit each actual base model revision and checksum, fork/runtime, dependency, teacher model, dataset, and generated training corpus. Do not assume all Whisper-named models have OpenAI Whisper's license. Reject incompatible or noncommercial dependencies for the intended open release, or record a different explicit disposition before reuse.
 
+## Speaker embedding model
+
+`rightyo enroll` ([speaker enrollment](speaker-enrollment.md)) uses a separately provisioned
+WeSpeaker ResNet34-LM speaker-embedding model. RightyO does not bundle or redistribute it.
+
+- **Work:** `voxceleb_resnet34_LM.onnx`, revision `f0c48c298fd835726c27956a5d617bad7115627e`,
+  SHA-256 `7bb2f06e9df17cdf1ef14ee8a15ab08ed28e8d0ef5054ee135741560df2ec068`
+  ([model card](https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM)).
+- **Creators:** the [WeSpeaker](https://github.com/wenet-e2e/wespeaker) project (Hongji Wang,
+  Chengdong Liang, Shuai Wang, Zhengyang Chen, Binbin Zhang, Xu Xiang, Yanlei Deng and Yanmin
+  Qian, "WeSpeaker: A Research and Production Oriented Speaker Embedding Learning Toolkit",
+  ICASSP 2023); the r-vector architecture follows Zeinali et al., "BUT System Description to
+  VoxCeleb Speaker Recognition Challenge 2019".
+- **Licence:** [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/), per the model card
+  and WeSpeaker's [pretrained-model notes](https://github.com/wenet-e2e/wespeaker/blob/master/docs/pretrained.md).
+  RightyO uses the weights unmodified. Its fbank front end is an independent numpy
+  reimplementation and imports no WeSpeaker code (Apache-2.0).
+- **Training data:** VoxCeleb2 dev (Chung, Nagrani and Zisserman, VGG, University of Oxford),
+  CC-BY-4.0, which its creators describe as available for research purposes. Mick decided on
+  [#137](https://github.com/mickdarling/rightyo/issues/137) that this wording is not a
+  blocker: RightyO is research for personal use, and any release would be a free public
+  tool. Keep these attributions with any setup that provisions the model.
+- **Runtime:** onnxruntime (MIT) and numpy (BSD-3-Clause), in an interpreter the user
+  provides.
+
 ## Datasets and consent
 
 Training permission, redistribution permission, personal-data consent, and model-release permission are separate checks. Record them separately. Public availability is not permission. Public GitHub issues must not contain participant identity, recordings, transcripts, paths exposing identity, or private consent records.
