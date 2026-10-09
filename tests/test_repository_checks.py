@@ -12,12 +12,17 @@ from scripts.repository_checks import (
     AI_REVIEW_WORKFLOW,
     MAX_FILE_BYTES,
     REVIEW_RELAY_WORKFLOW,
+    SYNTHETIC_VOICE_FIXTURES,
+    VOICE_DATA_REASON,
+    VOICE_DATA_SUFFIXES,
     actionlint_source,
     artifact_errors,
     artifact_reason,
+    git_files,
     ignore_errors,
     issue_references,
     markdown_errors,
+    voice_data_reason,
     workflow_errors,
 )
 
@@ -55,7 +60,7 @@ class ArtifactTests(unittest.TestCase):
             root = Path(directory)
             (root / "synthetic.wav").write_bytes(b"example-private-content")
             errors = artifact_errors(root, [Path("synthetic.wav")])
-            self.assertEqual(errors, ["tracked entry 1: private/artifact extension"])
+            self.assertEqual(errors, [f"tracked entry 1: {VOICE_DATA_REASON}"])
 
     def test_ignore_rules_and_negative_cases(self):
         self.assertEqual(ignore_errors(ROOT), [])
@@ -66,6 +71,89 @@ class ArtifactTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q", root], check=True)
             (root / ".gitignore").write_text(".env\n")
             self.assertTrue(ignore_errors(root))
+
+
+class VoiceDataGuardTests(unittest.TestCase):
+    """#109: real voice audio, embeddings and voiceprints never reach the repository."""
+
+    FIXTURES = {"tests/fixtures/synthetic-voice": "authored test tones"}
+
+    def test_required_extensions_are_covered(self):
+        required = (
+            ".wav .pcm .flac .mp3 .m4a .aac .ogg .opus .caf .aif .aiff .npy .npz .emb"
+            " .pt .pth .onnx .mlmodel .mlpackage .safetensors .wave .oga .amr .3gp .wma .m4b .spx"
+        ).split()
+        self.assertTrue(set(required) <= VOICE_DATA_SUFFIXES)
+
+    def test_voice_extensions_fail_with_privacy_reason(self):
+        for path in ("owner.WAV", "nested/owner.emb", "a/b.npy", "speaker.onnx", "x.m4a"):
+            self.assertEqual(artifact_reason(path, b"synthetic"), VOICE_DATA_REASON)
+        self.assertIn("#109", VOICE_DATA_REASON)
+
+    def test_model_bundle_directories_fail(self):
+        for path in ("embedder.mlpackage/Manifest.json", "a/embedder.mlmodelc/coremldata.bin"):
+            self.assertEqual(voice_data_reason(path), VOICE_DATA_REASON)
+
+    def test_enrollment_and_voiceprint_segments_fail(self):
+        for path in (
+            "enrollment/owner.json",
+            "tests/Enrollment/notes.txt",
+            "docs/voiceprints/readme.md",
+            "a/voiceprint/x.txt",
+        ):
+            self.assertEqual(artifact_reason(path, b"synthetic"), VOICE_DATA_REASON)
+
+    def test_similar_names_are_not_segments(self):
+        for path in (
+            "examples/enrolled-override.jsonl",
+            "docs/enrollment-plan.md",
+            "src/rightyo/voiceprints.py",
+            "tests/test_speaker_priority.py",
+        ):
+            self.assertIsNone(voice_data_reason(path))
+
+    def test_allow_list_admits_only_paths_strictly_under_a_prefix(self):
+        fixtures = self.FIXTURES
+        allowed = "tests/fixtures/synthetic-voice/tone.emb"
+        self.assertIsNone(voice_data_reason(allowed, fixtures))
+        self.assertIsNone(artifact_reason(allowed, b"synthetic text", fixtures))
+        self.assertIsNone(
+            voice_data_reason("tests/fixtures/synthetic-voice/enrollment/a.json", fixtures)
+        )
+        for path in (
+            "tests/fixtures/synthetic-voice.wav",
+            "tests/fixtures/synthetic-voice-real/owner.wav",
+            "tests/fixtures/owner.wav",
+            "enrollment/tests/fixtures/synthetic-voice/x.wav",
+        ):
+            self.assertEqual(voice_data_reason(path, fixtures), VOICE_DATA_REASON)
+
+    def test_allow_list_does_not_lift_binary_size_or_private_directory_rules(self):
+        fixtures = self.FIXTURES
+        path = "tests/fixtures/synthetic-voice/tone.wav"
+        self.assertEqual(artifact_reason(path, b"RIFF\0", fixtures), "binary file")
+        self.assertEqual(
+            artifact_reason(path, b"x" * (MAX_FILE_BYTES + 1), fixtures), "oversized file"
+        )
+        self.assertEqual(
+            artifact_reason("tests/fixtures/synthetic-voice/recordings/a.wav", b"x", fixtures),
+            "private/artifact directory",
+        )
+
+    def test_every_allow_list_entry_is_a_strict_relative_prefix(self):
+        # An empty, "." or escaping entry would match every path and switch the guard off.
+        for prefix in SYNTHETIC_VOICE_FIXTURES:
+            parts = prefix.split("/")
+            self.assertTrue(prefix and not prefix.startswith("/"), prefix)
+            self.assertNotIn("", parts, prefix)
+            self.assertNotIn(".", parts, prefix)
+            self.assertNotIn("..", parts, prefix)
+
+    def test_allow_list_matches_current_inventory(self):
+        # No tracked file is voice data today; any future entry must document why.
+        self.assertEqual(SYNTHETIC_VOICE_FIXTURES, {})
+        tracked = [path.as_posix() for path in git_files(ROOT)]
+        self.assertEqual([path for path in tracked if voice_data_reason(path)], [])
 
 
 class MarkdownTests(unittest.TestCase):

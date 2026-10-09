@@ -53,6 +53,20 @@ tensorboard/
 *.opus
 *.aac
 *.webm
+*.wave
+*.oga
+*.amr
+*.awb
+*.3gp
+*.3g2
+*.wma
+*.m4b
+*.m4p
+*.spx
+*.mka
+*.ac3
+*.au
+*.snd
 *.mp4
 
 # Downloaded weights/checkpoints; document sources instead
@@ -73,3 +87,10 @@ checkpoints/
 *.hdf5
 *.pkl
 *.pickle
+
+# Speaker enrollment and voiceprints stay on the host (#109); see CONTRIBUTING.md
+enrollment/
+enrollments/
+voiceprint/
+voiceprints/
+*.emb

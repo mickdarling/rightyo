@@ -64,6 +64,62 @@ PRIVATE_SUFFIXES = {
     ".log",
 }
 MAX_FILE_BYTES = 1024 * 1024
+
+# Voice-data guard (#109, #137): real voice audio, speaker embeddings and voiceprints
+# must never be tracked. Files with these extensions, and the path segments below, are
+# refused unless the path sits under SYNTHETIC_VOICE_FIXTURES. The guard runs before
+# the generic artifact rules so a failure names the privacy requirement.
+VOICE_DATA_SUFFIXES = {
+    ".wav",
+    ".pcm",
+    ".raw",
+    ".flac",
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".opus",
+    ".caf",
+    ".aif",
+    ".aiff",
+    ".aifc",
+    ".webm",
+    ".wave",
+    ".oga",
+    ".amr",
+    ".awb",
+    ".3gp",
+    ".3g2",
+    ".wma",
+    ".m4b",
+    ".m4p",
+    ".spx",
+    ".mka",
+    ".ac3",
+    ".au",
+    ".snd",
+    ".npy",
+    ".npz",
+    ".emb",
+    ".pt",
+    ".pth",
+    ".onnx",
+    ".mlmodel",
+    ".mlmodelc",
+    ".mlpackage",
+    ".safetensors",
+}
+VOICE_DATA_PARTS = {"enrollment", "enrollments", "voiceprint", "voiceprints"}
+# Path prefix -> why everything under it is synthetic. Inventory of tracked files on
+# 2026-10-09: none has a voice-data extension or segment, so the list is empty. An
+# entry needs a reviewed PR recording the synthetic source (an authored signal or a
+# TTS voice, never a recording of a real person). An entry lifts only the voice-data
+# and extension rules; the binary and size rules still apply.
+SYNTHETIC_VOICE_FIXTURES = {}
+VOICE_DATA_REASON = (
+    "voice audio/embedding/voiceprint outside the synthetic fixture allow-list "
+    "(privacy requirement #109; see CONTRIBUTING.md)"
+)
 IGNORE_CASES = {
     "src/rightyo.egg-info/PKG-INFO": True,
     "recordings/sample.unfamiliar": True,
@@ -79,6 +135,10 @@ IGNORE_CASES = {
     "wandb/sample.unfamiliar": True,
     "nested/example.npz": True,
     "nested/example.opus": True,
+    "nested/example.emb": True,
+    "enrollment/sample.unfamiliar": True,
+    "nested/voiceprints/sample.json": True,
+    "examples/enrolled-override.jsonl": False,
     ".env": True,
     ".env.local": True,
     "secrets/example.key": True,
@@ -96,13 +156,41 @@ def git_files(root):
     return [Path(p.decode()) for p in result.stdout.split(b"\0") if p]
 
 
-def artifact_reason(path, data):
+def synthetic_voice_fixture(path, fixtures=None):
+    """True only for a file strictly under an allow-listed synthetic fixture prefix."""
+    fixtures = SYNTHETIC_VOICE_FIXTURES if fixtures is None else fixtures
+    parts = PurePosixPath(path).parts
+    return any(
+        len(parts) > len(prefix) and parts[: len(prefix)] == prefix
+        for prefix in (PurePosixPath(entry).parts for entry in fixtures)
+    )
+
+
+def voice_data_reason(path, fixtures=None):
+    """Refuse voice audio, embeddings and enrollment paths outside synthetic fixtures."""
+    parts = [part.lower() for part in PurePosixPath(path).parts]
+    voice = any(PurePosixPath(part).suffix in VOICE_DATA_SUFFIXES for part in parts) or (
+        not VOICE_DATA_PARTS.isdisjoint(parts)
+    )
+    if voice and not synthetic_voice_fixture(path, fixtures):
+        return VOICE_DATA_REASON
+    return None
+
+
+def artifact_reason(path, data, fixtures=None):
     """Return a category only; never expose matched content or participant paths."""
+    voice = voice_data_reason(path, fixtures)
+    if voice:
+        return voice
     name = PurePosixPath(path)
     parts = {part.lower() for part in name.parts}
-    if parts & PRIVATE_PARTS or any(p.endswith((".mlmodelc", ".mlpackage")) for p in parts):
+    synthetic = synthetic_voice_fixture(path, fixtures)
+    if parts & PRIVATE_PARTS or (
+        not synthetic and any(p.endswith((".mlmodelc", ".mlpackage")) for p in parts)
+    ):
         return "private/artifact directory"
-    if name.suffix.lower() in PRIVATE_SUFFIXES:
+    suffix = name.suffix.lower()
+    if suffix in PRIVATE_SUFFIXES and not (synthetic and suffix in VOICE_DATA_SUFFIXES):
         return "private/artifact extension"
     if name.name == ".env" or (name.name.startswith(".env.") and name.name != ".env.example"):
         return "local environment"
