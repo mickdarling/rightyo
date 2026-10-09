@@ -34,6 +34,7 @@ from rightyo.speaker_id import (
     SpeakerEmbedder,
     SpeakerIdConfig,
     SpeakerIdError,
+    finite_number,
 )
 
 SCHEMA_VERSION = 1
@@ -207,14 +208,14 @@ def _entry(document: Any, identifier: str) -> dict[str, Any]:
     if (
         not isinstance(vector, list)
         or not 1 <= len(vector) <= 1024
-        or not all(type(value) in (int, float) and math.isfinite(value) for value in vector)
+        or not all(finite_number(value) for value in vector)
         or abs(math.sqrt(sum(value * value for value in vector)) - 1) > 1e-3
     ):
         raise ValueError
     if not isinstance(document["created_at"], str) or type(document["windows"]) is not int:
         raise ValueError
     seconds = document["speech_seconds"]
-    if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0:
+    if not finite_number(seconds) or seconds < 0:
         raise ValueError
     return document
 
@@ -318,6 +319,8 @@ class Store:
         self.create()
         if target.exists() and not replace:
             raise EnrollError("That identifier is already enrolled; pass --replace or delete it")
+        if os.path.lexists(target) and not self._ours(target):
+            raise EnrollError("That file is not a RightyO voiceprint; nothing was replaced")
         temporary = self.path / f".{entry['id']}.json.tmp-{os.getpid()}"
         payload = json.dumps(entry, allow_nan=False, indent=2).encode() + b"\n"
         try:

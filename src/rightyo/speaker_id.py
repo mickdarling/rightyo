@@ -124,8 +124,19 @@ def _worker(model: str, threads: int) -> int:
         protocol.close()
 
 
+def finite_number(value: Any) -> bool:
+    """A JSON number that is finite as a float; a huge int is rejected, never raised on.
+
+    `math.isfinite` raises OverflowError on an int too large for a float (a 400-digit
+    literal parses fine), so ints are compared instead of converted.
+    """
+    if type(value) is float:
+        return math.isfinite(value)
+    return type(value) is int and -1e308 < value < 1e308
+
+
 def _bounded(value: Any, low: float, high: float) -> bool:
-    return type(value) in (int, float) and math.isfinite(value) and low <= value <= high
+    return finite_number(value) and low <= value <= high
 
 
 @dataclass(frozen=True)
@@ -320,7 +331,7 @@ class SpeakerEmbedder:
         if (
             not isinstance(vector, list)
             or not 1 <= len(vector) <= MAX_EMBEDDING_DIM
-            or not all(type(item) in (int, float) and math.isfinite(item) for item in vector)
+            or not all(finite_number(item) for item in vector)
         ):
             self.close()
             raise SpeakerIdError("The speaker model failed")

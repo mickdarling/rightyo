@@ -514,6 +514,14 @@ class StorePrivacyTests(EnrollTestCase):
         self.assertTrue((self.store / "junk.json").exists())
         self.assertTrue((self.store / "other.json").exists())
 
+    def test_replace_refuses_a_file_that_is_not_a_voiceprint(self):
+        self.assertEqual(self.add("alex", self.wav("a.wav", tone(120, 35)))[0], 0)
+        stray = self.store / "notes.json"
+        stray.write_text('{"name": "x"}')
+        code, _, _, _ = self.add("notes", self.wav("b.wav", tone(160, 35)), "--replace")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(stray.read_text(), '{"name": "x"}')
+
     def test_delete_one_refuses_a_file_that_is_not_a_voiceprint(self):
         self.store.mkdir(mode=0o700, parents=True, exist_ok=True)
         (self.store / "package.json").write_text('{"name": "x"}')
@@ -586,6 +594,8 @@ class ConfigurationTests(EnrollTestCase):
             section | {"tentative_threshold": 0.6},  # equal to the bind threshold
             section | {"tentative_threshold": 0},
             section | {"bind_threshold": "0.6"},
+            section | {"bind_threshold": 10**400},  # parses, but overflows a float
+            section | {"min_turn_seconds": 10**400},
             section | {"min_turn_seconds": 0.1},
             section | {"threads": 0},
             section | {"enabled": "yes"},
