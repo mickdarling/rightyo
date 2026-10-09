@@ -81,7 +81,7 @@ class VoiceDataGuardTests(unittest.TestCase):
     def test_required_extensions_are_covered(self):
         required = (
             ".wav .pcm .flac .mp3 .m4a .aac .ogg .opus .caf .aif .aiff .npy .npz .emb"
-            " .pt .pth .onnx .mlmodel .mlpackage .safetensors"
+            " .pt .pth .onnx .mlmodel .mlpackage .safetensors .wave .oga .amr .3gp .wma .m4b .spx"
         ).split()
         self.assertTrue(set(required) <= VOICE_DATA_SUFFIXES)
 
@@ -139,6 +139,15 @@ class VoiceDataGuardTests(unittest.TestCase):
             artifact_reason("tests/fixtures/synthetic-voice/recordings/a.wav", b"x", fixtures),
             "private/artifact directory",
         )
+
+    def test_every_allow_list_entry_is_a_strict_relative_prefix(self):
+        # An empty, "." or escaping entry would match every path and switch the guard off.
+        for prefix in SYNTHETIC_VOICE_FIXTURES:
+            parts = prefix.split("/")
+            self.assertTrue(prefix and not prefix.startswith("/"), prefix)
+            self.assertNotIn("", parts, prefix)
+            self.assertNotIn(".", parts, prefix)
+            self.assertNotIn("..", parts, prefix)
 
     def test_allow_list_matches_current_inventory(self):
         # No tracked file is voice data today; any future entry must document why.
