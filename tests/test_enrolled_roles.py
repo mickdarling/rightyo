@@ -17,7 +17,18 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from test_edge_attribution import SPEECH, Timeline, Units
-from test_live_speaker_id import ENTRIES, RATE, ScriptedEmbedder, settings, tone, unit, wait_for
+from test_live_speaker_id import (
+    ENTRIES,
+    GUEST_F0,
+    OWNER_F0,
+    RATE,
+    ScriptedEmbedder,
+    ToneEmbedder,
+    settings,
+    tone,
+    unit,
+    wait_for,
+)
 from test_turn_merge import fragment
 
 from rightyo.contracts import (
@@ -238,7 +249,10 @@ class EnrolledRolesProviderTests(unittest.TestCase):
         for speaker in ("Speaker A", "Speaker B"):
             pcm = tone(2.0)  # one 3 s window: one scripted vector per turn
             shadow.audio(pcm)
-            shadow.turn(turn(f"t-{speaker}", received, received + 2000, "x", speaker))
+            shadow.turn(
+                turn(f"t-{speaker}", received, received + 2000, "x", speaker),
+                spans=((received, received + 2000),),
+            )
             received += 2000
         shadow.close(drain=True)
         self.assertEqual(shadow.binding("Speaker A"), ("bound", "owner"))
@@ -249,10 +263,12 @@ class EnrolledRolesProviderTests(unittest.TestCase):
         self.assertEqual(roles.role_for(turn("y", 0, 1, "x", "Speaker B")), "participant")
 
     def test_an_inferred_owner_tail_never_moves_a_guest_label_toward_owner(self):
-        """The owner's tail joined onto a guest's turn must not become guest evidence."""
-        guest, owner = unit(0, 1, 0), unit(1, 0, 0)
-        # Were the inferred turns embedded, these owner vectors would be accumulated.
-        embedder = ScriptedEmbedder([guest, owner, owner, owner, owner])
+        """The owner's tail joined onto a guest's turn must not become guest evidence.
+
+        Inferred turns are scored (#148), but only on the guest's own timeline pieces: the
+        tail's owner audio, outside them, is never embedded.
+        """
+        embedder = ToneEmbedder()
         lines = []
         shadow = ShadowSpeakerId(
             settings(bind_min_seconds=1.0),
@@ -263,21 +279,27 @@ class EnrolledRolesProviderTests(unittest.TestCase):
         shadow.start()
         received = 0
         for index, inferred in enumerate((False, True, True, True, True)):
-            shadow.audio(tone(2.0))
-            current = turn(f"g{index}", received, received + 2000, "x", "Speaker B")
-            shadow.turn(current, inferred=inferred)
-            received += 2000
+            if inferred:
+                # 2 s of the guest, then 1 s of the owner joined under the guest's label.
+                shadow.audio(tone(2.0, GUEST_F0) + tone(1.0, OWNER_F0))
+                end = received + 3000
+            else:
+                shadow.audio(tone(2.0, GUEST_F0))
+                end = received + 2000
+            current = turn(f"g{index}", received, end, "x", "Speaker B")
+            shadow.turn(current, inferred=inferred, spans=((received, received + 2000),))
+            received = end
         shadow.close(drain=True)
-        self.assertEqual(embedder.calls, 1)
-        self.assertEqual((shadow.scored, shadow.inferred, shadow.offered), (1, 4, 5))
+        self.assertEqual(embedder.frames["owner"], 0)
+        self.assertEqual((shadow.scored, shadow.inferred, shadow.offered), (5, 4, 5))
         state = shadow._labels["Speaker B"]
-        self.assertEqual((state.turns, state.state, state.identity), (1, "bound", "guest"))
+        self.assertEqual((state.turns, state.state, state.identity), (5, "bound", "guest"))
         self.assertLess(state.scores["owner"], 0.01)
         roles = EnrolledRoles(OWNER_ID)
         roles.source = shadow
         self.assertEqual(roles.role_for(turn("later", 0, 1, "x", "Speaker B")), "participant")
-        self.assertTrue(lines[-1].endswith(" inferred=4"))
-        self.assertEqual(len([line for line in lines if line.startswith("speaker_id label=")]), 1)
+        self.assertTrue(lines[-1].endswith(" inferred=4 unsegmented=0 labelled_ms=10000"))
+        self.assertEqual(len([line for line in lines if line.startswith("speaker_id label=")]), 5)
 
     def test_a_failed_identifier_reports_no_bindings(self):
         embedder = ScriptedEmbedder([unit(1, 0.1, 0)], fail_on=2)
@@ -294,7 +316,9 @@ class EnrolledRolesProviderTests(unittest.TestCase):
         received = 0
         for name in ("one", "two"):
             shadow.audio(tone(2.0))
-            shadow.turn(turn(name, received, received + 2000, "x"))
+            shadow.turn(
+                turn(name, received, received + 2000, "x"), spans=((received, received + 2000),)
+            )
             received += 2000
             if name == "one":
                 wait_for(lambda: shadow.binding("Speaker A") is not None)
@@ -755,6 +779,10 @@ class TwoSpeakerTurns:
             utterance = f"live-{self.count}"
             if self.count == 3:
                 self.config.on_inferred(utterance)
+            if self.config.on_labelled_spans is not None:
+                # Only the first 1.2 s of the inferred turn is its label's own audio.
+                end = start + 1200 if self.count == 3 else self.emitted_ms
+                self.config.on_labelled_spans(utterance, ((start, end),))
             self.on_turn(
                 Turn(
                     self.config.session_id,
@@ -783,6 +811,7 @@ class FakeShadow:
     def __init__(self, bindings):
         self.bindings = bindings
         self.turns = []
+        self.spans = []
         self.inferred = []
         self.closed = False
 
@@ -792,8 +821,9 @@ class FakeShadow:
     def audio(self, pcm):
         pass
 
-    def turn(self, current, *, inferred=False):
+    def turn(self, current, *, inferred=False, spans=None):
         self.turns.append(current.utterance_id)
+        self.spans.append(spans)
         if inferred:
             self.inferred.append(current.utterance_id)
             return
@@ -878,8 +908,10 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(roles, ["unknown", "unknown", "owner"])
         # The processor's inferred-label report reached the producer.
         self.assertEqual(set(self.publisher._inferred), {"live-3"})
-        # ...and the identifier, which counts the turn instead of scoring it.
+        # ...and the identifier, which counts the turn and is handed its own-label
+        # timeline pieces only (#148).
         self.assertEqual(shadows[0].inferred, ["live-3"])
+        self.assertEqual(shadows[0].spans, [((0, 2000),), ((2000, 4000),), ((4000, 5200),)])
         HaildModel(self).check(events)
 
     def test_load_requires_live_and_a_named_enrolled_role(self):
@@ -972,16 +1004,66 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(created[0].binding("Speaker A")[0], "bound")
         self.assertEqual(created[0].binding("Speaker B")[0], "unknown")
         self.assertFalse(any("Some words" in line for line in lines))
-        # The third (inferred) turn was counted, not embedded or accumulated.
-        self.assertEqual((created[0].scored, created[0].inferred), (2, 1))
-        self.assertEqual(embedder.calls, 2)
-        self.assertEqual(created[0]._labels["Speaker A"].turns, 1)
+        # The third (inferred) turn was counted, and scored on its labelled 1.2 s only.
+        self.assertEqual((created[0].scored, created[0].inferred), (3, 1))
+        self.assertEqual(embedder.calls, 3)
+        self.assertEqual(created[0]._labels["Speaker A"].turns, 2)
+        self.assertEqual(created[0]._labels["Speaker A"].seconds, 3.2)
         summary = [line for line in lines if line.startswith("speaker_id summary")]
         self.assertEqual(len(summary), 1)
-        self.assertIn(" inferred=1", summary[0])
+        self.assertIn(" inferred=1 unsegmented=0 labelled_ms=5200", summary[0])
 
-    def test_shadow_mode_also_skips_inferred_turns(self):
-        """Without roles too: inferred audio is never voiceprint evidence."""
+    def test_an_inferred_turn_scores_only_its_owner_audio_end_to_end(self):
+        """The owner's inferred turn binds the owner; the guest tail inside it never counts."""
+        demo = self.root / "two-voices.wav"
+        with wave.open(str(demo), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(RATE)
+            # A (owner) 0-2 s, B (guest) 2-4 s, A 4-5.2 s with B's 0.8 s tail joined to it.
+            audio.writeframes(
+                tone(2.0, OWNER_F0)
+                + tone(2.0, GUEST_F0)
+                + tone(1.2, OWNER_F0)
+                + tone(1.8, GUEST_F0)
+            )
+        embedder = ToneEmbedder()
+        created = []
+
+        def factory(settings, *, report):
+            created.append(
+                ShadowSpeakerId(
+                    settings,  # default bind_min_seconds: 3 s
+                    report=report,
+                    embedder_factory=lambda _settings: embedder,
+                    entries=lambda _settings: [dict(entry) for entry in ENTRIES],
+                )
+            )
+            return created[0]
+
+        config = replace(
+            self.base,
+            demo_audio=demo,
+            speakers=OWNER_ID,
+            speaker_id=self.identification(roles=True),
+        )
+        events = self.session(config, factory)
+        wait_for(lambda: created[0]._labels.get("Speaker A") is not None)
+        shadow = created[0]
+        # 2 s alone is below bind_min_seconds; the inferred turn's 1.2 s binds the owner.
+        self.assertEqual(shadow.binding("Speaker A"), ("bound", "owner"))
+        self.assertEqual(shadow._labels["Speaker A"].seconds, 3.2)
+        self.assertEqual(shadow.binding("Speaker B"), ("tentative", "guest"))  # 2 s only
+        # Of the guest's 2.8 s inside turn spans, only the 2 s labelled B was embedded.
+        self.assertEqual(embedder.frames["guest"], 100)
+        self.assertEqual((shadow.scored, shadow.inferred), (3, 1))
+        # The inferred turn still carries no owner authority: its role is the one emitted
+        # before the binding, and the inferred mark reached the producer unchanged.
+        self.assertEqual(set(self.publisher._inferred), {"live-3"})
+        HaildModel(self).check(events)
+
+    def test_shadow_mode_also_scores_only_labelled_audio_of_inferred_turns(self):
+        """Without roles too: inferred words' audio is never voiceprint evidence."""
         embedder = ScriptedEmbedder([unit(1, 0.1, 0), unit(0, 0, 1)])
         created = []
 
@@ -1001,7 +1083,8 @@ class ControllerTests(unittest.TestCase):
             replace(self.base, speaker_id=self.identification()), factory, report=lines.append
         )
         self.assertEqual((created[0].offered, created[0].inferred), (3, 1))
-        self.assertEqual(embedder.calls, 2)
+        self.assertEqual(embedder.calls, 3)
+        self.assertEqual(created[0].labelled_ms, 5200)
 
 
 if __name__ == "__main__":

@@ -147,12 +147,17 @@ What it does:
 
 - Each finalized turn with a session speaker label from the diarizer timeline (`Speaker A`)
   is scored. RightyO keeps the last 60 s of the session's audio in memory to cut the turn's
-  span from; nothing is written, and the buffer is cleared when the session ends.
-- The span is embedded the way `verify` does it: silence trimmed, 3 s windows, renormalised
-  mean. Turns with less than `min_turn_seconds` of speech, or with overlapping speakers, are
-  counted, not scored. So are turns with inferred-label words (edge attribution or a tail
-  join): their audio may be another speaker's, and accumulating it could bind one voice's
-  label to someone else's enrolled identity.
+  audio from; nothing is written, and the buffer is cleared when the session ends.
+- Only the parts of the turn's span that the diarizer timeline gave that label, and no
+  other speaker, are used (#148). Audio the timeline left unlabelled, gave to someone else,
+  or marked as overlap is left out, even inside the turn. Those parts are joined and
+  embedded the way `verify` does it: silence trimmed, 3 s windows, renormalised mean.
+- Turns with less than `min_turn_seconds` of speech in those parts, or with overlapping
+  speakers, are counted, not scored. So are turns for which the timeline gave the label no
+  part of the span (`unsegmented`).
+- Turns with inferred-label words (edge attribution or a tail join) are scored on their
+  labelled parts only. The inferred words lie outside the label's timeline segments, so
+  their audio, which may be another speaker's, is never accumulated into the label.
 - Each label accumulates a duration-weighted mean of its turn embeddings, renormalised, and
   that mean is scored against every voiceprint enrolled with the same model file.
 - A label is `bound` to an enrolled identifier once its accumulated score reaches
@@ -169,13 +174,13 @@ What it does:
 Each scored turn adds one stderr line, for example:
 
 ```text
-speaker_id label="Speaker A" turn_ms=2140 speech_ms=1880 turn_score=0.712 acc_score=0.781 acc_s=8.4 state=bound id=owner
+speaker_id label="Speaker A" turn_ms=2140 labelled_ms=1960 speech_ms=1880 turn_score=0.712 acc_score=0.781 acc_s=8.4 state=bound id=owner
 ```
 
 | Field | Meaning |
 | --- | --- |
 | `label` | The session speaker label (changes every session), always in double quotes |
-| `turn_ms` | The turn's span; `speech_ms` is the speech left after trimming silence |
+| `turn_ms` | The turn's span; `labelled_ms` is the part of it the timeline gave this label alone, and `speech_ms` the speech left in that after trimming silence |
 | `turn_score` | Cosine score of this turn alone against `id` |
 | `acc_score` | Cosine score of the label's accumulated mean against `id` |
 | `acc_s` | Seconds of speech accumulated for the label |
@@ -184,9 +189,11 @@ speaker_id label="Speaker A" turn_ms=2140 speech_ms=1880 turn_score=0.712 acc_sc
 
 The session also logs `speaker_id start enrolled=N` at start, and at the end one
 `speaker_id final label=…` line per label and a `speaker_id summary` line counting offered,
-scored, short, overlapping, dropped, clipped and inferred turns (clipped: part of the span
-was already outside the 60 s buffer; inferred: the turn had inferred-label words and was
-not scored). When a session ends, turns still queued are scored if the
+scored, short, overlapping, dropped, clipped, inferred and unsegmented turns, and the
+total `labelled_ms` taken from the buffer (clipped: part of the audio was already outside
+the 60 s buffer; inferred: the turn had inferred-label words, and was scored on its
+labelled parts only; unsegmented: the timeline gave the label no part of the turn, so it
+was not scored). When a session ends, turns still queued are scored if the
 stream ended normally, but that is best effort: `listen` stops the session moments after
 the end of input, so the last turn or two may be discarded rather than scored. A stopped or
 failed session discards them.
