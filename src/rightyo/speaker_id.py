@@ -152,6 +152,13 @@ class SpeakerIdConfig:
     enroll` uses it; with `live` true, live sessions also run shadow identification
     (#137 step 4a, `rightyo.live_speaker_id`): scores are logged, nothing else changes.
     A label binds only once `bind_min_seconds` of its speech has been accumulated.
+
+    `roles` (default false, requires `live`) applies the bindings (#137 step 4b): a label
+    bound to an enrolled identifier carries the role the `speakers` section gives that
+    identifier, and the session advertises `speakers: "enrolled"`. The optional
+    `enrolled_follow_up_min_probability` (above 0, up to 1; requires `roles`) lowers the
+    conversation-mode follow-up bar for an engaged owner or trusted speaker; it never
+    raises it.
     """
 
     python: Path
@@ -163,6 +170,8 @@ class SpeakerIdConfig:
     threads: int = 4
     live: bool = False
     bind_min_seconds: float = 3.0
+    roles: bool = False
+    enrolled_follow_up_min_probability: float | None = None
 
     @classmethod
     def from_dict(cls, value: Any) -> SpeakerIdConfig | None:
@@ -177,6 +186,8 @@ class SpeakerIdConfig:
             "threads",
             "live",
             "bind_min_seconds",
+            "roles",
+            "enrolled_follow_up_min_probability",
         }
         if not isinstance(value, dict) or set(value) - keys:
             raise ValueError("invalid speaker_id section")
@@ -197,6 +208,17 @@ class SpeakerIdConfig:
         threads = value.get("threads", 4)
         live = value.get("live", False)
         bind_min = value.get("bind_min_seconds", 3.0)
+        roles = value.get("roles", False)
+        follow_up = value.get("enrolled_follow_up_min_probability")
+        if (
+            type(roles) is not bool
+            or (roles and not live)
+            or (
+                follow_up is not None
+                and (not roles or not _bounded(follow_up, 0.0, 1.0) or follow_up == 0)
+            )
+        ):
+            raise ValueError("invalid speaker_id section")
         if (
             not _bounded(bind, 0.0, 1.0)
             or not _bounded(tentative, 0.0, 1.0)
@@ -218,6 +240,8 @@ class SpeakerIdConfig:
             threads,
             live,
             float(bind_min),
+            roles,
+            None if follow_up is None else float(follow_up),
         )
 
     def band(self, score: float) -> str:

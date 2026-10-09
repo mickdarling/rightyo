@@ -20,7 +20,9 @@ unattributed, non-overlapping fragment that starts within that many milliseconds
 held labelled, non-overlapping fragment's end, with the same session-stable
 `diarization-timeline` provenance, is joined into it and takes its speaker. Overlap is
 still never joined, nothing is joined into an unattributed held fragment, and a labelled
-fragment of another speaker is never joined.
+fragment of another speaker is never joined. A turn formed by a tail join, or joining a
+fragment marked `inferred` (edge-attributed words), is marked `"inferred": True`; the key
+is absent otherwise. Live identification roles (#137) use it to withhold owner authority.
 Fragments are plain dictionaries; the caller turns a
 released fragment into a `Turn` and assigns its utterance id at that moment, so ids stay
 unique and in emission order, and a joined turn reports the first fragment's start and
@@ -176,6 +178,10 @@ class TurnMerger:
             return
         if self._continues(fragment):
             held = self._held
+            if fragment["speaker"] is None or fragment.get("inferred"):
+                # A tail join, or a piece with edge-attributed words: the joined turn's
+                # label is partly inferred, which roles must know (#137). Absent otherwise.
+                held["inferred"] = True
             held["text"] = held["text"] + " " + fragment["text"]
             held["end_ms"] = max(held["end_ms"], fragment["end_ms"])
             self._hold_ms = self._hold_for(held)

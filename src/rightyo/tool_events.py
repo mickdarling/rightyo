@@ -130,6 +130,12 @@ class SpeechEvents:
         # emitted non-owner requests an owner's attended turn or stop phrase supersedes.
         self._priority = None
         self._roles = {}
+        # Live identification roles (#137 step 4b): resolved per turn from the provider's
+        # current bindings instead of fixed per speaker, with enrolled precedence.
+        self._per_turn = False
+        # Turns whose speaker label was partly inferred (edge attribution or tail join):
+        # they keep their role for attention and precedence, never for owner authority.
+        self._inferred = set()
         self._open = {}
         # Pending non-owner turns an owner superseded before their decisions arrived,
         # mapped to the owner's utterance: their late decisions never emit a request.
@@ -260,7 +266,13 @@ class SpeechEvents:
             self._seen.clear()
             self._decided.clear()
             self._roles.clear()
+            self._inferred.clear()
             self._priority = priority
+            self._per_turn = (
+                priority is not None
+                and getattr(priority, "per_turn", False) is True
+                and callable(getattr(priority, "role_for", None))
+            )
             self._former = former
             self._addressing = addressing
             self._dismissal = dismissal
@@ -378,7 +390,13 @@ class SpeechEvents:
                 self._queue_bytes += size
             self._queue = kept
 
-    def transcript(self, turn, now_ms, *, expect_decision=True):
+    def transcript(self, turn, now_ms, *, expect_decision=True, inferred=False):
+        """Emit one final turn; `inferred` marks a speaker label partly inferred (#137).
+
+        An inferred turn (edge-attributed words or a tail join) keeps its role for
+        attention and precedence, but never exercises owner or trusted authority:
+        no override, no owner stop phrase and only a limited dismissal.
+        """
         with self._lock:
             if not self._active:
                 raise ContractError("speech event session is not active")
@@ -386,6 +404,8 @@ class SpeechEvents:
                 raise ContractError("event producer requires a final turn in its active session")
             if type(expect_decision) is not bool:
                 raise ContractError("invalid decision expectation")
+            if type(inferred) is not bool:
+                raise ContractError("invalid inferred-label flag")
             integer(now_ms, "now_ms")
             self.expire(max(now_ms, turn.end_ms))
             digest = hashlib.sha256(
@@ -402,7 +422,17 @@ class SpeechEvents:
             context["turns"] = [t for t in context["turns"] if t["end_ms"] <= turn.start_ms]
             # The role is fixed before the first emission and repeated unchanged on the
             # decision, the request turn and every later context snapshot.
-            role = None if self._priority is None else self._assign_role(turn, context["turns"])
+            # With live identification the role is resolved per turn instead, from the
+            # bindings at this moment, and then repeated unchanged the same way.
+            role = (
+                None
+                if self._priority is None
+                else speaker_role(self._priority.role_for(turn))
+                if self._per_turn
+                else self._assign_role(turn, context["turns"])
+            )
+            if inferred and role is not None:
+                self._inferred.add(turn.utterance_id)
             self._memory.append(turn, role=role)
             self._seen[turn.utterance_id] = digest
             if turn.end_ms <= self._now - self.retention_ms:
@@ -419,7 +449,15 @@ class SpeechEvents:
             if self._dismissal is not None and self._stop_rules.is_stop_phrase(turn.text):
                 # The deterministic fast path (#98): an exact stop phrase dismisses at
                 # once, without waiting for (or depending on) the decision model.
-                plan = self._plan(turn, role, "stop", "stop-phrase", None, loose=False)
+                plan = self._plan(
+                    turn,
+                    role,
+                    "stop",
+                    "stop-phrase",
+                    None,
+                    loose=False,
+                    authority=self._authority_role(turn.utterance_id, role),
+                )
                 if plan is not None:
                     self._dismissed[turn.utterance_id] = plan["upgradable"]
                     self._emit("dismiss", **self._apply(turn, plan))
@@ -501,9 +539,23 @@ class SpeechEvents:
             return None
         return "full" if role == "trusted" else "playback"
 
-    def _plan(self, turn, role, kind, reason, confidence, *, loose):
-        """What a dismissal does, without changing state; None when it does nothing."""
-        authority = self._authority(role)
+    def _authority_role(self, key, role):
+        """The role a turn exercises authority with: an inferred label never grants one.
+
+        A turn with inferred-label words (#137) acts as `unknown` for overrides, owner stop
+        phrases, dismissal authority and owner supersession, whatever role it carries.
+        """
+        if key in self._inferred and role in {"owner", "trusted"}:
+            return "unknown"
+        return role
+
+    def _plan(self, turn, role, kind, reason, confidence, *, loose, authority=None):
+        """What a dismissal does, without changing state; None when it does nothing.
+
+        `role` is the turn's published role; `authority`, when given, is the role it acts
+        with (see `_authority_role`).
+        """
+        authority = self._authority(role if authority is None else authority)
         if authority is None:
             return None
         dismisser = self._facts(turn)
@@ -693,8 +745,13 @@ class SpeechEvents:
             at_ms=turn.end_ms,
         )
 
-    def _engage(self, turn, request_id):
-        """Engage a request's speaker, or extend their window; one speaker at a time."""
+    def _engage(self, turn, request_id, role=None):
+        """Engage a request's speaker, or extend their window; one speaker at a time.
+
+        With live identification roles (#113), an engaged owner or trusted speaker keeps
+        the engagement for their window: another speaker's request is still delivered, but
+        does not move the engagement to them.
+        """
         key = self._cooldown_key(self._facts(turn))
         if self._conversation is None or key is None:
             return
@@ -706,6 +763,16 @@ class SpeechEvents:
         if self._engaged is not None and self._engaged["key"] == key:
             # Each exchange extends the window; the state itself does not change.
             self._engaged["until_ms"] = max(self._engaged["until_ms"], until)
+            if self._per_turn:
+                self._engaged["role"] = role
+            return
+        if (
+            self._per_turn
+            and self._engaged is not None
+            and self._engaged.get("role") in {"owner", "trusted"}
+            and role not in {"owner", "trusted"}
+        ):
+            # Enrolled precedence: the window has not lapsed (`_lapse` ran first).
             return
         self._engaged = {
             "key": key,
@@ -713,6 +780,8 @@ class SpeechEvents:
             "from_ms": turn.end_ms,
             "until_ms": until,
         }
+        if self._per_turn:
+            self._engaged["role"] = role
         self._emit(
             "conversation",
             state="engaged",
@@ -733,13 +802,21 @@ class SpeechEvents:
             or evidence["label"] != "uncertain"
             or not self._engaged_with(turn)
             or decision.recipient not in {"system", "unknown"}
-            or decision.probabilities["attend"] < conversation.follow_up_min_probability
+            or decision.probabilities["attend"] < self._follow_up_bar(role)
             # A closing phrase ends the conversation; it is never a request of its own.
             or conversation.is_closing(turn.text)
         ):
             return False
         # Owner-only mode never lets another speaker's turn become a request.
         return not (role is not None and self._priority.priority.owner_only and role != "owner")
+
+    def _follow_up_bar(self, role):
+        """The follow-up attend bar: optionally lower for enrolled owners and trusted (#113)."""
+        bar = self._conversation.follow_up_min_probability
+        enrolled = getattr(self._priority, "follow_up_min_probability", None)
+        if self._per_turn and enrolled is not None and role in {"owner", "trusted"}:
+            return min(bar, enrolled)
+        return bar
 
     def _assign_role(self, turn, past):
         """Fix a speaker's role the first time that speaker is emitted in this session."""
@@ -849,6 +926,7 @@ class SpeechEvents:
                     # A degraded answer, as distinct from a genuine `uncertain`.
                     evidence["dismissal_status"] = "malformed"
             stop = False
+            authority = self._authority_role(key, role)
             if role is not None:
                 evidence["role"] = role
                 if key == self._degraded_turn:
@@ -858,7 +936,7 @@ class SpeechEvents:
                 if rules.owner_only and role != "owner" and evidence["label"] == "attend":
                     # Owner-only mode: other speakers remain context, never a request.
                     evidence["label"] = "ignore"
-                stop = role == "owner" and rules.is_stop_phrase(turn.text)
+                stop = authority == "owner" and rules.is_stop_phrase(turn.text)
             request_id = self._session + ":" + key
             superseded_by = self._superseded.pop(key, None)
             withdrawn_by = self._withdrawn.pop(key, None)
@@ -903,7 +981,7 @@ class SpeechEvents:
                 and superseded_by is None
                 and withdrawn_by is None
             )
-            overriding = role == "owner" and (attended or stop or dismissed)
+            overriding = authority == "owner" and (attended or stop or dismissed)
             plan = None
             if kind is not None:
                 plan = self._plan(
@@ -913,6 +991,7 @@ class SpeechEvents:
                     "decision",
                     event.decision.dismissal_confidence,
                     loose=event.decision.recipient == "system",
+                    authority=authority,
                 )
             # A pending turn withdrawn earlier only produces an event when it would have
             # formed a request.
@@ -1071,7 +1150,10 @@ class SpeechEvents:
                     del self._open[superseded]
                     self._delivered.pop(superseded, None)
                 for other, (earlier, _context, _size, other_role) in self._pending.items():
-                    if other_role != "owner" and earlier.end_ms <= turn.end_ms:
+                    if (
+                        self._authority_role(other, other_role) != "owner"
+                        and earlier.end_ms <= turn.end_ms
+                    ):
                         self._superseded.setdefault(other, key)
             if plan is not None:
                 self._dismissed[key] = plan["upgradable"]
@@ -1106,7 +1188,7 @@ class SpeechEvents:
                         # Bounded: the oldest delivered request can no longer be withdrawn.
                         del self._delivered[next(iter(self._delivered))]
                     self._delivered[request_id] = self._facts(turn)
-                if role is not None and role != "owner":
+                if role is not None and authority != "owner":
                     if len(self._open) >= self.max_open:
                         # Fail closed before an owner's override burst could overflow the
                         # queue; nothing is silently dropped.
@@ -1115,7 +1197,7 @@ class SpeechEvents:
                         raise ContractError("open request budget exceeded")
                     self._open[request_id] = turn.end_ms
                 if self._conversation is not None and not self._conversation.is_closing(turn.text):
-                    self._engage(turn, request_id)
+                    self._engage(turn, request_id, role)
                 if ack.get("acknowledge") is True:
                     self._hold_ack(turn)
                 if ack_note is not None and self._report is not None:

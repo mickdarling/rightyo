@@ -9,10 +9,12 @@ accumulated vector is scored against the enrolled voiceprints made with the same
 and each label gets a shadow binding state: `bound` to an enrolled identifier, `tentative`
 or `unknown`.
 
-Nothing here changes turns, roles, requests, attention or events: the result is a
-content-free stderr note per scored turn (labels, enrolled identifiers, durations and
-scores only; never audio, embeddings, transcript text or paths), which is calibration data
-for the accumulated-score thresholds (#141). A later step applies roles (#113).
+In shadow mode nothing here changes turns, roles, requests, attention or events: the
+result is a content-free stderr note per scored turn (labels, enrolled identifiers,
+durations and scores only; never audio, embeddings, transcript text or paths), which is
+calibration data for the accumulated-score thresholds (#141). With `"roles": true` (#137
+step 4b, #113), `EnrolledRoles` reads the current bindings when each turn is emitted and
+gives a bound label its enrolled identifier's configured role; it never waits for one.
 
 Embedding runs on a dedicated worker thread behind a small bounded queue, never on the
 audio thread: when the worker is busy, a turn is dropped and counted. A worker that fails
@@ -31,7 +33,9 @@ from array import array
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
+from rightyo.contracts import SpeakerPriority
 from rightyo.enroll import MAX_VERIFY_SECONDS, Store, cosine, normalize, speech, voiceprint
+from rightyo.providers import ConfiguredPriorityProvider
 from rightyo.speaker_id import SAMPLE_RATE, SpeakerEmbedder, SpeakerIdConfig
 
 BYTES_PER_MS = 32  # mono PCM16 at 16 kHz
@@ -187,6 +191,21 @@ class ShadowSpeakerId:
 
     def start(self) -> None:
         self._thread.start()
+
+    def binding(self, label: str) -> tuple[str, str | None] | None:
+        """A label's current state and identifier, or None before it was first scored.
+
+        Never blocks: committed `LabelState` objects are replaced, never changed, so this
+        reads one consistent snapshot without waiting for the worker. Once identification
+        has switched itself off mid-session (a failed model, no voiceprint), no label is
+        reported bound any more.
+        """
+        if self._off.is_set() and not (self._closing.is_set() or self._stop.is_set()):
+            return None
+        state = self._labels.get(label)
+        if state is None:
+            return None
+        return state.state, state.identity
 
     def _report(self, message: str) -> None:
         if self._report_to is not None:
@@ -345,3 +364,50 @@ class ShadowSpeakerId:
             f" short={self.short} overlap={self.overlap} dropped={self.dropped}"
             f" clipped={self.clipped}"
         )
+
+
+class EnrolledRoles(ConfiguredPriorityProvider):
+    """Per-turn speaker roles from live identification (#137 step 4b); never blocks.
+
+    `role_for` is asked once per turn when the turn is first emitted, and reads whatever
+    the identifier has bound by then:
+
+    - no speaker label: `unknown`;
+    - a label configured by session label in `speakers`: that role, as before;
+    - a label bound to an enrolled identifier: the role `speakers` gives that identifier
+      (`owner` or `trusted`), else `participant`;
+    - a label scored and matching no enrolled voice (`unknown` state): `participant`;
+    - a label not yet scored, `tentative`, or with identification off: `unknown`.
+
+    Only session-stable, unoverlapped `diarization-timeline` labels are ever looked up,
+    since those are the only ones the identifier scores.
+    """
+
+    # Read by `SpeechEvents`: roles are resolved per turn, and enrolled precedence applies.
+    per_turn = True
+
+    def __init__(self, priority: SpeakerPriority, follow_up_min_probability=None) -> None:
+        super().__init__(priority)
+        self.follow_up_min_probability = follow_up_min_probability
+        self.source = None  # the session's `ShadowSpeakerId`, once started
+
+    def role_for(self, turn) -> str:
+        label = turn.speaker_id
+        if label is None:
+            return "unknown"
+        configured = self.priority.configured_role(label)
+        if configured is not None:
+            return configured
+        source = self.source
+        if source is None or turn.overlap or turn.speaker_provenance != "diarization-timeline":
+            return "unknown"
+        try:
+            binding = source.binding(label)
+        except Exception:  # noqa: BLE001 - identification never fails the session
+            binding = None
+        if binding is None:
+            return "unknown"
+        state, identity = binding
+        if state == "bound" and identity is not None:
+            return self.priority.configured_role(identity) or "participant"
+        return "participant" if state == "unknown" else "unknown"

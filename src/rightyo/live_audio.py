@@ -103,6 +103,10 @@ class LiveConfig:
     # Called with (utterance_id, post_turn_gap) just before `on_turn` for each turn whose
     # gap was observed, so a decision can use it without changing the `Turn` contract.
     on_post_turn_gap: Callable[[str, dict[str, Any]], None] | None = None
+    # Called with the utterance id just before `on_turn` for each turn whose speaker label
+    # was partly inferred (edge attribution or tail join), so roles can withhold owner
+    # authority from it (#137) without changing the `Turn` contract.
+    on_inferred: Callable[[str], None] | None = None
     # Optional end-of-turn model (#117), such as `SmartTurn.score`: called with the open
     # utterance's PCM once `end_of_turn_silence_ms` of silence follows speech, returning
     # P(turn complete). At or above `end_of_turn_threshold` the utterance is finalized as
@@ -116,14 +120,16 @@ class LiveConfig:
     # slightly past the segment, or the word has zero length) takes the utterance's only
     # labelled speaker when the word overlaps no one and either touches only that
     # speaker's segments or, touching none, lies within this many milliseconds of one.
-    # A second speaker's first word in that slack would be mislabelled, so roles refuse
-    # it (see `PrototypeController.start`). Only for `diarization-timeline`.
+    # A second speaker's first word in that slack would be mislabelled, so session-label
+    # roles refuse it (see `PrototypeController.start`); live identification roles allow
+    # it but withhold owner authority from such a turn (`on_inferred`, #137). Only for
+    # `diarization-timeline`.
     edge_attribution_ms: int = 0
     # Tail join (opt-in, 0 = off; #129). Also an inference: an unlabelled, non-overlapping
     # turn starting within this many milliseconds of a held labelled turn's end joins it
     # and takes its speaker (see `TurnMerger`). Edge attribution only reaches words near
     # the speaker's timeline segment; this catches the rest of a trailing piece. Refused
-    # with roles, like edge attribution.
+    # with session-label roles, and reported through `on_inferred`, like edge attribution.
     tail_join_ms: int = 0
     end_of_turn_threshold: float = 0.5
     end_of_turn_silence_ms: int = 200
@@ -144,6 +150,8 @@ class LiveConfig:
             raise LiveAudioError("Invalid tail join window") from None
         if self.on_post_turn_gap is not None and not callable(self.on_post_turn_gap):
             raise LiveAudioError("Invalid post-turn gap observer")
+        if self.on_inferred is not None and not callable(self.on_inferred):
+            raise LiveAudioError("Invalid inferred-label observer")
         if self.turn_break is not None and not callable(self.turn_break):
             raise LiveAudioError("Invalid turn break predicate")
         if self.end_of_turn is not None and not callable(self.end_of_turn):
@@ -538,24 +546,27 @@ def _attribute(start: int, end: int, timeline: list[dict[str, Any]]) -> tuple[st
 
 def _attribute_edges(
     attributed: list[list[Any]], timeline: list[dict[str, Any]], gap_ms: int
-) -> None:
+) -> set[int]:
     """Give unlabelled edge words the utterance's only labelled speaker, in place.
+
+    Returns the indices of the entries it labelled: their labels are inferred (#137).
 
     Each entry is `[unit, start, end, speaker, overlap]`. Only when the utterance has
     exactly one labelled speaker; only for a word that overlaps no one and either touches
     segments of that speaker alone, or touches no segment and lies within `gap_ms` of one
     of that speaker's segments (timestamps running just past the segment's edge).
     """
+    inferred: set[int] = set()
     labels = {entry[3] for entry in attributed if entry[3] is not None}
     if len(labels) != 1:
-        return
+        return inferred
     label = next(iter(labels))
     own = [
         (segment["start_ms"], segment["end_ms"])
         for segment in timeline
         if "Speaker " + _speaker_label(segment["speaker"]) == label
     ]
-    for entry in attributed:
+    for index, entry in enumerate(attributed):
         _, start, end, speaker, overlap = entry
         if speaker is not None or overlap:
             continue
@@ -567,6 +578,8 @@ def _attribute_edges(
         near = any(max(start - seg_end, seg_start - end, 0) <= gap_ms for seg_start, seg_end in own)
         if touching == {label} or (not touching and near):
             entry[3] = label
+            inferred.add(index)
+    return inferred
 
 
 def _speaker_label(number: int) -> str:
@@ -1082,10 +1095,11 @@ class LiveProcessor:
         for unit in units:
             start, end = unit["start_ms"] + offset, unit["end_ms"] + offset
             attributed.append([unit, start, end, *_attribute(start, end, relevant)])
+        inferred: set[int] = set()
         if self.config.edge_attribution_ms and provenance == "diarization-timeline":
-            _attribute_edges(attributed, relevant, self.config.edge_attribution_ms)
+            inferred = _attribute_edges(attributed, relevant, self.config.edge_attribution_ms)
         groups: list[dict[str, Any]] = []
-        for unit, start, end, speaker, overlap in attributed:
+        for index, (unit, start, end, speaker, overlap) in enumerate(attributed):
             if speaker is not None and provenance == "diarization-utterance":
                 # Per-request labels are namespaced by utterance so that equal labels
                 # from independent requests can never be merged into one participant.
@@ -1103,6 +1117,9 @@ class LiveProcessor:
                         "overlap": overlap,
                     }
                 )
+            if index in inferred:
+                # Edge-attributed words make the group's label partly inferred (#137).
+                groups[-1]["inferred"] = True
         kept = [group for group in groups if group["text"].strip()]
         for index, group in enumerate(kept):
             group["text"] = group["text"].strip()
@@ -1115,6 +1132,7 @@ class LiveProcessor:
         """Number and emit one finalized (possibly joined) turn; ids follow emission order."""
         self._counter += 1
         gap = group.pop("post_turn_gap", None)
+        inferred = group.pop("inferred", False) is True
         turn = Turn(
             session_id=self.config.session_id,
             utterance_id=f"live-{self._counter}",
@@ -1131,6 +1149,8 @@ class LiveProcessor:
         )
         if gap is not None and self.config.on_post_turn_gap is not None:
             self.config.on_post_turn_gap(turn.utterance_id, gap)
+        if inferred and self.config.on_inferred is not None:
+            self.config.on_inferred(turn.utterance_id)
         self.on_turn(turn)
 
     def finish(self) -> None:

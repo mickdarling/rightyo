@@ -349,7 +349,8 @@ the range 0 to 5,000, and 0 turns joining off. A joined turn:
   labelled, non-overlapping turn's end, both with session-stable `diarization-timeline`
   provenance, is joined into that turn and takes its label. Utterance-local labels are
   never extended this way. Overlap is still never joined, nothing joins a held turn without a
-  label, and it is refused together with configured speaker roles.
+  label, and it is refused together with configured speaker roles, except
+  [roles from live speaker identification](#roles-from-live-speaker-identification).
 
 A joined turn spans at most twice `max_utterance_ms` (24 s by default) and 4,000
 characters; a piece that would exceed either starts a new turn. A role is still fixed
@@ -390,7 +391,9 @@ configuration's `speakers` object or the `--owner`, `--trusted`, `--owner-only` 
 `speakers: "enrolled"` and every turn object (in `transcript`, the `request` turn and
 `context.turns`) and every decision object carries `role`, one of the literals `owner`,
 `trusted`, `participant` or `unknown`. A role is fixed the first time a speaker is
-emitted in a session and never changes afterwards; a turn without a speaker label is
+emitted in a session and never changes afterwards (with
+[live speaker identification](#roles-from-live-speaker-identification), it is resolved
+per turn instead); a turn without a speaker label is
 `unknown`. Roles are descriptive data from configuration or a model answer. They are
 not authentication, they do not verify who is speaking, and they never unlock anything
 on the host: the host's own policy and confirmation flow decide what any request may do.
@@ -454,6 +457,56 @@ emission order; a later non-owner request that happened to be decided first stay
 [The enrolled fixture](../examples/enrolled-override.jsonl) shows a participant's
 attended request followed by the owner's "Ignore that." override; the shared anonymous
 fixture above is byte-identical to before.
+
+### Roles from live speaker identification
+
+Session labels change every session, so configured roles above only suit authored or
+replayed input. With live speaker identification
+([#137](https://github.com/mickdarling/rightyo/issues/137) step 4b,
+[speaker enrollment](speaker-enrollment.md)), a role follows an enrolled voice instead.
+It is opt-in: the `speaker_id` section sets `"live": true` and `"roles": true`, and the
+`speakers` section names enrolled identifiers (`"owner": ["owner"]`). Without
+`"roles": true` nothing in this section applies and the output is unchanged. With it,
+the session advertises `speakers: "enrolled"`, and everything above applies, with these
+differences:
+
+- **A role is resolved per turn, not fixed per speaker.** When a turn is first emitted,
+  its role comes from the identifier's binding for its label at that moment: a label
+  bound to an enrolled identifier takes the role `speakers` gives that identifier
+  (`owner` or `trusted`), or `participant` for an enrolled identifier given no role. A
+  label the identifier scored and matched to no enrolled voice is `participant`. A label
+  not yet scored, or only `tentative`, is `unknown`, as is a turn without a label and any
+  turn while identification is off or failed. A session label named in `speakers` keeps
+  its configured role as before.
+- **Binding is asynchronous and never waited for.** The identifier scores a turn on its
+  own thread after the turn is emitted, so a turn's role reflects the turns before it. A
+  voice's first turns in a session are therefore `unknown` until its label has
+  accumulated `bind_min_seconds` of speech (3 s by default) at or above `bind_threshold`;
+  the turns after that carry the role. A turn keeps the role it was emitted with on its
+  `attention`, its `request` and in every later context snapshot, even if the binding
+  changes before its decision arrives, so a host's fingerprint checks still match. A label
+  that falls below `tentative_threshold` loses its binding, and its later turns lose the
+  role.
+- **Precedence for enrolled owners and trusted speakers
+  ([#113](https://github.com/mickdarling/rightyo/issues/113)).** They get the owner and
+  trusted behaviours above (override, stop phrases, full dismissal authority). In
+  [conversation mode](#conversation-mode), an engaged owner or trusted speaker keeps the
+  engagement for its window: another speaker's request is still delivered but does not
+  move the engagement away. The optional `speaker_id.enrolled_follow_up_min_probability`
+  lowers the follow-up bar for an engaged owner or trusted speaker; it never raises it.
+  Unenrolled voices are not blocked: they keep today's behaviour, and `owner_only` stays
+  an explicit, separate choice.
+- **Inferred labels keep their role but carry no authority.** Edge attribution and tail
+  join may run alongside these roles. A turn with any inferred-label words (an
+  edge-attributed word or a tail join) keeps its speaker's role for attention, follow-ups
+  and engagement, but acts as `unknown` for authority: it emits no `override`, its stop
+  phrase supersedes nothing, its dismissal only stops playback, it supersedes no pending
+  decision, and its own request stays open to a later owner override. Only a turn without
+  inferred words exercises owner authority. The inference is internal; no event field
+  marks it.
+
+Logs stay content-free: the identifier's stderr lines carry labels, enrolled identifiers,
+durations and scores only.
 
 ## Conversation mode
 
