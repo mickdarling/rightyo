@@ -47,6 +47,13 @@ See [the tool guide](docs/tool-quickstart.md) for the event contract, Hailing St
 limits, and contribution checks. Replies, acknowledgement voices, routing, and tool
 execution belong to the consuming application.
 
+## Enroll speakers locally
+
+`rightyo enroll` computes a voiceprint for each person you enroll and stores it only on
+your machine (mode 700, never inside a repository checkout), with `list`, `verify` and
+`delete`. You provision the model yourself; RightyO never downloads it. Live identification
+is not wired yet. See [speaker enrollment](docs/speaker-enrollment.md).
+
 ## Try the replay MVP
 
 Python 3.11 or newer is sufficient for synthetic replay; the runtime has no Python dependencies. See [the MVP guide](docs/mvp.md) for secure credentials, local audio and speaker imports, and the limits of the experiment.

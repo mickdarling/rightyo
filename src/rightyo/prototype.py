@@ -56,6 +56,7 @@ from rightyo.providers import (
     unavailable_decision,
 )
 from rightyo.smart_turn import EndOfTurn, SmartTurn, SmartTurnError
+from rightyo.speaker_id import SpeakerIdConfig
 from rightyo.speech_backends import (
     HostedSpeechError,
     describe,
@@ -216,6 +217,10 @@ class PrototypeConfig:
     # acknowledgement on confidence or a name. Absent means off (every request is
     # acknowledged, as before); `{}` turns it on with the default threshold.
     acknowledgement: Acknowledgement | None = None
+    # The optional `speaker_id` section (#137 step 3): the local speaker-embedding model
+    # and enrollment store used by `rightyo enroll`. Absent or `"enabled": false` means
+    # off. Live identification (step 4) does not read it yet.
+    speaker_id: SpeakerIdConfig | None = None
 
     @property
     def hosted_speech(self) -> bool:
@@ -260,6 +265,7 @@ class PrototypeConfig:
                 "end_of_turn",
                 "conversation",
                 "acknowledgement",
+                "speaker_id",
                 *LOCAL_ASSETS,
             }
             if raw.keys() - required - optional:
@@ -286,6 +292,9 @@ class PrototypeConfig:
             end_of_turn = raw.pop("end_of_turn", None)
             if end_of_turn is not None:
                 end_of_turn = EndOfTurn.from_dict(end_of_turn)
+            speaker_id = raw.pop("speaker_id", None)
+            if speaker_id is not None:
+                speaker_id = SpeakerIdConfig.from_dict(speaker_id)
             turns = raw.pop("turns", {})
             if not isinstance(turns, dict) or set(turns) - {
                 "merge_gap_ms",
@@ -326,11 +335,16 @@ class PrototypeConfig:
                 end_of_turn=end_of_turn,
                 conversation=conversation,
                 acknowledgement=acknowledgement,
+                speaker_id=speaker_id,
             )
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
             if end_of_turn is not None and not (
                 end_of_turn.python.is_file() and end_of_turn.model.is_file()
+            ):
+                raise ValueError
+            if speaker_id is not None and not (
+                speaker_id.python.is_file() and speaker_id.model.is_file()
             ):
                 raise ValueError
             return config

@@ -251,6 +251,76 @@ def _add_name_option(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _record_seconds(low: int, high: int):
+    def parse(text: str) -> int:
+        try:
+            value = int(text)
+        except ValueError:
+            value = 0
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError(f"record between {low} and {high} seconds")
+        return value
+
+    return parse
+
+
+def _add_enroll_parser(commands) -> None:
+    enroll = commands.add_parser(
+        "enroll",
+        help="manage local speaker voiceprints (stored only on this machine; #137)",
+    )
+    actions = enroll.add_subparsers(dest="enroll_command", required=True)
+
+    def common(parser, *, config_required):
+        parser.add_argument(
+            "--config",
+            type=Path,
+            required=config_required,
+            help="local configuration with a speaker_id section",
+        )
+        parser.add_argument(
+            "--store",
+            type=Path,
+            help="enrollment directory (default: the speaker_id store, else "
+            "~/Library/Application Support/RightyO/enrollment)",
+        )
+
+    def source(parser, low, high):
+        group = parser.add_mutually_exclusive_group(required=True)
+        group.add_argument(
+            "--from",
+            dest="audio",
+            type=Path,
+            metavar="WAV",
+            help="16 kHz mono 16-bit PCM WAV, read into memory only",
+        )
+        group.add_argument(
+            "--record",
+            type=_record_seconds(low, high),
+            metavar="SECONDS",
+            help="record this many seconds from the microphone into memory only",
+        )
+
+    add = actions.add_parser(
+        "add", help="enroll a speaker from 20 s or more of speech (record 30 s or more)"
+    )
+    add.add_argument("--id", required=True, help="identifier: lowercase letters, digits, - or _")
+    add.add_argument("--name", help="display name (default: the identifier)")
+    add.add_argument("--replace", action="store_true", help="replace an existing voiceprint")
+    source(add, 30, 120)
+    common(add, config_required=True)
+    listing = actions.add_parser("list", help="list enrolled speakers")
+    common(listing, config_required=False)
+    remove = actions.add_parser("delete", help="delete one voiceprint or all of them")
+    target = remove.add_mutually_exclusive_group(required=True)
+    target.add_argument("--id")
+    target.add_argument("--all", action="store_true")
+    common(remove, config_required=False)
+    check = actions.add_parser("verify", help="score a clip against enrolled voiceprints")
+    source(check, 1, 30)
+    common(check, config_required=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="RightyO explicit transcript-first experiments")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -354,7 +424,12 @@ def main(argv: list[str] | None = None) -> int:
     _add_speaker_options(tool_replay)
     _add_request_former_option(tool_replay)
     _add_dismissal_option(tool_replay)
+    _add_enroll_parser(commands)
     args = parser.parse_args(argv)
+    if args.command == "enroll":
+        from rightyo.enroll import run
+
+        return run(args)
     try:
         if args.command in {"listen", "tool-replay"}:
             from rightyo.prototype import PrototypeError
