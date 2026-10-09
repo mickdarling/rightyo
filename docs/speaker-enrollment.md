@@ -15,8 +15,10 @@ you check locally that enrollment separates the people you enrolled.
   `--record`, into memory only. It is embedded and discarded, never written.
 - The store holds one JSON file per enrolled speaker: the voiceprint vector and minimal
   metadata (identifier, display name, model identity, creation time, seconds of speech used,
-  window count). The directory is mode 700 and each file mode 600; RightyO tightens looser
-  modes when it opens the store.
+  window count), plus an empty `.rightyo-voice-store` marker. The directory is mode 700 and
+  each voiceprint mode 600; RightyO tightens looser modes only in a directory carrying the
+  marker, so a mistaken `--store` never has its permissions changed. `add` creates the store,
+  or adopts an empty directory, and refuses an existing directory that holds other files.
 - The default store is `~/Library/Application Support/RightyO/enrollment/`. RightyO refuses a
   store inside any Git checkout, a symlinked store, or one owned by another user.
 - Command output carries identifiers, display names, durations and scores only: no audio,
@@ -104,7 +106,9 @@ afconvert -f WAVE -d LEI16@16000 -c 1 input.m4a /private/tmp/enroll.wav
 - Identifiers are 1 to 32 lowercase letters, digits, `-` or `_`. Adding an existing
   identifier is refused unless you pass `--replace`.
 - `list` and `delete` need no configuration; pass `--config` or `--store` if you moved the
-  store. `delete --all` removes every voiceprint and then the directory.
+  store. `delete` removes only RightyO voiceprints (and RightyO's own temporary files),
+  never other files; `delete --all` removes every voiceprint, then the marker and the
+  directory once nothing else is left.
 - `verify` (1 to 30 s of speech) prints one cosine score per enrolled speaker with its band:
   `bind` at or above `bind_threshold`, `tentative` at or above `tentative_threshold`,
   otherwise `below`. Voiceprints made with a different model file are counted, not scored;

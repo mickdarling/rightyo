@@ -376,7 +376,9 @@ class VerifyTests(EnrollTestCase):
         self.assertTrue(captures[0].started and captures[0].stopped)
         self.assertEqual(captures[0].helper, self.asset)
         self.assertAlmostEqual(result["speech_seconds"], 35, delta=0.1)
-        self.assertEqual(sorted(p.name for p in self.store.iterdir()), ["alex.json"])
+        self.assertEqual(
+            sorted(p.name for p in self.store.iterdir()), [".rightyo-voice-store", "alex.json"]
+        )
 
 
 class StorePrivacyTests(EnrollTestCase):
@@ -385,7 +387,9 @@ class StorePrivacyTests(EnrollTestCase):
         self.assertEqual(stat.S_IMODE(self.store.stat().st_mode), 0o700)
         entry_path = self.store / "alex.json"
         self.assertEqual(stat.S_IMODE(entry_path.stat().st_mode), 0o600)
-        self.assertEqual([p.name for p in self.store.iterdir()], ["alex.json"])
+        self.assertEqual(
+            sorted(p.name for p in self.store.iterdir()), [".rightyo-voice-store", "alex.json"]
+        )
         entry = json.loads(entry_path.read_text())
         self.assertEqual(
             set(entry),
@@ -480,7 +484,35 @@ class StorePrivacyTests(EnrollTestCase):
         code, result, _, _ = self.enroll("delete", "--all", "--store", str(self.store))
         self.assertEqual(code, 0)
         self.assertEqual(result["deleted"], ["alex"])
-        self.assertEqual(sorted(p.name for p in self.store.iterdir()), sorted(bystanders))
+        self.assertEqual(
+            sorted(p.name for p in self.store.iterdir()),
+            sorted([*bystanders, ".rightyo-voice-store"]),
+        )
+
+    def test_a_mistaken_store_keeps_its_permissions_and_is_not_taken_over(self):
+        home = self.root / "home-like"
+        home.mkdir(mode=0o755)
+        bystander = home / "package.json"
+        bystander.write_text('{"name": "x"}')
+        bystander.chmod(0o644)
+        for action in (("list",), ("delete", "--all"), ("delete", "--id", "package")):
+            self.enroll(*action, "--store", str(home))
+        self.assertEqual(stat.S_IMODE(home.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(bystander.stat().st_mode), 0o644)
+        code, _, _, _ = self.add("alex", self.wav("a.wav", tone(120, 35)), "--store", str(home))
+        self.assertNotEqual(code, 0)
+        self.assertEqual(sorted(p.name for p in home.iterdir()), ["package.json"])
+
+    def test_only_a_strictly_shaped_voiceprint_counts_as_ours(self):
+        self.assertEqual(self.add("alex", self.wav("a.wav", tone(120, 35)))[0], 0)
+        junk = {"schema_version": True, "id": "junk", "model": 0, "embedding": 0}
+        (self.store / "junk.json").write_text(json.dumps(junk))
+        (self.store / "other.json").write_text(json.dumps({**junk, "schema_version": 1, "id": "x"}))
+        code, result, _, _ = self.enroll("delete", "--all", "--store", str(self.store))
+        self.assertEqual(code, 0)
+        self.assertEqual(result["deleted"], ["alex"])
+        self.assertTrue((self.store / "junk.json").exists())
+        self.assertTrue((self.store / "other.json").exists())
 
     def test_delete_one_refuses_a_file_that_is_not_a_voiceprint(self):
         self.store.mkdir(mode=0o700, parents=True, exist_ok=True)

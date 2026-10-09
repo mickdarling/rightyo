@@ -50,6 +50,7 @@ RELATIVE_FLOOR = 10 ** (-35 / 10)  # a frame is speech within 35 dB of the loude
 ABSOLUTE_FLOOR = 1e-6 * 32768**2  # and above -60 dBFS
 MAX_ENTRY_BYTES = 65536
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+STORE_MARKER = ".rightyo-voice-store"
 TEMPORARY = re.compile(r"\.[a-z0-9][a-z0-9_-]{0,31}\.json\.tmp-[0-9]+")
 
 
@@ -230,7 +231,12 @@ class Store:
         self.path = path
 
     def _check(self) -> bool:
-        """Whether the store exists; tightens its permissions and refuses anything odd."""
+        """Whether the store exists; refuses anything odd; tightens only a marked store.
+
+        A mistaken `--store` (a home or project directory) must never have its permissions
+        changed: only a directory carrying our marker is tightened, and then only the
+        voiceprints in it.
+        """
         try:
             info = os.lstat(self.path)
         except FileNotFoundError:
@@ -239,23 +245,46 @@ class Store:
             raise EnrollError("The enrollment store could not be read") from None
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise EnrollError("The enrollment store must be a directory owned by you")
+        if not self._marked():
+            return True
         try:
             os.chmod(self.path, 0o700)
             for child in self.path.iterdir():
-                if child.suffix == ".json" and child.is_file() and not child.is_symlink():
+                if (
+                    child.suffix == ".json"
+                    and child.is_file()
+                    and not child.is_symlink()
+                    and self._ours(child)
+                ):
                     os.chmod(child, 0o600)
         except OSError:
             raise EnrollError("The enrollment store could not be secured") from None
         return True
 
+    def _marked(self) -> bool:
+        marker = self.path / STORE_MARKER
+        return marker.is_file() and not marker.is_symlink()
+
     def create(self) -> None:
+        """Create the store, or adopt an empty directory; never take over one in use."""
         if self._check():
-            return
+            if self._marked():
+                return
+            if any(self.path.iterdir()):
+                raise EnrollError(
+                    "That directory is not an enrollment store; choose a new or empty directory"
+                )
+        else:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                os.mkdir(self.path, 0o700)
+            except FileExistsError:
+                pass
+            except OSError:
+                raise EnrollError("The enrollment store could not be created") from None
         try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            os.mkdir(self.path, 0o700)
-        except FileExistsError:
-            pass
+            fd = os.open(self.path / STORE_MARKER, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            os.close(fd)
         except OSError:
             raise EnrollError("The enrollment store could not be created") from None
         self._check()
@@ -328,8 +357,10 @@ class Store:
             return False
         return (
             isinstance(document, dict)
-            and document.get("schema_version") == SCHEMA_VERSION
-            and {"id", "model", "embedding"} <= set(document)
+            and type(document.get("schema_version")) is int
+            and document["schema_version"] == SCHEMA_VERSION
+            and document.get("id") == child.stem
+            and {"model", "embedding"} <= set(document)
         )
 
     def delete(self, identifier: str) -> bool:
@@ -356,6 +387,9 @@ class Store:
                     if child.suffix == ".json":
                         removed.append(child.stem)
                     child.unlink()
+            marker = self.path / STORE_MARKER
+            if self._marked() and [child.name for child in self.path.iterdir()] == [STORE_MARKER]:
+                marker.unlink()
             if not any(self.path.iterdir()):
                 self.path.rmdir()
         except OSError:
