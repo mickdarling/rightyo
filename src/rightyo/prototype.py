@@ -44,7 +44,7 @@ from rightyo.live_audio import (
     LiveConfig,
     LiveProcessor,
 )
-from rightyo.live_speaker_id import ShadowSpeakerId
+from rightyo.live_speaker_id import EnrolledRoles, ShadowSpeakerId
 from rightyo.memory import MemorySessionLimitError, TranscriptMemory
 from rightyo.pipeline import ReplayRunner
 from rightyo.providers import (
@@ -221,8 +221,14 @@ class PrototypeConfig:
     # The optional `speaker_id` section (#137 step 3): the local speaker-embedding model
     # and enrollment store used by `rightyo enroll`. Absent or `"enabled": false` means
     # off. With `"live": true`, live sessions also run shadow identification (step 4a):
-    # per-label scores on stderr, with no change to turns, roles or events.
+    # per-label scores on stderr, with no change to turns, roles or events. With
+    # `"roles": true` as well (step 4b), bound labels carry their enrolled role.
     speaker_id: SpeakerIdConfig | None = None
+
+    @property
+    def voiceprint_roles(self) -> bool:
+        """Whether live identification applies roles (#137 step 4b)."""
+        return self.speaker_id is not None and self.speaker_id.roles
 
     @property
     def hosted_speech(self) -> bool:
@@ -349,6 +355,14 @@ class PrototypeConfig:
                 speaker_id.python.is_file() and speaker_id.model.is_file()
             ):
                 raise ValueError
+            if config.voiceprint_roles and (
+                speakers is None
+                or not (speakers.owners or speakers.trusted)
+                or speakers.source != "configured"
+            ):
+                # Roles from voiceprints name enrolled identifiers in `speakers`; with
+                # none named every voice would be a participant, which is a mistake.
+                raise ValueError
             return config
         except DecisionConfigError:
             raise
@@ -356,6 +370,10 @@ class PrototypeConfig:
             raise PrototypeError(
                 "Prototype requires an existing local asset configuration"
             ) from None
+
+
+def _no_report(_message: str) -> None:
+    """The diagnostic sink when a session has no channel (the lab)."""
 
 
 def _release_pending(processor) -> None:
@@ -425,6 +443,10 @@ class PrototypeController:
         self._decisions: dict[str, dict[str, Any]] = {}
         # Post-turn gaps observed by the processor, by utterance id, until decided (#96).
         self._turn_gaps: dict[str, dict[str, Any]] = {}
+        # Turns whose speaker label was partly inferred, until published (#137).
+        self._inferred_turns: set[str] = set()
+        # The session's live identification role provider, or None (#137 step 4b).
+        self._enrolled_roles: EnrolledRoles | None = None
         self._pending = 0
         self._requests = 0
         self._request_limit: int | None = DEFAULT_REQUEST_LIMIT
@@ -547,10 +569,20 @@ class PrototypeController:
                 "Configured speaker roles require a session-stable diarizer; the selected "
                 "diarizer labels speakers per utterance"
             )
+        # With live identification roles (#137 step 4b), inferred labels are allowed: a
+        # turn with inferred words keeps its role for attention and precedence, but never
+        # exercises owner authority (`SpeechEvents.transcript(inferred=True)`).
+        voiceprint = self.config.voiceprint_roles
+        if voiceprint and utterance_local_labels(self.config.diarizer):
+            raise PrototypeError(
+                "Speaker identification roles require a session-stable diarizer; the "
+                "selected diarizer labels speakers per utterance"
+            )
         if (
             roles is not None
             and (roles.owners or roles.trusted or roles.owner_only)
             and self.config.edge_attribution_ms
+            and not voiceprint
         ):
             # An inferred label must never carry a role's authority: a guest's first word
             # in the slack after the owner's segment would become the owner's.
@@ -562,6 +594,7 @@ class PrototypeController:
             roles is not None
             and (roles.owners or roles.trusted or roles.owner_only)
             and self.config.tail_join_ms
+            and not voiceprint
         ):
             # Likewise for tail join (#129): a guest's short reply right after the owner
             # would be joined into the owner's turn.
@@ -614,8 +647,14 @@ class PrototypeController:
             priority = (
                 None
                 if self.config.speakers is None
+                else EnrolledRoles(
+                    self.config.speakers,
+                    self.config.speaker_id.enrolled_follow_up_min_probability,
+                )
+                if voiceprint
                 else ConfiguredPriorityProvider(self.config.speakers)
             )
+            self._enrolled_roles = priority if voiceprint else None
             runner.restart(session)
             self._generation += 1
             generation = self._generation
@@ -626,6 +665,7 @@ class PrototypeController:
             self._decision_queue = work = queue.Queue(maxsize=32)
             self._decisions = {}
             self._turn_gaps = {}
+            self._inferred_turns = set()
             self._pending = self._requests = self._received_ms = 0
             self._received_bytes = 0
             self._budget_ms = None if budget_seconds is None else budget_seconds * 1000
@@ -674,8 +714,11 @@ class PrototypeController:
             if generation != self._generation or self._stop.is_set():
                 return
             memory.append(turn)
+            inferred = turn.utterance_id in self._inferred_turns
+            self._inferred_turns.discard(turn.utterance_id)
             if self._events is not None:
-                self._publish("transcript", turn)
+                # Passed only when set, so publishers without live roles see no change.
+                self._publish("transcript", turn, **({"inferred": True} if inferred else {}))
             if self._decision_status == "off" or self._decision_cancel.is_set():
                 return
             try:
@@ -706,6 +749,14 @@ class PrototypeController:
                 # Turns that were never queued for a decision leave stale entries.
                 del self._turn_gaps[next(iter(self._turn_gaps))]
 
+    def _observe_inferred(self, generation: int, utterance_id: str) -> None:
+        """Remember that a turn's label was partly inferred until it is published (#137)."""
+        with self._lock:
+            if generation != self._generation or self._stop.is_set():
+                return
+            # Called just before the same turn is accepted, so this holds at most one id.
+            self._inferred_turns.add(utterance_id)
+
     def _end_of_turn_model(self, stop):
         """Start the configured end-of-turn model, or None; never fails the session (#117)."""
         settings = self.config.end_of_turn
@@ -731,11 +782,17 @@ class PrototypeController:
         on it.
         """
         settings = self.config.speaker_id
-        if settings is None or not settings.live or self.report is None:
+        roles = self._enrolled_roles
+        if settings is None or not settings.live or (self.report is None and roles is None):
             return None
         try:
-            shadow = self.speaker_id_factory(settings, report=self.report)
+            # With roles on (step 4b) it runs without a diagnostic channel too (the lab).
+            report = self.report if self.report is not None else _no_report
+            shadow = self.speaker_id_factory(settings, report=report)
             shadow.start()
+            if roles is not None:
+                # Turns read the bindings from here on; until now every label is unknown.
+                roles.source = shadow
             return shadow
         except Exception:
             if self.report is not None:
@@ -746,10 +803,14 @@ class PrototypeController:
             return None
 
     def _turn(self, generation, work, memory, shadow, turn: Turn) -> None:
+        with self._lock:
+            # Read before `_accept` consumes it: inferred-label turns are never voiceprint
+            # evidence (#137), in shadow mode or with roles.
+            inferred = turn.utterance_id in self._inferred_turns
         self._accept(generation, work, memory, turn)
         if shadow is not None:
             # After the turn is accepted and published; it never raises or blocks.
-            shadow.turn(turn)
+            shadow.turn(turn, **({"inferred": True} if inferred else {}))
 
     def _audio(self, generation, stop, session, work, memory, mode):
         capture = processor = end_of_turn = shadow = None
@@ -788,6 +849,9 @@ class PrototypeController:
                     reply_wait_ms=self.config.reply_wait_ms,
                     on_post_turn_gap=lambda utterance_id, gap: self._observe_gap(
                         generation, utterance_id, gap
+                    ),
+                    on_inferred=lambda utterance_id: self._observe_inferred(
+                        generation, utterance_id
                     ),
                     end_of_turn=end_of_turn.score if end_of_turn is not None else None,
                     edge_attribution_ms=self.config.edge_attribution_ms,
@@ -1195,7 +1259,7 @@ class PrototypeController:
         """Run under the controller lock; a broken consumer cancels observation."""
         try:
             options = (
-                {"expect_decision": self._decision_status == "ready"}
+                {"expect_decision": self._decision_status == "ready", **fields}
                 if method == "transcript"
                 else fields
             )

@@ -246,7 +246,8 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual(harness.notes(), [])
         self.assertEqual(embedder.calls, 0)
         self.assertIn(
-            "speaker_id summary offered=2 scored=0 short=1 overlap=1 dropped=0 clipped=0",
+            "speaker_id summary offered=2 scored=0 short=1 overlap=1 dropped=0 clipped=0"
+            " inferred=0",
             harness.lines,
         )
 
@@ -358,7 +359,8 @@ class ShadowTests(unittest.TestCase):
             [
                 'speaker_id final label="Speaker B" turns=0 acc_score=- acc_s=0.0'
                 " state=unknown id=-",
-                "speaker_id summary offered=1 scored=0 short=0 overlap=0 dropped=0 clipped=0",
+                "speaker_id summary offered=1 scored=0 short=0 overlap=0 dropped=0 clipped=0"
+                " inferred=0",
             ],
         )
         self.assertEqual(Harness.fields(harness.lines[-2])["label"], "Speaker B")

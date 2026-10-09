@@ -132,7 +132,8 @@ To remove everything without RightyO, delete the directory:
 
 Step 4a of #137 runs identification alongside a `listen` session, in any mode (microphone,
 demo or stdin), without acting on it. Its only output is lines on `listen`'s stderr (each
-prefixed `rightyo: `), so the web lab, which has no such channel, doesn't run it. Turn it on with `"live": true` in the `speaker_id` section:
+prefixed `rightyo: `), so the web lab, which has no such channel, doesn't run it in shadow
+mode. Turn it on with `"live": true` in the `speaker_id` section:
 
 ```json
 "speaker_id": {
@@ -149,7 +150,9 @@ What it does:
   span from; nothing is written, and the buffer is cleared when the session ends.
 - The span is embedded the way `verify` does it: silence trimmed, 3 s windows, renormalised
   mean. Turns with less than `min_turn_seconds` of speech, or with overlapping speakers, are
-  counted, not scored.
+  counted, not scored. So are turns with inferred-label words (edge attribution or a tail
+  join): their audio may be another speaker's, and accumulating it could bind one voice's
+  label to someone else's enrolled identity.
 - Each label accumulates a duration-weighted mean of its turn embeddings, renormalised, and
   that mean is scored against every voiceprint enrolled with the same model file.
 - A label is `bound` to an enrolled identifier once its accumulated score reaches
@@ -161,6 +164,7 @@ What it does:
   turns shadow identification off for the session; the session itself carries on.
 - Nothing else changes: no roles are applied, `session.started` still advertises the same
   `speakers`, and no event gains a field. Edge attribution and tail join stay available.
+  To apply roles, see [roles from identification](#roles-from-identification) below.
 
 Each scored turn adds one stderr line, for example:
 
@@ -180,8 +184,9 @@ speaker_id label="Speaker A" turn_ms=2140 speech_ms=1880 turn_score=0.712 acc_sc
 
 The session also logs `speaker_id start enrolled=N` at start, and at the end one
 `speaker_id final label=…` line per label and a `speaker_id summary` line counting offered,
-scored, short, overlapping, dropped and clipped turns (clipped: part of the span was
-already outside the 60 s buffer). When a session ends, turns still queued are scored if the
+scored, short, overlapping, dropped, clipped and inferred turns (clipped: part of the span
+was already outside the 60 s buffer; inferred: the turn had inferred-label words and was
+not scored). When a session ends, turns still queued are scored if the
 stream ended normally, but that is best effort: `listen` stops the session moments after
 the end of input, so the last turn or two may be discarded rather than scored. A stopped or
 failed session discards them.
@@ -198,3 +203,37 @@ scores only: never audio, embeddings, transcript text or paths. They are calibra
 the bind and tentative thresholds will be recalibrated for accumulated scores from these
 logs (#141). Like `verify` scores, keep them local and only summarise them in public
 issues.
+
+## Roles from identification
+
+Step 4b of #137 acts on the bindings. It is off unless the `speaker_id` section sets both
+`"live": true` and `"roles": true`, and the `speakers` section names enrolled identifiers:
+
+```json
+"speakers": {"owner": ["owner"]},
+"speaker_id": {
+  "python": "/Users/you/Library/Caches/rightyo/smart-turn/venv/bin/python",
+  "model": "/Users/you/Library/Caches/rightyo/wespeaker/voxceleb_resnet34_LM.onnx",
+  "live": true,
+  "roles": true
+}
+```
+
+- The session advertises `speakers: "enrolled"`, and each turn carries a role: `owner` or
+  `trusted` once its label is bound to an identifier `speakers` names, `participant` for a
+  label bound to another enrolled identifier or scored as matching no enrolled voice, and
+  `unknown` before a label is scored, while it is `tentative`, or when identification is
+  off. The full rules, including precedence and inferred labels, are in
+  [the API notes](tool-api.md#roles-from-live-speaker-identification).
+- Binding never holds up a turn. A turn's role reflects the bindings when it is emitted,
+  so your first few seconds of speech in a session (until `bind_min_seconds` of it has
+  been scored) are `unknown`.
+- Loading refuses `"roles": true` without `"live": true`, or without an owner or trusted
+  identifier in `speakers`. A diarizer with utterance-local labels is refused at start.
+- With roles on, identification also runs in the web lab, which has no stderr channel; its
+  lines are then simply not written.
+- Edge attribution and tail join stay available: a turn with inferred-label words keeps
+  its role for attention but withdraws nothing: it never overrides, cancels or withdraws
+  any request, its own speaker's included, and its dismissal only stops playback.
+- The optional `enrolled_follow_up_min_probability` (above 0, up to 1) lowers the
+  conversation-mode follow-up bar for an engaged owner or trusted speaker.
