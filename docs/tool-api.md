@@ -474,8 +474,9 @@ differences:
   its role comes from the identifier's binding for its label at that moment: a label
   bound to an enrolled identifier takes the role `speakers` gives that identifier
   (`owner` or `trusted`), or `participant` for an enrolled identifier given no role. A
-  label the identifier scored and matched to no enrolled voice is `participant`. A label
-  not yet scored, or only `tentative`, is `unknown`, as is a turn without a label and any
+  label the identifier scored on at least `bind_min_seconds` of speech and matched to no
+  enrolled voice is `participant`. A label not yet scored, scored on less speech than
+  that, or only `tentative`, is `unknown`, as is a turn without a label and any
   turn while identification is off or failed. A session label named in `speakers` keeps
   its configured role as before.
 - **Binding is asynchronous and never waited for.** The identifier scores a turn on its
