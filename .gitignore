@@ -73,3 +73,10 @@ checkpoints/
 *.hdf5
 *.pkl
 *.pickle
+
+# Speaker enrollment and voiceprints stay on the host (#109); see CONTRIBUTING.md
+enrollment/
+enrollments/
+voiceprint/
+voiceprints/
+*.emb

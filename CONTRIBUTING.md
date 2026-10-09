@@ -11,3 +11,9 @@ Never commit recordings, private transcripts, credentials, source/device identif
 Contributions of original code/documentation use AGPL-3.0-or-later. Preserve upstream notices. Changes to trained weights require the model-release checklist, not only a code review. See docs/licensing.md and docs/training-process.md.
 
 The initial commit is a design-only bootstrap. Subsequent changes follow the issue/PR workflow above.
+
+## Voice data never enters the repository
+
+No voice sample, speaker embedding or voiceprint of a real person may be committed, attached to an issue or PR, uploaded as a CI artifact, or logged ([#109](https://github.com/mickdarling/rightyo/issues/109)). `scripts/verify.py`, which CI runs, refuses any tracked file with an audio, embedding or model extension (`.wav`, `.pcm`, `.flac`, `.mp3`, `.m4a`, `.aac`, `.ogg`, `.opus`, `.caf`, `.aif`/`.aiff`, `.npy`, `.npz`, `.emb`, `.pt`, `.pth`, `.onnx`, `.mlmodel`, `.mlpackage`, `.safetensors` and similar) and any path segment named `enrollment`, `enrollments`, `voiceprint` or `voiceprints`, unless the path sits under an entry in `SYNTHETIC_VOICE_FIXTURES` in `scripts/repository_checks.py`. That allow-list is empty today because no tracked file is voice data. Adding an entry takes a reviewed PR that records why everything under it is synthetic (an authored signal or a TTS voice). The binary and size rules still apply to allow-listed paths. The repository has no pre-commit hook; run `scripts/verify.py` before pushing.
+
+Enrollment data lives only on your machine. The forthcoming `rightyo enroll` tool ([#137](https://github.com/mickdarling/rightyo/issues/137), step 3) will store it in `~/Library/Application Support/RightyO/enrollment/` (mode 700) and provide `delete`. Until then, or to remove everything at once, delete that directory: `rm -rf ~/Library/Application\ Support/RightyO/enrollment`. Also remove any enrollment files you kept in the gitignored `local/` directory.
