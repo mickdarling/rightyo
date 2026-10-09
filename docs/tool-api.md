@@ -504,7 +504,10 @@ differences:
   `withdrawn_request_ids` (not even its own speaker's requests, delivered or pending) and
   does not end that speaker's engagement, it supersedes no pending decision, and its own
   request stays open to a later owner override. Only a turn without inferred words
-  exercises owner authority. The inference is internal; no event field marks it.
+  exercises owner authority. Nor is its audio ever voiceprint evidence: the identifier
+  counts such a turn and does not score it, so another voice's words joined under a label
+  can never bind that label to an enrolled identity. The inference is internal; no event
+  field marks it.
 - **Authority is re-checked when the decision arrives.** If the label's binding no longer
   gives the turn its owner or trusted role by then (it fell below `tentative_threshold`),
   the turn emits no `override` and acts with no authority. The role it was published with

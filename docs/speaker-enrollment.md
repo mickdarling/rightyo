@@ -150,7 +150,9 @@ What it does:
   span from; nothing is written, and the buffer is cleared when the session ends.
 - The span is embedded the way `verify` does it: silence trimmed, 3 s windows, renormalised
   mean. Turns with less than `min_turn_seconds` of speech, or with overlapping speakers, are
-  counted, not scored.
+  counted, not scored. So are turns with inferred-label words (edge attribution or a tail
+  join): their audio may be another speaker's, and accumulating it could bind one voice's
+  label to someone else's enrolled identity.
 - Each label accumulates a duration-weighted mean of its turn embeddings, renormalised, and
   that mean is scored against every voiceprint enrolled with the same model file.
 - A label is `bound` to an enrolled identifier once its accumulated score reaches
@@ -182,8 +184,9 @@ speaker_id label="Speaker A" turn_ms=2140 speech_ms=1880 turn_score=0.712 acc_sc
 
 The session also logs `speaker_id start enrolled=N` at start, and at the end one
 `speaker_id final label=…` line per label and a `speaker_id summary` line counting offered,
-scored, short, overlapping, dropped and clipped turns (clipped: part of the span was
-already outside the 60 s buffer). When a session ends, turns still queued are scored if the
+scored, short, overlapping, dropped, clipped and inferred turns (clipped: part of the span
+was already outside the 60 s buffer; inferred: the turn had inferred-label words and was
+not scored). When a session ends, turns still queued are scored if the
 stream ended normally, but that is best effort: `listen` stops the session moments after
 the end of input, so the last turn or two may be discarded rather than scored. A stopped or
 failed session discards them.

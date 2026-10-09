@@ -803,10 +803,14 @@ class PrototypeController:
             return None
 
     def _turn(self, generation, work, memory, shadow, turn: Turn) -> None:
+        with self._lock:
+            # Read before `_accept` consumes it: inferred-label turns are never voiceprint
+            # evidence (#137), in shadow mode or with roles.
+            inferred = turn.utterance_id in self._inferred_turns
         self._accept(generation, work, memory, turn)
         if shadow is not None:
             # After the turn is accepted and published; it never raises or blocks.
-            shadow.turn(turn)
+            shadow.turn(turn, **({"inferred": True} if inferred else {}))
 
     def _audio(self, generation, stop, session, work, memory, mode):
         capture = processor = end_of_turn = shadow = None

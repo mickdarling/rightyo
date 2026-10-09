@@ -183,7 +183,7 @@ class ShadowSpeakerId:
         self._embedder_lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, name="rightyo-speaker-id", daemon=True)
         self.offered = self.scored = self.short = self.overlap = 0
-        self.dropped = self.clipped = 0
+        self.dropped = self.clipped = self.inferred = 0
 
     @property
     def active(self) -> bool:
@@ -220,8 +220,13 @@ class ShadowSpeakerId:
             with contextlib.suppress(Exception):
                 self._ring.append(pcm)
 
-    def turn(self, turn) -> None:
-        """Queue one finalized turn for scoring; never blocks, never raises."""
+    def turn(self, turn, *, inferred: bool = False) -> None:
+        """Queue one finalized turn for scoring; never blocks, never raises.
+
+        A turn with inferred-label words (edge attribution or a tail join, #137) is
+        counted, never scored: its audio may be another speaker's, and accumulating it
+        could bind that speaker's label to the wrong enrolled identity.
+        """
         try:
             if (
                 not self.active
@@ -230,6 +235,9 @@ class ShadowSpeakerId:
             ):
                 return
             self.offered += 1
+            if inferred:
+                self.inferred += 1
+                return
             if turn.overlap:
                 # Two voices at once would blur the label's evidence.
                 self.overlap += 1
@@ -362,7 +370,7 @@ class ShadowSpeakerId:
         self._report(
             f"speaker_id summary offered={self.offered} scored={self.scored}"
             f" short={self.short} overlap={self.overlap} dropped={self.dropped}"
-            f" clipped={self.clipped}"
+            f" clipped={self.clipped} inferred={self.inferred}"
         )
 
 

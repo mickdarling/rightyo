@@ -51,9 +51,12 @@ execution belong to the consuming application.
 
 `rightyo enroll` computes a voiceprint for each person you enroll and stores it only on
 your machine (mode 700, never inside a repository checkout), with `list`, `verify` and
-`delete`. You provision the model yourself; RightyO never downloads it. Live sessions can
-run identification in shadow mode only: scores are logged on stderr, and turns, roles and
-events don't change. See [speaker enrollment](docs/speaker-enrollment.md).
+`delete`. You provision the model yourself; RightyO never downloads it. With
+`"live": true`, live sessions run identification. By default that is shadow mode: scores
+are logged on stderr, and turns, roles and events don't change. With `"roles": true` as
+well (opt-in), a voice bound to an enrolled identifier carries the role the `speakers`
+section gives it, the session advertises `speakers: "enrolled"`, and enrolled owners and
+trusted speakers take precedence. See [speaker enrollment](docs/speaker-enrollment.md).
 
 ## Try the replay MVP
 
