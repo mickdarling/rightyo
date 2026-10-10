@@ -821,22 +821,45 @@ class SpeechEvents:
             until_ms=until,
         )
 
-    def _follow_up(self, turn, role, decision, evidence, unavailable):
-        """Whether an engaged speaker's undecided turn forms a request as a follow-up."""
+    def _follow_up_refusal(self, turn, role, decision, evidence, unavailable):
+        """Why an undecided turn is not a follow-up (a fixed token), or None when it is one.
+
+        `not_engaged` covers conversation mode off and any turn but the engaged speaker's
+        within the window; every other token is about the engaged speaker's own turn (#153).
+        """
         conversation = self._conversation
-        if (
-            conversation is None
-            or unavailable is not None
-            or evidence["label"] != "uncertain"
-            or not self._engaged_with(turn)
-            or decision.recipient not in {"system", "unknown"}
-            or decision.probabilities["attend"] < self._follow_up_bar(role)
+        if conversation is None or not self._engaged_with(turn):
+            return "not_engaged"
+        if unavailable is not None:
+            return "unavailable"
+        if evidence["label"] != "uncertain":
+            return "label"
+        if decision.recipient not in {"system", "unknown"}:
+            return "recipient"
+        if decision.probabilities["attend"] < self._follow_up_bar(role):
+            return "below_bar"
+        if conversation.is_closing(turn.text):
             # A closing phrase ends the conversation; it is never a request of its own.
-            or conversation.is_closing(turn.text)
-        ):
-            return False
-        # Owner-only mode never lets another speaker's turn become a request.
-        return not (role is not None and self._priority.priority.owner_only and role != "owner")
+            return "closing"
+        if role is not None and self._priority.priority.owner_only and role != "owner":
+            # Owner-only mode never lets another speaker's turn become a request.
+            return "owner_only"
+        return None
+
+    def _follow_up_note(self, refusal, held, role, decision):
+        """The content-free diagnostic for an engaged speaker's undecided turn (#153): the
+        outcome, the reason, Jev's attend probability and the bar in force. Never text or ids.
+
+        `formed` means the turn became a request; `held` means it passed the follow-up checks
+        but a cooldown, stop, dismissal, supersession or withdrawal kept it back. Values carry
+        up to six significant digits, so a near miss never prints as a tie.
+        """
+        attend = decision.probabilities.get("attend", 0.0)
+        outcome = "refused" if refusal else "held" if held else "formed"
+        return (
+            f"follow_up outcome={outcome} reason={refusal or held or 'passed'}"
+            f" attend={attend:.6g} bar={self._follow_up_bar(role):.6g}"
+        )
 
     def _follow_up_bar(self, role):
         """The follow-up attend bar: optionally lower for enrolled owners and trusted (#113)."""
@@ -982,12 +1005,23 @@ class SpeechEvents:
                 kind = event.decision.dismissal
             dismissed = kind is not None or key in self._dismissed
             would_attend = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
+            # False: no follow-up note; None: a formed follow-up; else the refusal token.
+            follow_up_note: str | None | bool = False
+            follow_up_text = None
             if self._conversation is not None:
                 # The window is judged in stream time at each decided turn.
                 self._lapse(turn.start_ms)
-                if not would_attend and self._follow_up(
-                    turn, current, event.decision, evidence, unavailable
-                ):
+                refusal = (
+                    None
+                    if would_attend
+                    else self._follow_up_refusal(
+                        turn, current, event.decision, evidence, unavailable
+                    )
+                )
+                if not would_attend and refusal != "not_engaged":
+                    # Noted once the hold-backs below have had their say (#153).
+                    follow_up_note = refusal
+                if not would_attend and refusal is None:
                     # An engaged speaker's undecided follow-up (#82): the request evidence
                     # says so, beside Jev's unchanged recipient and confidence.
                     evidence["label"] = "attend"
@@ -1012,6 +1046,22 @@ class SpeechEvents:
                 and superseded_by is None
                 and withdrawn_by is None
             )
+            if follow_up_note is not False and self._report is not None:
+                held = None
+                if follow_up_note is None and not attended:
+                    held = (
+                        "cooldown"
+                        if evidence.get("cooldown")
+                        else "stop"
+                        if stop
+                        else "dismissed"
+                        if dismissed
+                        else "superseded"
+                        if superseded_by is not None
+                        else "withdrawn"
+                    )
+                # Written last, like the acknowledgement note, once the request is out.
+                follow_up_text = self._follow_up_note(follow_up_note, held, current, event.decision)
             overriding = authority == "owner" and (attended or stop or dismissed)
             plan = None
             if kind is not None:
@@ -1240,6 +1290,13 @@ class SpeechEvents:
                         self._report(ack_note)
                     except Exception:  # noqa: BLE001
                         pass
+            if follow_up_text is not None:
+                # After the request, if any, is out: a former or queue failure that ends the
+                # session raises before this, so `formed` is never reported for a lost one.
+                try:
+                    self._report(follow_up_text)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _acknowledge(self, turn, decision, evidence):
         """The optional ``acknowledge`` field and its diagnostic note (#132).
