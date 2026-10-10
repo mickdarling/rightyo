@@ -428,7 +428,7 @@ class ReplyNoteTests(unittest.TestCase):
         self.assertEqual(
             self.replies(),
             [
-                "reply phase=started action=held window_left_ms=8900",
+                "reply phase=started action=held window_left_ms=180000",
                 "reply phase=ended action=extended window_left_ms=10000",
             ],
         )

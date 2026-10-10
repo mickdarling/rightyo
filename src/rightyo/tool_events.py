@@ -723,7 +723,7 @@ class SpeechEvents:
                 return
             if phase == "started":
                 engaged.setdefault("replying_since", now_ms)
-                self._reply_note(phase, "held", left)
+                self._reply_note(phase, "held", self._window_end(engaged) - now_ms)
             else:
                 engaged.pop("replying_since", None)
                 engaged["until_ms"] = max(
