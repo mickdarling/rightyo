@@ -152,6 +152,8 @@ class SpeechEvents:
         # off by default, and the raw turn/context are unchanged either way.
         self._former = None
         self._addressing = None
+        # Other agents' names (#161): a turn naming one, and not this assistant, is never ours.
+        self._other_agents = None
         # Natural dismissal (#98), off unless configured at start.
         self._dismissal = None
         self._stop_rules = SpeakerPriority()
@@ -233,6 +235,7 @@ class SpeechEvents:
         dismissal=None,
         conversation=None,
         acknowledgement=None,
+        other_agents=None,
     ):
         with self._lock:
             identifier(session_id, "session_id")
@@ -248,6 +251,8 @@ class SpeechEvents:
             integer(now_ms, "now_ms")
             if type(attention_enabled) is not bool:
                 raise ContractError("invalid attention capability")
+            if other_agents is not None and not isinstance(other_agents, Addressing):
+                raise ContractError("invalid other agents")
             if addressing is not None and not isinstance(addressing, Addressing):
                 raise ContractError("invalid addressing")
             if priority is not None and (
@@ -281,6 +286,7 @@ class SpeechEvents:
             )
             self._former = former
             self._addressing = addressing
+            self._other_agents = other_agents
             self._dismissal = dismissal
             # The configured stop phrases, or the defaults when roles are off.
             self._stop_rules = SpeakerPriority() if priority is None else priority.priority
@@ -1072,6 +1078,12 @@ class SpeechEvents:
             ):
                 kind = event.decision.dismissal
             dismissed = kind is not None or key in self._dismissed
+            if mentions_name(self._other_agents, turn.text) and not mentions_name(
+                self._addressing, turn.text
+            ):
+                # Addressed to another agent (#161), such as the owner's dot: never a request,
+                # a follow-up or an acknowledgement here. Naming this assistant too keeps it ours.
+                evidence["label"] = "ignore"
             would_attend = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
             # False: no follow-up note; None: a formed follow-up; else the refusal token.
             follow_up_note: str | None | bool = False
