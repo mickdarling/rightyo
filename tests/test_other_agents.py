@@ -47,6 +47,14 @@ class OtherAgentTests(unittest.TestCase):
         self.assertEqual([e["type"] for e in events], ["attention"])
         self.assertNotIn("follow_up", events[0]["decision"])
 
+    def test_turning_to_another_agent_ends_this_conversation(self):
+        self.say(turn("j", 0, 900, "Jarvis, what time is it?"), "attend")
+        self.say(turn("p", 2000, 2900, "Puck, draft a reply."), "attend")
+        # The next unnamed remark is no longer a follow-up to Jarvis.
+        events = self.say(turn("c", 4000, 4900, "And make it concise."), "uncertain", attend=0.9)
+        self.assertEqual([e["type"] for e in events], ["attention"])
+        self.assertNotIn("follow_up", events[0]["decision"])
+
     def test_start_refuses_a_foreign_object(self):
         with self.assertRaises(ContractError):
             SpeechEvents().start(SESSION, other_agents={"names": ["Puck"]})

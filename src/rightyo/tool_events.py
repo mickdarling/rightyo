@@ -1078,11 +1078,13 @@ class SpeechEvents:
             ):
                 kind = event.decision.dismissal
             dismissed = kind is not None or key in self._dismissed
-            if mentions_name(self._other_agents, turn.text) and not mentions_name(
+            to_other_agent = mentions_name(self._other_agents, turn.text) and not mentions_name(
                 self._addressing, turn.text
-            ):
+            )
+            if to_other_agent:
                 # Addressed to another agent (#161), such as the owner's dot: never a request,
-                # a follow-up or an acknowledgement here. Naming this assistant too keeps it ours.
+                # a follow-up or an acknowledgement here, and it ends this assistant's
+                # conversation with them below. Naming this assistant too keeps it ours.
                 evidence["label"] = "ignore"
             would_attend = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
             # False: no follow-up note; None: a formed follow-up; else the refusal token.
@@ -1330,9 +1332,12 @@ class SpeechEvents:
                         self._disengage(turn, "dismissed")
                 elif self._conversation.is_closing(turn.text):
                     self._disengage(turn, "closed")
-                elif evidence["label"] == "ignore" and (
-                    event.decision.recipient == "other_human"
-                    or event.decision.recipient.startswith("speaker_")
+                elif to_other_agent or (
+                    evidence["label"] == "ignore"
+                    and (
+                        event.decision.recipient == "other_human"
+                        or event.decision.recipient.startswith("speaker_")
+                    )
                 ):
                     self._disengage(turn, "other_human")
             elif (
@@ -1340,6 +1345,7 @@ class SpeechEvents:
                 and self._dormant is not None
                 and (
                     plan is not None
+                    or to_other_agent
                     or self._conversation.is_closing(turn.text)
                     or (
                         evidence["label"] == "ignore"
