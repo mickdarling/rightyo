@@ -19,7 +19,8 @@ from rightyo.providers import DecisionProvider, dismissal_hints
 
 # How long after the assistant's spoken reply a turn still carries it as context (rightyo#153).
 REPLY_CONTEXT_MS = 60_000
-# Reply intervals kept for that (each is two integers).
+# Reply intervals kept for that, two integers each. Only this cap evicts them, never their age,
+# so a turn whose decision waits in the queue still sees the reply it began beside.
 MAX_REPLY_INTERVALS = 16
 
 
@@ -213,12 +214,6 @@ class ReplayRunner:
             else:
                 # An end with no start seen: the reply had begun before this session knew.
                 self._replies.append([now_ms, now_ms])
-        while (
-            self._replies
-            and (end := self._replies[0][1]) is not None
-            and (now_ms - end > REPLY_CONTEXT_MS)
-        ):
-            self._replies.popleft()
 
     def _reply_state(self, turn: Turn) -> dict[str, Any] | None:
         """`assistant_reply` as it stood when `turn` began, or None when no reply bears on it.

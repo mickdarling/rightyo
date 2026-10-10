@@ -85,6 +85,16 @@ class ReplyContextTests(unittest.TestCase):
         state = self.decide(turn("Thanks.", "u2", start=7000, end=7500))
         self.assertEqual(state["assistant_reply"], {"playing": False, "ended_ms_before": 500})
 
+    def test_a_slow_decision_still_sees_the_reply_its_turn_began_beside(self):
+        # The turn starts 500 ms after a reply ends; another reply is reported 61 s later,
+        # before the turn's decision is made.
+        self.runner.note_reply("started", 0)
+        self.runner.note_reply("ended", 1000)
+        self.runner.note_reply("started", 62_000)
+        self.runner.note_reply("ended", 63_000)
+        state = self.decide(turn("Thanks.", "u2", start=1500, end=2000))
+        self.assertEqual(state["assistant_reply"], {"playing": False, "ended_ms_before": 500})
+
     def test_an_unknown_phase_is_refused(self):
         with self.assertRaises(ValueError):
             self.runner.note_reply("paused", 1000)
