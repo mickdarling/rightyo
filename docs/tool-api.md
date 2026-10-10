@@ -587,11 +587,19 @@ are timed from the end of the assistant's spoken reply when the host reports it.
 and `{"reply": "ended"}` to inherited descriptor N, and RightyO stamps each with its own
 stream clock on arrival. While engaged, a playing reply holds the window open (bounded
 at 180 s if its end never comes), and its end restarts the window from that moment. A
-report after the window lapsed, or with nothing engaged, changes nothing; malformed lines
-are skipped with a content-free stderr note. Without `--control-fd` the window runs from
-the request, as before.
+report after the window lapsed first emits the `ambient` `timeout` event, then **revives**
+that speaker's engagement from the report's time if it lapsed by timeout within the last
+10 minutes ([#158](https://github.com/mickdarling/rightyo/issues/158)): the assistant spoke
+to them again (a proactive update, say), so their answer to it is a follow-up. Only speech
+after the reply counts, and no `engaged` event is emitted for a revival (that event names a
+request). An explicit end (a closing phrase, a dismissal, turning to another person), even
+one said after the lapse, or any delivered request, leaves nothing to revive. A report
+with nothing engaged and nothing to revive changes nothing; malformed lines are skipped
+with a content-free stderr note. Every report also writes a content-free stderr note:
+`reply phase=… action=held|extended|revived|not_engaged|inactive window_left_ms=…`.
+Without `--control-fd` the window runs from the request, as before.
 
-**Not yet.** Only a request engages, not a reply on its own. The decision model is not told the conversation is engaged; the follow-up
+**Not yet.** Only a request, or a reply that revives a lapsed one, engages. The decision model is not told the conversation is engaged; the follow-up
 rule works on its answer instead. Name-less direct requests before any engagement and
 looser name matching are separate work under #82.
 
