@@ -398,6 +398,47 @@ class FollowUpNoteTests(unittest.TestCase):
                 self.assertNotIn(content, note)
 
 
+class ReplyNoteTests(unittest.TestCase):
+    """The reply-report diagnostic (rightyo#158): every report says what it did to the window."""
+
+    def setUp(self):
+        self.notes = []
+        self.events = SpeechEvents(report=self.notes.append)
+        self.events.start(SESSION, now_ms=0, conversation=MODE)
+
+    def replies(self):
+        return [note for note in self.notes if note.startswith("reply ")]
+
+    def engage(self):
+        current = turn("t1", 0, 900, "Haili, what time is it?")
+        self.events.transcript(current, current.end_ms)
+        self.events.decision(decided(current, "attend"), current.end_ms + 100)
+        self.events.drain()
+
+    def test_a_report_with_nothing_engaged_says_so(self):
+        self.events.reply("ended", 500)
+        self.assertEqual(
+            self.replies(), ["reply phase=ended action=not_engaged window_left_ms=none"]
+        )
+
+    def test_a_reply_holds_then_extends_the_window(self):
+        self.engage()  # engaged until 900 + 10000
+        self.events.reply("started", 2000)
+        self.events.reply("ended", 5000)
+        self.assertEqual(
+            self.replies(),
+            [
+                "reply phase=started action=held window_left_ms=180000",
+                "reply phase=ended action=extended window_left_ms=10000",
+            ],
+        )
+
+    def test_a_report_after_the_window_lapsed_is_late(self):
+        self.engage()
+        self.events.reply("ended", 20000)
+        self.assertEqual(self.replies(), ["reply phase=ended action=late window_left_ms=-9100"])
+
+
 class ReplyTimingTests(unittest.TestCase):
     """The window runs from the end of the spoken reply when the host reports it (#124)."""
 
