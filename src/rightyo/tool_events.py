@@ -721,9 +721,10 @@ class SpeechEvents:
             if not self._active:
                 self._reply_note(phase, "inactive", None)
                 return
-            # The stream clock moves with the report, so anything emitted here is stamped no
-            # earlier than the time it names (haild requires at_ms <= emitted_at_ms).
-            self._now = max(self._now, now_ms)
+            # The stream clock moves with the report through the normal expiry path, so
+            # anything emitted here is stamped no earlier than the time it names (haild
+            # requires at_ms <= emitted_at_ms) and content past retention is reclaimed first.
+            self.expire(now_ms)
             if engaged is not None and now_ms >= self._window_end(engaged):
                 # Lapsed already, though no decision has said so yet: say so now.
                 self._lapse(now_ms)
@@ -820,6 +821,10 @@ class SpeechEvents:
 
     def _disengage(self, turn, reason):
         """Return the engaged speaker to ambient because of their own `turn`."""
+        # An engagement whose window ended before this turn began lapses first, so an end
+        # said just after the window (the stop-phrase fast path, before any decision has
+        # lapsed it) still forgets it rather than leaving it to be revived (#158).
+        self._lapse(turn.start_ms)
         self._forget_dormant(turn)
         if self._engaged is None or not self._engaged_with(turn):
             return

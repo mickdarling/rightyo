@@ -489,6 +489,20 @@ class ReplyNoteTests(unittest.TestCase):
             self.replies()[-1], "reply phase=ended action=not_engaged window_left_ms=none"
         )
 
+    def test_a_stop_phrase_just_after_the_window_is_not_revived(self):
+        # The stop-phrase fast path runs at the transcript, before any decision lapses the
+        # engagement; a reply ending right after must not revive it.
+        events = SpeechEvents(report=self.notes.append)
+        events.start(SESSION, now_ms=0, conversation=MODE, dismissal=Dismissal())
+        self.events = events
+        self.engage()
+        stop = turn("t2", 11000, 11400, "Stop")
+        self.events.transcript(stop, stop.end_ms)
+        self.events.reply("ended", 11500)
+        self.assertEqual(
+            self.replies()[-1], "reply phase=ended action=not_engaged window_left_ms=none"
+        )
+
     def test_an_explicit_end_is_never_revived(self):
         self.engage()
         closing = turn("t2", 2000, 2600, "That's all")
