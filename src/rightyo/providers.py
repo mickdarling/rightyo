@@ -276,6 +276,15 @@ GAP_GUIDANCE = (
     "unanswered request: it may be another person's reply. An unobserved gap is no evidence "
     "either way."
 )
+REPLY_GUIDANCE = (
+    " state.assistant_reply reports the assistant's own spoken reply: playing is true when it "
+    "was still speaking as current_turn began; otherwise ended_ms_before is how long before "
+    "current_turn began it finished. A short turn soon after the reply that responds to it "
+    "(acknowledges or thanks it, answers a question it asked, corrects it or continues the "
+    "exchange) is evidence that current_turn is addressed to the assistant/system, even with "
+    "no name. A turn that names, answers or turns to another person present is not, and the "
+    "reply's own words heard back are assistant playback, not a request."
+)
 
 
 DISMISSAL_QUESTION = (
@@ -361,6 +370,7 @@ def build_request(state: dict[str, Any]) -> dict[str, Any]:
         "make attribution uncertain."
         + ("" if scene is None else SCENE_PREFIX + scene)
         + (GAP_GUIDANCE if "post_turn_gap" in state else "")
+        + (REPLY_GUIDANCE if "assistant_reply" in state else "")
         + names
     )
     questions: dict[str, Any] = {}

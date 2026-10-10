@@ -1277,6 +1277,9 @@ class PrototypeController:
             ):
                 return
             self._publish("reply", phase)
+            if self._runner is not None:
+                # The decision context sees the reply too (rightyo#153), on the same clock.
+                self._runner.note_reply(phase, self._now_ms())
 
     def _publish(self, method, value, **fields):
         """Run under the controller lock; a broken consumer cancels observation."""
