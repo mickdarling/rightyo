@@ -179,6 +179,7 @@ class PrototypeConfig:
     microphone_helper: Path
     demo_audio: Path | None = None
     addressing: Addressing | None = None
+    other_agents: Addressing | None = None
     speakers: SpeakerPriority | None = None
     session_budget_seconds: int | None = None
     request_former: RequestForming | None = None
@@ -274,6 +275,7 @@ class PrototypeConfig:
                 "conversation",
                 "acknowledgement",
                 "speaker_id",
+                "other_agents",
                 *LOCAL_ASSETS,
             }
             if raw.keys() - required - optional:
@@ -281,6 +283,10 @@ class PrototypeConfig:
             addressing = raw.pop("addressing", None)
             if addressing is not None:
                 addressing = Addressing.from_dict(addressing)
+            # Other agents' names and variants (#161), in the `addressing` shape.
+            other_agents = raw.pop("other_agents", None)
+            if other_agents is not None:
+                other_agents = Addressing.from_dict(other_agents)
             speakers = raw.pop("speakers", None)
             if speakers is not None:
                 speakers = SpeakerPriority.from_dict(speakers)
@@ -327,6 +333,7 @@ class PrototypeConfig:
                 microphone_helper=values["microphone_helper"],
                 demo_audio=values.get("demo_audio"),
                 addressing=addressing,
+                other_agents=other_agents,
                 speakers=speakers,
                 session_budget_seconds=budget,
                 request_former=forming,
@@ -698,6 +705,7 @@ class PrototypeController:
                     dismissal=self.config.dismissal,
                     conversation=self.config.conversation,
                     acknowledgement=self.config.acknowledgement,
+                    other_agents=self.config.other_agents,
                 )
                 self._event_terminal = False
             threading.Thread(
