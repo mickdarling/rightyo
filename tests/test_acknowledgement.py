@@ -150,7 +150,7 @@ class AcknowledgementEventTests(SessionHarness, unittest.TestCase):
         self.assertIs(request["decision"]["follow_up"], True)
         self.assertIs(request["acknowledge"], False)
         self.assertEqual(
-            self.notes[-1],
+            [note for note in self.notes if note.startswith("ack ")][-1],
             "ack outcome=skip reason=low_confidence attend_confidence=0.45 min=0.70 follow_up=true",
         )
 
@@ -180,9 +180,9 @@ class AcknowledgementEventTests(SessionHarness, unittest.TestCase):
         self.start(conversation=Conversation(window_ms=10000))
         self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend", 0.92)
         self.say(turn("t2", 2000, 2600, "Okay, great."), "uncertain", 0.22, 0.45)
-        # Two acknowledgement notes and the follow-up note between them (#153).
+        # Two acknowledgement notes, then the follow-up note, written after its request (#153).
         self.assertEqual(len(self.notes), 3)
-        self.assertTrue(self.notes[1].startswith("follow_up "))
+        self.assertTrue(self.notes[2].startswith("follow_up "))
         for note in self.notes:
             for content in ("Haili", "time", "great", "t1", "t2", SESSION, "Speaker"):
                 self.assertNotIn(content, note)

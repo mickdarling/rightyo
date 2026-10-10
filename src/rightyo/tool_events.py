@@ -1007,6 +1007,7 @@ class SpeechEvents:
             would_attend = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
             # False: no follow-up note; None: a formed follow-up; else the refusal token.
             follow_up_note: str | None | bool = False
+            follow_up_text = None
             if self._conversation is not None:
                 # The window is judged in stream time at each decided turn.
                 self._lapse(turn.start_ms)
@@ -1059,13 +1060,8 @@ class SpeechEvents:
                         if superseded_by is not None
                         else "withdrawn"
                     )
-                # Best-effort, like the acknowledgement note: a failed write changes nothing.
-                try:
-                    self._report(
-                        self._follow_up_note(follow_up_note, held, current, event.decision)
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
+                # Written last, like the acknowledgement note, once the request is out.
+                follow_up_text = self._follow_up_note(follow_up_note, held, current, event.decision)
             overriding = authority == "owner" and (attended or stop or dismissed)
             plan = None
             if kind is not None:
@@ -1294,6 +1290,13 @@ class SpeechEvents:
                         self._report(ack_note)
                     except Exception:  # noqa: BLE001
                         pass
+            if follow_up_text is not None:
+                # After the request, if any, is out: a former or queue failure that ends the
+                # session raises before this, so `formed` is never reported for a lost one.
+                try:
+                    self._report(follow_up_text)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _acknowledge(self, turn, decision, evidence):
         """The optional ``acknowledge`` field and its diagnostic note (#132).
