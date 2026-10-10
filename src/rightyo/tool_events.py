@@ -710,19 +710,37 @@ class SpeechEvents:
             if self._active and self._pending_ack is not None:
                 self._answer_ack(phase)
             engaged = self._engaged
-            if not self._active or self._conversation is None or engaged is None:
+            if self._conversation is None:
                 return
-            if now_ms >= self._window_end(engaged):
+            if not self._active or engaged is None:
+                self._reply_note(phase, "inactive" if not self._active else "not_engaged", None)
+                return
+            left = self._window_end(engaged) - now_ms
+            if left <= 0:
                 # Lapsed already, though no decision has said so yet: a late report never
                 # revives a conversation.
+                self._reply_note(phase, "late", left)
                 return
             if phase == "started":
                 engaged.setdefault("replying_since", now_ms)
+                self._reply_note(phase, "held", left)
             else:
                 engaged.pop("replying_since", None)
                 engaged["until_ms"] = max(
                     engaged["until_ms"], now_ms + self._conversation.window_ms
                 )
+                self._reply_note(phase, "extended", self._window_end(engaged) - now_ms)
+
+    def _reply_note(self, phase, action, left_ms):
+        """The content-free reply-report diagnostic (rightyo#158): the phase, what it did to
+        the conversation window, and how long the window then had left. Best-effort."""
+        if self._report is None:
+            return
+        left = "none" if left_ms is None else str(left_ms)
+        try:
+            self._report(f"reply phase={phase} action={action} window_left_ms={left}")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _answer_ack(self, phase):
         """Track the pending acknowledgement through the host's playback reports (#122).
