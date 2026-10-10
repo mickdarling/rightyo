@@ -19,6 +19,8 @@ from rightyo.providers import DecisionProvider, dismissal_hints
 
 # How long after the assistant's spoken reply a turn still carries it as context (rightyo#153).
 REPLY_CONTEXT_MS = 60_000
+# Reply intervals kept for that (each is two integers).
+MAX_REPLY_INTERVALS = 16
 
 
 def _locked(method):
@@ -112,9 +114,10 @@ class ReplayRunner:
         self._emitted: set[str] = set()
         self._history: deque[Turn] = deque(maxlen=max_context_turns)
         self._last_end_ms = 0
-        # The host's spoken-reply reports (#124, rightyo#153), on the stream clock.
-        self._reply_since: int | None = None
-        self._reply_ended: int | None = None
+        # The host's spoken-reply reports (#124, rightyo#153) as [start, end] intervals on
+        # the stream clock, end None while playing; recent ones only, so a decision made after
+        # its turn still sees what was true when the turn began.
+        self._replies: deque[list[int | None]] = deque(maxlen=MAX_REPLY_INTERVALS)
         self.skipped = 0
         self.partial_turns = 0
 
@@ -131,7 +134,7 @@ class ReplayRunner:
             self.memory.clear()
         self._history.clear()
         self._last_end_ms = 0
-        self._reply_since = self._reply_ended = None
+        self._replies.clear()
 
     @_locked
     def clear(self, *, clear_memory: bool = True) -> None:
@@ -199,23 +202,40 @@ class ReplayRunner:
         playing when the turn began, or how long before it the last one ended. Nothing is
         added until the host reports a reply, so replays and older hosts are unchanged.
         """
-        if phase == "started":
-            if self._reply_since is None:
-                self._reply_since = now_ms
-        elif phase == "ended":
-            self._reply_since, self._reply_ended = None, now_ms
-        else:
+        if phase not in {"started", "ended"}:
             raise ValueError("invalid reply phase")
+        playing = bool(self._replies) and self._replies[-1][1] is None
+        if phase == "started" and not playing:
+            self._replies.append([now_ms, None])
+        elif phase == "ended":
+            if playing:
+                self._replies[-1][1] = now_ms
+            else:
+                # An end with no start seen: the reply had begun before this session knew.
+                self._replies.append([now_ms, now_ms])
+        while (
+            self._replies
+            and (end := self._replies[0][1]) is not None
+            and (now_ms - end > REPLY_CONTEXT_MS)
+        ):
+            self._replies.popleft()
 
     def _reply_state(self, turn: Turn) -> dict[str, Any] | None:
-        """`assistant_reply` for `turn`, or None when no recent reply bears on it."""
-        if self._reply_since is not None and self._reply_since <= turn.start_ms:
-            return {"playing": True}
-        if self._reply_ended is None:
-            return None
-        before = turn.start_ms - self._reply_ended
-        if 0 <= before <= REPLY_CONTEXT_MS:
-            return {"playing": False, "ended_ms_before": before}
+        """`assistant_reply` as it stood when `turn` began, or None when no reply bears on it.
+
+        Playing when a reply had started and not yet ended at the turn's start (a barge-in
+        stays one after the reply stops); otherwise how long before the start the latest
+        reply that had ended by then finished, within REPLY_CONTEXT_MS.
+        """
+        start = turn.start_ms
+        ended_before = None
+        for begun, end in self._replies:
+            if begun <= start and (end is None or end > start):
+                return {"playing": True}
+            if end is not None and end <= start:
+                ended_before = start - end
+        if ended_before is not None and ended_before <= REPLY_CONTEXT_MS:
+            return {"playing": False, "ended_ms_before": ended_before}
         return None
 
     def _state(self, turn: Turn, gap: dict[str, Any] | None = None) -> dict[str, Any]:
