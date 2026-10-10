@@ -321,6 +321,57 @@ class ConversationEventTests(unittest.TestCase):
         self.assertEqual(self.kinds(events), ["attention"])
 
 
+class FollowUpNoteTests(unittest.TestCase):
+    """The follow-up diagnostic (#153): every undecided turn of the engaged speaker says
+    whether it became a follow-up, why not, Jev's attend probability and the bar."""
+
+    def setUp(self):
+        self.notes = []
+        self.events = SpeechEvents(report=self.notes.append)
+        self.events.start(SESSION, now_ms=0, conversation=MODE)
+        self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+
+    def say(self, current, label, **options):
+        self.events.transcript(current, current.end_ms)
+        self.events.decision(decided(current, label, **options), current.end_ms + 100)
+        self.events.drain()
+        return [note for note in self.notes if note.startswith("follow_up ")]
+
+    def test_a_formed_follow_up_and_a_refused_one_are_both_noted(self):
+        self.assertEqual(
+            self.say(turn("t2", 2000, 2900, "And tomorrow?"), "uncertain", attend=0.55),
+            ["follow_up outcome=formed reason=passed attend=0.55 bar=0.40"],
+        )
+        self.assertEqual(
+            self.say(turn("t3", 4000, 4900, "I heard that."), "uncertain", attend=0.04)[-1],
+            "follow_up outcome=refused reason=below_bar attend=0.04 bar=0.40",
+        )
+
+    def test_each_refusal_reason_is_a_fixed_token(self):
+        cases = {
+            "recipient": ({"attend": 0.8, "recipient": "speaker_1"}, "uncertain"),
+            "label": ({}, "ignore"),
+            "closing": ({"attend": 0.8}, "uncertain"),
+        }
+        start = 2000
+        for reason, (options, label) in cases.items():
+            with self.subTest(reason):
+                text = "That's all" if reason == "closing" else "And then?"
+                notes = self.say(turn("r" + reason, start, start + 900, text), label, **options)
+                self.assertIn(f"reason={reason} ", notes[-1])
+                start += 2000
+
+    def test_other_speakers_and_turns_outside_a_conversation_are_not_noted(self):
+        self.assertEqual(self.say(turn("o", 2000, 2900, "And then?", "Speaker B"), "uncertain"), [])
+        self.assertEqual(self.say(turn("late", 30000, 30900, "And then?"), "uncertain"), [])
+
+    def test_notes_never_carry_transcript_text_or_ids(self):
+        self.say(turn("t2", 2000, 2900, "And tomorrow?"), "uncertain", attend=0.55)
+        for note in self.notes:
+            for content in ("Haili", "tomorrow", "t1", "t2", SESSION, "Speaker"):
+                self.assertNotIn(content, note)
+
+
 class ReplyTimingTests(unittest.TestCase):
     """The window runs from the end of the spoken reply when the host reports it (#124)."""
 

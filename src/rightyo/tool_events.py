@@ -821,22 +821,39 @@ class SpeechEvents:
             until_ms=until,
         )
 
-    def _follow_up(self, turn, role, decision, evidence, unavailable):
-        """Whether an engaged speaker's undecided turn forms a request as a follow-up."""
+    def _follow_up_refusal(self, turn, role, decision, evidence, unavailable):
+        """Why an undecided turn is not a follow-up (a fixed token), or None when it is one.
+
+        `not_engaged` covers conversation mode off and any turn but the engaged speaker's
+        within the window; every other token is about the engaged speaker's own turn (#153).
+        """
         conversation = self._conversation
-        if (
-            conversation is None
-            or unavailable is not None
-            or evidence["label"] != "uncertain"
-            or not self._engaged_with(turn)
-            or decision.recipient not in {"system", "unknown"}
-            or decision.probabilities["attend"] < self._follow_up_bar(role)
+        if conversation is None or not self._engaged_with(turn):
+            return "not_engaged"
+        if unavailable is not None:
+            return "unavailable"
+        if evidence["label"] != "uncertain":
+            return "label"
+        if decision.recipient not in {"system", "unknown"}:
+            return "recipient"
+        if decision.probabilities["attend"] < self._follow_up_bar(role):
+            return "below_bar"
+        if conversation.is_closing(turn.text):
             # A closing phrase ends the conversation; it is never a request of its own.
-            or conversation.is_closing(turn.text)
-        ):
-            return False
-        # Owner-only mode never lets another speaker's turn become a request.
-        return not (role is not None and self._priority.priority.owner_only and role != "owner")
+            return "closing"
+        if role is not None and self._priority.priority.owner_only and role != "owner":
+            # Owner-only mode never lets another speaker's turn become a request.
+            return "owner_only"
+        return None
+
+    def _follow_up_note(self, refusal, role, decision):
+        """The content-free diagnostic for an engaged speaker's undecided turn (#153): the
+        outcome, the reason, Jev's attend probability and the bar in force. Never text or ids."""
+        attend = decision.probabilities.get("attend", 0.0)
+        return (
+            f"follow_up outcome={'refused' if refusal else 'formed'} reason={refusal or 'passed'}"
+            f" attend={attend:.2f} bar={self._follow_up_bar(role):.2f}"
+        )
 
     def _follow_up_bar(self, role):
         """The follow-up attend bar: optionally lower for enrolled owners and trusted (#113)."""
@@ -985,9 +1002,20 @@ class SpeechEvents:
             if self._conversation is not None:
                 # The window is judged in stream time at each decided turn.
                 self._lapse(turn.start_ms)
-                if not would_attend and self._follow_up(
-                    turn, current, event.decision, evidence, unavailable
-                ):
+                refusal = (
+                    None
+                    if would_attend
+                    else self._follow_up_refusal(
+                        turn, current, event.decision, evidence, unavailable
+                    )
+                )
+                if not would_attend and refusal != "not_engaged" and self._report is not None:
+                    # Best-effort, like the acknowledgement note: a failed write changes nothing.
+                    try:
+                        self._report(self._follow_up_note(refusal, current, event.decision))
+                    except Exception:  # noqa: BLE001
+                        pass
+                if not would_attend and refusal is None:
                     # An engaged speaker's undecided follow-up (#82): the request evidence
                     # says so, beside Jev's unchanged recipient and confidence.
                     evidence["label"] = "attend"
