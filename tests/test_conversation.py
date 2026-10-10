@@ -433,10 +433,44 @@ class ReplyNoteTests(unittest.TestCase):
             ],
         )
 
-    def test_a_report_after_the_window_lapsed_is_late(self):
+    def test_a_reply_after_a_timeout_revives_the_conversation(self):
+        # rightyo#158: a proactive relay after the window lapsed re-engages the speaker.
+        self.engage()  # engaged until 10900
+        self.events.reply("started", 20000)
+        self.events.reply("ended", 25000)
+        self.assertEqual(
+            self.replies(),
+            [
+                "reply phase=started action=revived window_left_ms=180000",
+                "reply phase=ended action=extended window_left_ms=10000",
+            ],
+        )
+        timeouts = [e for e in self.events.drain() if e["type"] == "conversation"]
+        self.assertEqual([(e["state"], e["reason"]) for e in timeouts], [("ambient", "timeout")])
+        # The speaker's answer after the reply is a follow-up; nothing from before it counts.
+        answer = turn("t2", 27000, 28000, "Yes, do that.")
+        self.events.transcript(answer, answer.end_ms)
+        self.events.decision(decided(answer, "uncertain", attend=0.5), answer.end_ms + 100)
+        requests = [e for e in self.events.drain() if e["type"] == "request"]
+        self.assertEqual(len(requests), 1)
+        self.assertIs(requests[0]["decision"]["follow_up"], True)
+
+    def test_a_stale_lapse_is_not_revived(self):
         self.engage()
-        self.events.reply("ended", 20000)
-        self.assertEqual(self.replies(), ["reply phase=ended action=late window_left_ms=-9100"])
+        self.events.reply("ended", 10900 + 600_001 + 1)
+        self.assertEqual(
+            self.replies()[-1], "reply phase=ended action=not_engaged window_left_ms=none"
+        )
+
+    def test_an_explicit_end_is_never_revived(self):
+        self.engage()
+        closing = turn("t2", 2000, 2600, "That's all")
+        self.events.transcript(closing, closing.end_ms)
+        self.events.decision(decided(closing, "uncertain", attend=0.8), closing.end_ms + 100)
+        self.events.reply("ended", 3000)
+        self.assertEqual(
+            self.replies()[-1], "reply phase=ended action=not_engaged window_left_ms=none"
+        )
 
 
 class ReplyTimingTests(unittest.TestCase):
@@ -473,15 +507,16 @@ class ReplyTimingTests(unittest.TestCase):
         kinds = self.say(turn("t2", 200000, 200900, "And then?"), "uncertain", attend=0.6)
         self.assertEqual(kinds, ["conversation", "attention"])
 
-    def test_reports_after_a_lapse_or_without_engagement_change_nothing(self):
+    def test_a_report_without_engagement_changes_nothing_and_one_after_a_lapse_revives(self):
         self.events.reply("ended", 500)
         kinds = self.say(turn("t0", 1000, 1900, "And?"), "uncertain", attend=0.9)
         self.assertEqual(kinds, ["attention"])
         self.say(turn("t1", 2000, 2900, "Haili, what time is it?"), "attend")
-        # The window ended at 12.9 s; a report at 20 s does not revive it.
+        # The window ended at 12.9 s. A reply reported at 20 s (a proactive one, say) says
+        # the conversation lapsed, then revives it from 20 s (rightyo#158).
         self.events.reply("ended", 20000)
         kinds = self.say(turn("t2", 21000, 21900, "And then?"), "uncertain", attend=0.6)
-        self.assertEqual(kinds, ["conversation", "attention"])
+        self.assertEqual(kinds, ["conversation", "attention", "request"])
 
     def test_reports_are_validated(self):
         for phase in ("finished", None, 1):

@@ -31,6 +31,8 @@ MAX_EVENT_BYTES = 1200000
 # How long a reply reported as playing can keep a conversation engaged when its end is
 # never reported (#124).
 MAX_REPLY_HOLD_MS = 180000
+# How long after a conversation lapsed by timeout a spoken reply can still revive it (#158).
+REVIVE_WINDOW_MS = 600_000
 MAX_QUEUE_BYTES = 4194304
 MAX_PENDING_BYTES = 1048576
 # The context a role provider sees when a speaker first appears.
@@ -169,6 +171,9 @@ class SpeechEvents:
         # the host reports a reply playing (#124), or None when ambient.
         self._conversation = None
         self._engaged = None
+        # The last engagement that lapsed by timeout, kept so a later spoken reply can revive
+        # it (rightyo#158): {"engaged": <the engagement>, "at_ms": <when it lapsed>}, or None.
+        self._dormant = None
         # One acknowledgement per spoken request (#122), with acknowledgement gating on:
         # the last acknowledged request's un-answered acknowledgement,
         # {"until_ms", "heard_end"}, or None. See `_hold_ack` and `reply`.
@@ -285,6 +290,7 @@ class SpeechEvents:
             self._acknowledgement = acknowledgement
             self._pending_ack = None
             self._engaged = None
+            self._dormant = None
             self.role_status = "off" if priority is None else "ready"
             self._degraded_turn = None
             self._session = session_id
@@ -712,24 +718,46 @@ class SpeechEvents:
             engaged = self._engaged
             if self._conversation is None:
                 return
-            if not self._active or engaged is None:
-                self._reply_note(phase, "inactive" if not self._active else "not_engaged", None)
+            if not self._active:
+                self._reply_note(phase, "inactive", None)
                 return
-            left = self._window_end(engaged) - now_ms
-            if left <= 0:
-                # Lapsed already, though no decision has said so yet: a late report never
-                # revives a conversation.
-                self._reply_note(phase, "late", left)
-                return
+            if engaged is not None and now_ms >= self._window_end(engaged):
+                # Lapsed already, though no decision has said so yet: say so now.
+                self._lapse(now_ms)
+                engaged = None
+            if engaged is None:
+                engaged = self._revive(now_ms)
+                if engaged is None:
+                    self._reply_note(phase, "not_engaged", None)
+                    return
+                action = "revived"
+            else:
+                action = None
             if phase == "started":
                 engaged.setdefault("replying_since", now_ms)
-                self._reply_note(phase, "held", self._window_end(engaged) - now_ms)
+                self._reply_note(phase, action or "held", self._window_end(engaged) - now_ms)
             else:
                 engaged.pop("replying_since", None)
                 engaged["until_ms"] = max(
                     engaged["until_ms"], now_ms + self._conversation.window_ms
                 )
-                self._reply_note(phase, "extended", self._window_end(engaged) - now_ms)
+                self._reply_note(phase, action or "extended", self._window_end(engaged) - now_ms)
+
+    def _revive(self, now_ms):
+        """A spoken reply re-engages the speaker whose conversation lapsed by timeout within
+        REVIVE_WINDOW_MS (rightyo#158): the assistant spoke to them again, so their answer is a
+        follow-up. Only speech after the reply counts. An explicit end (closing, dismissal,
+        another person) left nothing dormant. Emits nothing: engagement events name a request."""
+        dormant = self._dormant
+        if dormant is None or now_ms - dormant["at_ms"] > REVIVE_WINDOW_MS:
+            return None
+        self._dormant = None
+        engaged = {
+            key: value for key, value in dormant["engaged"].items() if key != "replying_since"
+        }
+        engaged["from_ms"] = engaged["until_ms"] = now_ms
+        self._engaged = engaged
+        return engaged
 
     def _reply_note(self, phase, action, left_ms):
         """The content-free reply-report diagnostic (rightyo#158): the phase, what it did to
@@ -769,6 +797,7 @@ class SpeechEvents:
         engaged = self._engaged
         if engaged is not None and now_ms >= self._window_end(engaged):
             self._engaged = None
+            self._dormant = {"engaged": engaged, "at_ms": self._window_end(engaged)}
             self._emit(
                 "conversation",
                 state="ambient",
@@ -782,6 +811,8 @@ class SpeechEvents:
         if self._engaged is None or not self._engaged_with(turn):
             return
         self._engaged = None
+        # An explicit end is never revived by a later reply.
+        self._dormant = None
         self._emit(
             "conversation",
             state="ambient",
@@ -820,6 +851,7 @@ class SpeechEvents:
         ):
             # Enrolled precedence: the window has not lapsed (`_lapse` ran first).
             return
+        self._dormant = None
         self._engaged = {
             "key": key,
             "speaker_id": turn.speaker_id,
