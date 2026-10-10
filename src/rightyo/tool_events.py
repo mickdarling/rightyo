@@ -846,13 +846,19 @@ class SpeechEvents:
             return "owner_only"
         return None
 
-    def _follow_up_note(self, refusal, role, decision):
+    def _follow_up_note(self, refusal, held, role, decision):
         """The content-free diagnostic for an engaged speaker's undecided turn (#153): the
-        outcome, the reason, Jev's attend probability and the bar in force. Never text or ids."""
+        outcome, the reason, Jev's attend probability and the bar in force. Never text or ids.
+
+        `formed` means the turn became a request; `held` means it passed the follow-up checks
+        but a cooldown, stop, dismissal, supersession or withdrawal kept it back. Values carry
+        up to six significant digits, so a near miss never prints as a tie.
+        """
         attend = decision.probabilities.get("attend", 0.0)
+        outcome = "refused" if refusal else "held" if held else "formed"
         return (
-            f"follow_up outcome={'refused' if refusal else 'formed'} reason={refusal or 'passed'}"
-            f" attend={attend:.2f} bar={self._follow_up_bar(role):.2f}"
+            f"follow_up outcome={outcome} reason={refusal or held or 'passed'}"
+            f" attend={attend:.6g} bar={self._follow_up_bar(role):.6g}"
         )
 
     def _follow_up_bar(self, role):
@@ -999,6 +1005,8 @@ class SpeechEvents:
                 kind = event.decision.dismissal
             dismissed = kind is not None or key in self._dismissed
             would_attend = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
+            # False: no follow-up note; None: a formed follow-up; else the refusal token.
+            follow_up_note: str | None | bool = False
             if self._conversation is not None:
                 # The window is judged in stream time at each decided turn.
                 self._lapse(turn.start_ms)
@@ -1009,12 +1017,9 @@ class SpeechEvents:
                         turn, current, event.decision, evidence, unavailable
                     )
                 )
-                if not would_attend and refusal != "not_engaged" and self._report is not None:
-                    # Best-effort, like the acknowledgement note: a failed write changes nothing.
-                    try:
-                        self._report(self._follow_up_note(refusal, current, event.decision))
-                    except Exception:  # noqa: BLE001
-                        pass
+                if not would_attend and refusal != "not_engaged":
+                    # Noted once the hold-backs below have had their say (#153).
+                    follow_up_note = refusal
                 if not would_attend and refusal is None:
                     # An engaged speaker's undecided follow-up (#82): the request evidence
                     # says so, beside Jev's unchanged recipient and confidence.
@@ -1040,6 +1045,27 @@ class SpeechEvents:
                 and superseded_by is None
                 and withdrawn_by is None
             )
+            if follow_up_note is not False and self._report is not None:
+                held = None
+                if follow_up_note is None and not attended:
+                    held = (
+                        "cooldown"
+                        if evidence.get("cooldown")
+                        else "stop"
+                        if stop
+                        else "dismissed"
+                        if dismissed
+                        else "superseded"
+                        if superseded_by is not None
+                        else "withdrawn"
+                    )
+                # Best-effort, like the acknowledgement note: a failed write changes nothing.
+                try:
+                    self._report(
+                        self._follow_up_note(follow_up_note, held, current, event.decision)
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
             overriding = authority == "owner" and (attended or stop or dismissed)
             plan = None
             if kind is not None:

@@ -340,11 +340,11 @@ class FollowUpNoteTests(unittest.TestCase):
     def test_a_formed_follow_up_and_a_refused_one_are_both_noted(self):
         self.assertEqual(
             self.say(turn("t2", 2000, 2900, "And tomorrow?"), "uncertain", attend=0.55),
-            ["follow_up outcome=formed reason=passed attend=0.55 bar=0.40"],
+            ["follow_up outcome=formed reason=passed attend=0.55 bar=0.4"],
         )
         self.assertEqual(
             self.say(turn("t3", 4000, 4900, "I heard that."), "uncertain", attend=0.04)[-1],
-            "follow_up outcome=refused reason=below_bar attend=0.04 bar=0.40",
+            "follow_up outcome=refused reason=below_bar attend=0.04 bar=0.4",
         )
 
     def test_each_refusal_reason_is_a_fixed_token(self):
@@ -360,6 +360,32 @@ class FollowUpNoteTests(unittest.TestCase):
                 notes = self.say(turn("r" + reason, start, start + 900, text), label, **options)
                 self.assertIn(f"reason={reason} ", notes[-1])
                 start += 2000
+
+    def test_a_follow_up_a_cool_down_holds_back_is_noted_as_held(self):
+        notes = []
+        events = SpeechEvents(report=notes.append)
+        events.start(SESSION, now_ms=0, conversation=MODE, dismissal=Dismissal(cooldown_ms=60000))
+        for current, label, options in (
+            (turn("t1", 0, 900, "Haili, what time is it?"), "attend", {}),
+            (
+                turn("t2", 2000, 2900, "And tomorrow?"),
+                "uncertain",
+                {"attend": 0.6, "confidence": 0.5},
+            ),
+        ):
+            if current.utterance_id == "t2":
+                # Another speaker's disengage: a cool-down for everyone, engagement intact.
+                events._cooldowns[None] = (1000, 61000)
+            events.transcript(current, current.end_ms)
+            events.decision(decided(current, label, **options), current.end_ms + 100)
+        follow_ups = [note for note in notes if note.startswith("follow_up ")]
+        self.assertEqual(follow_ups, ["follow_up outcome=held reason=cooldown attend=0.6 bar=0.4"])
+
+    def test_a_near_miss_never_prints_as_a_tie(self):
+        notes = self.say(turn("t2", 2000, 2900, "Right."), "uncertain", attend=0.399)
+        self.assertEqual(
+            notes[-1], "follow_up outcome=refused reason=below_bar attend=0.399 bar=0.4"
+        )
 
     def test_other_speakers_and_turns_outside_a_conversation_are_not_noted(self):
         self.assertEqual(self.say(turn("o", 2000, 2900, "And then?", "Speaker B"), "uncertain"), [])
