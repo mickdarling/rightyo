@@ -17,6 +17,9 @@ from rightyo.contracts import Addressing, ContractError, DecisionEvent, Turn, id
 from rightyo.memory import TranscriptMemory
 from rightyo.providers import DecisionProvider, dismissal_hints
 
+# How long after the assistant's spoken reply a turn still carries it as context (rightyo#153).
+REPLY_CONTEXT_MS = 60_000
+
 
 def _locked(method):
     @wraps(method)
@@ -109,6 +112,9 @@ class ReplayRunner:
         self._emitted: set[str] = set()
         self._history: deque[Turn] = deque(maxlen=max_context_turns)
         self._last_end_ms = 0
+        # The host's spoken-reply reports (#124, rightyo#153), on the stream clock.
+        self._reply_since: int | None = None
+        self._reply_ended: int | None = None
         self.skipped = 0
         self.partial_turns = 0
 
@@ -125,6 +131,7 @@ class ReplayRunner:
             self.memory.clear()
         self._history.clear()
         self._last_end_ms = 0
+        self._reply_since = self._reply_ended = None
 
     @_locked
     def clear(self, *, clear_memory: bool = True) -> None:
@@ -184,6 +191,33 @@ class ReplayRunner:
             "overlap": turn.overlap,
         }
 
+    @_locked
+    def note_reply(self, phase: str, now_ms: int) -> None:
+        """The host's report that the assistant's spoken reply `started` or `ended` (rightyo#153).
+
+        Later decisions then see `assistant_reply` in their state: whether a reply was
+        playing when the turn began, or how long before it the last one ended. Nothing is
+        added until the host reports a reply, so replays and older hosts are unchanged.
+        """
+        if phase == "started":
+            if self._reply_since is None:
+                self._reply_since = now_ms
+        elif phase == "ended":
+            self._reply_since, self._reply_ended = None, now_ms
+        else:
+            raise ValueError("invalid reply phase")
+
+    def _reply_state(self, turn: Turn) -> dict[str, Any] | None:
+        """`assistant_reply` for `turn`, or None when no recent reply bears on it."""
+        if self._reply_since is not None and self._reply_since <= turn.start_ms:
+            return {"playing": True}
+        if self._reply_ended is None:
+            return None
+        before = turn.start_ms - self._reply_ended
+        if 0 <= before <= REPLY_CONTEXT_MS:
+            return {"playing": False, "ended_ms_before": before}
+        return None
+
     def _state(self, turn: Turn, gap: dict[str, Any] | None = None) -> dict[str, Any]:
         past: list[Turn] = []
         chars = len(turn.text)
@@ -209,6 +243,7 @@ class ReplayRunner:
             "addressing": None if self.addressing is None else self.addressing.to_dict(),
             **({} if self.scene is None else {"scene": self.scene}),
             **({"post_turn_gap": checked_gap(gap)} if self.post_turn_gaps else {}),
+            **({} if (reply := self._reply_state(turn)) is None else {"assistant_reply": reply}),
             **(
                 {}
                 if self.dismissal_phrases is None
