@@ -150,7 +150,7 @@ class AcknowledgementEventTests(SessionHarness, unittest.TestCase):
         self.assertIs(request["decision"]["follow_up"], True)
         self.assertIs(request["acknowledge"], False)
         self.assertEqual(
-            self.notes[-1],
+            [note for note in self.notes if note.startswith("ack ")][-1],
             "ack outcome=skip reason=low_confidence attend_confidence=0.45 min=0.70 follow_up=true",
         )
 
@@ -180,7 +180,9 @@ class AcknowledgementEventTests(SessionHarness, unittest.TestCase):
         self.start(conversation=Conversation(window_ms=10000))
         self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend", 0.92)
         self.say(turn("t2", 2000, 2600, "Okay, great."), "uncertain", 0.22, 0.45)
-        self.assertEqual(len(self.notes), 2)
+        # Two acknowledgement notes, then the follow-up note, written after its request (#153).
+        self.assertEqual(len(self.notes), 3)
+        self.assertTrue(self.notes[2].startswith("follow_up "))
         for note in self.notes:
             for content in ("Haili", "time", "great", "t1", "t2", SESSION, "Speaker"):
                 self.assertNotIn(content, note)
@@ -209,13 +211,14 @@ class OneAcknowledgementPerRequestTests(SessionHarness, unittest.TestCase):
         third = self.say(turn("t3", 3400, 3900, "Please."), "uncertain", 0.3, 0.8)
         # Every fragment is still delivered; only the first is acknowledged.
         self.assertEqual(self.acks(first, second, third), [True, False, False])
-        self.assertIn("outcome=ack reason=confident", self.notes[0])
+        acks = [note for note in self.notes if note.startswith("ack ")]
+        self.assertIn("outcome=ack reason=confident", acks[0])
         self.assertEqual(
-            self.notes[1],
+            acks[1],
             "ack outcome=skip reason=pending_ack attend_confidence=0.95 min=0.70 follow_up=false",
         )
-        self.assertIn("outcome=skip reason=pending_ack", self.notes[2])
-        self.assertIn("follow_up=true", self.notes[2])
+        self.assertIn("outcome=skip reason=pending_ack", acks[2])
+        self.assertIn("follow_up=true", acks[2])
 
     def test_a_named_fragment_is_not_acknowledged_twice(self):
         self.start()
