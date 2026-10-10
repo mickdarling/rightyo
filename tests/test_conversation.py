@@ -462,6 +462,33 @@ class ReplyNoteTests(unittest.TestCase):
             self.replies()[-1], "reply phase=ended action=not_engaged window_left_ms=none"
         )
 
+    def test_the_lapse_event_is_never_stamped_before_the_time_it_names(self):
+        self.engage()  # engaged until 10900; the last decision was at ~1000
+        self.events.reply("started", 20000)
+        lapse = [e for e in self.events.drain() if e["type"] == "conversation"][0]
+        self.assertLessEqual(lapse["at_ms"], lapse["emitted_at_ms"])
+
+    def test_a_closing_said_after_the_lapse_is_not_revived(self):
+        self.engage()
+        closing = turn("t2", 15000, 15600, "That's all")
+        self.events.transcript(closing, closing.end_ms)
+        self.events.decision(decided(closing, "uncertain", attend=0.2), closing.end_ms + 100)
+        self.events.reply("ended", 20000)
+        self.assertEqual(
+            self.replies()[-1], "reply phase=ended action=not_engaged window_left_ms=none"
+        )
+
+    def test_a_reply_to_another_request_does_not_revive_the_lapsed_speaker(self):
+        self.engage()
+        # Another, unattributed speaker's request is delivered after the lapse; it engages no one.
+        other = turn("t3", 30000, 30900, "Haili, play some music.", None)
+        self.events.transcript(other, other.end_ms)
+        self.events.decision(decided(other, "attend"), other.end_ms + 100)
+        self.events.reply("ended", 35000)
+        self.assertEqual(
+            self.replies()[-1], "reply phase=ended action=not_engaged window_left_ms=none"
+        )
+
     def test_an_explicit_end_is_never_revived(self):
         self.engage()
         closing = turn("t2", 2000, 2600, "That's all")

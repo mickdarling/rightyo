@@ -721,6 +721,9 @@ class SpeechEvents:
             if not self._active:
                 self._reply_note(phase, "inactive", None)
                 return
+            # The stream clock moves with the report, so anything emitted here is stamped no
+            # earlier than the time it names (haild requires at_ms <= emitted_at_ms).
+            self._now = max(self._now, now_ms)
             if engaged is not None and now_ms >= self._window_end(engaged):
                 # Lapsed already, though no decision has said so yet: say so now.
                 self._lapse(now_ms)
@@ -742,6 +745,15 @@ class SpeechEvents:
                     engaged["until_ms"], now_ms + self._conversation.window_ms
                 )
                 self._reply_note(phase, action or "extended", self._window_end(engaged) - now_ms)
+
+    def _forget_dormant(self, turn):
+        """An explicit end by the lapsed speaker, even after the lapse, is never revived (#158)."""
+        dormant = self._dormant
+        if (
+            dormant is not None
+            and self._cooldown_key(self._facts(turn)) == dormant["engaged"]["key"]
+        ):
+            self._dormant = None
 
     def _revive(self, now_ms):
         """A spoken reply re-engages the speaker whose conversation lapsed by timeout within
@@ -808,6 +820,7 @@ class SpeechEvents:
 
     def _disengage(self, turn, reason):
         """Return the engaged speaker to ambient because of their own `turn`."""
+        self._forget_dormant(turn)
         if self._engaged is None or not self._engaged_with(turn):
             return
         self._engaged = None
@@ -1305,7 +1318,28 @@ class SpeechEvents:
                     or event.decision.recipient.startswith("speaker_")
                 ):
                     self._disengage(turn, "other_human")
+            elif (
+                self._conversation is not None
+                and self._dormant is not None
+                and (
+                    plan is not None
+                    or self._conversation.is_closing(turn.text)
+                    or (
+                        evidence["label"] == "ignore"
+                        and (
+                            event.decision.recipient == "other_human"
+                            or event.decision.recipient.startswith("speaker_")
+                        )
+                    )
+                )
+            ):
+                # The same explicit ends, said after the conversation lapsed (#158).
+                self._forget_dormant(turn)
             if attended:
+                # Any delivered request makes the next reply that request's, so no lapsed
+                # conversation is revived by it (rightyo#158); a request that engages its own
+                # speaker replaces the dormant one anyway.
+                self._dormant = None
                 self._emit(
                     "request",
                     request_id=request_id,
