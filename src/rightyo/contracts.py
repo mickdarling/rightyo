@@ -29,6 +29,7 @@ DEFAULT_CLOSING_PHRASES = (
     "that'll be all",
     "that will be all",
     "that's it for now",
+    "that's it",
     "we're done",
     "all done",
     "never mind",
@@ -75,6 +76,26 @@ MAX_TRUSTED_SPEAKERS = 32
 MAX_STOP_PHRASES = 16
 _STOP_PHRASE = re.compile(r"[A-Za-z0-9' ]{1,48}")
 _PHRASE_SEPARATORS = re.compile(r"[^\w]+")
+# A turn whose last clause ends in a question mark (closing quotes, brackets, "!", periods,
+# ellipses, their full-width forms and whitespace after it aside) is a question, never a
+# closing (#167).
+_QUESTION_END = re.compile(r"[?\uff1f][\s!.\u2026\uff01\uff1f\u3002\"'\u201d\u2019)\]]*\Z")
+# Closing tolerance (#167): courtesy or filler words that may surround a closing phrase.
+_COURTESY = frozenset(
+    {
+        ("okay",),
+        ("ok",),
+        ("alright",),
+        ("all", "right"),
+        ("great",),
+        ("perfect",),
+        ("excellent",),
+        ("thanks",),
+        ("thank", "you"),
+        ("cheers",),
+        ("cool",),
+    }
+)
 
 
 class ContractError(ValueError):
@@ -404,7 +425,8 @@ class Conversation:
     recipient of `system` or `unknown`, forms a request as a follow-up. A confident
     `ignore`, another recipient, or another speaker never does. The speaker returns to
     ambient when the window lapses, when Jev confidently judges their turn addressed to
-    another person, on a whole-turn `closing_phrases` match, or on a dismissal.
+    another person, on a `closing_phrases` match
+    (courtesy words around it are tolerated, `is_closing`), or on a dismissal.
     """
 
     window_ms: int = DEFAULT_CONVERSATION_WINDOW_MS
@@ -429,9 +451,30 @@ class Conversation:
                 raise ContractError("invalid closing phrase")
 
     def is_closing(self, text: str) -> bool:
-        """Whole-utterance match after casefolding and punctuation removal."""
-        words = normalize_phrase(text)
-        return any(words == normalize_phrase(phrase) for phrase in self.closing_phrases)
+        """Whether the turn is a closing, tolerating courtesies around it (#167).
+
+        Ignoring case, apostrophes and punctuation, the turn must consist only of closing
+        phrases and courtesy words (okay, thanks, thank you, and so on), with at least one
+        closing phrase. So "Okay. That's it. Thank you." closes, and a configured phrase
+        still matches across punctuation, but any other word in the turn, such as a new
+        request, means it is no closing. Nor is a turn that ends as a question: a bare
+        "That's it?" is surprise, not a goodbye.
+        """
+        if _QUESTION_END.search(text):
+            return False
+        words = tuple(normalize_phrase(text).split())
+        phrases = {tuple(normalize_phrase(phrase).split()) for phrase in self.closing_phrases}
+        units = [(unit, False) for unit in _COURTESY] + [(unit, True) for unit in phrases]
+        # reach[i]: whether words[:i] parses into units, and whether one was a closing phrase.
+        reach: list[set[bool]] = [set() for _ in range(len(words) + 1)]
+        reach[0].add(False)
+        for index in range(len(words)):
+            if not reach[index]:
+                continue
+            for unit, closing in units:
+                if words[index : index + len(unit)] == unit:
+                    reach[index + len(unit)].update(seen or closing for seen in reach[index])
+        return True in reach[len(words)]
 
     @classmethod
     def from_dict(cls, raw: Any) -> Conversation:
