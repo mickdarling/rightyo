@@ -76,6 +76,9 @@ MAX_TRUSTED_SPEAKERS = 32
 MAX_STOP_PHRASES = 16
 _STOP_PHRASE = re.compile(r"[A-Za-z0-9' ]{1,48}")
 _PHRASE_SEPARATORS = re.compile(r"[^\w]+")
+# A turn whose last clause ends in a question mark (closing quotes, brackets, "!" and
+# whitespace after it aside) is a question, never a closing (#167).
+_QUESTION_END = re.compile(r"[?\uff1f][\s!\"'\u201d\u2019)\]]*\Z")
 # Closing tolerance (#167): courtesy or filler words that may surround a closing phrase.
 _COURTESY = frozenset(
     {
@@ -453,8 +456,11 @@ class Conversation:
         phrases and courtesy words (okay, thanks, thank you, and so on), with at least one
         closing phrase. So "Okay. That's it. Thank you." closes, and a configured phrase
         still matches across punctuation, but any other word in the turn, such as a new
-        request, means it is no closing.
+        request, means it is no closing. Nor is a turn that ends as a question: a bare
+        "That's it?" is surprise, not a goodbye.
         """
+        if _QUESTION_END.search(text):
+            return False
         words = tuple(normalize_phrase(text).split())
         phrases = {tuple(normalize_phrase(phrase).split()) for phrase in self.closing_phrases}
         units = [(unit, False) for unit in _COURTESY] + [(unit, True) for unit in phrases]

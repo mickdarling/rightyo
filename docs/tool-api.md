@@ -581,14 +581,17 @@ The `attention` and `request` events of a follow-up carry `"label": "attend"` an
 
 A request said before an explicit end (`closed`, `other_human` or `dismissed`) whose
 decision arrives only after it is still delivered, but it does not re-open the
-conversation ([#167](https://github.com/mickdarling/rightyo/issues/167)).
+conversation ([#167](https://github.com/mickdarling/rightyo/issues/167)). This applies
+only to the speaker whose conversation ended; another speaker's request still engages
+them.
 
 **Closings.** Matching ignores case, apostrophes and punctuation. A turn is a closing when
 it consists only of closing phrases and courtesy words, with at least one closing phrase.
 The courtesy words are okay, ok, alright, all right, great, perfect, excellent, thanks,
 thank you, cheers and cool. So "Okay. That's it. Thank you." is a closing, while "That's
-it, now book the flight." and "Thank you." are not. Stop phrases are a separate list and
-still need an exact whole-turn match.
+it, now book the flight." and "Thank you." are not. A turn whose last clause ends in a
+question mark is never a closing: a bare "That's it?" is surprise, not a goodbye. Stop
+phrases are a separate list and still need an exact whole-turn match.
 
 **Speakers.** Only a session-stable, unoverlapped speaker label is ever engaged. An
 unattributed or overlapping turn, or one with utterance-local labels, never engages and

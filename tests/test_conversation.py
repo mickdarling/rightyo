@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from rightyo.contracts import (
@@ -296,6 +297,55 @@ class ConversationEventTests(unittest.TestCase):
                 self.assertEqual([e["type"] for e in events], ["request"])
                 events = self.say(turn("t5", 16000, 16900, "And?"), "uncertain", attend=0.8)
                 self.assertEqual(self.kinds(events), ["attention"])
+
+    def test_ending_one_speakers_conversation_leaves_another_speakers_request_alone(self):
+        # #167 review: the end boundary is per speaker. A is engaged and B's request is
+        # pending when A's conversation ends; B's request decided afterwards still engages B.
+        ends = {
+            "labelled closing": (turn("t3", 3500, 4100, "That's all."), {}),
+            "unlabelled closing": (turn("t3", 3500, 4100, "Okay, that's it.", None), {}),
+            "other_human": (
+                turn("t3", 3500, 4100, "Sam, did you see that?"),
+                {"recipient": "other_human"},
+            ),
+            "stop phrase": (turn("t3", 3500, 4100, "Stop"), {}),
+            "model dismissal": (turn("t3", 3500, 4100, "Go away."), {"dismissal": "disengage"}),
+        }
+        for name, (end, options) in ends.items():
+            with self.subTest(name):
+                self.events = SpeechEvents()
+                self.start(dismissal=Dismissal())
+                self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+                other = turn("t2", 2000, 2900, "Haili, set a timer.", "Speaker B")
+                self.events.transcript(other, other.end_ms)
+                self.events.transcript(end, end.end_ms)
+                event = decided(end, "ignore", recipient=options.get("recipient", "system"))
+                if "dismissal" in options:
+                    event = replace(
+                        event,
+                        decision=replace(
+                            event.decision,
+                            dismissal=options["dismissal"],
+                            dismissal_choice=options["dismissal"],
+                            dismissal_confidence=1.0,
+                        ),
+                    )
+                self.events.decision(event, 4200)
+                ended = [e for e in self.events.drain() if e["type"] == "conversation"]
+                self.assertEqual(
+                    [(e["state"], e["speaker_id"]) for e in ended], [("ambient", "Speaker A")]
+                )
+                self.events.decision(decided(other, "attend"), 4300)
+                events = [
+                    e for e in self.events.drain() if e["type"] in {"request", "conversation"}
+                ]
+                self.assertEqual([e["type"] for e in events], ["request", "conversation"])
+                self.assertEqual(
+                    (events[1]["state"], events[1]["speaker_id"]), ("engaged", "Speaker B")
+                )
+                remark = turn("t4", 5000, 5600, "Right.", "Speaker B")
+                events = self.say(remark, "uncertain", attend=0.8)
+                self.assertEqual(self.kinds(events), ["attention", "request"])
 
     def test_an_unattributed_closing_after_the_window_ends_nothing_more(self):
         self.start()
@@ -896,6 +946,9 @@ class ConversationConfigTests(unittest.TestCase):
             "Excellent.",
             "That is it.",
             "Is that it?",
+            "That's it?",
+            "That's all?!",
+            "Okay. That's it?",
             "That's all the news?",
             "",
             "...",
@@ -911,6 +964,8 @@ class ConversationConfigTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertTrue(Conversation(closing_phrases=(phrase,)).is_closing(text))
         self.assertTrue(mode.is_closing("That's all. Never mind."))
+        # Only the last clause decides whether the turn is a question.
+        self.assertTrue(mode.is_closing("That's it? Okay, thanks, that's all."))
         # A configured phrase made only of courtesy words still matches.
         thanks = Conversation(closing_phrases=("thanks",))
         self.assertTrue(thanks.is_closing("Thanks. Okay."))

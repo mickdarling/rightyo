@@ -45,6 +45,8 @@ DISMISS_SCOPES = {
 }
 # Delivered requests a later dismissal can still withdraw; the oldest is dropped beyond.
 MAX_WITHDRAWABLE = 32
+# Speakers whose last explicit conversation end is remembered (#167).
+MAX_ENDED_SPEAKERS = 64
 
 
 def _role_state(record):
@@ -176,9 +178,10 @@ class SpeechEvents:
         # The last engagement that lapsed by timeout, kept so a later spoken reply can revive
         # it (rightyo#158): {"engaged": <the engagement>, "at_ms": <when it lapsed>}, or None.
         self._dormant = None
-        # The start of the latest explicit end (#167): a request said before it, decided
-        # out of order after it, never re-opens the conversation it ended.
-        self._ended_ms = None
+        # Per speaker key, the start of the latest explicit end of that speaker's
+        # conversation (#167): their request said before it, decided out of order after it,
+        # never re-opens it. Other speakers' requests are unaffected. Bounded (`_mark_ended`).
+        self._ended = {}
         # One acknowledgement per spoken request (#122), with acknowledgement gating on:
         # the last acknowledged request's un-answered acknowledgement,
         # {"until_ms", "heard_end"}, or None. See `_hold_ack` and `reply`.
@@ -300,7 +303,7 @@ class SpeechEvents:
             self._pending_ack = None
             self._engaged = None
             self._dormant = None
-            self._ended_ms = None
+            self._ended.clear()
             self.role_status = "off" if priority is None else "ready"
             self._degraded_turn = None
             self._session = session_id
@@ -798,7 +801,7 @@ class SpeechEvents:
             self._ends_for(turn, engaged, reason) and turn.start_ms >= self._closing_floor(engaged)
         ):
             self._dormant = None
-            self._mark_ended(turn)
+            self._mark_ended(engaged["key"], turn)
 
     def _end_revived(self, turn, reason):
         """An explicit end decided after a reply revived its speaker's lapsed conversation
@@ -813,7 +816,7 @@ class SpeechEvents:
             and engaged["revived_over_ms"] <= turn.start_ms < engaged["from_ms"]
         ):
             self._engaged = None
-            self._mark_ended(turn)
+            self._mark_ended(engaged["key"], turn)
             if self._report is not None:
                 try:
                     self._report(f"revival action=ended reason={reason}")
@@ -887,10 +890,17 @@ class SpeechEvents:
                 at_ms=self._window_end(engaged),
             )
 
-    def _mark_ended(self, turn):
-        """Record an explicit end's start, which only moves forward (#167)."""
-        if self._ended_ms is None or turn.start_ms > self._ended_ms:
-            self._ended_ms = turn.start_ms
+    def _mark_ended(self, key, turn):
+        """Record, for the speaker whose conversation `turn` ended, the end's start (#167).
+
+        `key` is the ended engagement's, which an unattributed closing's turn lacks. Each
+        speaker's boundary only moves forward; the oldest speaker's is dropped beyond
+        MAX_ENDED_SPEAKERS.
+        """
+        previous = self._ended.pop(key, None)
+        self._ended[key] = turn.start_ms if previous is None else max(previous, turn.start_ms)
+        if len(self._ended) > MAX_ENDED_SPEAKERS:
+            del self._ended[next(iter(self._ended))]
 
     def _disengage(self, turn, reason):
         """Return the engaged speaker to ambient because of their own `turn`, or because of
@@ -904,8 +914,8 @@ class SpeechEvents:
         if self._engaged is None or not (unattributed or self._engaged_with(turn)):
             return
         speaker_id = self._engaged["speaker_id"]
+        self._mark_ended(self._engaged["key"], turn)
         self._engaged = None
-        self._mark_ended(turn)
         # An explicit end is never revived by a later reply.
         self._dormant = None
         self._emit(
@@ -928,9 +938,9 @@ class SpeechEvents:
         key = self._cooldown_key(self._facts(turn))
         if self._conversation is None or key is None:
             return
-        if self._ended_ms is not None and turn.start_ms < self._ended_ms:
-            # Said before an explicit end that was decided first (#167): the request is
-            # still delivered, but it does not re-open the conversation that end closed.
+        if turn.start_ms < self._ended.get(key, turn.start_ms):
+            # Said before an explicit end of this speaker's conversation that was decided
+            # first (#167): the request is still delivered, but does not re-open it.
             return
         until = turn.end_ms + self._conversation.window_ms
         if self._engaged is not None and turn.end_ms < self._engaged["from_ms"]:
