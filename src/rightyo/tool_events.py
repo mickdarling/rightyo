@@ -176,6 +176,9 @@ class SpeechEvents:
         # The last engagement that lapsed by timeout, kept so a later spoken reply can revive
         # it (rightyo#158): {"engaged": <the engagement>, "at_ms": <when it lapsed>}, or None.
         self._dormant = None
+        # The start of the latest explicit end (#167): a request said before it, decided
+        # out of order after it, never re-opens the conversation it ended.
+        self._ended_ms = None
         # One acknowledgement per spoken request (#122), with acknowledgement gating on:
         # the last acknowledged request's un-answered acknowledgement,
         # {"until_ms", "heard_end"}, or None. See `_hold_ack` and `reply`.
@@ -297,6 +300,7 @@ class SpeechEvents:
             self._pending_ack = None
             self._engaged = None
             self._dormant = None
+            self._ended_ms = None
             self.role_status = "off" if priority is None else "ready"
             self._degraded_turn = None
             self._session = session_id
@@ -808,6 +812,7 @@ class SpeechEvents:
             and engaged["revived_over_ms"] <= turn.start_ms < engaged["from_ms"]
         ):
             self._engaged = None
+            self._mark_ended(turn)
             if self._report is not None:
                 try:
                     self._report(f"revival action=ended reason={reason}")
@@ -881,6 +886,11 @@ class SpeechEvents:
                 at_ms=self._window_end(engaged),
             )
 
+    def _mark_ended(self, turn):
+        """Record an explicit end's start, which only moves forward (#167)."""
+        if self._ended_ms is None or turn.start_ms > self._ended_ms:
+            self._ended_ms = turn.start_ms
+
     def _disengage(self, turn, reason):
         """Return the engaged speaker to ambient because of their own `turn`, or because of
         an unattributed closing inside the window (#167)."""
@@ -894,6 +904,7 @@ class SpeechEvents:
             return
         speaker_id = self._engaged["speaker_id"]
         self._engaged = None
+        self._mark_ended(turn)
         # An explicit end is never revived by a later reply.
         self._dormant = None
         self._emit(
@@ -915,6 +926,10 @@ class SpeechEvents:
         """
         key = self._cooldown_key(self._facts(turn))
         if self._conversation is None or key is None:
+            return
+        if self._ended_ms is not None and turn.start_ms < self._ended_ms:
+            # Said before an explicit end that was decided first (#167): the request is
+            # still delivered, but it does not re-open the conversation that end closed.
             return
         until = turn.end_ms + self._conversation.window_ms
         if self._engaged is not None and turn.end_ms < self._engaged["from_ms"]:

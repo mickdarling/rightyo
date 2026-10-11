@@ -579,6 +579,10 @@ The `attention` and `request` events of a follow-up carry `"label": "attend"` an
   with natural dismissal on), even when their dismissal only stops playback: ending
   their own engagement affects no one else.
 
+A request said before an explicit end (`closed`, `other_human` or `dismissed`) whose
+decision arrives only after it is still delivered, but it does not re-open the
+conversation ([#167](https://github.com/mickdarling/rightyo/issues/167)).
+
 **Closings.** Matching ignores case, apostrophes and punctuation. A turn is a closing when
 it consists only of closing phrases and courtesy words, with at least one closing phrase.
 The courtesy words are okay, ok, alright, all right, great, perfect, excellent, thanks,
