@@ -602,6 +602,24 @@ class ReplyNoteTests(unittest.TestCase):
         self.assertEqual(requests[-1]["turn"]["utterance_id"], "t9")
         self.assertIs(requests[-1]["decision"]["follow_up"], True)
 
+    def test_an_older_request_decided_late_never_lowers_the_boundary(self):
+        self.engage()  # engaged until 10900
+        self.events.reply("ended", 20000)  # revived from 20000
+        older = turn("t2", 21000, 21800, "Haili, and the weather?")
+        self.events.transcript(older, older.end_ms)
+        closing = turn("t3", 22000, 22400, "That's all")  # said, decision still pending
+        self.events.transcript(closing, closing.end_ms)
+        newer = turn("t4", 23000, 23800, "Haili, and tomorrow?")
+        self.events.transcript(newer, newer.end_ms)
+        self.events.decision(decided(newer, "attend"), newer.end_ms + 100)  # until 33800
+        self.events.decision(decided(older, "attend"), newer.end_ms + 200)  # decided late
+        self.events.reply("ended", 40000)  # lapsed at 33800, revived again
+        self.events.decision(decided(closing, "uncertain", attend=0.2), 40100)
+        self.assertNotIn("revival action=ended reason=closed", self.notes)
+        requests = self.remark_requests(42000)
+        self.assertEqual(requests[-1]["turn"]["utterance_id"], "t9")
+        self.assertIs(requests[-1]["decision"]["follow_up"], True)
+
     def test_an_ordinary_remark_decided_after_a_revival_keeps_it(self):
         remark = turn("t2", 15000, 15600, "Hmm.")
         requests = self.race(remark, "uncertain", attend=0.1)

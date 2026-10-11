@@ -889,8 +889,11 @@ class SpeechEvents:
             # request outranks any older end still to be decided against a revival (#158):
             # its end becomes the boundary. While engaged, [its end, from_ms) is empty, so it
             # ends nothing; after a later lapse, a revival keeps it (`_revive`'s setdefault).
+            # It only moves forward: an older request decided late never lowers it.
             self._engaged["until_ms"] = max(self._engaged["until_ms"], until)
-            self._engaged["revived_over_ms"] = turn.end_ms
+            self._engaged["revived_over_ms"] = max(
+                self._engaged.get("revived_over_ms", turn.end_ms), turn.end_ms
+            )
             if self._per_turn:
                 self._engaged["role"] = role
             return
