@@ -795,7 +795,7 @@ class SpeechEvents:
         }
         # Any explicit end said since the lapsed engagement began, decided only after this
         # reply, ends the revival (`_end_revived`). A revival of a revival keeps the first
-        # boundary (`_lapse` carries it), unless a request since has cleared it.
+        # boundary (`_lapse` carries it), or the end of a request said since (`_engage`).
         engaged.setdefault("revived_over_ms", engaged["from_ms"])
         engaged["from_ms"] = engaged["until_ms"] = now_ms
         self._engaged = engaged
@@ -886,9 +886,11 @@ class SpeechEvents:
             return
         if self._engaged is not None and self._engaged["key"] == key:
             # Each exchange extends the window; the state itself does not change. A new
-            # request outranks any older end still to be decided against a revival (#158).
+            # request outranks any older end still to be decided against a revival (#158):
+            # its end becomes the boundary. While engaged, [its end, from_ms) is empty, so it
+            # ends nothing; after a later lapse, a revival keeps it (`_revive`'s setdefault).
             self._engaged["until_ms"] = max(self._engaged["until_ms"], until)
-            self._engaged.pop("revived_over_ms", None)
+            self._engaged["revived_over_ms"] = turn.end_ms
             if self._per_turn:
                 self._engaged["role"] = role
             return

@@ -595,7 +595,8 @@ after the reply counts, and no `engaged` event is emitted for a revival (that ev
 request). An explicit end (a closing phrase, a dismissal, turning to another person), even
 one said after the lapse, or any delivered request, leaves nothing to revive; such an end
 whose decision arrives only after the reply revived the speaker ends the revival, silently,
-unless the speaker has made a request said after the reply. The stderr note is
+unless it was said before a later request of the speaker's, even across a further lapse
+and revival. The stderr note is
 `revival action=ended reason=closed|dismissed|other_human`. A report
 with nothing engaged and nothing to revive changes nothing; malformed lines are skipped
 with a content-free stderr note. Every report also writes a content-free stderr note:
