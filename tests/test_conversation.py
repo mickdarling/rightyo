@@ -280,6 +280,23 @@ class ConversationEventTests(unittest.TestCase):
                 events = self.say(turn("t5", 7000, 7900, "Haili, what's next?"), "attend")
                 self.assertEqual(self.kinds(events), ["attention", "request", "conversation"])
 
+    def test_an_older_request_decided_after_a_dormant_closing_does_not_re_engage(self):
+        for speaker in (None, "Speaker A"):
+            with self.subTest(closing_speaker=speaker):
+                self.events = SpeechEvents()
+                self.start()
+                self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+                # A remark after the window lapses the conversation, leaving it dormant.
+                self.say(turn("t2", 12000, 12500, "Hmm."), "uncertain", attend=0.1)
+                older = turn("t3", 13000, 13900, "Haili, and the weather?")
+                self.events.transcript(older, older.end_ms)
+                self.say(turn("t4", 15000, 15600, "Okay, that's it.", speaker), "ignore")
+                self.events.decision(decided(older, "attend"), 15800)
+                events = [e for e in self.events.drain() if e["type"] != "attention"]
+                self.assertEqual([e["type"] for e in events], ["request"])
+                events = self.say(turn("t5", 16000, 16900, "And?"), "uncertain", attend=0.8)
+                self.assertEqual(self.kinds(events), ["attention"])
+
     def test_an_unattributed_closing_after_the_window_ends_nothing_more(self):
         self.start()
         self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")

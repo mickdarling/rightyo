@@ -798,6 +798,7 @@ class SpeechEvents:
             self._ends_for(turn, engaged, reason) and turn.start_ms >= self._closing_floor(engaged)
         ):
             self._dormant = None
+            self._mark_ended(turn)
 
     def _end_revived(self, turn, reason):
         """An explicit end decided after a reply revived its speaker's lapsed conversation
