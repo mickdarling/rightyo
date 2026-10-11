@@ -193,6 +193,57 @@ class ConversationEventTests(unittest.TestCase):
                 events = self.say(turn("t3", 4000, 4900, "And?"), "uncertain", attend=0.9)
                 self.assertEqual(self.kinds(events), ["attention"])
 
+    def test_the_field_closing_without_a_label_ends_the_engagement(self):
+        # rightyo#167, session hail-61ada3a5: an attended closing with no speaker label,
+        # then "Excellent." from the engaged speaker 1.1 s later, must not be a follow-up.
+        self.start()
+        self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+        closing = turn("t2", 3000, 4500, "Okay. That's it. Thank you.", None)
+        events = self.say(closing, "attend", confidence=0.7)
+        # As for a labelled closing, the engagement ends before the request goes out.
+        self.assertEqual(self.kinds(events), ["attention", "conversation", "request"])
+        self.assertEqual(
+            {k: events[1][k] for k in ("state", "reason", "speaker_id", "utterance_id")},
+            {
+                "state": "ambient",
+                "reason": "closed",
+                "speaker_id": "Speaker A",
+                "utterance_id": "t2",
+            },
+        )
+        events = self.say(turn("t3", 5600, 6200, "Excellent."), "uncertain", attend=0.8)
+        self.assertEqual(self.kinds(events), ["attention"])
+        self.assertNotIn("follow_up", events[0]["decision"])
+
+    def test_an_unattributed_closing_with_nobody_engaged_changes_nothing(self):
+        self.start()
+        events = self.say(turn("t1", 0, 900, "That's it, thanks.", None), "uncertain", attend=0.2)
+        self.assertEqual(self.kinds(events), ["attention"])
+        self.assertIsNone(self.events._engaged)
+        # A request afterwards engages as usual, and its follow-up still forms.
+        events = self.say(turn("t2", 2000, 2900, "Haili, what time is it?"), "attend")
+        self.assertEqual(self.kinds(events), ["attention", "request", "conversation"])
+        events = self.say(turn("t3", 4000, 4900, "And tomorrow?"), "uncertain", attend=0.6)
+        self.assertEqual(self.kinds(events), ["attention", "request"])
+
+    def test_an_unattributed_request_with_a_closing_word_ends_nothing(self):
+        self.start()
+        self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+        for name, label in (("t2", "attend"), ("t3", "uncertain")):
+            with self.subTest(name):
+                current = turn(name, 2000, 2900, "That's it, now book the flight.", None)
+                events = self.say(current, label, attend=0.5 if label == "uncertain" else None)
+                self.assertNotIn("conversation", self.kinds(events))
+        events = self.say(turn("t4", 4000, 4900, "And tomorrow?"), "uncertain", attend=0.6)
+        self.assertEqual(self.kinds(events), ["attention", "request"])
+
+    def test_an_unattributed_closing_after_the_window_ends_nothing_more(self):
+        self.start()
+        self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+        events = self.say(turn("t2", 20000, 20900, "Okay, that's it.", None), "ignore")
+        conversation = [e for e in events if e["type"] == "conversation"]
+        self.assertEqual([e["reason"] for e in conversation], ["timeout"])
+
     def test_talking_to_another_person_returns_to_ambient(self):
         self.start()
         self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
@@ -478,6 +529,18 @@ class ReplyNoteTests(unittest.TestCase):
             self.replies()[-1], "reply phase=ended action=not_engaged window_left_ms=none"
         )
 
+    def test_an_unattributed_closing_after_the_lapse_is_not_revived(self):
+        # rightyo#167: an unattributed closing ends a dormant conversation as a labelled one does.
+        self.engage()
+        closing = turn("t2", 15000, 15600, "Okay. That's it. Thank you.", None)
+        self.events.transcript(closing, closing.end_ms)
+        # Undecided, so no delivered request clears the dormant conversation instead.
+        self.events.decision(decided(closing, "uncertain", attend=0.2), closing.end_ms + 100)
+        self.events.reply("ended", 20000)
+        self.assertEqual(
+            self.replies()[-1], "reply phase=ended action=not_engaged window_left_ms=none"
+        )
+
     def test_a_reply_to_another_request_does_not_revive_the_lapsed_speaker(self):
         self.engage()
         # Another, unattributed speaker's request is delivered after the lapse; it engages no one.
@@ -533,6 +596,27 @@ class ReplyNoteTests(unittest.TestCase):
         closing = turn("t2", 15000, 15600, "That's all")
         self.assertEqual(self.race(closing, "uncertain", attend=0.2), [])
         self.assertIn("revival action=ended reason=closed", self.notes)
+
+    def test_an_unattributed_closing_decided_after_a_revival_ends_it(self):
+        closing = turn("t2", 15000, 15600, "Okay, that's all. Thanks.", None)
+        self.assertEqual(self.race(closing, "uncertain", attend=0.2), [])
+        self.assertIn("revival action=ended reason=closed", self.notes)
+
+    def test_an_unattributed_closing_from_before_the_lapsed_request_ends_nothing(self):
+        # Said before the request that engaged, decided late: not part of that conversation.
+        self.events.transcript(turn("t0", 0, 400, "Never mind.", None), 400)
+        self.engage()
+        early = turn("t0", 0, 400, "Never mind.", None)
+        self.events.decision(decided(early, "uncertain", attend=0.2), 20100)
+        self.events.reply("ended", 20200)
+        self.assertEqual(
+            self.replies()[-1], "reply phase=ended action=revived window_left_ms=10000"
+        )
+
+    def test_an_unattributed_dismissal_after_a_revival_leaves_it_alone(self):
+        aside = turn("t2", 15000, 15600, "What do you think, Sam?", None)
+        self.assertEqual(len(self.race(aside, "ignore", recipient="other_human")), 1)
+        self.assertNotIn("revival action=ended reason=other_human", self.notes)
 
     def test_turning_to_another_person_decided_after_a_revival_ends_it(self):
         aside = turn("t2", 15000, 15600, "What do you think, Sam?")
@@ -705,6 +789,45 @@ class ConversationConfigTests(unittest.TestCase):
         ):
             with self.subTest(raw=raw), self.assertRaises(ContractError):
                 Conversation.from_dict(raw)
+
+    def test_courtesies_around_a_closing_are_tolerated(self):
+        # rightyo#167: clauses split at punctuation; courtesy words around the phrase.
+        mode = Conversation()
+        self.assertIn("that's it", mode.closing_phrases)
+        self.assertLessEqual(len(mode.closing_phrases), 16)
+        for text in (
+            "Okay. That's it. Thank you.",
+            "okay thats it thank you",
+            "That's it.",
+            "Great, thanks, that's all!",
+            "All right. All done. Cheers.",
+            "Perfect -- never mind; cool.",
+            "Ok, that's it for now. Excellent.",
+            "Thank you, that's all.",
+            "Alright... we're done.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(mode.is_closing(text))
+        for text in (
+            "That's it, now book the flight.",
+            "That's it for now book the flight",
+            "Okay. That's it. Book the flight.",
+            "Never mind the weather, what time is it?",
+            "Thank you.",
+            "Okay. Great. Excellent.",
+            "Excellent.",
+            "That is it.",
+            "Is that it?",
+            "That's all the news?",
+            "",
+            "...",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(mode.is_closing(text))
+        # A configured phrase made only of courtesy words still matches.
+        thanks = Conversation(closing_phrases=("thanks",))
+        self.assertTrue(thanks.is_closing("Thanks. Okay."))
+        self.assertFalse(thanks.is_closing("Okay."))
 
     def test_the_prototype_section_is_off_unless_present(self):
         with tempfile.TemporaryDirectory() as directory:

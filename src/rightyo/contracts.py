@@ -29,6 +29,7 @@ DEFAULT_CLOSING_PHRASES = (
     "that'll be all",
     "that will be all",
     "that's it for now",
+    "that's it",
     "we're done",
     "all done",
     "never mind",
@@ -75,6 +76,24 @@ MAX_TRUSTED_SPEAKERS = 32
 MAX_STOP_PHRASES = 16
 _STOP_PHRASE = re.compile(r"[A-Za-z0-9' ]{1,48}")
 _PHRASE_SEPARATORS = re.compile(r"[^\w]+")
+# Closing tolerance (#167): a turn is split into clauses at sentence or clause punctuation,
+# and courtesy words may surround the closing phrase.
+_CLAUSE_BREAKS = re.compile(r"[.!?,;:\u2026\u2013\u2014]+|\s-+\s")
+_COURTESY = frozenset(
+    {
+        ("okay",),
+        ("ok",),
+        ("alright",),
+        ("all", "right"),
+        ("great",),
+        ("perfect",),
+        ("excellent",),
+        ("thanks",),
+        ("thank", "you"),
+        ("cheers",),
+        ("cool",),
+    }
+)
 
 
 class ContractError(ValueError):
@@ -113,6 +132,30 @@ def normalize_phrase(text: str) -> str:
     """Casefolded words only: apostrophes removed, punctuation and whitespace collapsed."""
     stripped = text.replace("'", "").replace("’", "")
     return " ".join(_PHRASE_SEPARATORS.sub(" ", stripped).casefold().split())
+
+
+def _courtesy(words: tuple[str, ...]) -> bool:
+    """Whether `words` is a run of courtesy or filler words only (the empty run is)."""
+    index = 0
+    while index < len(words):
+        if words[index : index + 2] in _COURTESY:
+            index += 2
+        elif words[index : index + 1] in _COURTESY:
+            index += 1
+        else:
+            return False
+    return True
+
+
+def _closing_clause(words: tuple[str, ...], phrases: set[tuple[str, ...]]) -> bool:
+    """Whether a clause is a closing phrase with only courtesy words before and after it."""
+    return any(
+        words[start : start + len(phrase)] == phrase
+        and _courtesy(words[:start])
+        and _courtesy(words[start + len(phrase) :])
+        for phrase in phrases
+        for start in range(len(words) - len(phrase) + 1)
+    )
 
 
 def _speaker_list(values: Any, name: str, limit: int) -> tuple[str, ...]:
@@ -404,7 +447,8 @@ class Conversation:
     recipient of `system` or `unknown`, forms a request as a follow-up. A confident
     `ignore`, another recipient, or another speaker never does. The speaker returns to
     ambient when the window lapses, when Jev confidently judges their turn addressed to
-    another person, on a whole-turn `closing_phrases` match, or on a dismissal.
+    another person, on a `closing_phrases` match
+    (courtesy words around it are tolerated, `is_closing`), or on a dismissal.
     """
 
     window_ms: int = DEFAULT_CONVERSATION_WINDOW_MS
@@ -429,9 +473,22 @@ class Conversation:
                 raise ContractError("invalid closing phrase")
 
     def is_closing(self, text: str) -> bool:
-        """Whole-utterance match after casefolding and punctuation removal."""
-        words = normalize_phrase(text)
-        return any(words == normalize_phrase(phrase) for phrase in self.closing_phrases)
+        """Whether the turn is a closing, tolerating courtesies around it (#167).
+
+        The turn is split into clauses at sentence or clause punctuation. It is a closing
+        when one clause is a closing phrase, optionally led or followed by courtesy words
+        (okay, thanks, thank you, and so on), and every other clause is courtesy words
+        only. Anything else in the turn, such as a new request, means it is no closing.
+        """
+        phrases = {tuple(normalize_phrase(phrase).split()) for phrase in self.closing_phrases}
+        found = False
+        for clause in _CLAUSE_BREAKS.split(text):
+            words = tuple(normalize_phrase(clause).split())
+            if words and _closing_clause(words, phrases):
+                found = True
+            elif not _courtesy(words):
+                return False
+        return found
 
     @classmethod
     def from_dict(cls, raw: Any) -> Conversation:

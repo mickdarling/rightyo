@@ -538,7 +538,7 @@ events. The object takes three optional keys:
 | --- | --- | --- | --- |
 | `window_ms` | 20,000 | 1,000 to 120,000 | How long after a request turn ends its speaker stays engaged |
 | `follow_up_min_probability` | 0.4 | above 0, up to 1 | The attend probability an engaged speaker's `uncertain` turn needs to become a follow-up |
-| `closing_phrases` | "that's all", "thanks, that's all", "never mind", and so on | up to 16 | Whole-turn phrases that end the conversation |
+| `closing_phrases` | "that's all", "that's it", "thanks, that's all", "never mind", and so on | up to 16 | Phrases that end the conversation (see [closings](#closings)) |
 
 **States.**
 - **Ambient**, the default: a turn forms a request only on a confident `attend`, as
@@ -568,17 +568,28 @@ The `attention` and `request` events of a follow-up carry `"label": "attend"` an
 **Back to ambient**, with the `reason`:
 - `timeout`: the window lapsed. Stream time is judged at each decided turn, so the event
   is emitted with the next decision after the window, with `at_ms` set to the window end.
-- `closed`: the engaged speaker's whole turn matches a closing phrase. That turn never
-  re-engages, even if it was attended.
+- `closed`: the engaged speaker's turn is a closing (below). That turn never re-engages,
+  even if it was attended. A closing with no speaker label, said inside the window,
+  also ends the engagement ([#167](https://github.com/mickdarling/rightyo/issues/167)):
+  only one speaker is ever engaged, and if someone else said it, the cost is one lost
+  follow-up window. The event's `speaker_id` is then the engaged speaker's.
 - `other_human`: Jev confidently judged the engaged speaker's turn `ignore`, addressed to
   another person.
 - `dismissed`: the engaged speaker dismissed (a stop phrase or a model-judged dismissal,
   with natural dismissal on), even when their dismissal only stops playback: ending
   their own engagement affects no one else.
 
+**Closings.** Matching ignores case, apostrophes and punctuation. The turn is split into
+clauses at sentence or clause punctuation (`. ! ? , ; :`, an ellipsis or a dash). It is a
+closing when one clause is a closing phrase, optionally led or followed by courtesy words,
+and every other clause is courtesy words only. The courtesy words are okay, ok, alright,
+all right, great, perfect, excellent, thanks, thank you, cheers and cool. So "Okay. That's
+it. Thank you." is a closing, while "That's it, now book the flight." and "Thank you."
+are not. Stop phrases are a separate list and still need an exact whole-turn match.
+
 **Speakers.** Only a session-stable, unoverlapped speaker label is ever engaged. An
 unattributed or overlapping turn, or one with utterance-local labels, never engages and
-never counts as a follow-up, so a guest's question to someone else is not pulled in
+never counts as a follow-up (a closing is the one such turn that ends an engagement), so a guest's question to someone else is not pulled in
 ([#113](https://github.com/mickdarling/rightyo/issues/113)).
 
 **Reply timing** ([#124](https://github.com/mickdarling/rightyo/issues/124)). Follow-ups
@@ -592,7 +603,7 @@ that speaker's engagement from the report's time if it lapsed by timeout within 
 10 minutes ([#158](https://github.com/mickdarling/rightyo/issues/158)): the assistant spoke
 to them again (a proactive update, say), so their answer to it is a follow-up. Only speech
 after the reply counts, and no `engaged` event is emitted for a revival (that event names a
-request). An explicit end (a closing phrase, a dismissal, turning to another person), even
+request). An explicit end (a closing, labelled or not, a dismissal, turning to another person), even
 one said after the lapse, or any delivered request, leaves nothing to revive; such an end
 whose decision arrives only after the reply revived the speaker ends the revival, silently,
 unless it was said before a later request of the speaker's, even across a further lapse

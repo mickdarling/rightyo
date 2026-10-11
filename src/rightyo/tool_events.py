@@ -696,6 +696,24 @@ class SpeechEvents:
             and engaged["from_ms"] <= turn.start_ms < self._window_end(engaged)
         )
 
+    def _unattributed_closing(self, turn):
+        """Whether `turn` is a closing with no speaker label (no cooldown key) said inside
+        the window while one speaker is engaged (#167). It ends that engagement: if someone
+        else said it, the cost is one lost follow-up window, which fails safe."""
+        engaged = self._engaged
+        return (
+            engaged is not None
+            and self._cooldown_key(self._facts(turn)) is None
+            and engaged["from_ms"] <= turn.start_ms < self._window_end(engaged)
+            and self._conversation.is_closing(turn.text)
+        )
+
+    def _ends_for(self, turn, engaged, reason):
+        """Whether an explicit end said in `turn` belongs to `engaged`: the speaker's own
+        labelled turn, or, for a closing only, an unattributed turn (#167)."""
+        key = self._cooldown_key(self._facts(turn))
+        return key == engaged["key"] or (key is None and reason == "closed")
+
     @staticmethod
     def _window_end(engaged):
         """The engagement window's end: held open while a reply plays, up to a bound."""
@@ -753,12 +771,17 @@ class SpeechEvents:
                 )
                 self._reply_note(phase, action or "extended", self._window_end(engaged) - now_ms)
 
-    def _forget_dormant(self, turn):
-        """An explicit end by the lapsed speaker, even after the lapse, is never revived (#158)."""
+    def _forget_dormant(self, turn, reason):
+        """An explicit end by the lapsed speaker, even after the lapse, is never revived (#158).
+
+        An unattributed closing (#167) counts when said since the lapsed engagement began.
+        """
         dormant = self._dormant
-        if (
-            dormant is not None
-            and self._cooldown_key(self._facts(turn)) == dormant["engaged"]["key"]
+        if dormant is None:
+            return
+        engaged = dormant["engaged"]
+        if self._cooldown_key(self._facts(turn)) == engaged["key"] or (
+            self._ends_for(turn, engaged, reason) and turn.start_ms >= engaged["from_ms"]
         ):
             self._dormant = None
 
@@ -771,7 +794,7 @@ class SpeechEvents:
         if (
             engaged is not None
             and "revived_over_ms" in engaged
-            and self._cooldown_key(self._facts(turn)) == engaged["key"]
+            and self._ends_for(turn, engaged, reason)
             and engaged["revived_over_ms"] <= turn.start_ms < engaged["from_ms"]
         ):
             self._engaged = None
@@ -849,14 +872,17 @@ class SpeechEvents:
             )
 
     def _disengage(self, turn, reason):
-        """Return the engaged speaker to ambient because of their own `turn`."""
+        """Return the engaged speaker to ambient because of their own `turn`, or because of
+        an unattributed closing inside the window (#167)."""
         # An engagement whose window ended before this turn began lapses first, so an end
         # said just after the window (the stop-phrase fast path, before any decision has
         # lapsed it) still forgets it rather than leaving it to be revived (#158).
         self._lapse(turn.start_ms)
-        self._forget_dormant(turn)
-        if self._engaged is None or not self._engaged_with(turn):
+        self._forget_dormant(turn, reason)
+        unattributed = reason == "closed" and self._unattributed_closing(turn)
+        if self._engaged is None or not (unattributed or self._engaged_with(turn)):
             return
+        speaker_id = self._engaged["speaker_id"]
         self._engaged = None
         # An explicit end is never revived by a later reply.
         self._dormant = None
@@ -864,7 +890,8 @@ class SpeechEvents:
             "conversation",
             state="ambient",
             reason=reason,
-            speaker_id=turn.speaker_id,
+            # The engaged speaker's label, which an unattributed closing's turn lacks.
+            speaker_id=speaker_id,
             utterance_id=turn.utterance_id,
             at_ms=turn.end_ms,
         )
@@ -1370,6 +1397,10 @@ class SpeechEvents:
                     )
                 ):
                     self._disengage(turn, "other_human")
+            elif self._conversation is not None and self._unattributed_closing(turn):
+                # A closing with no speaker label inside the window ends the one engagement
+                # (#167); a dismissal or a turn to another person still needs the label.
+                self._disengage(turn, "closed")
             elif self._conversation is not None:
                 # The same explicit ends, said after the conversation lapsed (#158), whether
                 # it is still dormant or a reply already revived it before this decision.
@@ -1388,7 +1419,7 @@ class SpeechEvents:
                 else:
                     reason = None
                 if reason is not None:
-                    self._forget_dormant(turn)
+                    self._forget_dormant(turn, reason)
                     # As when engaged, an inferred turn's dismissal (#137) ends nothing: its
                     # words may not be the labelled speaker's.
                     if plan is None or key not in self._inferred:
