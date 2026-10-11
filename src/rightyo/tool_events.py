@@ -1454,12 +1454,11 @@ class SpeechEvents:
                     reason = "other_human"
                 else:
                     reason = None
-                if reason is not None:
+                # As when engaged, an inferred turn's dismissal (#137) ends nothing, dormant
+                # or revived: its words may not be the labelled speaker's.
+                if reason is not None and (plan is None or key not in self._inferred):
                     self._forget_dormant(turn, reason)
-                    # As when engaged, an inferred turn's dismissal (#137) ends nothing: its
-                    # words may not be the labelled speaker's.
-                    if plan is None or key not in self._inferred:
-                        self._end_revived(turn, reason)
+                    self._end_revived(turn, reason)
             if attended:
                 # Any delivered request makes the next reply that request's, so no lapsed
                 # conversation is revived by it (rightyo#158); a request that engages its own

@@ -604,6 +604,46 @@ class EnrolledEventTests(unittest.TestCase):
         self.assertIsNotNone(self.events._engaged)
         self.finish()
 
+    def test_an_inferred_dismissal_after_a_lapse_leaves_an_older_request_to_engage(self):
+        # #167: an inferred turn's dismissal ends nothing on the dormant path either, so it
+        # records no end boundary that would keep the speaker's older request from engaging.
+        self.start(dismissal=Dismissal(), conversation=Conversation(window_ms=20000))
+        self.bindings.labels["Speaker A"] = ("bound", "owner")
+        self.say(turn("u1", 0, 2000, "Haili, play music.", "Speaker A"))  # until 22000
+        self.say(turn("u2", 23000, 23500, "Hm.", "Speaker A"), "ignore", recipient="unknown")
+        self.assertIsNone(self.events._engaged)  # lapsed, dormant
+        older = turn("u3", 24000, 24800, "Haili, next song.", "Speaker A")
+        self.events.transcript(older, older.end_ms)
+        current = turn("u4", 25000, 26000, "Okay that's enough of that.", "Speaker A")
+        self.events.transcript(current, 26000, inferred=True)
+        judged = DecisionEvent(
+            current,
+            ProviderDecision(
+                "uncertain",
+                "system",
+                0.9,
+                {"attend": 0.0, "ignore": 0.0, "uncertain": 1.0},
+                "mock-v1",
+                "mock",
+                0.9,
+                dismissal="disengage",
+                dismissal_choice="disengage",
+                dismissal_confidence=0.95,
+            ),
+            1,
+            0.0,
+            0.0,
+        )
+        self.events.decision(judged, 26100)
+        self.stream += self.events.drain()
+        self.events.decision(decided(older, "attend"), 26200)
+        out = self.events.drain()
+        self.stream += out
+        self.assertEqual(len(self.of(out, "request")), 1)
+        engaged = self.of(out, "conversation")
+        self.assertEqual([e["state"] for e in engaged], ["engaged"])
+        self.finish()
+
     def test_a_non_inferred_owner_dismissal_still_withdraws(self):
         self.start(dismissal=Dismissal())
         self.bindings.labels["Speaker A"] = ("bound", "owner")
