@@ -705,7 +705,11 @@ class SpeechEvents:
         return (
             engaged is not None
             and turn.speaker_id is None
-            and engaged["from_ms"] <= turn.start_ms < self._window_end(engaged)
+            # Decided out of order, a closing said before the speaker's latest request
+            # (which `_engage` records as `revived_over_ms`) ends nothing.
+            and max(engaged["from_ms"], engaged.get("revived_over_ms", 0))
+            <= turn.start_ms
+            < self._window_end(engaged)
             and self._conversation.is_closing(turn.text)
         )
 

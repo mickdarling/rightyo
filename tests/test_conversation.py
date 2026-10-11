@@ -247,6 +247,17 @@ class ConversationEventTests(unittest.TestCase):
         events = self.say(turn("t3", 4000, 4900, "And tomorrow?"), "uncertain", attend=0.6)
         self.assertEqual(self.kinds(events), ["attention", "request"])
 
+    def test_an_unattributed_closing_decided_after_a_newer_request_ends_nothing(self):
+        self.start()
+        self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+        closing = turn("t2", 2000, 2600, "Okay, that's it.", None)
+        self.events.transcript(closing, closing.end_ms)
+        self.say(turn("t3", 3000, 3900, "Haili, and the weather?"), "attend")
+        self.events.decision(decided(closing, "uncertain", attend=0.2), 4000)
+        self.assertNotIn("conversation", [e["type"] for e in self.events.drain()])
+        events = self.say(turn("t4", 5000, 5900, "And tomorrow?"), "uncertain", attend=0.6)
+        self.assertEqual(self.kinds(events), ["attention", "request"])
+
     def test_an_unattributed_closing_after_the_window_ends_nothing_more(self):
         self.start()
         self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
