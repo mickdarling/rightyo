@@ -758,6 +758,23 @@ class ReplyNoteTests(unittest.TestCase):
             self.replies()[-1], "reply phase=ended action=revived window_left_ms=10000"
         )
 
+    def test_a_labelled_closing_before_a_newer_request_leaves_it_revivable(self):
+        # Said before the speaker's newer request, decided only after that request lapsed.
+        self.engage()
+        closing = turn("t2", 2000, 2600, "That's it.")
+        self.events.transcript(closing, closing.end_ms)
+        newer = turn("t3", 3000, 3900, "Haili, and the weather?")
+        self.events.transcript(newer, newer.end_ms)
+        self.events.decision(decided(newer, "attend"), 4000)  # engaged until 13900
+        remark = turn("t4", 15000, 15500, "Hmm.")
+        self.events.transcript(remark, remark.end_ms)
+        self.events.decision(decided(remark, "uncertain", attend=0.1), 15600)
+        self.events.decision(decided(closing, "uncertain", attend=0.2), 15700)
+        self.events.reply("ended", 20000)
+        self.assertEqual(
+            self.replies()[-1], "reply phase=ended action=revived window_left_ms=10000"
+        )
+
     def test_an_unattributed_dismissal_after_a_revival_leaves_it_alone(self):
         aside = turn("t2", 15000, 15600, "What do you think, Sam?", None)
         self.assertEqual(len(self.race(aside, "ignore", recipient="other_human")), 1)

@@ -790,16 +790,15 @@ class SpeechEvents:
     def _forget_dormant(self, turn, reason):
         """An explicit end by the lapsed speaker, even after the lapse, is never revived (#158).
 
-        An unattributed closing (#167) counts when said since the lapsed engagement began and
-        after the speaker's latest request in it.
+        So does an unattributed closing (#167). Either counts only when said after the
+        speaker's latest request in the lapsed engagement (`_closing_floor`): an older end
+        decided late never forgets the newer conversation.
         """
         dormant = self._dormant
         if dormant is None:
             return
         engaged = dormant["engaged"]
-        if self._cooldown_key(self._facts(turn)) == engaged["key"] or (
-            self._ends_for(turn, engaged, reason) and turn.start_ms >= self._closing_floor(engaged)
-        ):
+        if self._ends_for(turn, engaged, reason) and turn.start_ms >= self._closing_floor(engaged):
             self._dormant = None
             self._mark_ended(engaged["key"], turn)
 
