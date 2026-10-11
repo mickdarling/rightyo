@@ -893,13 +893,17 @@ class SpeechEvents:
         """Record, for the speaker whose conversation `turn` ended, the end's start (#167).
 
         `key` is the ended engagement's, which an unattributed closing's turn lacks. Each
-        speaker's boundary only moves forward; the oldest speaker's is dropped beyond
-        MAX_ENDED_SPEAKERS.
+        speaker's boundary only moves forward. Beyond MAX_ENDED_SPEAKERS, the least recently
+        ended speaker with no turn awaiting its decision is dropped: fewer turns than that
+        can be pending (`_pending` holds at most 32), so one always qualifies, and a
+        boundary a pending request may still need is never lost.
         """
         previous = self._ended.pop(key, None)
         self._ended[key] = turn.start_ms if previous is None else max(previous, turn.start_ms)
         if len(self._ended) > MAX_ENDED_SPEAKERS:
-            del self._ended[next(iter(self._ended))]
+            waiting = {self._cooldown_key(self._facts(t)) for t, *_ in self._pending.values()}
+            stale = next(k for k in self._ended if k not in waiting)
+            del self._ended[stale]
 
     def _disengage(self, turn, reason):
         """Return the engaged speaker to ambient because of their own `turn`, or because of

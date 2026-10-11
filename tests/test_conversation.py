@@ -399,6 +399,22 @@ class ConversationEventTests(unittest.TestCase):
         self.assertEqual([e["type"] for e in events], ["request"])
         self.assertEqual(self.events._engaged["speaker_id"], "Speaker B")
 
+    def test_a_pending_speakers_end_boundary_survives_many_other_ends(self):
+        self.start()
+        older = turn("t1", 0, 900, "Haili, what time is it?")
+        self.events.transcript(older, older.end_ms)
+        self.say(turn("t2", 1000, 1500, "That's all."), "ignore")
+        # Explicit ends from many other speakers, more than the remembered bound.
+        for index in range(70):
+            other = turn(
+                f"x{index}", 2000 + index * 10, 2005 + index * 10, "That's all.", f"Guest {index}"
+            )
+            self.events._disengage(other, "closed")
+        self.assertLessEqual(len(self.events._ended), 64)
+        self.events.decision(decided(older, "attend"), 3000)
+        events = [e for e in self.events.drain() if e["type"] in {"request", "conversation"}]
+        self.assertEqual([e["type"] for e in events], ["request"])
+
     def test_an_unattributed_closing_after_the_window_ends_nothing_more(self):
         self.start()
         self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
