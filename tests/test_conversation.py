@@ -364,6 +364,25 @@ class ConversationEventTests(unittest.TestCase):
                 events = self.say(turn("t4", 5000, 5900, "And tomorrow?"), "uncertain", attend=0.6)
                 self.assertEqual(self.kinds(events), ["attention", "request"])
 
+    def test_an_end_decided_while_another_speaker_is_engaged_still_bounds_its_speaker(self):
+        # Decisions arrive B's request, then A's closing, then A's older request.
+        self.start()
+        self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+        other = turn("t2", 2000, 2900, "Haili, set a timer.", "Speaker B")
+        older = turn("t3", 3000, 3900, "Haili, and the weather?")
+        closing = turn("t4", 4500, 5000, "That's all.")
+        for current in (other, older, closing):
+            self.events.transcript(current, current.end_ms)
+        self.events.decision(decided(other, "attend"), 5100)
+        moved = [e for e in self.events.drain() if e["type"] == "conversation"]
+        self.assertEqual([e["speaker_id"] for e in moved], ["Speaker B"])
+        self.events.decision(decided(closing, "ignore"), 5200)
+        self.events.decision(decided(older, "attend"), 5300)
+        events = [e for e in self.events.drain() if e["type"] in {"request", "conversation"}]
+        # The older request is delivered, but A's later closing keeps it from engaging A.
+        self.assertEqual([e["type"] for e in events], ["request"])
+        self.assertEqual(self.events._engaged["speaker_id"], "Speaker B")
+
     def test_an_unattributed_closing_after_the_window_ends_nothing_more(self):
         self.start()
         self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")

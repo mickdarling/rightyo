@@ -1462,6 +1462,12 @@ class SpeechEvents:
                 if reason is not None and (plan is None or key not in self._inferred):
                     self._forget_dormant(turn, reason)
                     self._end_revived(turn, reason)
+                    own = self._cooldown_key(self._facts(turn))
+                    if own is not None:
+                        # The speaker's own end bounds their own older requests (#167) even
+                        # when another speaker holds the engagement now: decided in order,
+                        # such a request would have engaged first and then ended here.
+                        self._mark_ended(own, turn)
             if attended:
                 # Any delivered request makes the next reply that request's, so no lapsed
                 # conversation is revived by it (rightyo#158); a request that engages its own
