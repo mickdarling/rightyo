@@ -513,6 +513,52 @@ class ReplyNoteTests(unittest.TestCase):
             self.replies()[-1], "reply phase=ended action=not_engaged window_left_ms=none"
         )
 
+    def race(self, said, label, **options):
+        """rightyo#158 follow-up race: the lapsed speaker's turn `said` after the window, a
+        reply reported before its decision (reviving the conversation), then the decision,
+        then an uncertain remark inside the revived window. Returns the remark's requests."""
+        self.engage()  # engaged until 10900
+        self.events.transcript(said, said.end_ms)
+        self.events.reply("ended", 20000)
+        self.assertEqual(
+            self.replies()[-1], "reply phase=ended action=revived window_left_ms=10000"
+        )
+        self.events.decision(decided(said, label, **options), 20100)
+        remark = turn("t3", 22000, 22800, "Right.")
+        self.events.transcript(remark, remark.end_ms)
+        self.events.decision(decided(remark, "uncertain", attend=0.5), remark.end_ms + 100)
+        return [e for e in self.events.drain() if e["type"] == "request"]
+
+    def test_a_closing_decided_after_a_revival_ends_it(self):
+        closing = turn("t2", 15000, 15600, "That's all")
+        self.assertEqual(self.race(closing, "uncertain", attend=0.2), [])
+
+    def test_turning_to_another_person_decided_after_a_revival_ends_it(self):
+        aside = turn("t2", 15000, 15600, "What do you think, Sam?")
+        self.assertEqual(self.race(aside, "ignore", recipient="other_human"), [])
+
+    def test_a_request_after_a_revival_outranks_an_older_closing_decided_later(self):
+        self.engage()
+        closing = turn("t2", 15000, 15600, "That's all")
+        self.events.transcript(closing, closing.end_ms)
+        self.events.reply("ended", 20000)  # revived
+        request = turn("t3", 21000, 21800, "Haili, and the weather?")
+        self.events.transcript(request, request.end_ms)
+        self.events.decision(decided(request, "attend"), request.end_ms + 100)
+        self.events.decision(decided(closing, "uncertain", attend=0.2), 22000)
+        remark = turn("t4", 23000, 23800, "Right.")
+        self.events.transcript(remark, remark.end_ms)
+        self.events.decision(decided(remark, "uncertain", attend=0.5), remark.end_ms + 100)
+        requests = [e for e in self.events.drain() if e["type"] == "request"]
+        self.assertIs(requests[-1]["decision"]["follow_up"], True)
+        self.assertEqual(requests[-1]["turn"]["utterance_id"], "t4")
+
+    def test_an_ordinary_remark_decided_after_a_revival_keeps_it(self):
+        remark = turn("t2", 15000, 15600, "Hmm.")
+        requests = self.race(remark, "uncertain", attend=0.1)
+        self.assertEqual(len(requests), 1)
+        self.assertIs(requests[0]["decision"]["follow_up"], True)
+
 
 class ReplyTimingTests(unittest.TestCase):
     """The window runs from the end of the spoken reply when the host reports it (#124)."""

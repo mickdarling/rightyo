@@ -593,7 +593,9 @@ that speaker's engagement from the report's time if it lapsed by timeout within 
 to them again (a proactive update, say), so their answer to it is a follow-up. Only speech
 after the reply counts, and no `engaged` event is emitted for a revival (that event names a
 request). An explicit end (a closing phrase, a dismissal, turning to another person), even
-one said after the lapse, or any delivered request, leaves nothing to revive. A report
+one said after the lapse, or any delivered request, leaves nothing to revive; such an end
+whose decision arrives only after the reply revived the speaker ends the revival, silently,
+unless the speaker has made a new request since. A report
 with nothing engaged and nothing to revive changes nothing; malformed lines are skipped
 with a content-free stderr note. Every report also writes a content-free stderr note:
 `reply phase=… action=held|extended|revived|not_engaged|inactive window_left_ms=…`.
