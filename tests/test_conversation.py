@@ -830,7 +830,7 @@ class ConversationConfigTests(unittest.TestCase):
                 Conversation.from_dict(raw)
 
     def test_courtesies_around_a_closing_are_tolerated(self):
-        # rightyo#167: clauses split at punctuation; courtesy words around the phrase.
+        # rightyo#167: courtesy words around the phrase, punctuation ignored.
         mode = Conversation()
         self.assertIn("that's it", mode.closing_phrases)
         self.assertLessEqual(len(mode.closing_phrases), 16)
@@ -863,6 +863,15 @@ class ConversationConfigTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertFalse(mode.is_closing(text))
+        # A configured phrase still matches across punctuation, as before #167.
+        for phrase, text in (
+            ("thanks that's all", "Thanks, that's all."),
+            ("okay bye", "Okay, bye!"),
+            ("we're good", "Okay. We're good, thanks."),
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertTrue(Conversation(closing_phrases=(phrase,)).is_closing(text))
+        self.assertTrue(mode.is_closing("That's all. Never mind."))
         # A configured phrase made only of courtesy words still matches.
         thanks = Conversation(closing_phrases=("thanks",))
         self.assertTrue(thanks.is_closing("Thanks. Okay."))

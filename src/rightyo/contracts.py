@@ -76,9 +76,7 @@ MAX_TRUSTED_SPEAKERS = 32
 MAX_STOP_PHRASES = 16
 _STOP_PHRASE = re.compile(r"[A-Za-z0-9' ]{1,48}")
 _PHRASE_SEPARATORS = re.compile(r"[^\w]+")
-# Closing tolerance (#167): a turn is split into clauses at sentence or clause punctuation,
-# and courtesy words may surround the closing phrase.
-_CLAUSE_BREAKS = re.compile(r"[.!?,;:\u2026\u2013\u2014]+|\s-+\s")
+# Closing tolerance (#167): courtesy or filler words that may surround a closing phrase.
 _COURTESY = frozenset(
     {
         ("okay",),
@@ -132,30 +130,6 @@ def normalize_phrase(text: str) -> str:
     """Casefolded words only: apostrophes removed, punctuation and whitespace collapsed."""
     stripped = text.replace("'", "").replace("’", "")
     return " ".join(_PHRASE_SEPARATORS.sub(" ", stripped).casefold().split())
-
-
-def _courtesy(words: tuple[str, ...]) -> bool:
-    """Whether `words` is a run of courtesy or filler words only (the empty run is)."""
-    index = 0
-    while index < len(words):
-        if words[index : index + 2] in _COURTESY:
-            index += 2
-        elif words[index : index + 1] in _COURTESY:
-            index += 1
-        else:
-            return False
-    return True
-
-
-def _closing_clause(words: tuple[str, ...], phrases: set[tuple[str, ...]]) -> bool:
-    """Whether a clause is a closing phrase with only courtesy words before and after it."""
-    return any(
-        words[start : start + len(phrase)] == phrase
-        and _courtesy(words[:start])
-        and _courtesy(words[start + len(phrase) :])
-        for phrase in phrases
-        for start in range(len(words) - len(phrase) + 1)
-    )
 
 
 def _speaker_list(values: Any, name: str, limit: int) -> tuple[str, ...]:
@@ -475,20 +449,25 @@ class Conversation:
     def is_closing(self, text: str) -> bool:
         """Whether the turn is a closing, tolerating courtesies around it (#167).
 
-        The turn is split into clauses at sentence or clause punctuation. It is a closing
-        when one clause is a closing phrase, optionally led or followed by courtesy words
-        (okay, thanks, thank you, and so on), and every other clause is courtesy words
-        only. Anything else in the turn, such as a new request, means it is no closing.
+        Ignoring case, apostrophes and punctuation, the turn must consist only of closing
+        phrases and courtesy words (okay, thanks, thank you, and so on), with at least one
+        closing phrase. So "Okay. That's it. Thank you." closes, and a configured phrase
+        still matches across punctuation, but any other word in the turn, such as a new
+        request, means it is no closing.
         """
+        words = tuple(normalize_phrase(text).split())
         phrases = {tuple(normalize_phrase(phrase).split()) for phrase in self.closing_phrases}
-        found = False
-        for clause in _CLAUSE_BREAKS.split(text):
-            words = tuple(normalize_phrase(clause).split())
-            if words and _closing_clause(words, phrases):
-                found = True
-            elif not _courtesy(words):
-                return False
-        return found
+        units = [(unit, False) for unit in _COURTESY] + [(unit, True) for unit in phrases]
+        # reach[i]: whether words[:i] parses into units, and whether one was a closing phrase.
+        reach: list[set[bool]] = [set() for _ in range(len(words) + 1)]
+        reach[0].add(False)
+        for index in range(len(words)):
+            if not reach[index]:
+                continue
+            for unit, closing in units:
+                if words[index : index + len(unit)] == unit:
+                    reach[index + len(unit)].update(seen or closing for seen in reach[index])
+        return True in reach[len(words)]
 
     @classmethod
     def from_dict(cls, raw: Any) -> Conversation:

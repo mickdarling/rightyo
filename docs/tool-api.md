@@ -579,13 +579,12 @@ The `attention` and `request` events of a follow-up carry `"label": "attend"` an
   with natural dismissal on), even when their dismissal only stops playback: ending
   their own engagement affects no one else.
 
-**Closings.** Matching ignores case, apostrophes and punctuation. The turn is split into
-clauses at sentence or clause punctuation (`. ! ? , ; :`, an ellipsis or a dash). It is a
-closing when one clause is a closing phrase, optionally led or followed by courtesy words,
-and every other clause is courtesy words only. The courtesy words are okay, ok, alright,
-all right, great, perfect, excellent, thanks, thank you, cheers and cool. So "Okay. That's
-it. Thank you." is a closing, while "That's it, now book the flight." and "Thank you."
-are not. Stop phrases are a separate list and still need an exact whole-turn match.
+**Closings.** Matching ignores case, apostrophes and punctuation. A turn is a closing when
+it consists only of closing phrases and courtesy words, with at least one closing phrase.
+The courtesy words are okay, ok, alright, all right, great, perfect, excellent, thanks,
+thank you, cheers and cool. So "Okay. That's it. Thank you." is a closing, while "That's
+it, now book the flight." and "Thank you." are not. Stop phrases are a separate list and
+still need an exact whole-turn match.
 
 **Speakers.** Only a session-stable, unoverlapped speaker label is ever engaged. An
 unattributed or overlapping turn, or one with utterance-local labels, never engages and
