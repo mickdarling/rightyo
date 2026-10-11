@@ -762,7 +762,7 @@ class SpeechEvents:
         ):
             self._dormant = None
 
-    def _end_revived(self, turn):
+    def _end_revived(self, turn, reason):
         """An explicit end decided after a reply revived its speaker's lapsed conversation
         ends the revival (rightyo#158): the turn predates the revival, so it is no follow-up,
         but it was said to the conversation the reply revived. Emits nothing, as reviving
@@ -775,6 +775,11 @@ class SpeechEvents:
             and engaged["revived_over_ms"] <= turn.start_ms < engaged["from_ms"]
         ):
             self._engaged = None
+            if self._report is not None:
+                try:
+                    self._report(f"revival action=ended reason={reason}")
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _revive(self, now_ms):
         """A spoken reply re-engages the speaker whose conversation lapsed by timeout within
@@ -789,8 +794,9 @@ class SpeechEvents:
             key: value for key, value in dormant["engaged"].items() if key != "replying_since"
         }
         # Any explicit end said since the lapsed engagement began, decided only after this
-        # reply, ends the revival (`_end_revived`).
-        engaged["revived_over_ms"] = engaged["from_ms"]
+        # reply, ends the revival (`_end_revived`). A revival of a revival keeps the first
+        # boundary (`_lapse` carries it), unless a request since has cleared it.
+        engaged.setdefault("revived_over_ms", engaged["from_ms"])
         engaged["from_ms"] = engaged["until_ms"] = now_ms
         self._engaged = engaged
         return engaged
@@ -1359,22 +1365,29 @@ class SpeechEvents:
                     )
                 ):
                     self._disengage(turn, "other_human")
-            elif self._conversation is not None and (
-                plan is not None
-                or to_other_agent
-                or self._conversation.is_closing(turn.text)
-                or (
+            elif self._conversation is not None:
+                # The same explicit ends, said after the conversation lapsed (#158), whether
+                # it is still dormant or a reply already revived it before this decision.
+                if plan is not None:
+                    reason = "dismissed"
+                elif self._conversation.is_closing(turn.text):
+                    reason = "closed"
+                elif to_other_agent or (
                     evidence["label"] == "ignore"
                     and (
                         event.decision.recipient == "other_human"
                         or event.decision.recipient.startswith("speaker_")
                     )
-                )
-            ):
-                # The same explicit ends, said after the conversation lapsed (#158), whether
-                # it is still dormant or a reply already revived it before this decision.
-                self._forget_dormant(turn)
-                self._end_revived(turn)
+                ):
+                    reason = "other_human"
+                else:
+                    reason = None
+                if reason is not None:
+                    self._forget_dormant(turn)
+                    # As when engaged, an inferred turn's dismissal (#137) ends nothing: its
+                    # words may not be the labelled speaker's.
+                    if plan is None or key not in self._inferred:
+                        self._end_revived(turn, reason)
             if attended:
                 # Any delivered request makes the next reply that request's, so no lapsed
                 # conversation is revived by it (rightyo#158); a request that engages its own

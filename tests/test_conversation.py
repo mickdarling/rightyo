@@ -532,10 +532,41 @@ class ReplyNoteTests(unittest.TestCase):
     def test_a_closing_decided_after_a_revival_ends_it(self):
         closing = turn("t2", 15000, 15600, "That's all")
         self.assertEqual(self.race(closing, "uncertain", attend=0.2), [])
+        self.assertIn("revival action=ended reason=closed", self.notes)
 
     def test_turning_to_another_person_decided_after_a_revival_ends_it(self):
         aside = turn("t2", 15000, 15600, "What do you think, Sam?")
         self.assertEqual(self.race(aside, "ignore", recipient="other_human"), [])
+
+    def remark_requests(self, start):
+        remark = turn("t9", start, start + 800, "Right.")
+        self.events.transcript(remark, remark.end_ms)
+        self.events.decision(decided(remark, "uncertain", attend=0.5), remark.end_ms + 100)
+        return [e for e in self.events.drain() if e["type"] == "request"]
+
+    def test_a_closing_decided_after_a_second_revival_ends_it(self):
+        self.engage()  # engaged until 10900
+        closing = turn("t2", 15000, 15600, "That's all")
+        self.events.transcript(closing, closing.end_ms)
+        self.events.reply("ended", 20000)  # revived until 30000
+        self.events.reply("ended", 40000)  # lapsed at 30000, revived again
+        self.assertEqual(
+            self.replies()[-1], "reply phase=ended action=revived window_left_ms=10000"
+        )
+        self.events.decision(decided(closing, "uncertain", attend=0.2), 40100)
+        self.assertEqual(self.notes[-1], "revival action=ended reason=closed")
+        self.assertEqual(self.remark_requests(42000), [])
+
+    def test_another_speakers_late_closing_leaves_the_revival_alone(self):
+        self.engage()
+        closing = turn("t2", 15000, 15600, "That's all", "Speaker B")
+        self.events.transcript(closing, closing.end_ms)
+        self.events.reply("ended", 20000)  # Speaker A revived
+        self.events.decision(decided(closing, "uncertain", attend=0.2), 20100)
+        self.assertNotIn("revival action=ended reason=closed", self.notes)
+        requests = self.remark_requests(22000)
+        self.assertEqual(len(requests), 1)
+        self.assertIs(requests[0]["decision"]["follow_up"], True)
 
     def test_a_request_after_a_revival_outranks_an_older_closing_decided_later(self):
         self.engage()
