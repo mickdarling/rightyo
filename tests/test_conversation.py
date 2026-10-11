@@ -237,6 +237,16 @@ class ConversationEventTests(unittest.TestCase):
         events = self.say(turn("t4", 4000, 4900, "And tomorrow?"), "uncertain", attend=0.6)
         self.assertEqual(self.kinds(events), ["attention", "request"])
 
+    def test_a_labelled_closing_without_a_cooldown_key_ends_nothing(self):
+        # Overlapping or utterance-local labels still name someone: not unattributed.
+        self.start()
+        self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+        overlapping = turn("t2", 2000, 2900, "Okay, that's it.", "Speaker B", overlap=True)
+        events = self.say(overlapping, "uncertain", attend=0.2)
+        self.assertNotIn("conversation", self.kinds(events))
+        events = self.say(turn("t3", 4000, 4900, "And tomorrow?"), "uncertain", attend=0.6)
+        self.assertEqual(self.kinds(events), ["attention", "request"])
+
     def test_an_unattributed_closing_after_the_window_ends_nothing_more(self):
         self.start()
         self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")

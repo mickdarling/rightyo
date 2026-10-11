@@ -697,22 +697,24 @@ class SpeechEvents:
         )
 
     def _unattributed_closing(self, turn):
-        """Whether `turn` is a closing with no speaker label (no cooldown key) said inside
-        the window while one speaker is engaged (#167). It ends that engagement: if someone
-        else said it, the cost is one lost follow-up window, which fails safe."""
+        """Whether `turn` is a closing with no speaker label at all said inside the window
+        while one speaker is engaged (#167). It ends that engagement: if someone else said
+        it, the cost is one lost follow-up window, which fails safe. A labelled turn without
+        a cooldown key (overlapping, utterance-local) names someone, so it does not count."""
         engaged = self._engaged
         return (
             engaged is not None
-            and self._cooldown_key(self._facts(turn)) is None
+            and turn.speaker_id is None
             and engaged["from_ms"] <= turn.start_ms < self._window_end(engaged)
             and self._conversation.is_closing(turn.text)
         )
 
     def _ends_for(self, turn, engaged, reason):
         """Whether an explicit end said in `turn` belongs to `engaged`: the speaker's own
-        labelled turn, or, for a closing only, an unattributed turn (#167)."""
-        key = self._cooldown_key(self._facts(turn))
-        return key == engaged["key"] or (key is None and reason == "closed")
+        labelled turn, or, for a closing only, a turn with no speaker label (#167)."""
+        return self._cooldown_key(self._facts(turn)) == engaged["key"] or (
+            turn.speaker_id is None and reason == "closed"
+        )
 
     @staticmethod
     def _window_end(engaged):
