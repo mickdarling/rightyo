@@ -705,13 +705,16 @@ class SpeechEvents:
         return (
             engaged is not None
             and turn.speaker_id is None
-            # Decided out of order, a closing said before the speaker's latest request
-            # (which `_engage` records as `revived_over_ms`) ends nothing.
-            and max(engaged["from_ms"], engaged.get("revived_over_ms", 0))
-            <= turn.start_ms
-            < self._window_end(engaged)
+            and self._closing_floor(engaged) <= turn.start_ms < self._window_end(engaged)
             and self._conversation.is_closing(turn.text)
         )
+
+    @staticmethod
+    def _closing_floor(engaged):
+        """The earliest start an unattributed closing needs to end `engaged` (#167): the
+        engagement's start or the speaker's latest request (which `_engage` records as
+        `revived_over_ms`), so one decided out of order never ends a newer conversation."""
+        return max(engaged["from_ms"], engaged.get("revived_over_ms", 0))
 
     def _ends_for(self, turn, engaged, reason):
         """Whether an explicit end said in `turn` belongs to `engaged`: the speaker's own
@@ -780,14 +783,15 @@ class SpeechEvents:
     def _forget_dormant(self, turn, reason):
         """An explicit end by the lapsed speaker, even after the lapse, is never revived (#158).
 
-        An unattributed closing (#167) counts when said since the lapsed engagement began.
+        An unattributed closing (#167) counts when said since the lapsed engagement began and
+        after the speaker's latest request in it.
         """
         dormant = self._dormant
         if dormant is None:
             return
         engaged = dormant["engaged"]
         if self._cooldown_key(self._facts(turn)) == engaged["key"] or (
-            self._ends_for(turn, engaged, reason) and turn.start_ms >= engaged["from_ms"]
+            self._ends_for(turn, engaged, reason) and turn.start_ms >= self._closing_floor(engaged)
         ):
             self._dormant = None
 
