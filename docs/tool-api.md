@@ -580,10 +580,12 @@ The `attention` and `request` events of a follow-up carry `"label": "attend"` an
   their own engagement affects no one else.
 
 A request said before an explicit end (`closed`, `other_human` or `dismissed`) whose
-decision arrives only after it is still delivered, but it does not re-open the
-conversation ([#167](https://github.com/mickdarling/rightyo/issues/167)). This applies
-only to the speaker whose conversation ended; another speaker's request still engages
-them.
+decision arrives only after it does not re-open the conversation
+([#167](https://github.com/mickdarling/rightyo/issues/167)). It is still delivered unless
+a dismissal withdrew it (see self-withdrawal below). This applies only to the speaker
+whose conversation ended; another speaker's request still engages them. Likewise, an
+explicit end said before the speaker's newer request, but decided after it, does not end
+the newer conversation.
 
 **Closings.** Matching ignores case, apostrophes and punctuation. A turn is a closing when
 it consists only of closing phrases and courtesy words, with at least one closing phrase.

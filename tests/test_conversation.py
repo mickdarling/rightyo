@@ -347,6 +347,23 @@ class ConversationEventTests(unittest.TestCase):
                 events = self.say(remark, "uncertain", attend=0.8)
                 self.assertEqual(self.kinds(events), ["attention", "request"])
 
+    def test_a_labelled_end_decided_after_a_newer_request_ends_nothing(self):
+        for name, text, options in (
+            ("closing", "That's it.", {}),
+            ("other_human", "Sam, did you see that?", {"recipient": "other_human"}),
+        ):
+            with self.subTest(name):
+                self.events = SpeechEvents()
+                self.start()
+                self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+                end = turn("t2", 2000, 2600, text)
+                self.events.transcript(end, end.end_ms)
+                self.say(turn("t3", 3000, 3900, "Haili, and the weather?"), "attend")
+                self.events.decision(decided(end, "ignore", **options), 4000)
+                self.assertNotIn("conversation", [e["type"] for e in self.events.drain()])
+                events = self.say(turn("t4", 5000, 5900, "And tomorrow?"), "uncertain", attend=0.6)
+                self.assertEqual(self.kinds(events), ["attention", "request"])
+
     def test_an_unattributed_closing_after_the_window_ends_nothing_more(self):
         self.start()
         self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")

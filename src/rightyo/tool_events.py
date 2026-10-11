@@ -718,7 +718,7 @@ class SpeechEvents:
 
     @staticmethod
     def _closing_floor(engaged):
-        """The earliest start an unattributed closing needs to end `engaged` (#167): the
+        """The earliest start an explicit end needs to end `engaged` (#167): the
         engagement's start or the speaker's latest request (which `_engage` records as
         `revived_over_ms`), so one decided out of order never ends a newer conversation."""
         return max(engaged["from_ms"], engaged.get("revived_over_ms", 0))
@@ -912,6 +912,10 @@ class SpeechEvents:
         self._forget_dormant(turn, reason)
         unattributed = reason == "closed" and self._unattributed_closing(turn)
         if self._engaged is None or not (unattributed or self._engaged_with(turn)):
+            return
+        if turn.start_ms < self._closing_floor(self._engaged):
+            # Said before the speaker's newer request, decided out of order after it (#167):
+            # it ended the conversation that request has since moved past, not this one.
             return
         speaker_id = self._engaged["speaker_id"]
         self._mark_ended(self._engaged["key"], turn)
