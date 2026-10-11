@@ -911,6 +911,11 @@ class SpeechEvents:
         self._forget_dormant(turn, reason)
         unattributed = reason == "closed" and self._unattributed_closing(turn)
         if self._engaged is None or not (unattributed or self._engaged_with(turn)):
+            own = self._cooldown_key(self._facts(turn))
+            if own is not None:
+                # Not the engaged speaker (another holds the engagement, or none does): the
+                # end still bounds the speaker's own older requests (#167), as when decided.
+                self._mark_ended(own, turn)
             return
         if turn.start_ms < self._closing_floor(self._engaged):
             # Said before the speaker's newer request, decided out of order after it (#167):

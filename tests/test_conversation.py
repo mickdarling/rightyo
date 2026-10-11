@@ -383,6 +383,22 @@ class ConversationEventTests(unittest.TestCase):
         self.assertEqual([e["type"] for e in events], ["request"])
         self.assertEqual(self.events._engaged["speaker_id"], "Speaker B")
 
+    def test_a_stop_phrase_while_another_speaker_is_engaged_bounds_its_speaker(self):
+        # A's stop takes the transcript-time fast path while B holds the engagement; A's
+        # older request, outside the dismissal window, is decided before the stop is.
+        self.start(dismissal=Dismissal(window_ms=1000))
+        self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+        self.say(turn("t2", 2000, 2900, "Haili, set a timer.", "Speaker B"), "attend")
+        older = turn("t3", 3000, 3900, "Haili, and the weather?")
+        self.events.transcript(older, older.end_ms)
+        stop = turn("t4", 6000, 6400, "Stop")
+        self.events.transcript(stop, stop.end_ms)
+        self.events.drain()
+        self.events.decision(decided(older, "attend"), 6500)
+        events = [e for e in self.events.drain() if e["type"] in {"request", "conversation"}]
+        self.assertEqual([e["type"] for e in events], ["request"])
+        self.assertEqual(self.events._engaged["speaker_id"], "Speaker B")
+
     def test_an_unattributed_closing_after_the_window_ends_nothing_more(self):
         self.start()
         self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
@@ -1002,6 +1018,10 @@ class ConversationConfigTests(unittest.TestCase):
             "That's it?",
             "That's all?!",
             "Okay. That's it?",
+            "That's it?...",
+            "That's it?\u2026",
+            "That's it\uff1f\uff01",
+            "That's it?.",
             "That's all the news?",
             "",
             "...",

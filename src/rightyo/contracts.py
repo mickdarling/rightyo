@@ -76,9 +76,10 @@ MAX_TRUSTED_SPEAKERS = 32
 MAX_STOP_PHRASES = 16
 _STOP_PHRASE = re.compile(r"[A-Za-z0-9' ]{1,48}")
 _PHRASE_SEPARATORS = re.compile(r"[^\w]+")
-# A turn whose last clause ends in a question mark (closing quotes, brackets, "!" and
-# whitespace after it aside) is a question, never a closing (#167).
-_QUESTION_END = re.compile(r"[?\uff1f][\s!\"'\u201d\u2019)\]]*\Z")
+# A turn whose last clause ends in a question mark (closing quotes, brackets, "!", periods,
+# ellipses, their full-width forms and whitespace after it aside) is a question, never a
+# closing (#167).
+_QUESTION_END = re.compile(r"[?\uff1f][\s!.\u2026\uff01\uff1f\u3002\"'\u201d\u2019)\]]*\Z")
 # Closing tolerance (#167): courtesy or filler words that may surround a closing phrase.
 _COURTESY = frozenset(
     {
