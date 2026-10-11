@@ -571,6 +571,39 @@ class EnrolledEventTests(unittest.TestCase):
         self.assertIsNotNone(self.events._engaged)
         self.finish()
 
+    def test_an_inferred_dismissal_decided_after_a_revival_leaves_it(self):
+        # rightyo#158: as on the engaged path, an inferred turn's model-judged dismissal
+        # never ends a revived conversation.
+        self.start(dismissal=Dismissal(), conversation=Conversation(window_ms=20000))
+        self.bindings.labels["Speaker A"] = ("bound", "owner")
+        self.say(turn("u1", 0, 2000, "Haili, play music.", "Speaker A"))  # until 22000
+        current = turn("u2", 25000, 26000, "Okay that's enough of that.", "Speaker A")
+        self.events.transcript(current, 26000, inferred=True)
+        self.events.reply("ended", 30000)  # lapsed at 22000, revived
+        self.assertIsNotNone(self.events._engaged)
+        judged = DecisionEvent(
+            current,
+            ProviderDecision(
+                "uncertain",
+                "system",
+                0.9,
+                {"attend": 0.0, "ignore": 0.0, "uncertain": 1.0},
+                "mock-v1",
+                "mock",
+                0.9,
+                dismissal="disengage",
+                dismissal_choice="disengage",
+                dismissal_confidence=0.95,
+            ),
+            1,
+            0.0,
+            0.0,
+        )
+        self.events.decision(judged, 30100)
+        self.stream += self.events.drain()
+        self.assertIsNotNone(self.events._engaged)
+        self.finish()
+
     def test_a_non_inferred_owner_dismissal_still_withdraws(self):
         self.start(dismissal=Dismissal())
         self.bindings.labels["Speaker A"] = ("bound", "owner")
