@@ -111,10 +111,29 @@ class NameForTests(unittest.TestCase):
         self.assertIsNone(roles.name_for(turn("b", 0, 1, "x", None), "participant"))
         local = replace(turn("c", 0, 1, "x"), speaker_provenance="unknown")
         self.assertIsNone(roles.name_for(local, "participant"))
-        # A binding that changed since the role was resolved gives no name.
-        self.assertIsNone(roles.name_for(turn("d", 0, 1, "x"), "owner"))
-        self.assertIsNone(roles.name_for(turn("d", 0, 1, "x"), "trusted"))
-        self.assertIsNone(roles.name_for(turn("d", 0, 1, "x"), None))
+        d = turn("d", 0, 1, "x")
+        self.assertEqual(roles.role_for(d), "participant")
+        # A role that does not match the resolved binding gives no name.
+        self.assertIsNone(roles.name_for(d, "owner"))
+        self.assertIsNone(roles.name_for(d, "trusted"))
+        self.assertIsNone(roles.name_for(d, None))
+        # Without a preceding `role_for` for the same turn there is no snapshot: no name.
+        self.assertIsNone(roles.name_for(turn("e", 0, 1, "x"), "participant"))
+
+    def test_the_name_follows_the_binding_the_role_came_from(self):
+        # Codex P2 on #171: a rebinding between role and name (guest -> another guest, or
+        # an unmatched participant -> a guest) keeps the role but must not change the name.
+        roles = self.roles(Speaker_A=("bound", "guest"))
+        roles.source.names["bob"] = "Bob"
+        a = turn("a", 0, 1, "x")
+        role = roles.role_for(a)
+        roles.source.labels["Speaker A"] = ("bound", "bob")
+        self.assertEqual(roles.name_for(a, role), GUEST_NAME)
+        roles.source.labels["Speaker A"] = ("unknown", "guest")
+        role = roles.role_for(a)
+        self.assertEqual(role, "participant")
+        roles.source.labels["Speaker A"] = ("bound", "bob")
+        self.assertIsNone(roles.name_for(a, role))
 
     def test_off_by_default_and_session_label_roles_are_never_named(self):
         roles = EnrolledRoles(OWNER_ID)
@@ -131,12 +150,13 @@ class NameForTests(unittest.TestCase):
         roles = EnrolledRoles(OWNER_ID, emit_names=True)
         roles.source = Bindings(Speaker_A=("bound", "guest"))
         a = turn("a", 0, 1, "x")
-        self.assertIsNone(roles.name_for(a, "participant"))
+        self.assertIsNone(roles.name_for(a, roles.role_for(a)))
         failing = NamedBindings(Speaker_A=("bound", "guest"))
-        failing.display_name = None
-        failing.binding = lambda _label: (_ for _ in ()).throw(RuntimeError("boom"))
+        failing.display_name = lambda _identity: (_ for _ in ()).throw(RuntimeError("boom"))
         roles.source = failing
-        self.assertIsNone(roles.name_for(a, "participant"))
+        self.assertIsNone(roles.name_for(a, roles.role_for(a)))
+        failing.binding = lambda _label: (_ for _ in ()).throw(RuntimeError("boom"))
+        self.assertIsNone(roles.name_for(a, roles.role_for(a)))
 
 
 class NamedEventTests(unittest.TestCase):

@@ -483,8 +483,12 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         self.follow_up_min_probability = follow_up_min_probability
         self.emit_names = emit_names is True
         self.source = None  # the session's `ShadowSpeakerId`, once started
+        # The binding the latest `role_for` resolved, as (utterance id, label, binding), so
+        # `name_for` names the identity that role came from, never a later rebinding.
+        self._resolved = None
 
     def role_for(self, turn) -> str:
+        self._resolved = None
         label = turn.speaker_id
         if label is None:
             return "unknown"
@@ -500,6 +504,7 @@ class EnrolledRoles(ConfiguredPriorityProvider):
             binding = None
         if binding is None:
             return "unknown"
+        self._resolved = (turn.utterance_id, label, binding)
         state, identity = binding
         if state == "bound" and identity is not None:
             return self.priority.configured_role(identity) or "participant"
@@ -510,14 +515,19 @@ class EnrolledRoles(ConfiguredPriorityProvider):
 
         Only with `emit_names`, for an unoverlapped `diarization-timeline` turn whose label
         is not configured by session label and is `bound` to an enrolled identifier whose
-        role is exactly `role` and is not `owner`. Never blocks or raises: the binding is
-        re-read, so a binding that changed since `role_for` gives no name.
+        role is exactly `role` and is not `owner`. It uses the binding the immediately
+        preceding `role_for` call resolved for this same turn (one snapshot), so a label
+        rebound in between never names another voice; without that call, no name. Never
+        blocks or raises.
         """
         try:
             label = turn.speaker_id
             source = self.source
+            resolved = self._resolved
             if (
                 not self.emit_names
+                or resolved is None
+                or resolved[:2] != (turn.utterance_id, label)
                 or role in (None, "owner")
                 or label is None
                 or source is None
@@ -526,10 +536,7 @@ class EnrolledRoles(ConfiguredPriorityProvider):
                 or self.priority.configured_role(label) is not None
             ):
                 return None
-            binding = source.binding(label)
-            if binding is None:
-                return None
-            state, identity = binding
+            state, identity = resolved[2]
             if state != "bound" or identity is None:
                 return None
             bound_role = self.priority.configured_role(identity) or "participant"
