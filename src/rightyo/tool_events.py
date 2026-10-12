@@ -53,6 +53,33 @@ MAX_ENDED_SPEAKERS = 64
 # refuses (control, format, surrogate, private use, unassigned, line/paragraph separator).
 MAX_SPEAKER_NAME_SCALARS = 64
 REFUSED_NAME_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
+# Owner-voice status (rightyo#164): the default and allowed seconds of scored speech before
+# an enrolled owner never bound counts as "not recognised on this input".
+DEFAULT_OWNER_VOICE_THRESHOLD_S = 20
+MIN_OWNER_VOICE_THRESHOLD_S = 5
+MAX_OWNER_VOICE_THRESHOLD_S = 600
+
+
+class OwnerVoice:
+    """Owner-voice status events (rightyo#164); absent means off and nothing changes.
+
+    With it, a session whose role provider reports owner-voice evidence advertises
+    `owner_voice: {"threshold_s": N}` in `started` and may emit `owner_voice` events:
+    `unrecognized` once, after at least `threshold_s` seconds of speech were scored by live
+    identification while an enrolled owner voiceprint was compared and no label bound to
+    it; then `recognized` once, if an owner binding follows. Never scores, ids or names.
+    """
+
+    __slots__ = ("threshold_s",)
+
+    def __init__(self, threshold_s=DEFAULT_OWNER_VOICE_THRESHOLD_S):
+        integer(threshold_s, "owner voice threshold", MIN_OWNER_VOICE_THRESHOLD_S)
+        if threshold_s > MAX_OWNER_VOICE_THRESHOLD_S:
+            raise ContractError("invalid owner voice threshold")
+        self.threshold_s = threshold_s
+
+    def to_dict(self):
+        return {"threshold_s": self.threshold_s}
 
 
 def speaker_name(value):
@@ -180,6 +207,10 @@ class SpeechEvents:
         self._names = False
         # Other agents' names (#161): a turn naming one, and not this assistant, is never ours.
         self._other_agents = None
+        # Owner-voice status (rightyo#164), off by default: the settings, and the last state
+        # emitted this session (None, "unrecognized" or "recognized"; each at most once).
+        self._owner_voice = None
+        self._owner_voice_state = None
         # Natural dismissal (#98), off unless configured at start.
         self._dismissal = None
         self._stop_rules = SpeakerPriority()
@@ -279,9 +310,12 @@ class SpeechEvents:
         conversation=None,
         acknowledgement=None,
         other_agents=None,
+        owner_voice=None,
     ):
         with self._lock:
             identifier(session_id, "session_id")
+            if owner_voice is not None and not isinstance(owner_voice, OwnerVoice):
+                raise ContractError("invalid owner voice settings")
             if acknowledgement is not None and not isinstance(acknowledgement, Acknowledgement):
                 raise ContractError("invalid acknowledgement")
             if dismissal is not None and not isinstance(dismissal, Dismissal):
@@ -335,6 +369,14 @@ class SpeechEvents:
             )
             self._addressing = addressing
             self._other_agents = other_agents
+            # Only a per-turn provider that reports owner-voice evidence (live speaker
+            # identification roles) can ever say anything, so only it is advertised.
+            self._owner_voice = (
+                owner_voice
+                if self._per_turn and callable(getattr(priority, "owner_voice", None))
+                else None
+            )
+            self._owner_voice_state = None
             self._dismissal = dismissal
             # The configured stop phrases, or the defaults when roles are off.
             self._stop_rules = SpeakerPriority() if priority is None else priority.priority
@@ -372,6 +414,13 @@ class SpeechEvents:
                     {"speaker_names": {"max_scalars": MAX_SPEAKER_NAME_SCALARS}}
                     if self._names
                     else {}
+                ),
+                # And for owner-voice status (rightyo#164): a host that accepts this object
+                # must accept `owner_voice` events, which are never emitted without it.
+                **(
+                    {}
+                    if self._owner_voice is None
+                    else {"owner_voice": self._owner_voice.to_dict()}
                 ),
                 # Likewise for request forming: a separate top-level object, never a key
                 # inside the strictly validated capability set.
@@ -462,6 +511,25 @@ class SpeechEvents:
                 kept.append((payload, size))
                 self._queue_bytes += size
             self._queue = kept
+            self._poll_owner_voice()
+
+    def _poll_owner_voice(self):
+        """Emit an owner-voice status change (rightyo#164), each state at most once.
+
+        Polled with `expire`, which the session's timer and consumer call often. Reads the
+        provider's current evidence without blocking: `unrecognized` first, then
+        `recognized` only after it; a session whose owner bound before the threshold
+        never emits either.
+        """
+        if self._owner_voice is None or not self._active or self._owner_voice_state == "recognized":
+            return
+        try:
+            state = self._priority.owner_voice(self._owner_voice.threshold_s)
+        except Exception:  # noqa: BLE001 - a status is optional and never fails the session
+            return
+        if state == ("recognized" if self._owner_voice_state else "unrecognized"):
+            self._owner_voice_state = state
+            self._emit("owner_voice", state=state)
 
     def transcript(self, turn, now_ms, *, expect_decision=True, inferred=False):
         """Emit one final turn; `inferred` marks a speaker label partly inferred (#137).

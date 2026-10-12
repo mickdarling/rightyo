@@ -405,8 +405,16 @@ class PrototypeController:
         report=None,
         end_of_turn_factory=SmartTurn,
         speaker_id_factory=ShadowSpeakerId,
+        owner_voice=None,
+        input_route=None,
     ):
         self.config = config
+        # Owner-voice status events (rightyo#164): an `OwnerVoice` from the host's opt-in,
+        # else None and nothing new is advertised or emitted.
+        self.owner_voice = owner_voice
+        # The host-declared input route kind for speaker_id notes (rightyo#164), already
+        # checked against the allowlist by `listen`, and checked again by the identifier.
+        self.input_route = input_route
         self.processor_factory = processor_factory
         self.end_of_turn_factory = end_of_turn_factory
         self.speaker_id_factory = speaker_id_factory
@@ -707,8 +715,12 @@ class PrototypeController:
                     conversation=self.config.conversation,
                     acknowledgement=self.config.acknowledgement,
                     other_agents=self.config.other_agents,
+                    **({} if self.owner_voice is None else {"owner_voice": self.owner_voice}),
                 )
                 self._event_terminal = False
+                if self.owner_voice is not None and not voiceprint and self.report is not None:
+                    with contextlib.suppress(Exception):
+                        self.report("owner_voice off: speaker identification roles are not on")
             threading.Thread(
                 target=self._decide,
                 args=(generation, stop, work, runner, hosted),
@@ -810,7 +822,8 @@ class PrototypeController:
         try:
             # With roles on (step 4b) it runs without a diagnostic channel too (the lab).
             report = self.report if self.report is not None else _no_report
-            shadow = self.speaker_id_factory(settings, report=report)
+            route = {} if self.input_route is None else {"route": self.input_route}
+            shadow = self.speaker_id_factory(settings, report=report, **route)
             shadow.start()
             if roles is not None:
                 # Turns read the bindings from here on; until now every label is unknown.

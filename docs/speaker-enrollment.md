@@ -186,6 +186,7 @@ speaker_id label="Speaker A" turn_ms=2140 labelled_ms=1960 speech_ms=1880 turn_s
 | `acc_s` | Seconds of speech accumulated for the label |
 | `state` | `bound`, `tentative` or `unknown` |
 | `id` | The bound identifier, or else the closest enrolled one |
+| `route` | Only when the host set `RIGHTYO_INPUT_ROUTE`: the input route kind, such as `usb_audio` or `car_audio` (see [a new microphone or input](#a-new-microphone-or-input)) |
 
 The session also logs `speaker_id start enrolled=N` at start, and at the end one
 `speaker_id final label=…` line per label and a `speaker_id summary` line counting offered,
@@ -248,3 +249,37 @@ Step 4b of #137 acts on the bindings. It is off unless the `speaker_id` section 
   guest's enrolled display name to their `transcript` events as `speaker_name`, so a host
   can show "Ben" instead of "Someone". The owner's name is never sent, and names never
   appear in stderr lines. Rules: [named guests](tool-api.md#named-guests).
+
+## A new microphone or input
+
+A voiceprint matches best through the input chain it was enrolled on. Through a different
+one (a USB microphone, a headset, or the car's microphone over CarPlay) your score can stay
+below `bind_threshold`, so your turns stay `unknown` and owner-only behaviour does not
+happen. With [owner voice status](tool-api.md#owner-voice-status) on, the host is told
+after about 20 s of speech, and the Hailing Station app shows "Your voice isn't recognised
+on this input". The `route=` field on the `speaker_id` stderr lines shows which input
+chain a session was using.
+
+The fix is a second voiceprint for the same person, enrolled on that input. Several
+voiceprints per owner already work: the best-matching one binds, and each maps to the
+owner role.
+
+1. Record 30 to 60 s of yourself talking naturally through the new input. If the
+   microphone is on the Mac, `--record` uses it. If it is on the iPhone or iPad (a USB
+   microphone plugged into the device, or the car), record a clip on the device through
+   that input and copy it to the Mac.
+2. Enroll it under its own identifier, converting it first if needed (see
+   [above](#enroll-list-verify-and-delete)):
+
+   ```sh
+   .venv/bin/rightyo enroll add --config local/prototype.json \
+     --id owner-usb --name "Your Name" --from /private/tmp/enroll-usb.wav
+   ```
+
+3. Add the identifier to your owners in the configuration, next to the first one:
+
+   ```json
+   "speakers": {"owner": ["owner", "owner-usb"]}
+   ```
+
+4. Restart the ambient session. No reinstall is needed. Delete the WAV once enrolled.
