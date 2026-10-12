@@ -206,6 +206,9 @@ class ShadowSpeakerId:
         self._queue: queue.Queue[tuple[str, int, int, bytes]] = queue.Queue(maxsize=queue_size)
         self._ring = PcmRing(ring_ms)
         self._labels: dict[str, LabelState] = {}
+        # Enrolled display names by identifier (hailing-station #434), for the voiceprints
+        # compared this session; replaced whole, never changed, and never reported.
+        self._names: dict[str, str] = {}
         self._stop = threading.Event()  # discard pending work and exit
         self._closing = threading.Event()  # finish pending work, then exit
         self._off = threading.Event()  # failed or nothing to compare against
@@ -243,6 +246,11 @@ class ShadowSpeakerId:
             # may be judged a non-enrolled participant; until then it stays undetermined.
             return "insufficient", state.identity
         return state.state, state.identity
+
+    def display_name(self, identity: str) -> str | None:
+        """The enrolled display name of a compared identifier, or None; never blocks."""
+        name = self._names.get(identity)
+        return name if isinstance(name, str) else None
 
     def _report(self, message: str) -> None:
         if self._report_to is not None:
@@ -321,11 +329,17 @@ class ShadowSpeakerId:
             if self._stop.is_set():
                 return
             model = dict(embedder.model)
-            prints = {
-                entry["id"]: normalize(entry["embedding"])
+            matched = [
+                entry
                 for entry in self._entries(self.settings)
                 if all(entry["model"].get(key) == model.get(key) for key in ("id", "revision"))
                 and entry["model"].get("sha256") == model.get("sha256")
+            ]
+            prints = {entry["id"]: normalize(entry["embedding"]) for entry in matched}
+            self._names = {
+                entry["id"]: entry["display_name"]
+                for entry in matched
+                if isinstance(entry.get("display_name"), str)
             }
             if not prints:
                 self._off.set()
@@ -454,17 +468,27 @@ class EnrolledRoles(ConfiguredPriorityProvider):
 
     Only session-stable, unoverlapped `diarization-timeline` labels are ever looked up,
     since those are the only ones the identifier scores.
+
+    With `emit_names` (hailing-station #434), `name_for` gives the enrolled display name
+    of a turn's bound, non-owner identity; the event producer validates it before use.
     """
 
     # Read by `SpeechEvents`: roles are resolved per turn, and enrolled precedence applies.
     per_turn = True
 
-    def __init__(self, priority: SpeakerPriority, follow_up_min_probability=None) -> None:
+    def __init__(
+        self, priority: SpeakerPriority, follow_up_min_probability=None, *, emit_names=False
+    ) -> None:
         super().__init__(priority)
         self.follow_up_min_probability = follow_up_min_probability
+        self.emit_names = emit_names is True
         self.source = None  # the session's `ShadowSpeakerId`, once started
+        # The binding the latest `role_for` resolved, as (utterance id, label, binding), so
+        # `name_for` names the identity that role came from, never a later rebinding.
+        self._resolved = None
 
     def role_for(self, turn) -> str:
+        self._resolved = None
         label = turn.speaker_id
         if label is None:
             return "unknown"
@@ -480,7 +504,45 @@ class EnrolledRoles(ConfiguredPriorityProvider):
             binding = None
         if binding is None:
             return "unknown"
+        self._resolved = (turn.utterance_id, label, binding)
         state, identity = binding
         if state == "bound" and identity is not None:
             return self.priority.configured_role(identity) or "participant"
         return "participant" if state == "unknown" else "unknown"
+
+    def name_for(self, turn, role: str | None) -> str | None:
+        """The bound guest's enrolled display name for a turn emitted with `role`, or None.
+
+        Only with `emit_names`, for an unoverlapped `diarization-timeline` turn whose label
+        is not configured by session label and is `bound` to an enrolled identifier whose
+        role is exactly `role` and is not `owner`. It uses the binding the immediately
+        preceding `role_for` call resolved for this same turn (one snapshot), so a label
+        rebound in between never names another voice; without that call, no name. Never
+        blocks or raises.
+        """
+        try:
+            label = turn.speaker_id
+            source = self.source
+            resolved = self._resolved
+            if (
+                not self.emit_names
+                or resolved is None
+                or resolved[:2] != (turn.utterance_id, label)
+                or role in (None, "owner")
+                or label is None
+                or source is None
+                or turn.overlap
+                or turn.speaker_provenance != "diarization-timeline"
+                or self.priority.configured_role(label) is not None
+            ):
+                return None
+            state, identity = resolved[2]
+            if state != "bound" or identity is None:
+                return None
+            bound_role = self.priority.configured_role(identity) or "participant"
+            if bound_role == "owner" or bound_role != role:
+                return None
+            name = getattr(source, "display_name", None)
+            return name(identity) if callable(name) else None
+        except Exception:  # noqa: BLE001 - identification never fails the session
+            return None

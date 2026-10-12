@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import unicodedata
 from collections import deque
 from threading import RLock
 
@@ -47,6 +48,27 @@ DISMISS_SCOPES = {
 MAX_WITHDRAWABLE = 32
 # Speakers whose last explicit conversation end is remembered (#167).
 MAX_ENDED_SPEAKERS = 64
+# A bound guest's display name on a `transcript` event (hailing-station #434): the bound
+# HailProtocol's `AmbientOverheard.name` accepts, in Unicode scalars, and the categories it
+# refuses (control, format, surrogate, private use, unassigned, line/paragraph separator).
+MAX_SPEAKER_NAME_SCALARS = 64
+REFUSED_NAME_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
+
+
+def speaker_name(value):
+    """`value` when it is a display name a host may show, else None (never raises).
+
+    1 to 64 Unicode scalars, no control, format or line-breaking characters, and no
+    leading or trailing whitespace.
+    """
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= MAX_SPEAKER_NAME_SCALARS
+        or value != value.strip()
+        or any(unicodedata.category(char) in REFUSED_NAME_CATEGORIES for char in value)
+    ):
+        return None
+    return value
 
 
 def _role_state(record):
@@ -154,6 +176,8 @@ class SpeechEvents:
         # off by default, and the raw turn/context are unchanged either way.
         self._former = None
         self._addressing = None
+        # Bound guests' display names on transcripts (hailing-station #434), off by default.
+        self._names = False
         # Other agents' names (#161): a turn naming one, and not this assistant, is never ours.
         self._other_agents = None
         # Natural dismissal (#98), off unless configured at start.
@@ -200,6 +224,19 @@ class SpeechEvents:
     @staticmethod
     def _size(payload):
         return len(encode_json(payload)) + 1  # Include the JSONL newline.
+
+    def _speaker_name(self, turn, role):
+        """A bound guest's validated display name for this turn, or None (#434).
+
+        Only when names are on, never for an owner, and never for an inferred-label turn,
+        whose words may not all be the bound voice's. Never raises.
+        """
+        if not self._names or role in (None, "owner") or turn.utterance_id in self._inferred:
+            return None
+        try:
+            return speaker_name(self._priority.name_for(turn, role))
+        except Exception:  # noqa: BLE001 - a name is optional and never fails the turn
+            return None
 
     def _emit(self, kind, **fields):
         self._sequence += 1
@@ -291,6 +328,11 @@ class SpeechEvents:
                 and callable(getattr(priority, "role_for", None))
             )
             self._former = former
+            self._names = (
+                self._per_turn
+                and getattr(priority, "emit_names", False) is True
+                and callable(getattr(priority, "name_for", None))
+            )
             self._addressing = addressing
             self._other_agents = other_agents
             self._dismissal = dismissal
@@ -323,6 +365,14 @@ class SpeechEvents:
                 # Configured forms of address are advertised beside, not inside, the
                 # existing capability set so strict consumers of that set are unchanged.
                 **({} if addressing is None else {"addressing": addressing.to_dict()}),
+                # And for guest names (hailing-station #434): a host that accepts this
+                # object must accept `speaker_name` on `transcript` events, which is never
+                # emitted without it.
+                **(
+                    {"speaker_names": {"max_scalars": MAX_SPEAKER_NAME_SCALARS}}
+                    if self._names
+                    else {}
+                ),
                 # Likewise for request forming: a separate top-level object, never a key
                 # inside the strictly validated capability set.
                 **({} if former is None else {"request_forming": {"kind": former.kind}}),
@@ -469,7 +519,13 @@ class SpeechEvents:
                     raise ContractError("pending attention context budget exceeded")
                 self._pending[turn.utterance_id] = (turn, context, size, role)
                 self._pending_bytes += size
-            self._emit("transcript", turn=_with_role(turn, role))
+            name = self._speaker_name(turn, role)
+            self._emit(
+                "transcript",
+                turn=_with_role(turn, role),
+                # Beside the turn, never inside it, so turn fingerprints are unchanged.
+                **({} if name is None else {"speaker_name": name}),
+            )
             if self._dismissal is not None and self._stop_rules.is_stop_phrase(turn.text):
                 # The deterministic fast path (#98): an exact stop phrase dismisses at
                 # once, without waiting for (or depending on) the decision model.
