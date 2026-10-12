@@ -659,6 +659,7 @@ class PrototypeController:
                 else EnrolledRoles(
                     self.config.speakers,
                     self.config.speaker_id.enrolled_follow_up_min_probability,
+                    emit_names=self.config.speaker_id.emit_names,
                 )
                 if voiceprint
                 else ConfiguredPriorityProvider(self.config.speakers)

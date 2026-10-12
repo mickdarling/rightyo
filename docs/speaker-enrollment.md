@@ -244,3 +244,7 @@ Step 4b of #137 acts on the bindings. It is off unless the `speaker_id` section 
   any request, its own speaker's included, and its dismissal only stops playback.
 - The optional `enrolled_follow_up_min_probability` (above 0, up to 1) lowers the
   conversation-mode follow-up bar for an engaged owner or trusted speaker.
+- The optional `"emit_names": true` (default false; requires `"roles": true`) adds a bound
+  guest's enrolled display name to their `transcript` events as `speaker_name`, so a host
+  can show "Ben" instead of "Someone". The owner's name is never sent, and names never
+  appear in stderr lines. Rules: [named guests](tool-api.md#named-guests).

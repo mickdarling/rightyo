@@ -29,7 +29,7 @@ The events are:
 | Type | Additional fields | Meaning |
 | --- | --- | --- |
 | `session` | `phase`, initial `capabilities`, optional terminal `reason`, `skipped_segments` and `skipped_utterances` | `started`, `stopped`, `cancelled`, or `error` |
-| `transcript` | `turn` | One immutable finalized transcript turn |
+| `transcript` | `turn`, optional `speaker_name` | One immutable finalized transcript turn (`speaker_name` only when advertised; see [named guests](#named-guests)) |
 | `attention` | `utterance_id`, `speech_end_ms`, `decision`, optional `request_id` | `attend`, `ignore`, or `uncertain` evidence |
 | `request` | `request_id`, `turn`, `decision`, `context`, `decision_at_ms`, optional `formed_request`, optional `acknowledge` | Complete attended input available for host handling |
 | `override` | `superseded_request_id`, `by_utterance_id`, `role` | An owner's turn supersedes an earlier open non-owner request |
@@ -519,6 +519,44 @@ differences:
 
 Logs stay content-free: the identifier's stderr lines carry labels, enrolled identifiers,
 durations and scores only.
+
+### Named guests
+
+With identification roles on, a host can also show a known guest by name instead of
+"Someone" ([hailing-station#434](https://github.com/mickdarling/hailing-station/issues/434)).
+It is opt-in: the `speaker_id` section sets `"emit_names": true` as well as
+`"live": true` and `"roles": true` (loading refuses it without `roles`). Without it the
+output is unchanged. With it, the `started` event carries a top-level object beside the
+capability set, `"speaker_names": {"max_scalars": 64}`, and a host that accepts this
+object must accept an optional top-level `speaker_name` string on `transcript` events,
+which is never emitted without it:
+
+```json
+{"type": "transcript", "turn": {"speaker_id": "Speaker B", "role": "participant"}, "speaker_name": "Ben"}
+```
+
+(Other event and turn fields omitted.)
+
+- `speaker_name` is the `display_name` the voice was enrolled with (`rightyo enroll
+  --name`). It is present only when all of these hold: the turn's label is `bound` (not
+  `tentative`, `unknown` or not yet scored) to an enrolled identifier; that identifier's
+  role is not `owner` (a `trusted` or role-less enrolled voice is named, the owner never
+  is); the turn was emitted with that same role; the turn has no overlap, has
+  `diarization-timeline` speaker provenance, has a label that `speakers` does not
+  configure by session label, and has no inferred-label words; and the name passes the
+  rule below. Otherwise the key is absent, and the turn is unchanged.
+- The rule matches HailProtocol's `AmbientOverheard.name`: 1 to 64 Unicode scalars, no
+  control, format, surrogate, private-use, unassigned, line or paragraph separator
+  characters (so no newline, tab, zero-width space or bidi mark), and no leading or
+  trailing whitespace. A name that fails it is omitted, never fatal; the key is never
+  `null`.
+- The name sits beside `turn`, never inside it, so turn fingerprints are unchanged: the
+  `attention`, `request` and context snapshots never carry it, and a host correlating a
+  request's turn with its transcript sees the same object.
+- Like the role, it reflects the binding when the turn is emitted, so a guest's first
+  turns in a session (before their label binds) carry no name.
+- Names are stdout content only. No stderr line ever carries a display name: the
+  identifier's lines name enrolled identifiers only.
 
 ## Conversation mode
 

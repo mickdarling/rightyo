@@ -159,6 +159,10 @@ class SpeakerIdConfig:
     `enrolled_follow_up_min_probability` (above 0, up to 1; requires `roles`) lowers the
     conversation-mode follow-up bar for an engaged owner or trusted speaker; it never
     raises it.
+
+    `emit_names` (default false, requires `roles`) adds the enrolled display name of a
+    bound non-owner voice to its `transcript` event as `speaker_name` (hailing-station
+    #434), and the session advertises `speaker_names`.
     """
 
     python: Path
@@ -172,6 +176,7 @@ class SpeakerIdConfig:
     bind_min_seconds: float = 3.0
     roles: bool = False
     enrolled_follow_up_min_probability: float | None = None
+    emit_names: bool = False
 
     @classmethod
     def from_dict(cls, value: Any) -> SpeakerIdConfig | None:
@@ -188,6 +193,7 @@ class SpeakerIdConfig:
             "bind_min_seconds",
             "roles",
             "enrolled_follow_up_min_probability",
+            "emit_names",
         }
         if not isinstance(value, dict) or set(value) - keys:
             raise ValueError("invalid speaker_id section")
@@ -210,9 +216,12 @@ class SpeakerIdConfig:
         bind_min = value.get("bind_min_seconds", 3.0)
         roles = value.get("roles", False)
         follow_up = value.get("enrolled_follow_up_min_probability")
+        emit_names = value.get("emit_names", False)
         if (
             type(roles) is not bool
             or (roles and not live)
+            or type(emit_names) is not bool
+            or (emit_names and not roles)
             or (
                 follow_up is not None
                 and (not roles or not _bounded(follow_up, 0.0, 1.0) or follow_up == 0)
@@ -242,6 +251,7 @@ class SpeakerIdConfig:
             float(bind_min),
             roles,
             None if follow_up is None else float(follow_up),
+            emit_names,
         )
 
     def band(self, score: float) -> str:
