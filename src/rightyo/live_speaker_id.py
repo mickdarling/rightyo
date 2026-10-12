@@ -48,6 +48,33 @@ BYTES_PER_MS = 32  # mono PCM16 at 16 kHz
 RING_MS = 60000
 QUEUE_SIZE = 4
 CLOSE_DRAIN_SECONDS = 3.0
+# The input route kinds a host may name for diagnostics (rightyo#164): exactly
+# HailProtocol's diagnostic `route` tokens, never a port or device name.
+INPUT_ROUTES = frozenset(
+    {
+        "none",
+        "built_in_mic",
+        "built_in_speaker",
+        "built_in_receiver",
+        "headphones",
+        "headset_mic",
+        "line_in",
+        "line_out",
+        "bluetooth_a2dp",
+        "bluetooth_hfp",
+        "bluetooth_le",
+        "airplay",
+        "hdmi",
+        "car_audio",
+        "usb_audio",
+        "other",
+    }
+)
+
+
+def input_route(value: Any) -> str | None:
+    """`value` when it is exactly one of `INPUT_ROUTES`, else None (never raises)."""
+    return value if isinstance(value, str) and value in INPUT_ROUTES else None
 
 
 class PcmRing:
@@ -198,8 +225,13 @@ class ShadowSpeakerId:
         entries: Callable[[SpeakerIdConfig], list[dict[str, Any]]] = _default_entries,
         queue_size: int = QUEUE_SIZE,
         ring_ms: int = RING_MS,
+        route: str | None = None,
     ):
         self.settings = settings
+        # The host's input route kind (rightyo#164), only from the allowlist, appended to
+        # the `key=value` notes so a mismatch can be attributed to an input chain.
+        route = input_route(route)
+        self._route = "" if route is None else f" route={route}"
         self._report_to = report
         self._embedder_factory = embedder_factory
         self._entries = entries
@@ -209,6 +241,13 @@ class ShadowSpeakerId:
         # Enrolled display names by identifier (hailing-station #434), for the voiceprints
         # compared this session; replaced whole, never changed, and never reported.
         self._names: dict[str, str] = {}
+        # Owner-voice evidence (rightyo#164), never reported: the identifiers compared this
+        # session (replaced whole), every identifier a label has bound to (only added to),
+        # and the seconds of speech scored. The worker records a binding before the
+        # seconds that produced it, so a reader that sees the seconds sees the binding.
+        self._compared: frozenset[str] = frozenset()
+        self._bound_ids: set[str] = set()
+        self.scored_seconds = 0.0
         self._stop = threading.Event()  # discard pending work and exit
         self._closing = threading.Event()  # finish pending work, then exit
         self._off = threading.Event()  # failed or nothing to compare against
@@ -251,6 +290,22 @@ class ShadowSpeakerId:
         """The enrolled display name of a compared identifier, or None; never blocks."""
         name = self._names.get(identity)
         return name if isinstance(name, str) else None
+
+    def owner_evidence(self, owners) -> tuple[bool, bool, float]:
+        """Owner-voice evidence for `owners` (rightyo#164); never blocks.
+
+        Whether an owner identifier's voiceprint is compared this session, whether any
+        label has bound to one, and the seconds of speech scored so far. Scored speech is
+        always a single label's own, unoverlapped timeline audio (#148).
+        """
+        seconds = self.scored_seconds  # read first: see the write order in `__init__`
+        owners = tuple(owners)
+        compared = self._compared
+        return (
+            any(owner in compared for owner in owners),
+            any(owner in self._bound_ids for owner in owners),
+            seconds,
+        )
 
     def _report(self, message: str) -> None:
         if self._report_to is not None:
@@ -345,7 +400,8 @@ class ShadowSpeakerId:
                 self._off.set()
                 self._report("speaker_id live: no voiceprint enrolled with this model; shadow off")
                 return
-            self._report(f"speaker_id start enrolled={len(prints)}")
+            self._compared = frozenset(prints)
+            self._report(f"speaker_id start enrolled={len(prints)}{self._route}")
             while not self._stop.is_set():
                 try:
                     item = self._queue.get(timeout=0.05)
@@ -396,12 +452,15 @@ class ShadowSpeakerId:
         bind(state, {key: cosine(mean, value) for key, value in comparable.items()}, self.settings)
         self._labels[label] = state
         self.scored += 1
+        if state.state == "bound" and state.identity is not None:
+            self._bound_ids.add(state.identity)
+        self.scored_seconds += seconds
         # Report after the bookkeeping, best-effort: a failing channel changes nothing.
         self._report(
             f"speaker_id label={_quoted(label)} turn_ms={turn_ms}"
             f" labelled_ms={labelled_ms} speech_ms={round(seconds * 1000)}"
             f" turn_score={turn_scores[state.identity]:.3f} acc_score={state.score:.3f}"
-            f" acc_s={state.seconds:.1f} state={state.state} id={state.identity}"
+            f" acc_s={state.seconds:.1f} state={state.state} id={state.identity}{self._route}"
         )
 
     def _discard_queue(self) -> None:
@@ -442,13 +501,13 @@ class ShadowSpeakerId:
                     f"speaker_id final label={_quoted(label)} turns={state.turns}"
                     f" acc_score={_number(state.score, '.3f')}"
                     f" acc_s={_number(state.seconds, '.1f')}"
-                    f" state={state.state} id={state.identity or '-'}"
+                    f" state={state.state} id={state.identity or '-'}{self._route}"
                 )
         self._report(
             f"speaker_id summary offered={self.offered} scored={self.scored}"
             f" short={self.short} overlap={self.overlap} dropped={self.dropped}"
             f" clipped={self.clipped} inferred={self.inferred}"
-            f" unsegmented={self.unsegmented} labelled_ms={self.labelled_ms}"
+            f" unsegmented={self.unsegmented} labelled_ms={self.labelled_ms}{self._route}"
         )
 
 
@@ -509,6 +568,27 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         if state == "bound" and identity is not None:
             return self.priority.configured_role(identity) or "participant"
         return "participant" if state == "unknown" else "unknown"
+
+    def owner_voice(self, threshold_s: float) -> str | None:
+        """This session's owner-voice status (rightyo#164), or None; never blocks or raises.
+
+        `recognized` once a label has bound to an owner identifier; `unrecognized` while
+        none has, once an owner's voiceprint is compared and at least `threshold_s` seconds
+        of speech have been scored; otherwise None (no owner enrolled for this model, too
+        little speech, or identification not started).
+        """
+        try:
+            evidence = getattr(self.source, "owner_evidence", None)
+            if not callable(evidence):
+                return None
+            enrolled, bound, seconds = evidence(self.priority.owners)
+            if not enrolled:
+                return None
+            if bound:
+                return "recognized"
+            return "unrecognized" if seconds >= threshold_s else None
+        except Exception:  # noqa: BLE001 - identification never fails the session
+            return None
 
     def name_for(self, turn, role: str | None) -> str | None:
         """The bound guest's enrolled display name for a turn emitted with `role`, or None.

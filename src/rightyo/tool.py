@@ -19,6 +19,7 @@ from rightyo.cli import (
     priority_from_args,
 )
 from rightyo.contracts import ContractError, SpeakerPriority
+from rightyo.live_speaker_id import input_route
 from rightyo.pipeline import ReplayRunner
 from rightyo.prototype import (
     PrototypeConfig,
@@ -35,7 +36,46 @@ from rightyo.providers import (
     replay_request_budget,
     request_former_for,
 )
-from rightyo.tool_events import SpeechEvents, encode_json
+from rightyo.tool_events import OwnerVoice, SpeechEvents, encode_json
+
+# Set by the host (haild) when it spawns `listen` (rightyo#164). Exactly "1" opts in to
+# owner-voice status: the `owner_voice` object in `started` and `owner_voice` events,
+# which a strict consumer refuses unless it asked for them.
+OWNER_VOICE_EVENTS_ENV = "RIGHTYO_OWNER_VOICE_EVENTS"
+# Optional: whole seconds of scored speech before `unrecognized` (5-600, default 20).
+OWNER_VOICE_THRESHOLD_ENV = "RIGHTYO_OWNER_VOICE_THRESHOLD_S"
+# Optional: the input route kind, one of HailProtocol's diagnostic `route` tokens; it only
+# annotates the content-free `speaker_id` stderr notes. Anything else is ignored.
+INPUT_ROUTE_ENV = "RIGHTYO_INPUT_ROUTE"
+
+
+def host_options(environ=None) -> dict:
+    """The controller options the host set in the environment (rightyo#164).
+
+    Invalid values are reported on stderr (without echoing them) and ignored, so a bad
+    setting never starts a session with an unvalidated route or threshold.
+    """
+    environ = os.environ if environ is None else environ
+    options = {}
+    if environ.get(OWNER_VOICE_EVENTS_ENV) == "1":
+        owner_voice = OwnerVoice()
+        raw = environ.get(OWNER_VOICE_THRESHOLD_ENV)
+        if raw is not None:
+            try:
+                if not (raw.isascii() and raw.isdigit()):
+                    raise ContractError("invalid owner voice threshold")
+                owner_voice = OwnerVoice(int(raw))
+            except ContractError:
+                _stderr(f"invalid {OWNER_VOICE_THRESHOLD_ENV}; using {owner_voice.threshold_s}")
+        options["owner_voice"] = owner_voice
+    raw = environ.get(INPUT_ROUTE_ENV)
+    if raw is not None:
+        route = input_route(raw)
+        if route is None:
+            _stderr(f"invalid {INPUT_ROUTE_ENV}; ignored")
+        else:
+            options["input_route"] = route
+    return options
 
 
 def _emit(events, output: TextIO):
@@ -223,6 +263,8 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
     if args.mode == "stdin":
         consent["audio_input"] = sys.stdin.buffer if audio_input is None else audio_input
         consent["audio_provenance"] = provenance
+    # Host opt-ins from the environment (rightyo#164); absent, nothing changes.
+    consent.update(host_options())
     controller = controller_factory(config, event_publisher=events, **consent)
     # Signal handlers are installed only by this explicit foreground operation.
     previous = None

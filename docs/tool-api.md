@@ -558,6 +558,60 @@ which is never emitted without it:
 - Names are stdout content only. No stderr line ever carries a display name: the
   identifier's lines name enrolled identifiers only.
 
+### Owner voice status
+
+A voiceprint enrolled through one input chain can fail to match through another: a USB
+microphone, or the car's microphone over CarPlay. The owner's turns then stay `unknown`,
+and owner-only behaviour fails without saying why
+([#164](https://github.com/mickdarling/rightyo/issues/164)). RightyO can tell the host
+instead, so its app can show "Your voice isn't recognised on this input".
+
+It is opt-in, by the host, through `listen`'s environment. A strict consumer refuses an
+unknown event type, so without the opt-in nothing new is advertised or emitted:
+
+| Variable | Value |
+| --- | --- |
+| `RIGHTYO_OWNER_VOICE_EVENTS` | Exactly `1` turns owner-voice status on; anything else, or unset, leaves it off |
+| `RIGHTYO_OWNER_VOICE_THRESHOLD_S` | Optional whole seconds of scored speech before `unrecognized`, 5 to 600 (default 20). An invalid value is reported on stderr and the default is used |
+| `RIGHTYO_INPUT_ROUTE` | Optional input route kind, for diagnostics only (below) |
+
+Owner-voice status needs identification roles (`"live": true` and `"roles": true`; see
+[above](#roles-from-live-speaker-identification)). Opted in without them, `listen` writes
+`owner_voice off: speaker identification roles are not on` to stderr and nothing else
+changes. Opted in with them, `started` carries a top-level object beside the capability
+set, `"owner_voice": {"threshold_s": 20}`, and a host that accepts this object must accept
+`owner_voice` events, which are never emitted without it:
+
+```json
+{"schema_version": 1, "type": "owner_voice", "session_id": "hail-example", "sequence": 14, "emitted_at_ms": 31250, "state": "unrecognized"}
+```
+
+- `unrecognized` is emitted once, when all of these hold: `speakers` names at least one
+  owner identifier that has a voiceprint enrolled with the session's model; at least
+  `threshold_s` seconds of speech have been scored by live identification this session
+  (scored speech is always a single label's own, unoverlapped timeline audio); and no
+  label has bound to an owner identifier.
+- `recognized` is emitted once, when a label later binds to an owner identifier, and only
+  if `unrecognized` was emitted before. An owner who binds before the threshold produces
+  neither event.
+- Nothing is emitted when no owner voiceprint is enrolled for the model, or once the
+  session has ended. The event carries `state` only: never scores, identifiers, labels or
+  names.
+- The status is a session-wide hint, not a per-turn fact: other people speaking also
+  count toward the threshold. It is checked about every 50 ms, so it follows the scoring
+  that produced it closely, never a turn.
+
+`RIGHTYO_INPUT_ROUTE` names the input route kind the host is capturing from. It must be
+exactly one of HailProtocol's diagnostic `route` tokens (`none`, `built_in_mic`,
+`built_in_speaker`, `built_in_receiver`, `headphones`, `headset_mic`, `line_in`,
+`line_out`, `bluetooth_a2dp`, `bluetooth_hfp`, `bluetooth_le`, `airplay`, `hdmi`,
+`car_audio`, `usb_audio`, `other`); anything else is reported on stderr, without echoing
+it, and ignored. A valid route is appended as `route=<token>` to the identifier's
+`speaker_id` `key=value` stderr lines (`start`, per-turn, `final` and `summary`), so a
+mismatch can be traced to an input chain. It never reaches stdout and changes nothing
+else. To fix a mismatch, enroll a voiceprint on that input; see
+[a new microphone or input](speaker-enrollment.md#a-new-microphone-or-input).
+
 ## Conversation mode
 
 Per-turn attention judges every turn on its own. Real use is conversational: once the
