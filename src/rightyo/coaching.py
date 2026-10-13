@@ -286,13 +286,16 @@ class CoachingSession:
         self._last_clock = now
         return now
 
-    def _tick(self, now: float) -> None:
+    def _tick(self, now: float, *, profile_revision: int | None = None) -> None:
         if not self._enabled:
             return
         if now - self._started >= MAX_SESSION_SECONDS:
             self._stop("session_expired", disable=True)
             return
-        if self._profile_revision != self.profiles.revisioned_snapshot()[0]:
+        revision = (
+            self.profiles.revisioned_snapshot()[0] if profile_revision is None else profile_revision
+        )
+        if self._profile_revision != revision:
             self._stop("profile_changed", disable=True)
             return
         if self._lease is not None and now >= self._lease.deadline:
@@ -310,7 +313,9 @@ class CoachingSession:
     def capture_permitted(self) -> bool:
         with self._condition:
             self._tick(self._now())
-            return self._enabled and self._lease is not None
+            with self.profiles.delivery_guard(self._profile_revision) as (_, revision):
+                self._tick(self._now(), profile_revision=revision)
+                return self._enabled and self._lease is not None
 
     def tick(self) -> None:
         with self._condition:
@@ -500,6 +505,13 @@ class CoachingSession:
         result = None
         failed = False
         admission = None
+
+        def validate_admission(revision: int) -> bool:
+            # Called with both session and registry locks held. The clock supplier is
+            # trusted, nonblocking and non-reentrant; _tick uses the locked revision.
+            self._tick(self._now(), profile_revision=revision)
+            return self._pending is ticket and self._valid_ticket(ticket)
+
         try:
             with self._condition:
                 now = self._now()
@@ -510,7 +522,7 @@ class CoachingSession:
                     # leaves a race with update/remove. This is the admission boundary,
                     # not a promise to retract data from an already admitted provider.
                     admission = self.profiles.admit_dispatch(
-                        ticket.profile_revision, ticket.cancelled
+                        ticket.profile_revision, ticket.cancelled, validate=validate_admission
                     )
             if admission is not None and not ticket.cancelled.is_set():
                 # No registry/session locks cross provider execution. Successful edits
@@ -534,16 +546,29 @@ class CoachingSession:
                 now = self._now()
                 self._tick(now)
                 if self._pending is ticket and self._valid_ticket(ticket):
-                    if failed:
-                        self._stop("provider_failed", disable=True)
-                    elif result is not None:
+                    with self.profiles.delivery_guard(
+                        ticket.profile_revision, ticket.cancelled
+                    ) as (current, revision):
+                        # Read time after acquiring the guard, including any wait. The
+                        # passed revision keeps _tick from reacquiring the registry lock.
+                        now = self._now()
+                        self._tick(now, profile_revision=revision)
                         if (
-                            len(wire_json(self._advice_event(ticket, result, now)))
-                            <= MAX_ADVICE_BYTES
+                            not current
+                            or self._pending is not ticket
+                            or not self._valid_ticket(ticket)
                         ):
-                            self._advice = (ticket, result)
-                        else:
+                            pass
+                        elif failed:
                             self._stop("provider_failed", disable=True)
+                        elif result is not None:
+                            if (
+                                len(wire_json(self._advice_event(ticket, result, now)))
+                                <= MAX_ADVICE_BYTES
+                            ):
+                                self._advice = (ticket, result)
+                            else:
+                                self._stop("provider_failed", disable=True)
             except ContractError:
                 pass  # _now already clears content and reports a sanitized clock failure.
             finally:
@@ -577,22 +602,26 @@ class CoachingSession:
 
     def drain(self) -> list[dict[str, Any]]:
         with self._condition:
-            now = self._now()
-            self._tick(now)
-            events = []
-            if self._state_event is not None:
-                events.append(dict(self._state_event))
-                self._state_event = None
-            if self._advice is not None:
-                ticket, suggestion = self._advice
-                self._advice = None
-                event = self._advice_event(ticket, suggestion, now)
-                if (
-                    self._valid_ticket(ticket)
-                    and 1 <= event["valid_for_ms"] <= MAX_QUALIFICATION_MS
-                ):
-                    events.append(event)
-            return events
+            self._tick(self._now())
+            with self.profiles.delivery_guard(self._profile_revision) as (_, revision):
+                # Guard the complete state/advice handoff, including capture_permitted.
+                # Recompute time after any lock wait; no expired lease becomes an output.
+                now = self._now()
+                self._tick(now, profile_revision=revision)
+                events = []
+                if self._state_event is not None:
+                    events.append(dict(self._state_event))
+                    self._state_event = None
+                if self._advice is not None:
+                    ticket, suggestion = self._advice
+                    self._advice = None
+                    event = self._advice_event(ticket, suggestion, now)
+                    if (
+                        self._valid_ticket(ticket)
+                        and 1 <= event["valid_for_ms"] <= MAX_QUALIFICATION_MS
+                    ):
+                        events.append(event)
+                return events
 
     def wait_idle(self, timeout: float = 0.5) -> bool:
         """Bounded receipt for local authored replay; does not advance the injected clock."""

@@ -3,6 +3,7 @@
 import json
 import threading
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
 from unittest.mock import patch
 from uuid import UUID
@@ -128,6 +129,7 @@ class PausedProfiles(ListenerProfiles):
         super().__init__([PROFILE])
         self.pause_snapshot = False
         self.pause_admission = False
+        self.pause_delivery = False
         self.paused = threading.Event()
         self.resume = threading.Event()
 
@@ -140,13 +142,23 @@ class PausedProfiles(ListenerProfiles):
                 raise AssertionError("snapshot test synchronization budget")
         return snapshot
 
-    def admit_dispatch(self, revision, cancelled):
+    def admit_dispatch(self, revision, cancelled, *, validate=None):
         if self.pause_admission:
             self.pause_admission = False
             self.paused.set()
             if not self.resume.wait(2):
                 raise AssertionError("admission test synchronization budget")
-        return super().admit_dispatch(revision, cancelled)
+        return super().admit_dispatch(revision, cancelled, validate=validate)
+
+    @contextmanager
+    def delivery_guard(self, revision, cancelled=None):
+        if self.pause_delivery:
+            self.pause_delivery = False
+            self.paused.set()
+            if not self.resume.wait(2):
+                raise AssertionError("delivery test synchronization budget")
+        with super().delivery_guard(revision, cancelled) as current:
+            yield current
 
 
 class CoachingTests(unittest.TestCase):
@@ -517,6 +529,222 @@ class CoachingTests(unittest.TestCase):
                 self.observe()
         self.assertFalse(self.session._busy)
         self.assertEqual(len(self.profiles._admissions), 0)
+
+    def test_queued_advice_revocation_after_drain_snapshot_never_hands_off(self):
+        for mutation in ("remove", "update", "remove_readd", "update_revert"):
+            with self.subTest(mutation=mutation):
+                self.make()
+                self.profiles = PausedProfiles()
+                self.session.profiles = self.profiles
+                self.start()
+                self.observe()
+                self.assertTrue(self.session.wait_idle(1))
+                self.assertIsNotNone(self.session._advice)
+                # The provider has finished: no admission remains to signal this ticket.
+                self.assertEqual(len(self.profiles._admissions), 0)
+                self.profiles.pause_snapshot = True
+                self.addCleanup(self.profiles.resume.set)
+                drained, failures = [], []
+
+                def drain():
+                    try:
+                        drained.extend(self.session.drain())
+                    except Exception as error:
+                        failures.append(error)
+
+                drainer = threading.Thread(target=drain)
+                drainer.start()
+                try:
+                    self.assertTrue(self.profiles.paused.wait(1))
+                    self._mutate_profiles(mutation)
+                finally:
+                    self.profiles.resume.set()
+                    drainer.join(2)
+                self.assertFalse(drainer.is_alive())
+                self.assertEqual(failures, [])
+                self.assertFalse(any(e["type"] == "coaching_advice" for e in drained))
+                self.assertEqual(drained[-1]["reason"], "profile_changed")
+                self.assertIsNone(self.session._advice)
+                self.assertFalse(self.session.capture_permitted)
+
+    def test_mutation_between_drain_precheck_and_guard_rejects_queued_advice(self):
+        self.make()
+        self.profiles = PausedProfiles()
+        self.session.profiles = self.profiles
+        self.start()
+        self.observe()
+        self.assertTrue(self.session.wait_idle(1))
+        self.profiles.pause_delivery = True
+        self.addCleanup(self.profiles.resume.set)
+        drained = []
+        drainer = threading.Thread(target=lambda: drained.extend(self.session.drain()))
+        drainer.start()
+        try:
+            self.assertTrue(self.profiles.paused.wait(1))
+            self.profiles.update(PROFILE)
+        finally:
+            self.profiles.resume.set()
+            drainer.join(2)
+        self.assertFalse(drainer.is_alive())
+        self.assertFalse(any(e["type"] == "coaching_advice" for e in drained))
+        self.assertIsNone(self.session._advice)
+        self.assertEqual(len(self.profiles._admissions), 0)
+
+    def test_mutation_after_worker_precheck_before_guard_never_queues_advice(self):
+        self.make()
+        self.profiles = PausedProfiles()
+        self.session.profiles = self.profiles
+        self.start()
+        self.profiles.pause_delivery = True
+        self.addCleanup(self.profiles.resume.set)
+        self.observe()
+        try:
+            self.assertTrue(self.profiles.paused.wait(1))
+            self.profiles.remove("coach")
+            self.profiles.add(PROFILE)
+        finally:
+            self.profiles.resume.set()
+        self.assertEqual(self.advice(), [])
+        self.assertIsNone(self.session._advice)
+        self.assertFalse(self.session.capture_permitted)
+        self.assertEqual(len(self.profiles._admissions), 0)
+
+    def test_delivery_handoff_serializes_with_mutation_without_resource_records(self):
+        registry = ListenerProfiles([PROFILE])
+        cancelled = threading.Event()
+        entered, release, attempted = threading.Event(), threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        operations = []
+
+        def deliver():
+            with registry.delivery_guard(0, cancelled) as (current, _revision):
+                if current:
+                    entered.set()
+                    if not release.wait(2):
+                        raise AssertionError("guard test synchronization budget")
+                    operations.append("handoff")
+
+        def revoke():
+            attempted.set()
+            registry.remove("coach")
+            operations.append("revoked")
+
+        delivery = threading.Thread(target=deliver)
+        delivery.start()
+        self.assertTrue(entered.wait(1))
+        revoker = threading.Thread(target=revoke)
+        revoker.start()
+        try:
+            self.assertTrue(attempted.wait(1))
+            self.assertEqual(operations, [])
+        finally:
+            release.set()
+            delivery.join(2)
+            revoker.join(2)
+        self.assertFalse(delivery.is_alive() or revoker.is_alive())
+        self.assertEqual(operations, ["handoff", "revoked"])
+        self.assertEqual(len(registry._admissions), 0)
+        with registry.delivery_guard(0, cancelled) as (current, _revision):
+            self.assertFalse(current)
+        with self.assertRaisesRegex(RuntimeError, "synthetic"):
+            with registry.delivery_guard(1, cancelled):
+                raise RuntimeError("synthetic")
+        # Exceptions release the guard; the next ordinary host mutation still works.
+        registry.add(PROFILE)
+        self.assertEqual(registry.snapshot(), (PROFILE,))
+
+    def test_guard_wait_expiry_blocks_admission_queue_delivery_and_capture_permission(self):
+        for boundary in ("admission", "result", "drain", "permission"):
+            with self.subTest(boundary=boundary):
+                self.make()
+                self.profiles = PausedProfiles()
+                self.session.profiles = self.profiles
+                self.start()
+                self.addCleanup(self.profiles.resume.set)
+                output = []
+                caller = None
+                if boundary in {"admission", "result"}:
+                    self.profiles.pause_admission = boundary == "admission"
+                    self.profiles.pause_delivery = boundary == "result"
+                    self.observe()
+                else:
+                    if boundary == "drain":
+                        self.observe()
+                        self.assertTrue(self.session.wait_idle(1))
+                    self.profiles.pause_delivery = True
+
+                    def read_boundary():
+                        if boundary == "drain":
+                            output.extend(self.session.drain())
+                        else:
+                            output.append(self.session.capture_permitted)
+
+                    caller = threading.Thread(target=read_boundary)
+                    caller.start()
+                try:
+                    self.assertTrue(self.profiles.paused.wait(1))
+                    # Resume while the registry is held: the boundary must read fresh
+                    # time after acquiring it, rather than reuse the pre-wait clock.
+                    with self.profiles._lock:
+                        self.profiles.resume.set()
+                        self.clock.at = 2
+                finally:
+                    self.profiles.resume.set()
+                    if caller is not None:
+                        caller.join(2)
+                if caller is not None:
+                    self.assertFalse(caller.is_alive())
+                self.assertTrue(self.session.wait_idle(1))
+                self.assertIsNone(self.session._advice)
+                self.assertFalse(self.session.capture_permitted)
+                self.assertEqual(len(self.profiles._admissions), 0)
+                if boundary == "admission":
+                    self.assertEqual(self.provider.calls, [])
+                elif boundary == "permission":
+                    self.assertEqual(output, [False])
+                elif boundary == "drain":
+                    self.assertFalse(any(e["type"] == "coaching_advice" for e in output))
+                    self.assertFalse(any(e.get("capture_permitted") for e in output))
+
+    def test_permission_and_qualified_state_revoke_after_old_tick_snapshot(self):
+        for boundary in ("permission", "state"):
+            for mutation in ("remove", "update", "remove_readd", "update_revert"):
+                with self.subTest(boundary=boundary, mutation=mutation):
+                    self.make()
+                    self.profiles = PausedProfiles()
+                    self.session.profiles = self.profiles
+                    self.start()
+                    if boundary == "state":
+                        self.session.apply_control(qualify(qualification_id=uid(50)))
+                    self.profiles.pause_snapshot = True
+                    self.addCleanup(self.profiles.resume.set)
+                    output, failures = [], []
+
+                    def read_boundary():
+                        try:
+                            if boundary == "state":
+                                output.extend(self.session.drain())
+                            else:
+                                output.append(self.session.capture_permitted)
+                        except Exception as error:
+                            failures.append(error)
+
+                    reader = threading.Thread(target=read_boundary)
+                    reader.start()
+                    try:
+                        self.assertTrue(self.profiles.paused.wait(1))
+                        self._mutate_profiles(mutation)
+                    finally:
+                        self.profiles.resume.set()
+                        reader.join(2)
+                    self.assertFalse(reader.is_alive())
+                    self.assertEqual(failures, [])
+                    if boundary == "permission":
+                        self.assertEqual(output, [False])
+                    else:
+                        self.assertEqual(output[-1]["reason"], "profile_changed")
+                        self.assertFalse(any(e.get("capture_permitted") for e in output))
+                    self.assertEqual(len(self.profiles._admissions), 0)
 
     def test_measured_floor_and_playback_hold_without_model_and_speaker_is_not_identity(self):
         self.make()
