@@ -518,10 +518,12 @@ class ProviderTransportTests(unittest.TestCase):
             self.assertFalse({"work", "profile", "context", "body", "payload", "self"} & set(cells))
             states.append(cells["state"].cell_contents)
             callback = cells["cancelled"].cell_contents
-            self.assertFalse(any(
-                isinstance(cell.cell_contents, (CoachWork, ListenerProfile, Turn, bytes))
-                for cell in callback.__closure__
-            ))
+            self.assertFalse(
+                any(
+                    isinstance(cell.cell_contents, (CoachWork, ListenerProfile, Turn, bytes))
+                    for cell in callback.__closure__
+                )
+            )
             if not release.wait(1):
                 raise AssertionError("authored late credential watchdog")
             return KEY
