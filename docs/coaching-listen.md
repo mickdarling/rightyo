@@ -95,16 +95,49 @@ it is not speech recognition accuracy or speaker discrimination evidence.
 The optional suggestion file is an authored JSON object keyed by actual final ID,
 for example `{"live-1":"Ask what outcome they need next."}`. It is at most 64 KiB,
 uses the existing MockCoachProvider count/text limits, and defaults to hold when
-absent or unmatched. No hosted coaching provider is configured by this interface yet.
-The existing Jev adapter returns classification choices rather than generated advice.
-A real semantic selector could reuse its pinned model/endpoint and credentials to
-choose hold/uncertain or a bounded authored suggestion catalog, with a new strict
-coaching request/parser and explicit hosted-text consent. Freely composed advice
-requires a generative provider/model response contract that this repository does not
-currently implement. Either adapter can use the same `CoachProvider.advise` boundary;
-it needs cooperative credential/transport cancellation, a whole-call deadline and
-mocked transport qualification before any hosted experiment. These are software
-requirements in addition to actual speech quality and private hardware qualification.
+absent or unmatched. Mock remains the default provider.
+
+## Optional Jev catalog selector
+
+The separate opt-in `--coaching-provider jev` selects one locally authored suggestion
+or holds/abstains. It uses the existing pinned `jev-1.13.0` model and fixed
+`https://api.typesafe.ai/v1/systemone` endpoint through the documented
+[Choice API](https://docs.typesafe.ai/api). It does not generate advice text. A strict
+parser verifies model, question, distribution, confidence and bounded usage; only a
+catalog entry can become advice. Transcript/profile content stays untrusted evidence.
+
+In addition to the normal coaching process/control requirements, Jev requires all
+three explicit options: `--coaching-allow-hosted-text`, `--coaching-max-requests N`
+(1–100 attempts per child), and `--coaching-advice-catalog /absolute/path/catalog.json`.
+The catalog is a JSON object such as
+`{"clarify":"Ask which outcome matters most.","pause":"Give them time to finish."}`.
+It contains 1–8 distinct ASCII IDs (1–64 letters/digits/underscore/dot/hyphen, starting
+with a letter or digit); `hold` and `uncertain` are reserved. Each authored text meets
+the existing 280-character/45-word limit. File and encoded catalog each fit 8 KiB.
+Duplicate keys, malformed text and nonfinite JSON fail closed. Mock suggestion files
+cannot be combined with Jev. Jev-only options are rejected in mock/ordinary listening.
+
+This consent sends the bounded coaching transcript and listener profile to Jev.
+Ordinary `--allow-hosted` does not supply that consent; it separately authorizes any
+configured hosted speech backend. Ordinary Jev attention decisions must remain off
+in coaching mode. Selecting the catalog provider does not perform credential lookup,
+inference or transmission; those occur only for actual admitted, still-qualified work.
+The existing local Jev credential mechanism is used at request time, without a new
+service or credential configuration. Do not put credentials in these files or argv.
+
+Each admitted work item carries its immutable original monotonic qualification
+deadline internally, never in model input or wire events. Credential lookup, TLS/DNS,
+send/read and parsing share the remaining original lifetime, capped at 1.5 seconds;
+renewal cannot extend it. Cancellation is checked during lookup/transport and again
+before accepting a suggestion; the coordinator independently checks ticket/profile,
+route and deadline before delivery. Failures consume an attempt and are not retried.
+Responses are capped at 64 KiB and abandoned transport helpers are process-bounded.
+Data already transmitted cannot be retracted by later cancellation.
+
+All provider qualification uses authored text and fake credential/HTTPS transport,
+including cancellation and late-DNS/body cases. This establishes the software path;
+hosted model usefulness/latency and real speech/private hardware quality remain
+unvalidated. The source/test slice does not authorize hosted experiments.
 
 The original cadence of at least 20 seconds and all context/session/qualification
 limits still apply. Multi-turn authored tests can demonstrate holds and cancellation

@@ -78,6 +78,35 @@ def mock_provider(path: Path | None):
     return MockCoachProvider(decode_object(content))
 
 
+def provider_from_args(args):
+    """Choose advice explicitly, independently of ordinary attention/speech consent."""
+    provider = getattr(args, "coaching_provider", "mock")
+    allow_hosted = getattr(args, "coaching_allow_hosted_text", False)
+    budget = getattr(args, "coaching_max_requests", None)
+    catalog_path = getattr(args, "coaching_advice_catalog", None)
+    mock_path = getattr(args, "coaching_mock_suggestions", None)
+    if provider == "mock":
+        if allow_hosted or budget is not None or catalog_path is not None:
+            raise ContractError("hosted coaching options require --coaching-provider jev")
+        return mock_provider(mock_path)
+    if provider != "jev":
+        raise ContractError("unsupported coaching provider")
+    if not allow_hosted or budget is None or catalog_path is None or mock_path is not None:
+        raise ContractError("Jev coaching requires separate consent, budget and authored catalog")
+    from rightyo.coaching_jev import JevCatalogCoachProvider
+
+    try:
+        with Path(catalog_path).open("rb") as source:
+            content = source.read(MAX_CONTROL_BYTES + 1)
+    except OSError:
+        raise ContractError("authored advice catalog unavailable") from None
+    if len(content) > MAX_CONTROL_BYTES:
+        raise ContractError("authored advice catalog exceeds byte budget")
+    return JevCatalogCoachProvider(
+        decode_object(content), allow_hosted=allow_hosted, max_requests=budget
+    )
+
+
 class ControlReader:
     """Only the foreground loop reads; no blocked reader outlives the child session."""
 
@@ -218,7 +247,7 @@ def run(args, *, config, events, consent, controller_factory, output, use_jev=Fa
     )
     try:
         session_id = canonical_uuid(args.session_id)
-        provider = mock_provider(getattr(args, "coaching_mock_suggestions", None))
+        provider = provider_from_args(args)
         output_fd = output.fileno()
         if output_fd == fd:
             raise ValueError
