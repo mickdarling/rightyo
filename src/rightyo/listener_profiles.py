@@ -10,6 +10,26 @@ from rightyo.contracts import ContractError, ListenerProfile, identifier
 
 MAX_LISTENERS = 8
 MAX_LISTENER_PROFILES_BYTES = 16384
+MAX_LISTENER_DISPATCHES = 8
+
+
+class ListenerDispatch:
+    """One committed provider handoff, released when its worker finishes.
+
+    Admission, not the later Python provider invocation, is the linearization point.
+    Revocation cannot retract this already admitted payload; it immediately signals
+    cancellation. A provider that ignores cancellation can retain its bounded work
+    until it returns, so its admission continues occupying the registry's small cap.
+    """
+
+    def __init__(self, registry: ListenerProfiles, cancelled: threading.Event) -> None:
+        self._registry = registry
+        self.cancelled = cancelled
+
+    def close(self) -> None:
+        """Idempotently release the admission; no provider code runs under this lock."""
+        with self._registry._lock:
+            self._registry._admissions.discard(self)
 
 
 def _validated_profile(value: Any) -> ListenerProfile:
@@ -45,6 +65,7 @@ class ListenerProfiles:
         self._lock = threading.Lock()
         self._profiles = _checked_profiles(tuple(_validated_profile(value) for value in initial))
         self._revision = 0
+        self._admissions: set[ListenerDispatch] = set()
 
     def snapshot(self) -> tuple[ListenerProfile, ...]:
         with self._lock:
@@ -55,12 +76,38 @@ class ListenerProfiles:
         with self._lock:
             return self._revision, self._profiles
 
+    def admit_dispatch(self, revision: int, cancelled: threading.Event) -> ListenerDispatch | None:
+        """Commit one bounded handoff atomically with profile mutation/revocation.
+
+        A mutation that wins this lock prevents admission of its previous revision.
+        A handoff that wins first is already in flight, even if its provider function
+        is scheduled later. Mutations immediately cancel it without waiting for that
+        function. Only fixed-size bookkeeping and Event.set run under the lock;
+        callers may hold their session lock, but registry operations never acquire it.
+        """
+        if type(revision) is not int or not 0 <= revision <= 2**53 - 1:
+            raise ContractError("invalid listener dispatch revision")
+        if type(cancelled) is not threading.Event:
+            raise ContractError("invalid listener dispatch cancellation")
+        with self._lock:
+            if revision != self._revision or cancelled.is_set():
+                return None
+            if len(self._admissions) >= MAX_LISTENER_DISPATCHES:
+                raise ContractError("listener dispatch budget exceeded")
+            admission = ListenerDispatch(self, cancelled)
+            self._admissions.add(admission)
+            return admission
+
     def _replace(self, profiles: tuple[ListenerProfile, ...]) -> None:
         checked = _checked_profiles(profiles)
         if self._revision >= 2**53 - 1:
             raise ContractError("listener profile revision budget exceeded")
         self._profiles = checked
         self._revision += 1
+        # Retain the records until their workers finish, including uncooperative
+        # workers. Clearing them here would allow repeated edits to evade the cap.
+        for admission in self._admissions:
+            admission.cancelled.set()
 
     def add(self, profile: ListenerProfile | dict[str, Any]) -> None:
         validated = _validated_profile(profile)

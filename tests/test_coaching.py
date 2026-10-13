@@ -17,7 +17,7 @@ from rightyo.coaching import (
 )
 from rightyo.coaching_input import CoachingInputAdapter
 from rightyo.contracts import ContractError, ListenerProfile, Turn
-from rightyo.listener_profiles import ListenerProfiles
+from rightyo.listener_profiles import MAX_LISTENER_DISPATCHES, ListenerProfiles
 from rightyo.tool_events import SpeechEvents
 
 
@@ -119,6 +119,34 @@ class Provider:
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
+
+
+class PausedProfiles(ListenerProfiles):
+    """Hold an old snapshot or an attempted handoff without holding the registry lock."""
+
+    def __init__(self):
+        super().__init__([PROFILE])
+        self.pause_snapshot = False
+        self.pause_admission = False
+        self.paused = threading.Event()
+        self.resume = threading.Event()
+
+    def revisioned_snapshot(self):
+        snapshot = super().revisioned_snapshot()
+        if self.pause_snapshot:
+            self.pause_snapshot = False
+            self.paused.set()
+            if not self.resume.wait(2):
+                raise AssertionError("snapshot test synchronization budget")
+        return snapshot
+
+    def admit_dispatch(self, revision, cancelled):
+        if self.pause_admission:
+            self.pause_admission = False
+            self.paused.set()
+            if not self.resume.wait(2):
+                raise AssertionError("admission test synchronization budget")
+        return super().admit_dispatch(revision, cancelled)
 
 
 class CoachingTests(unittest.TestCase):
@@ -358,6 +386,137 @@ class CoachingTests(unittest.TestCase):
         self.assertFalse(self.session.capture_permitted)
         with self.assertRaises(ContractError):
             self.session.apply_control(qualify(qualification_id=uid(50)))
+
+    def _mutate_profiles(self, mutation):
+        if mutation in {"remove", "remove_readd"}:
+            self.profiles.remove("coach")
+            if mutation == "remove_readd":
+                self.profiles.add(PROFILE)
+        else:
+            self.profiles.update(replace(PROFILE, domain="Changed host profile"))
+            if mutation == "update_revert":
+                self.profiles.update(PROFILE)
+
+    def test_revocation_after_observe_snapshot_prevents_provider_handoff(self):
+        for mutation in ("remove", "update", "remove_readd", "update_revert"):
+            with self.subTest(mutation=mutation):
+                self.make()
+                self.profiles = PausedProfiles()
+                self.session.profiles = self.profiles
+                self.start()
+                self.profiles.pause_snapshot = True
+                self.addCleanup(self.profiles.resume.set)
+                failures = []
+
+                def observe():
+                    try:
+                        self.observe(turn(text="New synthetic evidence after the old snapshot"))
+                    except Exception as error:
+                        failures.append(error)
+
+                observer = threading.Thread(target=observe)
+                observer.start()
+                try:
+                    self.assertTrue(self.profiles.paused.wait(1))
+                    self._mutate_profiles(mutation)
+                finally:
+                    self.profiles.resume.set()
+                    observer.join(2)
+                self.assertFalse(observer.is_alive())
+                self.assertEqual(failures, [])
+                self.assertEqual(self.advice(), [])
+                self.assertEqual(self.provider.calls, [])
+                self.assertFalse(self.session.capture_permitted)
+                self.assertEqual(len(self.session._context), 0)
+                self.assertEqual(len(self.profiles._admissions), 0)
+
+    def test_revocation_winning_at_worker_admission_prevents_provider_call(self):
+        self.make()
+        self.profiles = PausedProfiles()
+        self.session.profiles = self.profiles
+        self.start()
+        self.profiles.pause_admission = True
+        self.addCleanup(self.profiles.resume.set)
+        self.observe()
+        try:
+            self.assertTrue(self.profiles.paused.wait(1))
+            # The worker already checked session validity. A second check alone would
+            # still race here; the registry admission must reject this revised profile.
+            self.profiles.remove("coach")
+            self.profiles.add(PROFILE)
+        finally:
+            self.profiles.resume.set()
+        self.assertEqual(self.advice(), [])
+        self.assertEqual(self.provider.calls, [])
+        self.assertFalse(self.session.capture_permitted)
+        self.assertEqual(len(self.profiles._admissions), 0)
+
+    def test_admitted_uncooperative_provider_does_not_block_immediate_revocation(self):
+        for mutation in ("remove", "update"):
+            with self.subTest(mutation=mutation):
+                self.make(Provider(blocking=True))
+                self.start()
+                self.observe()
+                self.assertTrue(self.provider.entered.wait(0.5))
+                self.assertEqual(len(self.profiles._admissions), 1)
+                completed = threading.Event()
+
+                def revoke():
+                    self._mutate_profiles(mutation)
+                    completed.set()
+
+                revoker = threading.Thread(target=revoke)
+                revoker.start()
+                try:
+                    self.assertTrue(completed.wait(0.5))
+                    self.assertFalse(self.provider.release.is_set())
+                    # Immediate cancellation must not depend on the next session tick.
+                    self.assertTrue(self.provider.cancelled.is_set())
+                    self.assertEqual(len(self.profiles._admissions), 1)
+                finally:
+                    self.provider.release.set()
+                    revoker.join(2)
+                self.assertEqual(self.advice(), [])
+                self.assertFalse(self.session.capture_permitted)
+                self.assertEqual(len(self.profiles._admissions), 0)
+
+    def test_dispatch_cap_survives_revocation_and_releases_idempotently(self):
+        registry = ListenerProfiles([PROFILE])
+        active = [
+            registry.admit_dispatch(0, threading.Event()) for _ in range(MAX_LISTENER_DISPATCHES)
+        ]
+        self.addCleanup(lambda: [admission.close() for admission in active])
+        with self.assertRaises(ContractError):
+            registry.update(replace(PROFILE, listener_id="absent"))
+        self.assertFalse(any(admission.cancelled.is_set() for admission in active))
+        registry.update(PROFILE)
+        self.assertTrue(all(admission.cancelled.is_set() for admission in active))
+        self.assertIsNone(registry.admit_dispatch(0, threading.Event()))
+        with self.assertRaisesRegex(ContractError, "dispatch budget"):
+            registry.admit_dispatch(1, threading.Event())
+        self.assertEqual(len(registry._admissions), MAX_LISTENER_DISPATCHES)
+        active[0].close()
+        active[0].close()
+        new = registry.admit_dispatch(1, threading.Event())
+        self.assertIsNotNone(new)
+        new.close()
+        for admission in active:
+            admission.close()
+        self.assertEqual(len(registry._admissions), 0)
+
+    def test_failed_provider_and_start_failure_leave_no_dispatch_records(self):
+        self.make(Provider(result=RuntimeError("synthetic private failure")))
+        self.start()
+        self.observe()
+        self.assertEqual(self.advice(), [])
+        self.assertEqual(len(self.profiles._admissions), 0)
+        self.make()
+        self.start()
+        with patch("rightyo.coaching.threading.Thread.start", side_effect=RuntimeError("start")):
+            with self.assertRaises(ContractError):
+                self.observe()
+        self.assertFalse(self.session._busy)
+        self.assertEqual(len(self.profiles._admissions), 0)
 
     def test_measured_floor_and_playback_hold_without_model_and_speaker_is_not_identity(self):
         self.make()
