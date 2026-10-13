@@ -195,6 +195,7 @@ class _Ticket:
     lease: _Qualification
     work: CoachWork
     cancelled: threading.Event
+    profile_revision: int
 
 
 class CoachingSession:
@@ -464,7 +465,14 @@ class CoachingSession:
             ):
                 return
             work = CoachWork(self._profile, self._snapshot(), turn, pause_ms, str(uuid4()))
-            ticket = _Ticket(self._session, self._destination, lease, work, threading.Event())
+            ticket = _Ticket(
+                self._session,
+                self._destination,
+                lease,
+                work,
+                threading.Event(),
+                self._profile_revision,
+            )
             self._pending = ticket
             self._busy = True
             self._last_call = now
@@ -485,20 +493,42 @@ class CoachingSession:
             and ticket.destination == self._destination
             and ticket.lease.generation == self._lease.generation
             and ticket.work.profile == self._profile
+            and ticket.profile_revision == self._profile_revision
         )
 
     def _compute(self, ticket: _Ticket) -> None:
         result = None
         failed = False
+        admission = None
         try:
-            raw = self._provider.advise(ticket.work, ticket.cancelled)
-            if raw is not None:
-                if type(raw) is not CoachSuggestion:
-                    raise ContractError("invalid coaching provider result")
-                result = CoachSuggestion(raw.text, raw.provider, raw.model, raw.confidence)
+            with self._condition:
+                now = self._now()
+                self._tick(now)
+                if self._pending is ticket and self._valid_ticket(ticket):
+                    # Commit the immutable payload's provider handoff against the
+                    # registry revision under its mutation lock. A _tick/recheck alone
+                    # leaves a race with update/remove. This is the admission boundary,
+                    # not a promise to retract data from an already admitted provider.
+                    admission = self.profiles.admit_dispatch(
+                        ticket.profile_revision, ticket.cancelled
+                    )
+            if admission is not None and not ticket.cancelled.is_set():
+                # No registry/session locks cross provider execution. Successful edits
+                # immediately cancel this admission; an uncooperative provider holds
+                # only its single bounded snapshot, and cannot block those edits.
+                # Skip a cancellation already visible here as a best effort; this
+                # check does not move the admission boundary or erase scheduling races.
+                raw = self._provider.advise(ticket.work, ticket.cancelled)
+                if raw is not None:
+                    if type(raw) is not CoachSuggestion:
+                        raise ContractError("invalid coaching provider result")
+                    result = CoachSuggestion(raw.text, raw.provider, raw.model, raw.confidence)
         except Exception:
             # No exception text, transcript, speaker ID or provider payload enters state.
             failed = True
+        finally:
+            if admission is not None:
+                admission.close()
         with self._condition:
             try:
                 now = self._now()

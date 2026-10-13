@@ -85,6 +85,9 @@ Disable, cancellation, invalidation, expiry and active-profile changes discard o
 plaintext context and queued advice and cancel pending work. A single uncooperative
 provider may retain its bounded work snapshot until it returns; cancellation is not
 forensic zeroization or a promise to erase data already handed to another process.
+The registry serializes provider admission against successful profile changes:
+revocation before admission denies old work; revocation after admission cancels
+already admitted work without waiting for provider execution or retracting its data.
 Providers must cooperate and impose their own finite transport timeout. No retry or
 new physical call is launched until the prior call finishes. There is no transcript
 archive or recording default.

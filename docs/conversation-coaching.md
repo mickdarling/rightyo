@@ -103,7 +103,12 @@ control text cannot perform a host action.
 
 Any successful profile-registry change disables the selected coaching session,
 including an update subsequently reverted before the next tick. Re-enable with a
-fresh session UUID and new qualification. Context is cleared on expiry, stop and
+fresh session UUID and new qualification. Provider admission and successful profile
+changes are serialized by the registry: a change that wins before admission denies
+the old work; a change after admission immediately signals cancellation. Already
+admitted work may have reached an uncooperative provider and cannot be retracted.
+Provider execution does not hold the registry lock, so revocation does not wait for
+that call to finish. Context is cleared on expiry, stop and
 invalidation. The coordinator retains at most 1,000 content-free final fingerprints
 per session and 4,096 session, qualification and retired-generation identifiers per
 instance; exhausting a bound fails closed. State output is coalesced to the latest
