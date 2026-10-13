@@ -409,6 +409,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     listen.add_argument("--use-jev", action="store_true")
     listen.add_argument("--allow-hosted", action="store_true")
+    listen.add_argument(
+        "--coaching",
+        action="store_true",
+        help="opt-in owner-private coaching; stdin PCM plus trusted coaching controls",
+    )
+    listen.add_argument(
+        "--coaching-mock-suggestions",
+        type=Path,
+        help="with --coaching: bounded authored JSON suggestions keyed by final utterance ID",
+    )
     _add_name_option(listen)
     _add_session_budget_option(listen)
     _add_request_former_option(listen)

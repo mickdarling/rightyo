@@ -64,6 +64,7 @@ from rightyo.speech_backends import (
     diarizer_factory,
     diarizer_spec,
     is_hosted,
+    is_synthetic,
     speech_summary,
     transcriber_factory,
     transcriber_spec,
@@ -171,12 +172,12 @@ def validate_session_budget(value: Any) -> int | None:
 
 @dataclass(frozen=True)
 class PrototypeConfig:
-    # Local assets are required by the local backends only; a hosted selection may omit them.
+    # Native assets are required only by native backends; explicit mocks need none.
     whisper_executable: Path | None
     whisper_model: Path | None
     diarization_library: Path | None
     diarization_model: Path | None
-    microphone_helper: Path
+    microphone_helper: Path | None
     demo_audio: Path | None = None
     addressing: Addressing | None = None
     other_agents: Addressing | None = None
@@ -236,6 +237,10 @@ class PrototypeConfig:
         """Whether a selected speech backend would send audio to a hosted service."""
         return is_hosted(self.transcriber) or is_hosted(self.diarizer)
 
+    @property
+    def synthetic_speech(self) -> bool:
+        return is_synthetic(self.transcriber) or is_synthetic(self.diarizer)
+
     @classmethod
     def load(cls, path: Path) -> PrototypeConfig:
         try:
@@ -248,18 +253,27 @@ class PrototypeConfig:
                 raise ValueError
             transcriber = transcriber_spec(raw.pop("transcriber", None))
             diarizer = diarizer_spec(raw.pop("diarizer", None))
+            synthetic = is_synthetic(transcriber) or is_synthetic(diarizer)
+            if synthetic and (
+                not (is_synthetic(transcriber) and is_synthetic(diarizer))
+                or "end_of_turn" in raw
+                or "speaker_id" in raw
+            ):
+                raise ValueError
             has_decision = "decision" in raw
             decision = raw.pop("decision", None)
             hosted_decisions = has_decision and decision_spec(decision)
+            if synthetic and hosted_decisions:
+                raise ValueError
             # Optional per-session cap on live Jev requests; absent means none (#75).
             decision_requests = decision.get("max_requests") if hosted_decisions else None
             scene = (
                 scene_text(decision.get("scene", DEFAULT_SCENE)) if has_decision else DEFAULT_SCENE
             )
-            required = {"microphone_helper"}
-            if not is_hosted(transcriber):
+            required = set() if synthetic else {"microphone_helper"}
+            if transcriber["kind"] == "whisper.cpp":
                 required |= {"whisper_executable", "whisper_model"}
-            if not is_hosted(diarizer):
+            if diarizer["kind"] == "nemotron.cpp":
                 required |= {"diarization_library", "diarization_model"}
             if not required <= raw.keys():
                 raise ValueError
@@ -276,6 +290,7 @@ class PrototypeConfig:
                 "acknowledgement",
                 "speaker_id",
                 "other_agents",
+                "microphone_helper",
                 *LOCAL_ASSETS,
             }
             if raw.keys() - required - optional:
@@ -330,7 +345,7 @@ class PrototypeConfig:
                 values[name] = Path(value)
             config = cls(
                 **{name: values.get(name) for name in LOCAL_ASSETS},
-                microphone_helper=values["microphone_helper"],
+                microphone_helper=values.get("microphone_helper"),
                 demo_audio=values.get("demo_audio"),
                 addressing=addressing,
                 other_agents=other_agents,
@@ -407,7 +422,11 @@ class PrototypeController:
         speaker_id_factory=ShadowSpeakerId,
         owner_voice=None,
         input_route=None,
+        retain_transcripts=True,
     ):
+        if type(retain_transcripts) is not bool:
+            raise PrototypeError("Invalid transcript retention setting")
+        self.retain_transcripts = retain_transcripts
         self.config = config
         # Owner-voice status events (rightyo#164): an `OwnerVoice` from the host's opt-in,
         # else None and nothing new is advertised or emitted.
@@ -564,6 +583,20 @@ class PrototypeController:
             raise PrototypeError("Stdin audio requires an explicit source provenance")
         if mode == "stdin" and self._stdin_used:
             raise PrototypeError("Stdin audio feeds one session only; start a new process")
+        if not self.retain_transcripts and hosted:
+            raise PrototypeError("Ordinary decisions require transcript retention")
+        if self.config.synthetic_speech and (
+            not (is_synthetic(self.config.transcriber) and is_synthetic(self.config.diarizer))
+            or mode != "stdin"
+            or self.audio_provenance != "synthetic"
+            or hosted
+            or self.config.hosted_decisions
+            or self.config.end_of_turn is not None
+            or self.config.speaker_id is not None
+        ):
+            # Reject before starting workers or selecting any backend/helper. A host
+            # must explicitly identify authored PCM; mocks never label live speech.
+            raise PrototypeError("Synthetic speech requires model-free synthetic stdin mode")
         if self.config.speakers is not None and self.config.speakers.source == "model":
             # A hosted role question would run on the audio path under the controller
             # lock, where Stop and lease expiry cannot reach it; tool-replay has no such
@@ -648,7 +681,7 @@ class PrototypeController:
                 raise PrototypeError("Hosted decisions could not be initialized") from None
             runner = ReplayRunner(
                 provider,
-                memory=memory,
+                memory=memory if self.retain_transcripts else None,
                 cancelled=cancelled,
                 addressing=self.config.addressing,
                 scene=self.config.decision_scene,
@@ -737,7 +770,8 @@ class PrototypeController:
         with self._lock:
             if generation != self._generation or self._stop.is_set():
                 return
-            memory.append(turn)
+            if self.retain_transcripts:
+                memory.append(turn)
             inferred = turn.utterance_id in self._inferred_turns
             self._inferred_turns.discard(turn.utterance_id)
             if self._events is not None:

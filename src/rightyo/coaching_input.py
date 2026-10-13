@@ -12,6 +12,29 @@ from rightyo.coaching import CoachingSession, canonical_uuid
 from rightyo.contracts import ContractError, Turn, integer, speaker_role
 
 
+def validate_coaching_transcript(event: Any) -> Turn:
+    """Validate the ordinary transcript envelope, without granting speaker authority."""
+    if not isinstance(event, dict) or event.get("type") != "transcript":
+        raise ContractError("coaching input requires a transcript event")
+    required = {"schema_version", "type", "session_id", "sequence", "emitted_at_ms", "turn"}
+    if not required <= set(event) or set(event) - required - {"speaker_name"}:
+        raise ContractError("invalid coaching input fields")
+    if type(event["schema_version"]) is not int or event["schema_version"] != 1:
+        raise ContractError("unsupported coaching input version")
+    integer(event["sequence"], "coaching input sequence", 1)
+    integer(event["emitted_at_ms"], "coaching input time")
+    canonical_uuid(event["session_id"])
+    raw = event["turn"]
+    if not isinstance(raw, dict):
+        raise ContractError("invalid coaching input turn")
+    if "role" in raw:
+        speaker_role(raw["role"])
+    turn = Turn.from_dict({key: value for key, value in raw.items() if key != "role"})
+    if turn.session_id != event["session_id"] or turn.end_ms > event["emitted_at_ms"]:
+        raise ContractError("invalid coaching input causal identity")
+    return turn
+
+
 class CoachingInputAdapter:
     def __init__(self, session: CoachingSession, *, generation_id: str) -> None:
         if not isinstance(session, CoachingSession):
@@ -28,26 +51,9 @@ class CoachingInputAdapter:
         playback: bool = False,
     ) -> None:
         """Transcript channel only; no text, session event or model result is a control."""
-        if not isinstance(event, dict) or event.get("type") != "transcript":
-            raise ContractError("coaching input requires a transcript event")
-        required = {"schema_version", "type", "session_id", "sequence", "emitted_at_ms", "turn"}
-        if not required <= set(event) or set(event) - required - {"speaker_name"}:
-            raise ContractError("invalid coaching input fields")
-        if type(event["schema_version"]) is not int or event["schema_version"] != 1:
-            raise ContractError("unsupported coaching input version")
-        integer(event["sequence"], "coaching input sequence", 1)
-        integer(event["emitted_at_ms"], "coaching input time")
-        canonical_uuid(event["session_id"])
-        raw = event["turn"]
-        if not isinstance(raw, dict):
-            raise ContractError("invalid coaching input turn")
         # Ordinary tool events can carry a descriptive role and display name. They
         # are never owner binding, playback permission or command authorization.
-        if "role" in raw:
-            speaker_role(raw["role"])
-        turn = Turn.from_dict({key: value for key, value in raw.items() if key != "role"})
-        if turn.session_id != event["session_id"] or turn.end_ms > event["emitted_at_ms"]:
-            raise ContractError("invalid coaching input causal identity")
+        turn = validate_coaching_transcript(event)
         self._session.observe(
             turn,
             generation_id=self._generation,

@@ -69,6 +69,11 @@ Try its authored mock fixture without a microphone, model, API key or audio outp
 PYTHONPATH=src python3 -m rightyo coach-replay --input examples/coaching-replay.json
 ```
 
+For continuous host composition, [the coaching listener](docs/coaching-listen.md)
+documents opt-in raw PCM input, separate trusted controls and an executable authored
+speech backend. It requires no model assets for synthetic qualification; actual
+recognition/coaching quality and private hardware behavior remain unvalidated.
+
 See [the coaching guide](docs/conversation-coaching.md) for the replay and library
 adapter, and [the wire contract](docs/coaching-wire-v1.md) for the host boundary. This
 is a separate opt-in experiment; actual coaching inference and device audio wiring
