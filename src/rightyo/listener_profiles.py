@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Callable
 
 from rightyo.contracts import ContractError, ListenerProfile, identifier
 
@@ -76,27 +77,64 @@ class ListenerProfiles:
         with self._lock:
             return self._revision, self._profiles
 
-    def admit_dispatch(self, revision: int, cancelled: threading.Event) -> ListenerDispatch | None:
+    def admit_dispatch(
+        self,
+        revision: int,
+        cancelled: threading.Event,
+        *,
+        validate: Callable[[int], bool] | None = None,
+    ) -> ListenerDispatch | None:
         """Commit one bounded handoff atomically with profile mutation/revocation.
 
         A mutation that wins this lock prevents admission of its previous revision.
         A handoff that wins first is already in flight, even if its provider function
         is scheduled later. Mutations immediately cancel it without waiting for that
-        function. Only fixed-size bookkeeping and Event.set run under the lock;
+        function. The optional internal validator receives the locked revision and
+        rechecks time after any lock wait; it must perform only bounded session
+        bookkeeping and a trusted nonblocking monotonic clock read, without reentry.
+        No provider, I/O, playback or other host callback runs under the lock;
         callers may hold their session lock, but registry operations never acquire it.
         """
         if type(revision) is not int or not 0 <= revision <= 2**53 - 1:
             raise ContractError("invalid listener dispatch revision")
         if type(cancelled) is not threading.Event:
             raise ContractError("invalid listener dispatch cancellation")
+        if validate is not None and not callable(validate):
+            raise ContractError("invalid listener dispatch validator")
         with self._lock:
             if revision != self._revision or cancelled.is_set():
                 return None
             if len(self._admissions) >= MAX_LISTENER_DISPATCHES:
                 raise ContractError("listener dispatch budget exceeded")
+            if validate is not None and validate(self._revision) is not True:
+                return None
+            if cancelled.is_set():
+                return None
             admission = ListenerDispatch(self, cancelled)
             self._admissions.add(admission)
             return admission
+
+    @contextmanager
+    def delivery_guard(self, revision: int, cancelled: threading.Event | None = None):
+        """Serialize a bounded local result commit/handoff with profile revocation.
+
+        Callers already own their session lock. Only bounded in-memory validation and
+        queue operations and the trusted nonblocking monotonic clock belong inside:
+        no provider, playback, I/O or other host callback.
+        Mutation winning first rejects the old revision, even after its provider
+        admission closed. Appending to an output batch while guarded is the handoff
+        boundary; mutation afterward cannot retract data already handed downstream.
+        This guard adds no admission record and never acquires a session lock.
+        """
+        if type(revision) is not int or not 0 <= revision <= 2**53 - 1:
+            raise ContractError("invalid listener delivery revision")
+        if cancelled is not None and type(cancelled) is not threading.Event:
+            raise ContractError("invalid listener delivery cancellation")
+        with self._lock:
+            yield (
+                revision == self._revision and (cancelled is None or not cancelled.is_set()),
+                self._revision,
+            )
 
     def _replace(self, profiles: tuple[ListenerProfile, ...]) -> None:
         checked = _checked_profiles(profiles)

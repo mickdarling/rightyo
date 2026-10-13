@@ -83,6 +83,9 @@ one immutable profile, bounded diarized context, the current final turn and a
 measured pause. A provider returns `CoachSuggestion` or `None` to hold; it must
 cooperate with cancellation and enforce a finite transport timeout. No real model
 backend is selected by this slice. `MockCoachProvider` is an authored lookup only.
+An injected clock must be a bounded, side-effect-free monotonic read: it must not
+re-enter the coordinator or registry, invoke providers, or perform I/O. Commit gates
+sample it after acquiring the registry lock so lock waits cannot extend a ticket.
 
 Feed the existing tool's `transcript` events through `CoachingInputAdapter`, constructed
 once per capture generation. Ordinary tool sessions used for this adapter must use
@@ -108,7 +111,10 @@ changes are serialized by the registry: a change that wins before admission deni
 the old work; a change after admission immediately signals cancellation. Already
 admitted work may have reached an uncooperative provider and cannot be retracted.
 Provider execution does not hold the registry lock, so revocation does not wait for
-that call to finish. Context is cleared on expiry, stop and
+that call to finish. Final advice dequeue also validates and commits its handoff
+under the registry's mutation lock. A profile change that wins first suppresses
+queued advice; a change after committed delivery cannot retract downstream content.
+Context is cleared on expiry, stop and
 invalidation. The coordinator retains at most 1,000 content-free final fingerprints
 per session and 4,096 session, qualification and retired-generation identifiers per
 instance; exhausting a bound fails closed. State output is coalesced to the latest
