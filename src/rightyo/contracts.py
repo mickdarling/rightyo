@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from dataclasses import asdict, dataclass
@@ -43,6 +44,12 @@ DEFAULT_ACK_MIN_CONFIDENCE = 0.7
 # an acknowledged request's turn, a later request goes unacknowledged; 0 turns it off.
 DEFAULT_ACK_DEDUP_WINDOW_MS = 8000
 MAX_ACK_DEDUP_WINDOW_MS = 60000
+# Host-supplied listener descriptions (#69). Bound both decoded fields and the ASCII
+# JSON wire representation: non-ASCII prose can expand substantially when serialized.
+MAX_LISTENER_PROFILE_TEXT_CHARS = 1024
+MAX_LISTENER_PROFILE_BYTES = 4096
+MAX_LISTENER_PROFILE_PRIORITY = 100
+MAX_LISTENER_PROFILE_COOLDOWN_MS = 600000
 CONVERSATION_REASONS = frozenset({"request", "timeout", "other_human", "closed", "dismissed"})
 PROVENANCE = frozenset({"synthetic", "recorded-file", "causal-replay", "live-microphone"})
 SPEAKER_PROVENANCE = frozenset(
@@ -159,6 +166,85 @@ def probability(value: Any) -> float:
 def name_key(text: str) -> str:
     """Casefolded ASCII letters and digits only, so "Righty-O" and "righty o" compare equal."""
     return _NAME_KEY_SEPARATORS.sub("", text.casefold())
+
+
+@dataclass(frozen=True)
+class ListenerProfile:
+    """Versioned descriptions supplied explicitly by the embedding host, never speech.
+
+    These are model-neutral inputs, not permission to invoke an agent. Delivery and
+    pacing are hints for downstream consumers; this contract makes no decisions.
+    """
+
+    listener_id: str
+    name: str
+    domain: str
+    speak_when: str
+    stay_quiet_when: str
+    delivery: str
+    priority: int = 0
+    cooldown_ms: int = 0
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ContractError("unsupported listener profile version")
+        identifier(self.listener_id, "listener id")
+        if self.listener_id != self.listener_id.strip():
+            raise ContractError("invalid listener id")
+        address_name(self.name)
+        for value in (self.domain, self.speak_when, self.stay_quiet_when):
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > MAX_LISTENER_PROFILE_TEXT_CHARS
+                or any(
+                    ord(char) < 32 and char not in "\t\r\n" or ord(char) == 127 for char in value
+                )
+            ):
+                raise ContractError("invalid listener profile description")
+            try:
+                value.encode("utf-8")
+            except UnicodeError:
+                raise ContractError("invalid listener profile description") from None
+        if not isinstance(self.delivery, str) or self.delivery not in {"room", "owner_private"}:
+            raise ContractError("invalid listener profile delivery")
+        if (
+            type(self.priority) is not int
+            or not 0 <= self.priority <= MAX_LISTENER_PROFILE_PRIORITY
+        ):
+            raise ContractError("invalid listener profile priority")
+        if (
+            type(self.cooldown_ms) is not int
+            or not 0 <= self.cooldown_ms <= MAX_LISTENER_PROFILE_COOLDOWN_MS
+        ):
+            raise ContractError("invalid listener profile cooldown")
+        if len(json.dumps(self.to_dict(), ensure_ascii=True, separators=(",", ":"))) > (
+            MAX_LISTENER_PROFILE_BYTES
+        ):
+            raise ContractError("listener profile byte budget exceeded")
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> ListenerProfile:
+        if not isinstance(raw, dict) or "version" not in raw:
+            raise ContractError("listener profile must be a versioned object")
+        try:
+            return cls(**raw)
+        except TypeError:
+            raise ContractError("missing or unrecognized listener profile fields") from None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "listener_id": self.listener_id,
+            "name": self.name,
+            "domain": self.domain,
+            "speak_when": self.speak_when,
+            "stay_quiet_when": self.stay_quiet_when,
+            "delivery": self.delivery,
+            "priority": self.priority,
+            "cooldown_ms": self.cooldown_ms,
+        }
 
 
 @dataclass(frozen=True)
