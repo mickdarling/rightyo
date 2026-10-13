@@ -128,8 +128,10 @@ service or credential configuration. Do not put credentials in these files or ar
 Each admitted work item carries its immutable original monotonic qualification
 deadline internally, never in model input or wire events. Credential lookup, TLS/DNS,
 send/read and parsing share the remaining original lifetime, capped at 1.5 seconds;
-renewal cannot extend it. Cancellation is checked during lookup/transport and again
-before accepting a suggestion; the coordinator independently checks ticket/profile,
+renewal cannot extend it. Connect/send workers recheck cancellation and original
+expiry before starting transport, flushing headers and sending the body; parent
+polling is a backup. Cancellation is also checked before accepting a suggestion;
+the coordinator independently checks ticket/profile,
 route and deadline before delivery. Failures consume an attempt and are not retried.
 Responses are capped at 64 KiB and abandoned transport helpers are process-bounded.
 Coaching stops waiting for TLS certificate-store setup and credential cleanup at

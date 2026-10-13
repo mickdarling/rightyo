@@ -1215,13 +1215,21 @@ class HostedTranscriberTests(unittest.TestCase):
         self.assertTrue(connection.closed)
 
     def test_blocked_body_is_abandoned_at_the_wall_clock_deadline_and_closed(self):
-        clock = [0.0]
+        response = self.blocking_response()
+        reading = threading.Event()
+        original_read = response.read
+
+        def read(limit):
+            reading.set()
+            return original_read(limit)
+
+        response.read = read
 
         def monotonic():
-            clock[0] += 10.0
-            return clock[0]
+            # Exercise the response-body deadline, independently of how many
+            # earlier connection/upload guards check the clock.
+            return 40.0 if reading.is_set() else 0.0
 
-        response = self.blocking_response()
         with patch("http.client.HTTPSConnection", side_effect=connection_for(response)):
             with patch("rightyo.speech_backends.time.monotonic", monotonic):
                 with self.assertRaisesRegex(HostedSpeechError, "deadline") as caught:
@@ -1239,13 +1247,18 @@ class HostedTranscriberTests(unittest.TestCase):
         self.assertTrue(response.closed)
 
     def test_cancellation_mid_read_stops_the_request_and_closes_it(self):
-        checks = []
         response = self.blocking_response()
+        reading = threading.Event()
+        original_read = response.read
+
+        def read(limit):
+            reading.set()
+            return original_read(limit)
+
+        response.read = read
         with patch("http.client.HTTPSConnection", side_effect=connection_for(response)):
             with self.assertRaisesRegex(HostedSpeechError, "cancelled"):
-                self.transcriber(
-                    cancelled=lambda: checks.append(1) is None and len(checks) >= 4
-                ).transcribe(bytes(640))
+                self.transcriber(cancelled=reading.is_set).transcribe(bytes(640))
         self.assertTrue(response.fp.raw._sock.shut)
         self.assertTrue(response.closed)
 

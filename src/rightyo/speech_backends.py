@@ -473,14 +473,23 @@ class _HostedClient:
         """
         state = {"abort": False}
         outcome: dict[str, Any] = {}
+        cancelled = self.cancelled
+
+        def check() -> None:
+            if state["abort"] or cancelled():
+                raise _ReadCancelled
+            if time.monotonic() >= deadline:
+                raise _OpenDeadline
 
         def run() -> None:
             try:
+                # Parent polling may not run before this helper is scheduled.
+                check()
                 connection.connect()
-                if state["abort"]:
-                    connection.close()
+                check()
             except BaseException as error:
                 outcome["error"] = error
+                _abort_connection(connection)
 
         thread = threading.Thread(target=run, name="rightyo-hosted-connect", daemon=True)
         thread.start()
@@ -509,32 +518,39 @@ class _HostedClient:
         state = {"abort": False}
         outcome: dict[str, Any] = {}
         handoff = [body]
+        cancelled = self.cancelled
+
+        def check() -> None:
+            if state["abort"] or cancelled():
+                raise _ReadCancelled
+            if time.monotonic() >= deadline:
+                raise _OpenDeadline
 
         def run() -> None:
-            payload = handoff.pop()
+            payload = b""
             try:
-                if state["abort"]:
-                    connection.close()
-                    return
+                check()
+                payload = handoff.pop()
+                check()
                 connection.putrequest("POST", target)
                 for name, value in headers.items():
+                    check()
                     connection.putheader(name, value)
+                # endheaders is the first wire write; preparation above is local.
+                check()
                 connection.endheaders()
-                if state["abort"]:
-                    connection.close()
-                    return
+                check()
                 connection.send(payload)
                 payload = b""
-                if state["abort"]:
-                    connection.close()
-                    return
+                check()
                 response = connection.getresponse()
                 outcome["response"] = response
-                if state["abort"]:
-                    _abort_response(response)
-                    connection.close()
+                check()
             except BaseException as error:
                 outcome["error"] = error
+                if "response" in outcome:
+                    _abort_response(outcome["response"])
+                _abort_connection(connection)
             finally:
                 payload = b""
                 handoff.clear()

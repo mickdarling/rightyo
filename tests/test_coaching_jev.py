@@ -24,7 +24,13 @@ from rightyo.contracts import ContractError, ListenerProfile, Turn
 from rightyo.credentials import CredentialError
 from rightyo.listener_profiles import ListenerProfiles
 from rightyo.providers import JEV_MODEL
-from rightyo.speech_backends import MAX_STALLED_CONNECTS, _HostedClient
+from rightyo.speech_backends import (
+    MAX_STALLED_CONNECTS,
+    _ConnectSlot,
+    _HostedClient,
+    _OpenDeadline,
+    _ReadCancelled,
+)
 
 SESSION = "11111111-1111-4111-8111-111111111111"
 DESTINATION = "22222222-2222-4222-8222-222222222222"
@@ -120,6 +126,8 @@ class Connection:
         self.connect_done = threading.Event()
         self.sent = []
         self.headers = {}
+        self.request_calls = 0
+        self.headers_flushed = False
         self.closed = False
         self.sock = Mock(shutdown=self.shutdown)
 
@@ -132,13 +140,14 @@ class Connection:
             raise OSError("closed authored transport")
 
     def putrequest(self, method, target):
+        self.request_calls += 1
         self.method, self.target = method, target
 
     def putheader(self, key, value):
         self.headers[key] = value
 
     def endheaders(self):
-        pass
+        self.headers_flushed = True
 
     def send(self, payload):
         if self.closed:
@@ -329,6 +338,125 @@ class ProviderTransportTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             provider.advise(work(), threading.Event())
         self.assertEqual(len(connection.sent), 1)
+
+    def scheduled_worker_refusal(self, worker, *, expired):
+        connection, _ = self.transport()
+        now = [10.0]
+        cancelled = threading.Event()
+        original_start = threading.Thread.start
+
+        def start(thread):
+            if thread.name == worker:
+                if expired:
+                    now[0] = 11.0
+                else:
+                    cancelled.set()
+                original_start(thread)
+                # Deterministically finish the scheduled helper before its parent's
+                # _wait can observe expiry. Worker-side checks must protect the wire.
+                thread.join(0.2)
+                self.assertFalse(thread.is_alive())
+                return
+            return original_start(thread)
+
+        with patch("rightyo.speech_backends.threading.Thread.start", new=start):
+            result = self.provider(clock=lambda: now[0]).advise(work(deadline=10.5), cancelled)
+        self.assertIsNone(result)
+        if worker == "rightyo-hosted-connect":
+            self.assertFalse(connection.connect_entered.is_set())
+        self.assertEqual(connection.request_calls, 0)
+        self.assertFalse(connection.headers_flushed)
+        self.assertFalse(connection.sent)
+
+    def test_connect_worker_scheduled_after_original_expiry_has_no_connection(self):
+        self.scheduled_worker_refusal("rightyo-hosted-connect", expired=True)
+
+    def test_connect_worker_scheduled_after_revocation_has_no_connection(self):
+        self.scheduled_worker_refusal("rightyo-hosted-connect", expired=False)
+
+    def test_send_worker_scheduled_after_original_expiry_sends_no_headers_or_body(self):
+        self.scheduled_worker_refusal("rightyo-hosted-send", expired=True)
+
+    def test_send_worker_scheduled_after_revocation_sends_no_headers_or_body(self):
+        self.scheduled_worker_refusal("rightyo-hosted-send", expired=False)
+
+    def test_expiry_or_revocation_during_header_preparation_prevents_header_flush(self):
+        for expired in (True, False):
+            with self.subTest(expired=expired):
+                connection, _ = self.transport()
+                now = [10.0]
+                cancelled = threading.Event()
+                putheader = connection.putheader
+
+                def header(key, value):
+                    putheader(key, value)
+                    if expired:
+                        now[0] = 11.0
+                    else:
+                        cancelled.set()
+
+                connection.putheader = header
+                self.assertIsNone(
+                    self.provider(clock=lambda: now[0]).advise(work(deadline=10.5), cancelled)
+                )
+                self.assertFalse(connection.headers_flushed)
+                self.assertFalse(connection.sent)
+
+    def test_expiry_or_revocation_immediately_before_body_send_prevents_transcript_upload(self):
+        for expired in (True, False):
+            with self.subTest(expired=expired):
+                connection, _ = self.transport()
+                now = [10.0]
+                cancelled = threading.Event()
+                endheaders = connection.endheaders
+
+                def flush_headers():
+                    endheaders()
+                    if expired:
+                        now[0] = 11.0
+                    else:
+                        cancelled.set()
+
+                connection.endheaders = flush_headers
+                self.assertIsNone(
+                    self.provider(clock=lambda: now[0]).advise(work(deadline=10.5), cancelled)
+                )
+                # The header operation began while authorized; its completed bytes
+                # are irretractable. The transcript body must still be withheld.
+                self.assertTrue(connection.headers_flushed)
+                self.assertFalse(connection.sent)
+
+    def test_ordinary_worker_wall_deadline_blocks_transport_with_false_callback(self):
+        for operation in ("connect", "send"):
+            with self.subTest(operation=operation):
+                connection, _ = self.transport()
+                client = _HostedClient(
+                    "authored ordinary",
+                    allow_hosted=True,
+                    timeout_seconds=1,
+                    cancelled=lambda: False,
+                    load_key=self.lookup,
+                )
+                slot = _ConnectSlot.reserve("authored ordinary test")
+                try:
+                    with self.assertRaises((_ReadCancelled, _OpenDeadline)):
+                        if operation == "connect":
+                            client._connect(connection, time.monotonic() - 1, slot)
+                        else:
+                            client._send(
+                                connection,
+                                "/authored",
+                                b"synthetic",
+                                {},
+                                time.monotonic() - 1,
+                                slot,
+                            )
+                    self.assertFalse(connection.connect_entered.is_set())
+                    self.assertEqual(connection.request_calls, 0)
+                    self.assertFalse(connection.headers_flushed)
+                    self.assertFalse(connection.sent)
+                finally:
+                    slot.release()
 
     def test_tls_setup_deadline_returns_before_late_context_without_lookup_or_send(self):
         _, factory = self.transport()
