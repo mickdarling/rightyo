@@ -1,7 +1,9 @@
 """Jev catalog qualification with authored evidence and fake credentials/HTTPS only."""
 
 import copy
+import io
 import json
+import subprocess
 import threading
 import time
 import unittest
@@ -20,6 +22,7 @@ from rightyo.contracts import ContractError, ListenerProfile, Turn
 from rightyo.credentials import CredentialError
 from rightyo.listener_profiles import ListenerProfiles
 from rightyo.providers import JEV_MODEL
+from rightyo.speech_backends import MAX_STALLED_CONNECTS
 
 SESSION = "11111111-1111-4111-8111-111111111111"
 DESTINATION = "22222222-2222-4222-8222-222222222222"
@@ -149,6 +152,35 @@ class Connection:
     def close(self):
         self.closed = True
         self.response.close()
+
+
+class SlowCredentialProcess:
+    """Fake security process whose legal terminate/kill cleanup waits for release."""
+
+    def __init__(self):
+        self.stdout = io.BytesIO(KEY.encode())
+        self.terminated = threading.Event()
+        self.killed = threading.Event()
+        self.release = threading.Event()
+        self.closed = threading.Event()
+        self.wait_calls = []
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        self.terminated.set()
+
+    def kill(self):
+        self.killed.set()
+
+    def wait(self, timeout):
+        self.wait_calls.append(timeout)
+        if not self.release.wait(1):
+            raise AssertionError("authored cleanup receipt watchdog")
+        if len(self.wait_calls) == 1:
+            raise subprocess.TimeoutExpired("authored security", timeout)
+        return -9
 
 
 class CatalogContractTests(unittest.TestCase):
@@ -326,6 +358,21 @@ class ProviderTransportTests(unittest.TestCase):
         self.assertEqual(provider.requests, 1)
         self.assertEqual(connection.sent, [])
 
+    def test_helper_scheduled_after_revocation_never_starts_credential_lookup(self):
+        _, factory = self.transport()
+        cancelled = threading.Event()
+        original_start = threading.Thread.start
+
+        def start(thread):
+            if thread.name == "rightyo-coach-credential":
+                cancelled.set()
+            return original_start(thread)
+
+        with patch("rightyo.coaching_jev.threading.Thread.start", new=start):
+            self.assertIsNone(self.provider().advise(work(), cancelled))
+        self.lookup.assert_not_called()
+        factory.assert_not_called()
+
     def test_original_deadline_includes_credential_lookup(self):
         connection, factory = self.transport()
         now = [10.0]
@@ -365,6 +412,171 @@ class ProviderTransportTests(unittest.TestCase):
         self.assertEqual(outcome, [None])
         self.assertEqual(provider.requests, 1)
         factory.assert_not_called()
+
+    def test_underlying_keychain_cleanup_cannot_extend_original_deadline(self):
+        # Exercise the actual credential loader and _keychain_lookup, not a stand-in
+        # loader. Only Popen/TLS/HTTPS are replaced: no security or network command runs.
+        from rightyo.credentials import load_jev_api_key
+
+        _, factory = self.transport()
+        process = SlowCredentialProcess()
+        self.lookup.side_effect = load_jev_api_key
+        helper_threads = []
+
+        def popen(*args, **kwargs):
+            helper_threads.append(threading.current_thread())
+            self.assertEqual(args[0][0], "/usr/bin/security")
+            return process
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("rightyo.credentials.sys.platform", "darwin"),
+            patch("rightyo.credentials.subprocess.Popen", side_effect=popen) as launch,
+        ):
+            watchdog = threading.Timer(0.4, process.release.set)
+            watchdog.start()  # Also bounds this test against the pre-repair source.
+            try:
+                start = time.monotonic()
+                result = self.provider().advise(work(deadline=start + 0.08), threading.Event())
+                self.assertLess(time.monotonic() - start, 0.3)
+                self.assertIsNone(result)
+                self.assertTrue(process.terminated.wait(0.3))
+                self.assertFalse(process.release.is_set())
+                self.assertTrue(helper_threads[0].is_alive())
+                factory.assert_not_called()
+                launch.assert_called_once()
+            finally:
+                watchdog.cancel()
+                process.release.set()
+                for thread in helper_threads:
+                    if thread is not threading.current_thread():
+                        thread.join(0.5)
+                        self.assertFalse(thread.is_alive())
+            self.assertTrue(process.killed.is_set())
+            self.assertEqual(process.wait_calls, [2, 2])
+            self.assertTrue(process.stdout.closed)
+            factory.assert_not_called()
+
+    def test_cancellation_returns_before_underlying_terminate_and_kill_cleanup(self):
+        from rightyo.credentials import load_jev_api_key
+
+        _, factory = self.transport()
+        process = SlowCredentialProcess()
+        entered = threading.Event()
+        helpers = []
+        self.lookup.side_effect = load_jev_api_key
+
+        def popen(*args, **kwargs):
+            helpers.append(threading.current_thread())
+            entered.set()
+            return process
+
+        cancelled = threading.Event()
+        result = []
+        caller = threading.Thread(
+            target=lambda: result.append(self.provider().advise(work(), cancelled))
+        )
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("rightyo.credentials.sys.platform", "darwin"),
+            patch("rightyo.credentials.subprocess.Popen", side_effect=popen),
+        ):
+            watchdog = threading.Timer(0.4, process.release.set)
+            watchdog.start()
+            caller.start()
+            try:
+                self.assertTrue(entered.wait(0.5))
+                cancelled.set()
+                caller.join(0.3)
+                self.assertFalse(caller.is_alive())
+                self.assertEqual(result, [None])
+                self.assertTrue(process.terminated.wait(0.3))
+                self.assertTrue(helpers[0].is_alive())
+                factory.assert_not_called()
+            finally:
+                watchdog.cancel()
+                process.release.set()
+                caller.join(0.5)
+                for helper in helpers:
+                    helper.join(0.5)
+                    self.assertFalse(helper.is_alive())
+            self.assertTrue(process.killed.is_set())
+            self.assertTrue(process.stdout.closed)
+            factory.assert_not_called()
+
+    def test_late_credential_success_is_discarded_and_helper_retains_no_speech(self):
+        _, factory = self.transport()
+        release = threading.Event()
+        helpers = []
+        states = []
+
+        def lookup(**options):
+            helper = threading.current_thread()
+            helpers.append(helper)
+            target = helper._target
+            cells = dict(zip(target.__code__.co_freevars, target.__closure__))
+            self.assertFalse({"work", "profile", "context", "body", "payload", "self"} & set(cells))
+            states.append(cells["state"].cell_contents)
+            callback = cells["cancelled"].cell_contents
+            self.assertFalse(any(
+                isinstance(cell.cell_contents, (CoachWork, ListenerProfile, Turn, bytes))
+                for cell in callback.__closure__
+            ))
+            if not release.wait(1):
+                raise AssertionError("authored late credential watchdog")
+            return KEY
+
+        self.lookup.side_effect = lookup
+        try:
+            result = self.provider().advise(
+                work(deadline=time.monotonic() + 0.05), threading.Event()
+            )
+            self.assertIsNone(result)
+            self.assertTrue(states[0]["abandoned"])
+            self.assertNotIn("key", states[0])
+            factory.assert_not_called()
+        finally:
+            release.set()
+            for helper in helpers:
+                helper.join(0.5)
+                self.assertFalse(helper.is_alive())
+        self.assertNotIn("key", states[0])
+        factory.assert_not_called()
+
+    def test_abandoned_credential_helpers_remain_process_wide_bounded(self):
+        _, factory = self.transport()
+        release = threading.Event()
+        helpers = []
+
+        def lookup(**options):
+            helpers.append(threading.current_thread())
+            if not release.wait(1):
+                raise AssertionError("authored bounded helper watchdog")
+            return KEY
+
+        self.lookup.side_effect = lookup
+        failures = 0
+        try:
+            # Fresh provider instances cannot reset the global abandoned-helper cap.
+            for _ in range(MAX_STALLED_CONNECTS + 2):
+                try:
+                    self.provider().advise(
+                        work(deadline=time.monotonic() + 0.02), threading.Event()
+                    )
+                except ContractError:
+                    failures += 1
+            self.assertGreater(failures, 0)
+            self.assertLessEqual(len(helpers), MAX_STALLED_CONNECTS)
+            self.assertTrue(all(helper.is_alive() for helper in helpers))
+            factory.assert_not_called()
+        finally:
+            release.set()
+            for helper in helpers:
+                helper.join(0.5)
+                self.assertFalse(helper.is_alive())
+        # Completed helpers release capacity; a normal fake exchange can run again.
+        self.lookup.side_effect = None
+        self.assertIsNotNone(self.provider().advise(work(), threading.Event()))
 
     def test_invalid_duplicate_nonfinite_oversize_redirect_and_failure_are_sanitized(self):
         raws = [

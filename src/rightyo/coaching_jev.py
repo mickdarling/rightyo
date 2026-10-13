@@ -169,6 +169,77 @@ def _nonfinite(_value):
     raise ValueError
 
 
+def _clock_value(clock: Callable[[], float]) -> float:
+    now = clock()
+    if type(now) not in (int, float) or not math.isfinite(now) or now < 0:
+        raise ContractError("invalid Jev coaching clock")
+    return float(now)
+
+
+def _deadline_credential(*, cancelled, timeout_seconds, deadline, clock) -> str:
+    """Bound credential lookup AND its subprocess cleanup without retaining speech.
+
+    Only this coaching path abandons a cleanup that exceeds its deadline. The
+    bounded helper carries a clock/cancellation callback and credential state, never
+    work, profile, transcript or request bytes. Late keys/failures are discarded.
+    """
+    remaining = min(timeout_seconds, deadline - _clock_value(clock))
+    if remaining <= 0 or cancelled():
+        raise CredentialError("Jev coaching credential lookup cancelled or expired")
+    slot = _ConnectSlot.reserve("Jev coaching credentials")
+    lock = threading.Lock()
+    completed = threading.Event()
+    state = {"abandoned": False}
+    wait_deadline = time.monotonic() + remaining
+    lookup_timeout = remaining
+
+    def lookup():
+        key = None
+        try:
+            # A scheduled helper may not run until after its caller has abandoned it.
+            if cancelled() or _clock_value(clock) >= deadline or time.monotonic() >= wait_deadline:
+                return
+            with lock:
+                if state["abandoned"]:
+                    return
+            # This ordinary loader may be slow while terminating/killing its child.
+            # No parent waits for that cleanup beyond the original coaching budget.
+            key = load_jev_api_key(cancelled=cancelled, timeout_seconds=lookup_timeout)
+        except BaseException:
+            pass  # No exception or failure detail is retained by the helper.
+        finally:
+            with lock:
+                if not state["abandoned"] and key is not None:
+                    state["key"] = key
+                key = None
+            completed.set()
+
+    thread = threading.Thread(target=lookup, name="rightyo-coach-credential", daemon=True)
+    try:
+        # Recheck after capacity reservation and before starting an actual lookup.
+        if cancelled() or _clock_value(clock) >= deadline:
+            raise CredentialError("Jev coaching credential lookup cancelled or expired")
+        thread.start()
+        while not completed.is_set():
+            remaining = min(deadline - _clock_value(clock), wait_deadline - time.monotonic())
+            if cancelled() or remaining <= 0:
+                raise CredentialError("Jev coaching credential lookup cancelled or expired")
+            completed.wait(min(READ_POLL_SECONDS, remaining))
+        if cancelled() or _clock_value(clock) >= deadline or time.monotonic() >= wait_deadline:
+            raise CredentialError("Jev coaching credential lookup cancelled or expired")
+        with lock:
+            key = state.pop("key", None)
+        if key is None:
+            raise CredentialError("Jev coaching credential is unavailable")
+        return key
+    finally:
+        with lock:
+            state["abandoned"] = True
+            state.pop("key", None)
+        # The process-wide stalled cap also spans old provider/coordinator instances.
+        slot.release(stalled=thread if thread.is_alive() else None)
+
+
 class _JevClient(_HostedClient):
     """Reuse TLS/redirect/DNS/send guards with strict, smaller, deadline-bound JSON reads."""
 
@@ -247,10 +318,7 @@ class JevCatalogCoachProvider:
         self._lock = threading.Lock()
 
     def _now(self) -> float:
-        now = self._clock()
-        if type(now) not in (int, float) or not math.isfinite(now) or now < 0:
-            raise ContractError("invalid Jev coaching clock")
-        return float(now)
+        return _clock_value(self._clock)
 
     def advise(self, work: CoachWork, cancelled: threading.Event) -> CoachSuggestion | None:
         if type(work) is not CoachWork or work.deadline is None:
@@ -259,9 +327,10 @@ class JevCatalogCoachProvider:
             raise ContractError("invalid Jev coaching cancellation")
         now = self._now()
         deadline = min(work.deadline, now + self.timeout_seconds)
+        clock = self._clock
 
         def expired():
-            return cancelled.is_set() or self._now() >= deadline
+            return cancelled.is_set() or _clock_value(clock) >= deadline
 
         if expired():
             return None
@@ -278,10 +347,9 @@ class JevCatalogCoachProvider:
             self.requests += 1
 
         def credential(*, cancelled, timeout_seconds):
-            remaining = min(timeout_seconds, deadline - self._now())
-            if remaining <= 0 or cancelled():
-                raise CredentialError("Jev coaching credential lookup cancelled or expired")
-            return load_jev_api_key(cancelled=cancelled, timeout_seconds=remaining)
+            return _deadline_credential(
+                cancelled=cancelled, timeout_seconds=timeout_seconds, deadline=deadline, clock=clock
+            )
 
         failed = False
         result = None
