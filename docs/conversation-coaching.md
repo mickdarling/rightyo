@@ -86,7 +86,9 @@ backend is selected by this slice. `MockCoachProvider` is an authored lookup onl
 
 Feed the existing tool's `transcript` events through `CoachingInputAdapter`, constructed
 once per capture generation. Ordinary tool sessions used for this adapter must use
-canonical UUID session and utterance IDs. Role/display-name metadata remains
+a canonical UUID session ID (select it explicitly using `listen --session-id`).
+Utterance IDs retain the existing bounded source identifiers, including `live-1`.
+Role/display-name metadata remains
 descriptive; it never enables coaching or authorizes anything. The host passes
 measured `pause_ms`, `owner_mid_answer` and `playback` separately. Old callbacks retain
 their old adapter and generation and are discarded after invalidation.
