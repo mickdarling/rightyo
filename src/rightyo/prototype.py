@@ -422,7 +422,11 @@ class PrototypeController:
         speaker_id_factory=ShadowSpeakerId,
         owner_voice=None,
         input_route=None,
+        retain_transcripts=True,
     ):
+        if type(retain_transcripts) is not bool:
+            raise PrototypeError("Invalid transcript retention setting")
+        self.retain_transcripts = retain_transcripts
         self.config = config
         # Owner-voice status events (rightyo#164): an `OwnerVoice` from the host's opt-in,
         # else None and nothing new is advertised or emitted.
@@ -579,6 +583,8 @@ class PrototypeController:
             raise PrototypeError("Stdin audio requires an explicit source provenance")
         if mode == "stdin" and self._stdin_used:
             raise PrototypeError("Stdin audio feeds one session only; start a new process")
+        if not self.retain_transcripts and hosted:
+            raise PrototypeError("Ordinary decisions require transcript retention")
         if self.config.synthetic_speech and (
             not (is_synthetic(self.config.transcriber) and is_synthetic(self.config.diarizer))
             or mode != "stdin"
@@ -675,7 +681,7 @@ class PrototypeController:
                 raise PrototypeError("Hosted decisions could not be initialized") from None
             runner = ReplayRunner(
                 provider,
-                memory=memory,
+                memory=memory if self.retain_transcripts else None,
                 cancelled=cancelled,
                 addressing=self.config.addressing,
                 scene=self.config.decision_scene,
@@ -764,7 +770,8 @@ class PrototypeController:
         with self._lock:
             if generation != self._generation or self._stop.is_set():
                 return
-            memory.append(turn)
+            if self.retain_transcripts:
+                memory.append(turn)
             inferred = turn.utterance_id in self._inferred_turns
             self._inferred_turns.discard(turn.utterance_id)
             if self._events is not None:

@@ -10,6 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from rightyo.contracts import ContractError
 from rightyo.live_audio import BYTES_PER_MS, LiveAudioError, LiveConfig, LiveProcessor
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
 from rightyo.providers import Diarizer, Transcriber
@@ -91,9 +92,9 @@ class SyntheticBackendTests(unittest.TestCase):
     def test_one_text_per_pcm_utterance_exhaustion_and_cancellation(self):
         cancelled = threading.Event()
         transcriber = SyntheticAuthoredTranscriber(live_config(cancelled=cancelled.is_set), SCRIPT)
-        self.assertEqual(transcriber.transcribe(TONE), [
-            {"text": SCRIPT[0], "start_ms": 0, "end_ms": 1000}
-        ])
+        self.assertEqual(
+            transcriber.transcribe(TONE), [{"text": SCRIPT[0], "start_ms": 0, "end_ms": 1000}]
+        )
         cancelled.set()
         with self.assertRaises(LiveAudioError):
             transcriber.transcribe(TONE)
@@ -111,12 +112,14 @@ class SyntheticBackendTests(unittest.TestCase):
         pcm = bytes(32000)
         for _ in range(MAX_SYNTHETIC_AUDIO_MS // 1000):
             diarizer.push(pcm)
-        self.assertEqual(diarizer.segments(), [
-            {"start_ms": 0, "end_ms": MAX_SYNTHETIC_AUDIO_MS, "speaker": 1}
-        ])
-        self.assertTrue(all(
-            not isinstance(value, (bytes, bytearray, list)) for value in vars(diarizer).values()
-        ))
+        self.assertEqual(
+            diarizer.segments(), [{"start_ms": 0, "end_ms": MAX_SYNTHETIC_AUDIO_MS, "speaker": 1}]
+        )
+        self.assertTrue(
+            all(
+                not isinstance(value, (bytes, bytearray, list)) for value in vars(diarizer).values()
+            )
+        )
         with self.assertRaisesRegex(LiveAudioError, "budget"):
             diarizer.push(bytes(640))
         self.assertEqual(diarizer.finish(), diarizer.segments())
@@ -140,7 +143,7 @@ class SyntheticBackendTests(unittest.TestCase):
         self.assertEqual(turns, [])  # Silence consumes no authored text.
         for pcm in (UTTERANCE, UTTERANCE):
             for start in range(0, len(pcm), 6400):
-                processor.push_pcm16(pcm[start:start + 6400])
+                processor.push_pcm16(pcm[start : start + 6400])
         processor.finish()
         self.assertEqual([turn.text for turn in turns], SCRIPT)
         self.assertEqual([turn.utterance_id for turn in turns], ["live-1", "live-2"])
@@ -161,6 +164,44 @@ class SyntheticPrototypeTests(unittest.TestCase):
     def load(self, value=None):
         self.path.write_text(json.dumps(config_dict() if value is None else value))
         return PrototypeConfig.load(self.path)
+
+    def test_nonretaining_pipeline_emits_finals_without_parallel_plaintext_histories(self):
+        events = SpeechEvents(retain_transcripts=False)
+        controller = PrototypeController(
+            self.load(),
+            event_publisher=events,
+            retain_transcripts=False,
+            audio_input=io.BytesIO(UTTERANCE * 2),
+            audio_provenance="synthetic",
+        )
+        self.addCleanup(controller.close)
+        controller.start({"mode": "stdin", "session_id": SESSION})
+        controller._audio_thread.join(timeout=2)
+        self.assertFalse(controller._audio_thread.is_alive())
+        self.assertEqual(controller.snapshot()["phase"], "complete")
+        self.assertEqual(controller.snapshot()["turns"], [])
+        self.assertEqual(controller._memory.snapshot(6000)["turns"], [])
+        self.assertEqual(events._memory.snapshot(6000)["turns"], [])
+        self.assertIsNone(controller._runner.memory)
+        emitted = controller.drain_events()
+        self.assertEqual([e["turn"]["text"] for e in emitted if e["type"] == "transcript"], SCRIPT)
+
+    def test_nonretaining_speech_lane_cannot_enable_ordinary_decisions(self):
+        events = SpeechEvents(retain_transcripts=False)
+        with self.assertRaises(ContractError):
+            events.start(SESSION, attention_enabled=True)
+        provider = Mock(side_effect=AssertionError("No provider should start"))
+        controller = PrototypeController(
+            self.load(),
+            retain_transcripts=False,
+            audio_input=io.BytesIO(),
+            audio_provenance="synthetic",
+            provider_factory=provider,
+        )
+        self.addCleanup(controller.close)
+        with self.assertRaises(PrototypeError):
+            controller.start({"mode": "stdin", "use_jev": True})
+        provider.assert_not_called()
 
     def test_config_needs_no_assets_and_rejects_mixed_or_native_extras(self):
         config = self.load()
@@ -193,9 +234,13 @@ class SyntheticPrototypeTests(unittest.TestCase):
                 Mock(side_effect=AssertionError("A backend must not start")) for _ in range(5)
             ]
             controller = PrototypeController(
-                self.load(), audio_input=io.BytesIO(UTTERANCE), audio_provenance=provenance,
-                processor_factory=factories[0], capture_factory=factories[1],
-                provider_factory=factories[2], end_of_turn_factory=factories[3],
+                self.load(),
+                audio_input=io.BytesIO(UTTERANCE),
+                audio_provenance=provenance,
+                processor_factory=factories[0],
+                capture_factory=factories[1],
+                provider_factory=factories[2],
+                end_of_turn_factory=factories[3],
                 speaker_id_factory=factories[4],
             )
             try:
@@ -222,7 +267,9 @@ class SyntheticPrototypeTests(unittest.TestCase):
     def run_controller(self, config, pcm):
         events = SpeechEvents()
         controller = PrototypeController(
-            config, event_publisher=events, audio_input=io.BytesIO(pcm),
+            config,
+            event_publisher=events,
+            audio_input=io.BytesIO(pcm),
             audio_provenance="synthetic",
         )
         try:

@@ -91,9 +91,24 @@ The optional suggestion file is an authored JSON object keyed by actual final ID
 for example `{"live-1":"Ask what outcome they need next."}`. It is at most 64 KiB,
 uses the existing MockCoachProvider count/text limits, and defaults to hold when
 absent or unmatched. No hosted coaching provider is configured by this interface yet.
+The existing Jev adapter returns classification choices rather than generated advice.
+A real semantic selector could reuse its pinned model/endpoint and credentials to
+choose hold/uncertain or a bounded authored suggestion catalog, with a new strict
+coaching request/parser and explicit hosted-text consent. Freely composed advice
+requires a generative provider/model response contract that this repository does not
+currently implement. Either adapter can use the same `CoachProvider.advise` boundary;
+it needs cooperative credential/transport cancellation, a whole-call deadline and
+mocked transport qualification before any hosted experiment. These are software
+requirements in addition to actual speech quality and private hardware qualification.
+
 The original cadence of at least 20 seconds and all context/session/qualification
 limits still apply. Multi-turn authored tests can demonstrate holds and cancellation
 without lowering those limits.
+
+The upstream controller and ordinary speech publisher disable their usual transcript
+history in this mode. Coaching owns the sole historical context (60 seconds, 32 turns,
+12 KiB); the pending final and bounded transport queues are transient delivery buffers.
+Ordinary listening retains its existing context behavior.
 
 ## Shutdown and bounded transport
 
@@ -104,7 +119,8 @@ Unsent advice is discarded on newer evidence or revocation; a partially handed-o
 line cannot be retracted, so the child retires and the host must reject stale data.
 Host route/activity checks apply again before mock or real rendering/playback.
 
-SIGTERM/disable/invalidation cancel advice before speech cleanup. Control loss,
+SIGTERM/disable/invalidation cancel advice and stop the speech worker before final
+output or diagnostics. Stderr diagnostics are nonblocking and best effort. Control loss,
 malformed input, speech failure, output failure or expiry fail closed with content-free
 errors. PCM EOF finalizes only the still-qualified source, then allows at most two
 seconds for activity/provider receipt; cancelled sources discard open speech. The

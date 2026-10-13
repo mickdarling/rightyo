@@ -33,6 +33,14 @@ POLL_SECONDS = 0.05
 EOF_RECEIPT_SECONDS = 2
 
 
+def _note(message):
+    """Best-effort content-free diagnostic on the already nonblocking stderr fd."""
+    try:
+        os.write(2, ("rightyo: " + message[:384] + "\n").encode("ascii", "replace"))
+    except OSError:
+        pass
+
+
 def _unique(pairs):
     result = {}
     for key, value in pairs:
@@ -210,6 +218,7 @@ def run(args, *, config, events, consent, controller_factory, output, use_jev=Fa
             raise ValueError
         was_control_blocking = os.get_blocking(fd)
         was_output_blocking = os.get_blocking(output_fd)
+        was_stderr_blocking = os.get_blocking(2)
     except (ContractError, ValueError, OSError, AttributeError):
         raise PrototypeError(
             "coaching requires valid session, provider and pipe descriptors"
@@ -225,6 +234,7 @@ def run(args, *, config, events, consent, controller_factory, output, use_jev=Fa
     startup_deadline = time.monotonic() + STARTUP_SECONDS
     result = 0
     retirement_events = []
+    failure_note = None
     previous = None
     if threading.current_thread() is threading.main_thread():
         previous = signal.getsignal(signal.SIGTERM)
@@ -236,6 +246,7 @@ def run(args, *, config, events, consent, controller_factory, output, use_jev=Fa
     try:
         os.set_blocking(fd, False)
         os.set_blocking(output_fd, False)
+        os.set_blocking(2, False)
         sink.add_coaching(session)
         retire = False
         while not retire:
@@ -286,7 +297,11 @@ def run(args, *, config, events, consent, controller_factory, output, use_jev=Fa
                     adapter = CoachingActivityAdapter(
                         session, session_id=session_id, generation_id=generation
                     )
-                    controller = controller_factory(config, event_publisher=events, **consent)
+                    controller = controller_factory(
+                        config,
+                        event_publisher=events,
+                        **{**consent, "retain_transcripts": False, "report": _note},
+                    )
                     controller.start({"mode": "stdin", "use_jev": False, "session_id": session_id})
                 elif time.monotonic() >= startup_deadline:
                     raise ContractError("coaching qualification startup timed out")
@@ -318,9 +333,7 @@ def run(args, *, config, events, consent, controller_factory, output, use_jev=Fa
     except KeyboardInterrupt:
         result = 0
     except (ContractError, PrototypeError, OSError, ValueError):
-        from rightyo.tool import _stderr
-
-        _stderr("coaching listener stopped: invalid or unavailable input/output")
+        failure_note = "coaching listener stopped: invalid or unavailable input/output"
         result = 2
     finally:
         # Revoke before potentially slower speech cleanup. Neither PCM EOF on a
@@ -328,6 +341,17 @@ def run(args, *, config, events, consent, controller_factory, output, use_jev=Fa
         if adapter is not None:
             adapter.close()
         session.close()
+        if controller is not None:
+            # The coordinator does not own the audio worker's cancellation token.
+            # Signal/stop that worker before any final output grace period; blocked
+            # stdout must never keep PCM processing alive after host revocation.
+            try:
+                controller.close()
+            except Exception:
+                failure_note = "coaching speech cleanup failed"
+                result = 2
+        if failure_note is not None:
+            _note(failure_note)
         try:
             sink.retire()
             sink.add(retirement_events)
@@ -339,9 +363,11 @@ def run(args, *, config, events, consent, controller_factory, output, use_jev=Fa
                     select.select([], [output_fd], [], POLL_SECONDS)
         except (ContractError, OSError, ValueError):
             result = 2
-        if controller is not None:
-            controller.close()
-        with_context = ((fd, was_control_blocking), (output_fd, was_output_blocking))
+        with_context = (
+            (fd, was_control_blocking),
+            (output_fd, was_output_blocking),
+            (2, was_stderr_blocking),
+        )
         for descriptor, blocking in with_context:
             try:
                 os.set_blocking(descriptor, blocking)

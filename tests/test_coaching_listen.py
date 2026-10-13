@@ -21,9 +21,11 @@ import threading
 import time
 import unittest
 import uuid
+from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
-from rightyo.coaching_listen import OUTPUT_STALL_SECONDS, OutputQueue
+from rightyo.coaching_listen import OUTPUT_STALL_SECONDS, OutputQueue, run
 from rightyo.contracts import ContractError
 
 SESSION = "11111111-1111-4111-8111-111111111111"
@@ -558,6 +560,131 @@ class CoachingListenTests(unittest.TestCase):
                 for event in child.events
             )
         )
+
+
+class CoachingRetirementOrderingTests(unittest.TestCase):
+    def test_disable_signals_audio_cancellation_before_final_output_or_backpressure_wait(self):
+        for output_blocked in (False, True):
+            with self.subTest(output_blocked=output_blocked):
+                started = threading.Event()
+                cancelled = threading.Event()
+                final_writes = []
+                writer_errors = []
+                control_read, control_write = os.pipe()
+                output_read, output_write = os.pipe()
+                self.addCleanup(os.close, control_read)
+                self.addCleanup(os.close, control_write)
+                self.addCleanup(os.close, output_read)
+                output = os.fdopen(output_write, "wb", buffering=0)
+                self.addCleanup(output.close)
+                if output_blocked:
+                    os.set_blocking(output_write, False)
+                    while True:
+                        try:
+                            os.write(output_write, bytes(4096))
+                        except BlockingIOError:
+                            break
+
+                class Controller:
+                    input_overrun = False
+
+                    def __init__(self, *_args, **_kwargs):
+                        pass
+
+                    def start(self, _options):
+                        started.set()
+
+                    def snapshot(self):
+                        return {"phase": "listening"}
+
+                    def drain_events(self):
+                        return []
+
+                    def close(self):
+                        # This is the controller's existing cancellation boundary:
+                        # output/grace must not precede the audio stop token.
+                        cancelled.set()
+
+                class ObservedOutput(OutputQueue):
+                    retired = False
+
+                    def retire(self):
+                        self.retired = True
+                        return super().retire()
+
+                    def write(self):
+                        if self.retired and self.items:
+                            final_writes.append(cancelled.is_set())
+                        return super().write()
+
+                def host_controls():
+                    try:
+                        controls = [
+                            {
+                                "version": 1,
+                                "type": "listener_profile",
+                                "action": "add",
+                                "profile": PROFILE,
+                            },
+                            {
+                                "schema_version": 1,
+                                "type": "coaching_control",
+                                "action": "enable",
+                                "session_id": SESSION,
+                                "destination_id": DESTINATION,
+                                "listener_id": "coach",
+                                "participant_awareness": True,
+                            },
+                            {
+                                "schema_version": 1,
+                                "type": "coaching_control",
+                                "action": "qualify",
+                                "session_id": SESSION,
+                                "destination_id": DESTINATION,
+                                "generation_id": GENERATION,
+                                "qualification_id": QUALIFICATION,
+                                "valid_for_ms": 2000,
+                            },
+                        ]
+                        data = "".join(json.dumps(control) + "\n" for control in controls).encode()
+                        os.write(control_write, data)
+                        if not started.wait(timeout=2):
+                            raise AssertionError("qualified fake controller did not start")
+                        disable = {
+                            "schema_version": 1,
+                            "type": "coaching_control",
+                            "action": "disable",
+                            "session_id": SESSION,
+                        }
+                        os.write(control_write, (json.dumps(disable) + "\n").encode())
+                    except Exception as error:
+                        writer_errors.append(error)
+
+                writer = threading.Thread(target=host_controls)
+                writer.start()
+                try:
+                    with patch("rightyo.coaching_listen.OutputQueue", ObservedOutput):
+                        result = run(
+                            Namespace(mode="stdin", session_id=SESSION, control_fd=control_read),
+                            config=object(),
+                            events=object(),
+                            consent={},
+                            controller_factory=Controller,
+                            output=output,
+                        )
+                finally:
+                    writer.join(timeout=3)
+                self.assertFalse(writer.is_alive())
+                self.assertEqual(writer_errors, [])
+                self.assertTrue(started.is_set())
+                self.assertTrue(cancelled.is_set())
+                self.assertTrue(final_writes, "exercise the actual final-output/grace path")
+                self.assertTrue(
+                    all(final_writes), "audio must be cancelled before every final write"
+                )
+                # A trusted disable may finish its bounded final-output grace with
+                # either a clean stop or a transport error. Both retire capture.
+                self.assertIn(result, (0, 2) if output_blocked else (0,))
 
 
 class CoachingOutputPressureTests(unittest.TestCase):
