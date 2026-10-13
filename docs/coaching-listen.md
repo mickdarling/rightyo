@@ -21,6 +21,9 @@ in coaching mode; suggestions never enter application action dispatch. Without
 `--coaching`, existing reply-started/ended fd controls and ordinary behavior stay intact.
 `--coaching` requires stdin, an inherited descriptor above 2, and a canonical nonzero
 session UUID. The host must explicitly select this capability before spawning it.
+Ordinary dismissal, conversation, request-forming and acknowledgement configuration
+is disabled in this mode. A spoken stop phrase remains transcript evidence; trusted
+host controls own coaching revocation.
 
 The child initially emits `coaching_state` disabled/initial. This signals the control
 loop, not ASR model readiness. No controller or PCM consumer starts until the host
@@ -29,6 +32,8 @@ and qualifies a current private output destination. Startup has a 10-second dead
 Each child owns exactly one session and capture generation. Invalidation, disable,
 profile mutation after enable, or qualification loss retires it. A new enable uses a
 new child/source/session/generation; queued old PCM is never relabelled.
+An invalidation for another generation is ignored, preserving the current lease and
+any admitted work's original deadline; a matching invalidation retires the child.
 
 ## Trusted fd controls
 

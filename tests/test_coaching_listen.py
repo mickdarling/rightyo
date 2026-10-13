@@ -27,6 +27,7 @@ from unittest.mock import patch
 
 from rightyo.coaching_listen import OUTPUT_STALL_SECONDS, OutputQueue, run
 from rightyo.contracts import ContractError
+from rightyo.prototype import PrototypeConfig
 from rightyo.tool_events import SpeechEvents
 
 SESSION = "11111111-1111-4111-8111-111111111111"
@@ -62,6 +63,7 @@ class Child:
         suggestions=None,
         provenance="synthetic",
         read_output=True,
+        dismissal=None,
     ):
         self.events = []
         self._pending = queue.Queue()
@@ -76,6 +78,7 @@ class Child:
                     },
                     "diarizer": {"kind": "synthetic-authored"},
                     "turns": {"merge_gap_ms": 0, "reply_wait_ms": 0},
+                    **({} if dismissal is None else {"dismissal": dismissal}),
                 }
             )
         )
@@ -184,7 +187,12 @@ class Child:
     def audio(self, pcm=PCM_TURN):
         view = memoryview(pcm)
         while view:
-            written = self.process.stdin.write(view[:6400])
+            try:
+                written = self.process.stdin.write(view[:6400])
+            except BrokenPipeError:
+                raise AssertionError(
+                    "child unexpectedly retired while receiving synthetic PCM"
+                ) from None
             if not written:
                 raise RuntimeError("child stopped accepting synthetic PCM")
             view = view[written:]
@@ -285,7 +293,10 @@ class CoachingListenTests(unittest.TestCase):
 
     def assert_no_actions(self, child):
         self.assertFalse(
-            any(event.get("type") in {"attention", "request", "action"} for event in child.events)
+            any(
+                event.get("type") in {"attention", "request", "action", "dismiss"}
+                for event in child.events
+            )
         )
         for event in child.events:
             if event.get("type") == "coaching_advice":
@@ -418,6 +429,80 @@ class CoachingListenTests(unittest.TestCase):
         child.process.stdin.close()
         child.exited(0)
         self.assert_terminal(child, "stopped")
+        self.assert_no_actions(child)
+
+    def test_configured_ordinary_stop_phrase_remains_transcript_until_trusted_disable(self):
+        child = self.child(
+            dismissal={},
+            utterances=["Stop.", "The authored conversation continues."],
+        )
+        child.enable()
+        stop = self.final(child)
+        self.assertEqual(stop["turn"]["text"], "Stop.")
+        child.activity(owner_mid_answer=True)
+        child.collect(0.1)
+        self.assertIsNone(child.process.poll(), "speech cannot retire the coaching child")
+        continuation = self.final(child, "live-2")
+        self.assertEqual(continuation["turn"]["text"], "The authored conversation continues.")
+        child.activity(utterance="live-2", owner_mid_answer=True)
+        child.control(
+            {
+                "schema_version": 1,
+                "type": "coaching_control",
+                "action": "disable",
+                "session_id": SESSION,
+            }
+        )
+        child.exited(0)
+        self.assert_terminal(child, "cancelled")
+        self.assert_no_actions(child)
+
+    def test_foreign_generation_invalidate_preserves_current_lease_until_matching_invalidate(self):
+        child = self.child()
+        child.enable()
+        child.control(
+            {
+                "schema_version": 1,
+                "type": "coaching_control",
+                "action": "invalidate",
+                "session_id": SESSION,
+                "generation_id": str(uuid.uuid4()),
+                "reason": "route_changed",
+            }
+        )
+        child.collect(0.15)
+        self.assertFalse(
+            any(
+                event.get("type") == "session"
+                and event.get("phase")
+                in {
+                    "stopped",
+                    "cancelled",
+                    "error",
+                }
+                for event in child.events
+            ),
+            "stale generation cannot terminate the current speech session",
+        )
+        self.assertIsNone(child.process.poll(), "stale generation cannot retire current capture")
+        self.final(child)
+        child.activity()
+        advice = child.next(lambda event: event.get("type") == "coaching_advice")
+        self.assertEqual(advice["generation_id"], GENERATION)
+        self.assertEqual(advice["qualification_id"], QUALIFICATION)
+        child.control(
+            {
+                "schema_version": 1,
+                "type": "coaching_control",
+                "action": "invalidate",
+                "session_id": SESSION,
+                "generation_id": GENERATION,
+                "reason": "route_changed",
+            }
+        )
+        child.exited(0)
+        self.assert_terminal(child, "cancelled")
+        self.assertEqual(sum(event.get("type") == "coaching_advice" for event in child.events), 1)
         self.assert_no_actions(child)
 
     def test_control_eof_retires_open_pcm_without_flushing_partial_speech(self):
@@ -627,6 +712,18 @@ class CoachingListenTests(unittest.TestCase):
 
 
 class CoachingRetirementOrderingTests(unittest.TestCase):
+    @staticmethod
+    def config():
+        return PrototypeConfig(
+            whisper_executable=None,
+            whisper_model=None,
+            diarization_library=None,
+            diarization_model=None,
+            microphone_helper=None,
+            transcriber={"kind": "synthetic-authored", "utterances": ["An authored turn."]},
+            diarizer={"kind": "synthetic-authored"},
+        )
+
     def test_already_drained_overrun_terminal_preserves_gap_counts_exactly_once(self):
         control_read, control_write = os.pipe()
         output_read, output_write = os.pipe()
@@ -687,7 +784,7 @@ class CoachingRetirementOrderingTests(unittest.TestCase):
         )
         result = run(
             Namespace(mode="stdin", session_id=SESSION, control_fd=control_read),
-            config=object(),
+            config=self.config(),
             events=publisher,
             consent={},
             controller_factory=OverrunController,
@@ -806,7 +903,7 @@ class CoachingRetirementOrderingTests(unittest.TestCase):
                     with patch("rightyo.coaching_listen.OutputQueue", ObservedOutput):
                         result = run(
                             Namespace(mode="stdin", session_id=SESSION, control_fd=control_read),
-                            config=object(),
+                            config=self.config(),
                             events=object(),
                             consent={},
                             controller_factory=Controller,

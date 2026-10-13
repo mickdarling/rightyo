@@ -15,6 +15,7 @@ import signal
 import threading
 import time
 from collections import deque
+from dataclasses import replace
 from pathlib import Path
 
 from rightyo.coaching import CoachingSession, MockCoachProvider, canonical_uuid, wire_json
@@ -210,6 +211,11 @@ def run(args, *, config, events, consent, controller_factory, output, use_jev=Fa
         raise PrototypeError(
             "coaching uses a separate provider; ordinary Jev decisions must be off"
         )
+    # Ordinary request/dismissal/conversation settings do not control coaching.
+    # Speech content remains evidence; only the trusted fd can retire this mode.
+    config = replace(
+        config, dismissal=None, conversation=None, request_former=None, acknowledgement=None
+    )
     try:
         session_id = canonical_uuid(args.session_id)
         provider = mock_provider(getattr(args, "coaching_mock_suggestions", None))
@@ -274,7 +280,9 @@ def run(args, *, config, events, consent, controller_factory, output, use_jev=Fa
                             enabled = True
                         elif raw["action"] == "qualify":
                             generation = raw["generation_id"]
-                        elif raw["action"] in {"disable", "invalidate"}:
+                        elif raw["action"] == "disable" or (
+                            raw["action"] == "invalidate" and raw["generation_id"] == generation
+                        ):
                             retire = True
                     elif kind == "coaching_activity" and adapter is not None:
                         adapter.accept_activity(raw)
