@@ -234,6 +234,7 @@ def run(args, *, config, events, consent, controller_factory, output, use_jev=Fa
     startup_deadline = time.monotonic() + STARTUP_SECONDS
     result = 0
     retirement_events = []
+    terminal_event = None
     failure_note = None
     previous = None
     if threading.current_thread() is threading.main_thread():
@@ -308,6 +309,7 @@ def run(args, *, config, events, consent, controller_factory, output, use_jev=Fa
             if controller is not None:
                 state = controller.snapshot()
                 batch = controller.drain_events()
+                deliver = []
                 for index, event in enumerate(batch):
                     if event.get("type") == "transcript":
                         sink.discard_advice()
@@ -315,7 +317,17 @@ def run(args, *, config, events, consent, controller_factory, output, use_jev=Fa
                     elif event.get("type") not in {"session", "owner_voice"}:
                         # Attention/requests/action-shaped output cannot enter coaching.
                         raise ContractError("unexpected coaching speech output")
-                sink.add(batch)
+                    if event.get("type") == "session" and event.get("phase") in {
+                        "stopped",
+                        "cancelled",
+                        "error",
+                    }:
+                        # Preserve a terminal produced by an audio error as well as
+                        # the one close() produces. Hand it off only after cancellation.
+                        terminal_event = event
+                    else:
+                        deliver.append(batch[index])
+                sink.add(deliver)
                 adapter.tick()
                 if state["phase"] == "error" or getattr(controller, "input_overrun", False):
                     raise ContractError("coaching speech input failed")
@@ -350,10 +362,23 @@ def run(args, *, config, events, consent, controller_factory, output, use_jev=Fa
             except Exception:
                 failure_note = "coaching speech cleanup failed"
                 result = 2
+            try:
+                for event in controller.drain_events():
+                    if event.get("type") == "session" and event.get("phase") in {
+                        "stopped",
+                        "cancelled",
+                        "error",
+                    }:
+                        terminal_event = event
+            except Exception:
+                failure_note = "coaching speech terminal unavailable"
+                result = 2
         if failure_note is not None:
             _note(failure_note)
         try:
             sink.retire()
+            if terminal_event is not None:
+                sink.add([terminal_event])
             sink.add(retirement_events)
             sink.add_coaching(session)
             deadline = time.monotonic() + OUTPUT_STALL_SECONDS

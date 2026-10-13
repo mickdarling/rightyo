@@ -126,3 +126,9 @@ errors. PCM EOF finalizes only the still-qualified source, then allows at most t
 seconds for activity/provider receipt; cancelled sources discard open speech. The
 existing controller owns stopping its audio worker. No source is restarted within
 the same child, and no transcript/audio retention is introduced.
+
+After cancellation the child drains and sends exactly one ordinary terminal speech
+`session` event, including stdin `input_gaps` diagnostics, before final coaching state
+when output remains available. A terminal already produced by a speech error is
+preserved. EOF without a complete terminal line remains incomplete at the host;
+broken or stalled output cannot establish clean completion.

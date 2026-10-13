@@ -27,6 +27,7 @@ from unittest.mock import patch
 
 from rightyo.coaching_listen import OUTPUT_STALL_SECONDS, OutputQueue, run
 from rightyo.contracts import ContractError
+from rightyo.tool_events import SpeechEvents
 
 SESSION = "11111111-1111-4111-8111-111111111111"
 GENERATION = "22222222-2222-4222-8222-222222222222"
@@ -292,6 +293,30 @@ class CoachingListenTests(unittest.TestCase):
                 self.assertEqual(event["decision"]["label"], "speak_now")
                 self.assertNotIn("action", event)
 
+    def assert_terminal(self, child, phase, *, input_gaps=None):
+        terminals = [
+            event
+            for event in child.events
+            if event.get("type") == "session"
+            and event.get("phase")
+            in {
+                "stopped",
+                "cancelled",
+                "error",
+            }
+        ]
+        self.assertEqual(len(terminals), 1, "started speech must emit exactly one terminal")
+        terminal = terminals[0]
+        self.assertEqual(terminal["session_id"], SESSION)
+        self.assertEqual(terminal["phase"], phase)
+        self.assertEqual(
+            terminal["input_gaps"],
+            input_gaps or {"gaps": 0, "dropped_bytes": 0, "discarded_tail_bytes": 0},
+        )
+        ordinary_sequences = [event["sequence"] for event in child.events if "sequence" in event]
+        self.assertEqual(ordinary_sequences, sorted(set(ordinary_sequences)))
+        return terminal
+
     def final(self, child, utterance="live-1"):
         child.audio()
         return child.next(
@@ -328,6 +353,7 @@ class CoachingListenTests(unittest.TestCase):
         child.process.stdin.close()
         child.exited(0)
         self.assertEqual(sum(event.get("type") == "coaching_advice" for event in child.events), 1)
+        self.assert_terminal(child, "stopped")
         self.assert_no_actions(child)
 
     def test_two_actual_finals_preserve_cadence_and_heartbeat_does_not_repeat_advice(self):
@@ -349,6 +375,7 @@ class CoachingListenTests(unittest.TestCase):
             [ADVICE],
         )
         self.assertEqual(advice["qualification_id"], QUALIFICATION)
+        self.assert_terminal(child, "stopped")
         self.assert_no_actions(child)
 
     def test_missing_host_activity_never_admits_mock_advice(self):
@@ -362,6 +389,7 @@ class CoachingListenTests(unittest.TestCase):
         child.qualify(qualification=str(uuid.uuid4()))
         child.exited(0, timeout=3)
         self.assertFalse(any(event.get("type") == "coaching_advice" for event in child.events))
+        self.assert_terminal(child, "stopped")
         self.assert_no_actions(child)
 
     def test_measured_owner_speech_playback_or_short_pause_holds(self):
@@ -376,6 +404,7 @@ class CoachingListenTests(unittest.TestCase):
                 self.assertFalse(
                     any(event.get("type") == "coaching_advice" for event in child.events)
                 )
+                self.assert_terminal(child, "stopped")
                 self.assert_no_actions(child)
 
     def test_control_looking_transcript_cannot_disable_or_dispatch_actions(self):
@@ -388,6 +417,7 @@ class CoachingListenTests(unittest.TestCase):
         child.next(lambda event: event.get("type") == "coaching_advice")
         child.process.stdin.close()
         child.exited(0)
+        self.assert_terminal(child, "stopped")
         self.assert_no_actions(child)
 
     def test_control_eof_retires_open_pcm_without_flushing_partial_speech(self):
@@ -399,6 +429,7 @@ class CoachingListenTests(unittest.TestCase):
         self.assertFalse(
             any(event.get("type") in {"transcript", "coaching_advice"} for event in child.events)
         )
+        self.assert_terminal(child, "cancelled")
         self.assert_no_actions(child)
 
     def test_idle_qualification_expiry_retires_even_when_pcm_pipe_stays_open(self):
@@ -411,6 +442,7 @@ class CoachingListenTests(unittest.TestCase):
                 for event in child.events
             )
         )
+        self.assert_terminal(child, "cancelled")
         self.assert_no_actions(child)
 
     def test_profile_mutation_retires_the_current_child(self):
@@ -427,6 +459,7 @@ class CoachingListenTests(unittest.TestCase):
         )
         child.exited(0)
         self.assertFalse(any(event.get("type") == "coaching_advice" for event in child.events))
+        self.assert_terminal(child, "cancelled")
         self.assert_no_actions(child)
 
     def test_disable_or_route_invalidation_retires_without_waiting_for_pcm_eof(self):
@@ -448,6 +481,7 @@ class CoachingListenTests(unittest.TestCase):
                 self.assertFalse(
                     any(event.get("type") == "coaching_advice" for event in child.events)
                 )
+                self.assert_terminal(child, "cancelled")
                 self.assert_no_actions(child)
 
     def test_duplicate_malformed_nonfinite_or_oversized_control_fails_closed(self):
@@ -547,6 +581,36 @@ class CoachingListenTests(unittest.TestCase):
         self.assertFalse(
             any(event.get("type") in {"transcript", "coaching_advice"} for event in child.events)
         )
+        self.assert_terminal(child, "cancelled")
+        self.assert_no_actions(child)
+
+    def test_clean_pcm_eof_preserves_discarded_tail_in_exactly_one_terminal(self):
+        child = self.child()
+        child.enable()
+        self.final(child)
+        child.activity(owner_mid_answer=True)
+        child.audio(b"x")  # Deliberately incomplete PCM sample, never a transcript.
+        child.process.stdin.close()
+        child.exited(0)
+        self.assert_terminal(
+            child,
+            "stopped",
+            input_gaps={"gaps": 0, "dropped_bytes": 0, "discarded_tail_bytes": 1},
+        )
+        self.assertFalse(any(event.get("type") == "coaching_advice" for event in child.events))
+        self.assert_no_actions(child)
+
+    def test_synthetic_asr_exhaustion_preserves_already_queued_error_terminal(self):
+        child = self.child(utterances=["Only one authored turn is configured."])
+        child.enable()
+        self.final(child)
+        child.activity(owner_mid_answer=True)
+        child.audio()  # Real second endpoint reaches the exhausted mock transcriber.
+        child.exited(2)
+        terminal = self.assert_terminal(child, "error")
+        self.assertEqual(terminal["reason"], "audio-unavailable")
+        self.assertEqual(sum(event.get("type") == "transcript" for event in child.events), 1)
+        self.assertFalse(any(event.get("type") == "coaching_advice" for event in child.events))
         self.assert_no_actions(child)
 
     def test_synthetic_backend_refuses_non_synthetic_pcm_provenance(self):
@@ -563,6 +627,82 @@ class CoachingListenTests(unittest.TestCase):
 
 
 class CoachingRetirementOrderingTests(unittest.TestCase):
+    def test_already_drained_overrun_terminal_preserves_gap_counts_exactly_once(self):
+        control_read, control_write = os.pipe()
+        output_read, output_write = os.pipe()
+        self.addCleanup(os.close, control_read)
+        self.addCleanup(os.close, control_write)
+        self.addCleanup(os.close, output_read)
+        output = os.fdopen(output_write, "wb", buffering=0)
+        self.addCleanup(output.close)
+        gap_counts = {"gaps": 1, "dropped_bytes": 32000, "discarded_tail_bytes": 1}
+        publisher = SpeechEvents()
+        closed = []
+
+        class OverrunController:
+            input_overrun = True
+
+            def __init__(self, _config, *, event_publisher, **_kwargs):
+                self.events = event_publisher
+
+            def start(self, options):
+                self.events.start(options["session_id"], attention_enabled=False)
+                self.events.end(phase="error", reason="input-overrun", input_gaps=gap_counts)
+
+            def snapshot(self):
+                return {"phase": "error"}
+
+            def drain_events(self):
+                return self.events.drain()
+
+            def close(self):
+                closed.append(True)
+                # The genuine publisher keeps the original terminal idempotently.
+                self.events.end(phase="cancelled", input_gaps=gap_counts)
+
+        controls = [
+            {"version": 1, "type": "listener_profile", "action": "add", "profile": PROFILE},
+            {
+                "schema_version": 1,
+                "type": "coaching_control",
+                "action": "enable",
+                "session_id": SESSION,
+                "destination_id": DESTINATION,
+                "listener_id": "coach",
+                "participant_awareness": True,
+            },
+            {
+                "schema_version": 1,
+                "type": "coaching_control",
+                "action": "qualify",
+                "session_id": SESSION,
+                "destination_id": DESTINATION,
+                "generation_id": GENERATION,
+                "qualification_id": QUALIFICATION,
+                "valid_for_ms": 2000,
+            },
+        ]
+        os.write(
+            control_write, "".join(json.dumps(control) + "\n" for control in controls).encode()
+        )
+        result = run(
+            Namespace(mode="stdin", session_id=SESSION, control_fd=control_read),
+            config=object(),
+            events=publisher,
+            consent={},
+            controller_factory=OverrunController,
+            output=output,
+        )
+        self.assertEqual(result, 2)
+        self.assertEqual(closed, [True])
+        emitted = [json.loads(line) for line in os.read(output_read, 8192).splitlines()]
+        terminals = [event for event in emitted if event.get("type") == "session"]
+        self.assertEqual(len(terminals), 1)
+        self.assertEqual(
+            (terminals[0]["phase"], terminals[0]["reason"]), ("error", "input-overrun")
+        )
+        self.assertEqual(terminals[0]["input_gaps"], gap_counts)
+
     def test_disable_signals_audio_cancellation_before_final_output_or_backpressure_wait(self):
         for output_blocked in (False, True):
             with self.subTest(output_blocked=output_blocked):
