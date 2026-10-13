@@ -171,7 +171,8 @@ class MockCoachProvider:
         if not isinstance(suggestions, dict) or len(suggestions) > 512:
             raise ContractError("invalid authored coaching suggestions")
         self._suggestions = {
-            canonical_uuid(key): CoachSuggestion(value) for key, value in suggestions.items()
+            identifier(key, "coaching utterance id"): CoachSuggestion(value)
+            for key, value in suggestions.items()
         }
 
     def advise(self, work: CoachWork, cancelled: threading.Event) -> CoachSuggestion | None:
@@ -397,7 +398,9 @@ class CoachingSession:
         if type(turn) is not Turn:
             raise ContractError("invalid coaching transcript")
         canonical_uuid(turn.session_id)
-        canonical_uuid(turn.utterance_id)
+        # Existing live ASR uses live-1/live-2 and imported turns have source IDs.
+        # Turn already bounds this identifier; only delivery scope uses UUIDs.
+        identifier(turn.utterance_id, "coaching utterance id")
         canonical_uuid(generation_id)
         integer(pause_ms, "coaching pause")
         if pause_ms > MAX_TIMING_MS:

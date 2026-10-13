@@ -591,6 +591,22 @@ class CoachingTests(unittest.TestCase):
         adapter.accept(event, pause_ms=1000, owner_mid_answer=False)
         self.assertEqual(self.provider.calls, [])
 
+    def test_real_live_identifier_format_connects_and_mock_is_scoped_to_source_id(self):
+        self.make(MockCoachProvider({"live-1": "Ask which outcome matters most."}))
+        self.start()
+        source = SpeechEvents()
+        source.start(SESSION, attention_enabled=False)
+        source.drain()
+        item = turn(utterance_id="live-1")
+        source.transcript(item, item.end_ms, expect_decision=False)
+        adapter = CoachingInputAdapter(self.session, generation_id=GENERATION)
+        adapter.accept(source.drain()[0], pause_ms=1000, owner_mid_answer=False)
+        advice = self.advice()
+        self.assertEqual(len(advice), 1)
+        self.assertEqual(advice[0]["text"], "Ask which outcome matters most.")
+        self.observe(item)  # Same source final is still once-only.
+        self.assertEqual(self.advice(), [])
+
 
 if __name__ == "__main__":
     unittest.main()
