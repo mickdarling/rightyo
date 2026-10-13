@@ -95,7 +95,11 @@ def load_document(path: Path) -> dict[str, Any]:
         if not isinstance(record["event"], dict):
             raise ContractError("invalid coaching replay event")
         if record["channel"] == "control":
-            if record["event"].get("type") not in {"coaching_control", "listener_profile"}:
+            control_type = record["event"].get("type")
+            if not isinstance(control_type, str) or control_type not in {
+                "coaching_control",
+                "listener_profile",
+            }:
                 raise ContractError("invalid coaching replay control channel")
             if record["event"]["type"] == "listener_profile":
                 profiles.apply_control(record["event"])
