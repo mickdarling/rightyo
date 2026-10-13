@@ -166,6 +166,28 @@ class CoachReplayExecutionTests(unittest.TestCase):
                 run(Namespace(input=self.fixture), output=output)
         self.assertEqual(output.getvalue(), "")
 
+    def test_malformed_control_types_return_safe_cli_error_before_replay(self):
+        raw = json.loads(self.fixture.read_text())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fixture.json"
+            for value in ([], {"private value": True}, None, True, 1):
+                with self.subTest(control_type=value):
+                    invalid = copy.deepcopy(raw)
+                    invalid["records"][1]["event"]["type"] = value
+                    path.write_text(json.dumps(invalid), encoding="utf-8")
+                    output, errors = io.StringIO(), io.StringIO()
+                    with (
+                        patch("rightyo.coaching.CoachingSession") as session,
+                        contextlib.redirect_stdout(output),
+                        contextlib.redirect_stderr(errors),
+                    ):
+                        self.assertEqual(main(["coach-replay", "--input", str(path)]), 2)
+                    session.assert_not_called()
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertIn("invalid coaching replay control channel", errors.getvalue())
+                    self.assertNotIn("Traceback", errors.getvalue())
+                    self.assertNotIn("private value", errors.getvalue())
+
     def test_invalid_trusted_controls_and_profiles_fail_before_session_creation(self):
         raw = json.loads(self.fixture.read_text())
         malformed = [
