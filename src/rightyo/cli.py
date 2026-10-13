@@ -419,6 +419,27 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="with --coaching: bounded authored JSON suggestions keyed by final utterance ID",
     )
+    listen.add_argument(
+        "--coaching-provider",
+        choices=("mock", "jev"),
+        default="mock",
+        help="with --coaching: advice provider (default mock; Jev selects authored catalog text)",
+    )
+    listen.add_argument(
+        "--coaching-allow-hosted-text",
+        action="store_true",
+        help="explicit consent for Jev to receive bounded coaching transcript/profile text",
+    )
+    listen.add_argument(
+        "--coaching-max-requests",
+        type=int,
+        help="required for Jev coaching: maximum hosted attempts in this child (1..100)",
+    )
+    listen.add_argument(
+        "--coaching-advice-catalog",
+        type=Path,
+        help="required for Jev coaching: bounded JSON object of authored advice ID/text pairs",
+    )
     _add_name_option(listen)
     _add_session_budget_option(listen)
     _add_request_former_option(listen)

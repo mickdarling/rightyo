@@ -579,8 +579,11 @@ class ControllerTests(unittest.TestCase):
                         self.controller._last_browser -= 20
                     else:
                         self.controller._started -= 601
+                # Idle is published just before the audio thread exits; the next
+                # subcase must wait until start's old-runtime guard can pass too.
                 await_condition(
                     lambda: self.controller.snapshot(heartbeat=False)["phase"] == "idle"
+                    and not self.controller._audio_thread.is_alive()
                 )
                 self.assertEqual(self.controller.snapshot()["turns"], [])
 

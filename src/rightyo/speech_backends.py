@@ -473,14 +473,23 @@ class _HostedClient:
         """
         state = {"abort": False}
         outcome: dict[str, Any] = {}
+        cancelled = self.cancelled
+
+        def check() -> None:
+            if state["abort"] or cancelled():
+                raise _ReadCancelled
+            if time.monotonic() >= deadline:
+                raise _OpenDeadline
 
         def run() -> None:
             try:
+                # Parent polling may not run before this helper is scheduled.
+                check()
                 connection.connect()
-                if state["abort"]:
-                    connection.close()
+                check()
             except BaseException as error:
                 outcome["error"] = error
+                _abort_connection(connection)
 
         thread = threading.Thread(target=run, name="rightyo-hosted-connect", daemon=True)
         thread.start()
@@ -509,32 +518,39 @@ class _HostedClient:
         state = {"abort": False}
         outcome: dict[str, Any] = {}
         handoff = [body]
+        cancelled = self.cancelled
+
+        def check() -> None:
+            if state["abort"] or cancelled():
+                raise _ReadCancelled
+            if time.monotonic() >= deadline:
+                raise _OpenDeadline
 
         def run() -> None:
-            payload = handoff.pop()
+            payload = b""
             try:
-                if state["abort"]:
-                    connection.close()
-                    return
+                check()
+                payload = handoff.pop()
+                check()
                 connection.putrequest("POST", target)
                 for name, value in headers.items():
+                    check()
                     connection.putheader(name, value)
+                # endheaders is the first wire write; preparation above is local.
+                check()
                 connection.endheaders()
-                if state["abort"]:
-                    connection.close()
-                    return
+                check()
                 connection.send(payload)
                 payload = b""
-                if state["abort"]:
-                    connection.close()
-                    return
+                check()
                 response = connection.getresponse()
                 outcome["response"] = response
-                if state["abort"]:
-                    _abort_response(response)
-                    connection.close()
+                check()
             except BaseException as error:
                 outcome["error"] = error
+                if "response" in outcome:
+                    _abort_response(outcome["response"])
+                _abort_connection(connection)
             finally:
                 payload = b""
                 handoff.clear()
@@ -591,7 +607,7 @@ class _HostedClient:
         # The TLS context and the connection object exist before any credential is
         # loaded, so a TLS setup failure can never retain a key in its traceback.
         try:
-            context = ssl.create_default_context()
+            context = self._tls_context(deadline)
         except (ssl.SSLError, OSError, ValueError):
             context = None
         if context is None:
@@ -703,6 +719,10 @@ class _HostedClient:
         if not isinstance(document, dict):
             raise HostedSpeechError(f"{self.label} returned an invalid response")
         return document
+
+    def _tls_context(self, deadline: float):
+        """Ordinary TLS initialization; deadline-bound subclasses may override it."""
+        return ssl.create_default_context()
 
 
 def _multipart(fields: list[tuple[str, str]], filename: str, audio: bytes) -> tuple[bytes, str]:
