@@ -58,6 +58,22 @@ well (opt-in), a voice bound to an enrolled identifier carries the role the `spe
 section gives it, the session advertises `speakers: "enrolled"`, and enrolled owners and
 trusted speakers take precedence. See [speaker enrollment](docs/speaker-enrollment.md).
 
+## Replay private coaching
+
+An explicitly enabled, owner-private coaching component can accept final tool transcripts
+under a host-qualified private output generation. It uses bounded context, a replaceable
+provider and short-lived advice tickets. It grants no command or playback authority.
+Try its authored mock fixture without a microphone, model, API key or audio output:
+
+```sh
+PYTHONPATH=src python3 -m rightyo coach-replay --input examples/coaching-replay.json
+```
+
+See [the coaching guide](docs/conversation-coaching.md) for the replay and library
+adapter, and [the wire contract](docs/coaching-wire-v1.md) for the host boundary. This
+is a separate opt-in experiment; actual coaching inference and device audio wiring
+remain unvalidated.
+
 ## Try the replay MVP
 
 Python 3.11 or newer is sufficient for synthetic replay; the runtime has no Python dependencies. See [the MVP guide](docs/mvp.md) for secure credentials, local audio and speaker imports, and the limits of the experiment.
