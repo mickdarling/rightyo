@@ -321,6 +321,33 @@ class CoachingSession:
         with self._condition:
             self._tick(self._now())
 
+    def capture_permitted_for(self, *, session_id: str, generation_id: str) -> bool:
+        """Check one immutable input binding against current qualified host scope."""
+        canonical_uuid(session_id)
+        canonical_uuid(generation_id)
+        with self._condition:
+            self._tick(self._now())
+            with self.profiles.delivery_guard(self._profile_revision) as (_, revision):
+                self._tick(self._now(), profile_revision=revision)
+                return (
+                    self._enabled
+                    and self._lease is not None
+                    and self._session == session_id
+                    and self._lease.generation == generation_id
+                )
+
+    def cancel_pending(self) -> None:
+        """A newly observed floor cancels advice without resetting context or cadence.
+
+        The physical provider remains busy until it returns, even when it ignores
+        cancellation. This method does not grant capture or alter host qualification.
+        """
+        with self._condition:
+            if self._pending is not None:
+                self._pending.cancelled.set()
+                self._pending = None
+            self._advice = None
+
     def apply_control(self, raw: Any) -> None:
         """Trusted host channel only; never call this from transcripts/model output."""
         control = validate_coaching_control(raw)
