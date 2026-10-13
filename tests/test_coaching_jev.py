@@ -1,12 +1,14 @@
 """Jev catalog qualification with authored evidence and fake credentials/HTTPS only."""
 
 import copy
+import gc
 import io
 import json
 import subprocess
 import threading
 import time
 import unittest
+import weakref
 from dataclasses import replace
 from unittest.mock import Mock, patch
 
@@ -22,7 +24,7 @@ from rightyo.contracts import ContractError, ListenerProfile, Turn
 from rightyo.credentials import CredentialError
 from rightyo.listener_profiles import ListenerProfiles
 from rightyo.providers import JEV_MODEL
-from rightyo.speech_backends import MAX_STALLED_CONNECTS
+from rightyo.speech_backends import MAX_STALLED_CONNECTS, _HostedClient
 
 SESSION = "11111111-1111-4111-8111-111111111111"
 DESTINATION = "22222222-2222-4222-8222-222222222222"
@@ -327,6 +329,214 @@ class ProviderTransportTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             provider.advise(work(), threading.Event())
         self.assertEqual(len(connection.sent), 1)
+
+    def test_tls_setup_deadline_returns_before_late_context_without_lookup_or_send(self):
+        _, factory = self.transport()
+        release = threading.Event()
+        helpers = []
+        contexts = []
+        states = []
+
+        class Context:
+            pass
+
+        def setup():
+            helper = threading.current_thread()
+            helpers.append(helper)
+            if helper.name == "rightyo-coach-tls":
+                target = helper._target
+                cells = dict(zip(target.__code__.co_freevars, target.__closure__))
+                self.assertFalse(
+                    {"work", "profile", "context", "body", "payload", "self"} & set(cells)
+                )
+                states.append(cells["state"].cell_contents)
+                callback = cells["cancelled"].cell_contents
+                self.assertFalse(
+                    any(
+                        isinstance(cell.cell_contents, (CoachWork, ListenerProfile, Turn, bytes))
+                        for cell in callback.__closure__
+                    )
+                )
+            if not release.wait(1):
+                raise AssertionError("authored TLS setup watchdog")
+            context = Context()
+            contexts.append(weakref.ref(context))
+            return context
+
+        with patch("rightyo.speech_backends.ssl.create_default_context", side_effect=setup):
+            watchdog = threading.Timer(0.4, release.set)
+            watchdog.start()
+            try:
+                start = time.monotonic()
+                result = self.provider().advise(work(deadline=start + 0.05), threading.Event())
+                self.assertLess(time.monotonic() - start, 0.3)
+                self.assertIsNone(result)
+                self.assertTrue(helpers[0].is_alive())
+                self.assertTrue(states[0]["abandoned"])
+                self.assertNotIn("context", states[0])
+                self.lookup.assert_not_called()
+                factory.assert_not_called()
+            finally:
+                watchdog.cancel()
+                release.set()
+                for helper in helpers:
+                    if helper is not threading.current_thread():
+                        helper.join(0.5)
+                        self.assertFalse(helper.is_alive())
+        gc.collect()
+        self.assertTrue(contexts)
+        self.assertTrue(all(context() is None for context in contexts))
+        self.assertNotIn("context", states[0])
+        self.lookup.assert_not_called()
+        factory.assert_not_called()
+
+    def test_tls_helpers_are_process_wide_bounded_and_capacity_recovers(self):
+        _, factory = self.transport()
+        release = threading.Event()
+        helpers = []
+
+        def setup():
+            helpers.append(threading.current_thread())
+            if not release.wait(1):
+                raise AssertionError("authored TLS helper cap watchdog")
+            return object()
+
+        with patch("rightyo.speech_backends.ssl.create_default_context", side_effect=setup):
+            failures = 0
+            try:
+                for _ in range(MAX_STALLED_CONNECTS + 2):
+                    try:
+                        self.provider().advise(
+                            work(deadline=time.monotonic() + 0.02), threading.Event()
+                        )
+                    except ContractError:
+                        failures += 1
+                self.assertGreater(failures, 0)
+                self.assertLessEqual(len(helpers), MAX_STALLED_CONNECTS)
+                self.assertTrue(all(helper.is_alive() for helper in helpers))
+                self.lookup.assert_not_called()
+                factory.assert_not_called()
+            finally:
+                release.set()
+                for helper in helpers:
+                    helper.join(0.5)
+                    self.assertFalse(helper.is_alive())
+        self.assertIsNotNone(self.provider().advise(work(), threading.Event()))
+
+    def test_tls_helper_scheduled_after_revocation_skips_setup_entirely(self):
+        _, factory = self.transport()
+        cancelled = threading.Event()
+        original_start = threading.Thread.start
+
+        def start(thread):
+            if thread.name == "rightyo-coach-tls":
+                cancelled.set()
+            return original_start(thread)
+
+        with (
+            patch("rightyo.coaching_jev.threading.Thread.start", new=start),
+            patch("rightyo.speech_backends.ssl.create_default_context") as setup,
+        ):
+            self.assertIsNone(self.provider().advise(work(), cancelled))
+        setup.assert_not_called()
+        self.lookup.assert_not_called()
+        factory.assert_not_called()
+
+    def test_tls_helper_scheduled_after_original_deadline_skips_setup_entirely(self):
+        _, factory = self.transport()
+        now = [10.0]
+        original_start = threading.Thread.start
+
+        def start(thread):
+            if thread.name == "rightyo-coach-tls":
+                now[0] = 11.0
+            return original_start(thread)
+
+        with (
+            patch("rightyo.coaching_jev.threading.Thread.start", new=start),
+            patch("rightyo.speech_backends.ssl.create_default_context") as setup,
+        ):
+            self.assertIsNone(
+                self.provider(clock=lambda: now[0]).advise(work(deadline=10.5), threading.Event())
+            )
+        setup.assert_not_called()
+        self.lookup.assert_not_called()
+        factory.assert_not_called()
+
+    def test_ordinary_tls_hook_keeps_existing_synchronous_context_factory(self):
+        client = _HostedClient(
+            "authored ordinary backend",
+            allow_hosted=True,
+            timeout_seconds=10,
+            cancelled=None,
+            load_key=self.lookup,
+        )
+        context = object()
+        thread = threading.current_thread()
+        seen = []
+
+        def setup():
+            seen.append(threading.current_thread())
+            return context
+
+        with patch("rightyo.speech_backends.ssl.create_default_context", side_effect=setup) as call:
+            self.assertIs(client._tls_context(0), context)
+            call.assert_called_once_with()
+        self.assertEqual(seen, [thread])
+        self.lookup.assert_not_called()
+
+    def test_tls_setup_failure_is_sanitized_and_never_loads_credentials(self):
+        _, factory = self.transport()
+        with patch(
+            "rightyo.speech_backends.ssl.create_default_context",
+            side_effect=OSError("authored TLS failure detail"),
+        ):
+            with self.assertRaisesRegex(ContractError, "^Jev coaching provider failed$") as error:
+                self.provider().advise(work(), threading.Event())
+        self.assertIsNone(error.exception.__context__)
+        self.lookup.assert_not_called()
+        factory.assert_not_called()
+
+    def test_tls_cancellation_returns_promptly_without_late_lookup_or_send(self):
+        _, factory = self.transport()
+        release = threading.Event()
+        entered = threading.Event()
+        helpers = []
+        cancelled = threading.Event()
+        results = []
+
+        def setup():
+            helpers.append(threading.current_thread())
+            entered.set()
+            if not release.wait(1):
+                raise AssertionError("authored TLS cancellation watchdog")
+            return object()
+
+        caller = threading.Thread(
+            target=lambda: results.append(self.provider().advise(work(), cancelled))
+        )
+        with patch("rightyo.speech_backends.ssl.create_default_context", side_effect=setup):
+            watchdog = threading.Timer(0.4, release.set)
+            watchdog.start()
+            caller.start()
+            try:
+                self.assertTrue(entered.wait(0.5))
+                cancelled.set()
+                caller.join(0.3)
+                self.assertFalse(caller.is_alive())
+                self.assertEqual(results, [None])
+                self.assertTrue(helpers[0].is_alive())
+                self.lookup.assert_not_called()
+                factory.assert_not_called()
+            finally:
+                watchdog.cancel()
+                release.set()
+                caller.join(0.5)
+                for helper in helpers:
+                    helper.join(0.5)
+                    self.assertFalse(helper.is_alive())
+        self.lookup.assert_not_called()
+        factory.assert_not_called()
 
     def test_expired_missing_deadline_and_cancelled_work_never_load_or_send(self):
         connection, factory = self.transport()

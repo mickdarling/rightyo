@@ -591,7 +591,7 @@ class _HostedClient:
         # The TLS context and the connection object exist before any credential is
         # loaded, so a TLS setup failure can never retain a key in its traceback.
         try:
-            context = ssl.create_default_context()
+            context = self._tls_context(deadline)
         except (ssl.SSLError, OSError, ValueError):
             context = None
         if context is None:
@@ -703,6 +703,10 @@ class _HostedClient:
         if not isinstance(document, dict):
             raise HostedSpeechError(f"{self.label} returned an invalid response")
         return document
+
+    def _tls_context(self, deadline: float):
+        """Ordinary TLS initialization; deadline-bound subclasses may override it."""
+        return ssl.create_default_context()
 
 
 def _multipart(fields: list[tuple[str, str]], filename: str, audio: bytes) -> tuple[bytes, str]:

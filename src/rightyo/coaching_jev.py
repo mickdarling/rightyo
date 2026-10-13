@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import ssl
 import threading
 import time
 from typing import Any, Callable
@@ -240,8 +241,67 @@ def _deadline_credential(*, cancelled, timeout_seconds, deadline, clock) -> str:
         slot.release(stalled=thread if thread.is_alive() else None)
 
 
+def _deadline_tls(*, cancelled, deadline):
+    """Bound slow certificate-store setup without retaining model evidence.
+
+    The helper owns only setup state and the payload-free deadline/cancellation
+    callback. It cannot load credentials or create a connection; late contexts and
+    failures are discarded. Its capacity survives old provider instances.
+    """
+    if cancelled() or time.monotonic() >= deadline:
+        raise HostedSpeechError("Jev coaching TLS setup cancelled or expired")
+    slot = _ConnectSlot.reserve("Jev coaching TLS")
+    lock = threading.Lock()
+    completed = threading.Event()
+    state = {"abandoned": False}
+
+    def setup():
+        context = None
+        try:
+            if cancelled() or time.monotonic() >= deadline:
+                return
+            with lock:
+                if state["abandoned"]:
+                    return
+            context = ssl.create_default_context()
+        except BaseException:
+            pass  # Retain neither exception details nor late setup results.
+        finally:
+            with lock:
+                if not state["abandoned"] and context is not None:
+                    state["context"] = context
+                context = None
+            completed.set()
+
+    thread = threading.Thread(target=setup, name="rightyo-coach-tls", daemon=True)
+    try:
+        if cancelled() or time.monotonic() >= deadline:
+            raise HostedSpeechError("Jev coaching TLS setup cancelled or expired")
+        thread.start()
+        while not completed.is_set():
+            remaining = deadline - time.monotonic()
+            if cancelled() or remaining <= 0:
+                raise HostedSpeechError("Jev coaching TLS setup cancelled or expired")
+            completed.wait(min(READ_POLL_SECONDS, remaining))
+        if cancelled() or time.monotonic() >= deadline:
+            raise HostedSpeechError("Jev coaching TLS setup cancelled or expired")
+        with lock:
+            context = state.pop("context", None)
+        if context is None:
+            raise HostedSpeechError("Jev coaching TLS setup unavailable")
+        return context
+    finally:
+        with lock:
+            state["abandoned"] = True
+            state.pop("context", None)
+        slot.release(stalled=thread if thread.is_alive() else None)
+
+
 class _JevClient(_HostedClient):
     """Reuse TLS/redirect/DNS/send guards with strict, smaller, deadline-bound JSON reads."""
+
+    def _tls_context(self, deadline: float):
+        return _deadline_tls(cancelled=self.cancelled, deadline=deadline)
 
     def _read_body(self, response: Any, deadline: float) -> bytes:
         # Also cap abandoned body-read helpers process-wide. No abort join can extend

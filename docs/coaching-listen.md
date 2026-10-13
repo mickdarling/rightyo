@@ -132,15 +132,16 @@ renewal cannot extend it. Cancellation is checked during lookup/transport and ag
 before accepting a suggestion; the coordinator independently checks ticket/profile,
 route and deadline before delivery. Failures consume an attempt and are not retried.
 Responses are capped at 64 KiB and abandoned transport helpers are process-bounded.
-The coaching credential wrapper also stops waiting at the original deadline even
-when the existing Keychain subprocess is still terminating. Such bounded cleanup
-helpers carry no work/profile/transcript/request bytes, discard late keys, and
-cannot resume the abandoned transport. Ordinary credential behavior is unchanged.
+Coaching stops waiting for TLS certificate-store setup and credential cleanup at
+the original deadline, including when the existing Keychain subprocess is still
+terminating. These bounded helpers carry no work/profile/transcript/request bytes,
+discard late contexts or keys, and cannot resume the abandoned transport. Ordinary
+TLS setup and credential behavior are unchanged.
 Data already transmitted cannot be retracted by later cancellation.
 
 All provider qualification uses authored text and fake credential/HTTPS transport,
-including actual credential-loader cleanup through fake subprocesses and late-DNS/body
-cases. This establishes the software path;
+including delayed TLS setup, actual credential-loader cleanup through fake subprocesses
+and late-DNS/body cases. This establishes the software path;
 hosted model usefulness/latency and real speech/private hardware quality remain
 unvalidated. The source/test slice does not authorize hosted experiments.
 
