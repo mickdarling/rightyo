@@ -178,3 +178,14 @@ After cancellation the child drains and sends exactly one ordinary terminal spee
 when output remains available. A terminal already produced by a speech error is
 preserved. EOF without a complete terminal line remains incomplete at the host;
 broken or stalled output cannot establish clean completion.
+
+## Local recognizer pipe privacy
+
+Part of #69. The pinned whisper.cpp v1.9.4 local live transcriber uses `--file -` and
+`--output-file - --output-json-full`: its WAV packet and result stay in memory/pipes.
+No regular captured-audio or transcript files are written. The child retains the
+existing empty private working-directory isolation, register/cancellation ownership
+and timeout cleanup. JSON retention is capped at 2 MiB while excess stdout is drained;
+oversized, malformed, failed or cancelled results cannot become a transcript. Native
+stderr stays discarded. Authored fake-child tests qualify these privacy/ownership
+boundaries; they do not establish native recognition quality or physical latency.
