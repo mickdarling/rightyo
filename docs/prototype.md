@@ -288,8 +288,9 @@ launch URL again. Only one session runs at a time.
 Capture reads are aggregated into 200 ms PCM blocks. The pending capture queue holds
 at most 32 seconds (1,024,000 bytes) by default, accommodating the local 30-second recognizer
 timeout. Sustained slower-than-real-time processing still fails closed at that bound.
-PCM buffers are bounded and temporary Whisper files are deleted after use; microphone audio
-is not archived. Expiry and Stop release application-owned plaintext references. This is
+PCM buffers are bounded. The local whisper.cpp live recognizer sends WAV bytes on stdin and
+receives capped JSON on stdout; it creates no regular audio or transcript files. An empty
+private working directory isolates runtime HOME/TMPDIR, and native stderr is discarded. Expiry and Stop release application-owned plaintext references. This is
 not forensic zeroization of Python/native memory or a guarantee about OS swap or crash
 collection. Copying text intentionally transfers it to the clipboard. The HTTP endpoint
 binds only to loopback with Host/Origin checks, bearer controls, and no-store responses;
