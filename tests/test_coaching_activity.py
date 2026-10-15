@@ -148,6 +148,62 @@ class CoachingActivityTests(unittest.TestCase):
         self.assertEqual(len(self.advice()), 1)
         self.assertEqual(self.provider.calls[0].pause_ms, 500)
 
+    def test_superseded_activity_keeps_latest_pending_and_inflight_work(self):
+        self.make(blocking=True)
+        self.adapter.accept_transcript(event())
+        self.adapter.accept_transcript(event(2))
+        for _ in range(3):
+            self.adapter.accept_activity(activity())
+        self.assertTrue(self.adapter.pending)
+        self.assertEqual(self.provider.calls, [])
+        self.adapter.accept_activity(activity(2))
+        self.assertTrue(self.provider.entered.wait(1))
+        for _ in range(3):
+            self.adapter.accept_activity(activity())
+        self.assertFalse(self.provider.cancelled.is_set())
+        self.provider.release.set()
+        self.assertEqual(len(self.advice()), 1)
+        self.assertEqual(self.provider.calls[0].current.utterance_id, "live-2")
+        self.assertEqual([item.playback for item in self.provider.calls[0].context], [True, False])
+        self.assertTrue(self.session.capture_permitted)
+
+    def test_superseded_activity_does_not_extend_current_receipt_deadline(self):
+        self.make()
+        self.adapter.accept_transcript(event())
+        self.clock.at = 0.1
+        self.adapter.accept_transcript(event(2))
+        self.clock.at = 1.9
+        self.renew(5)
+        self.adapter.accept_activity(activity())
+        self.clock.at = 2.2
+        self.adapter.tick()
+        self.assertFalse(self.adapter.pending)
+        self.assertEqual(self.provider.calls, [])
+        self.assertEqual(len(self.session._context), 2)
+        self.assertTrue(all(item.playback for _, item in self.session._context))
+        with self.assertRaises(ContractError):
+            self.adapter.accept_activity(activity(2))
+
+    def test_known_superseded_id_cannot_bypass_scope_or_expiry(self):
+        for change in ("session", "generation", "expired", "closed"):
+            with self.subTest(change=change):
+                self.make()
+                self.adapter.accept_transcript(event())
+                self.adapter.accept_transcript(event(2))
+                raw = activity()
+                if change == "session":
+                    raw["session_id"] = uid(80)
+                elif change == "generation":
+                    raw["generation_id"] = uid(81)
+                elif change == "expired":
+                    self.clock.at = 2
+                else:
+                    self.adapter.close()
+                with self.assertRaises(ContractError):
+                    self.adapter.accept_activity(raw)
+                self.assertFalse(self.adapter.pending)
+                self.assertEqual(self.provider.calls, [])
+
     def test_activity_before_final_is_rejected_without_speculative_queue(self):
         self.make()
         with self.assertRaises(ContractError):
