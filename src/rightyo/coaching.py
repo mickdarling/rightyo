@@ -496,7 +496,6 @@ class CoachingSession:
                 playback
                 or owner_mid_answer
                 or turn.overlap
-                or turn.speaker_id is None
                 or turn.speaker_provenance not in {"authored-fixture", "diarization-timeline"}
                 or not turn.text.strip()
                 or pause_ms < MIN_PAUSE_MS

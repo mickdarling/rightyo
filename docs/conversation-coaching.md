@@ -80,7 +80,10 @@ separate integration and verification work.
 `CoachingSession` accepts a host-configured `ListenerProfiles` registry and a
 replaceable `CoachProvider.advise(work, cancelled)` implementation. Work contains
 one immutable profile, bounded diarized context, the current final turn and a
-measured pause. A provider returns `CoachSuggestion` or `None` to hold; it must
+measured pause. An unassigned speaker remains `null` in that evidence; a label is not a
+prerequisite for general coaching and no person or role is inferred to fill it. Unknown
+source provenance, overlap and all trusted activity/qualification/deadline gates still
+hold before provider admission. A provider returns `CoachSuggestion` or `None` to hold; it must
 cooperate with cancellation and enforce a finite transport timeout. No real model
 backend is selected by this slice. `MockCoachProvider` is an authored lookup only.
 An injected clock must be a bounded, side-effect-free monotonic read: it must not
