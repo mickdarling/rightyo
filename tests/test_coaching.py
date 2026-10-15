@@ -746,6 +746,53 @@ class CoachingTests(unittest.TestCase):
                         self.assertFalse(any(e.get("capture_permitted") for e in output))
                     self.assertEqual(len(self.profiles._admissions), 0)
 
+    def test_unassigned_speaker_remains_anonymous_in_provider_evidence(self):
+        self.make()
+        self.start()
+        self.observe(turn(speaker_id=None))
+        self.assertEqual(len(self.advice()), 1)
+        self.assertIsNone(self.provider.calls[0].current.speaker_id)
+        self.assertIsNone(self.provider.calls[0].context[-1].turn.speaker_id)
+        self.assertIsNone(self.provider.calls[0].current.to_dict()["speaker_id"])
+
+    def test_unassigned_speaker_cannot_bypass_floor_source_scope_or_deadline(self):
+        for boundary in (
+            "owner",
+            "pause",
+            "playback",
+            "overlap",
+            "source",
+            "generation",
+            "expiry",
+            "disabled",
+            "profile",
+        ):
+            with self.subTest(boundary=boundary):
+                self.make()
+                self.start()
+                flags, fields = {}, {"speaker_id": None}
+                if boundary == "owner":
+                    flags["owner_mid_answer"] = True
+                elif boundary == "pause":
+                    flags["pause_ms"] = 399
+                elif boundary == "playback":
+                    flags["playback"] = True
+                elif boundary == "overlap":
+                    fields["overlap"] = True
+                elif boundary == "source":
+                    fields["speaker_provenance"] = "unknown"
+                elif boundary == "generation":
+                    flags["generation_id"] = uid(999)
+                elif boundary == "expiry":
+                    self.clock.at = 2
+                elif boundary == "disabled":
+                    self.session.apply_control(control("disable"))
+                else:
+                    self.profiles.remove("coach")
+                self.observe(turn(**fields), **flags)
+                self.assertEqual(self.advice(), [])
+                self.assertEqual(self.provider.calls, [])
+
     def test_measured_floor_and_playback_hold_without_model_and_speaker_is_not_identity(self):
         self.make()
         self.start()
@@ -754,7 +801,6 @@ class CoachingTests(unittest.TestCase):
             (turn(11), {"pause_ms": 399}),
             (turn(12), {"playback": True}),
             (turn(13, overlap=True), {}),
-            (turn(14, speaker_id=None), {}),
             (turn(15, speaker_provenance="unknown"), {}),
             (turn(16, finalized=False), {}),
         )

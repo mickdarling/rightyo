@@ -167,6 +167,22 @@ class CoachingActivityTests(unittest.TestCase):
         self.assertEqual([item.playback for item in self.provider.calls[0].context], [True, False])
         self.assertTrue(self.session.capture_permitted)
 
+    def test_unassigned_newest_tail_can_be_considered_without_speaker_relabelling(self):
+        self.make()
+        self.adapter.accept_transcript(event())
+        latest = event(2)
+        latest["turn"]["speaker_id"] = None
+        self.adapter.accept_transcript(latest)
+        self.adapter.accept_activity(activity())  # Earlier result has been superseded.
+        self.adapter.accept_activity(activity(2))
+        self.assertEqual(len(self.advice()), 1)
+        self.assertEqual(len(self.provider.calls), 1)
+        work = self.provider.calls[0]
+        self.assertIsNone(work.current.speaker_id)
+        self.assertEqual(work.context[0].turn.speaker_id, "Speaker A")
+        self.assertIsNone(work.context[-1].turn.speaker_id)
+        self.assertEqual([item.playback for item in work.context], [True, False])
+
     def test_superseded_activity_does_not_extend_current_receipt_deadline(self):
         self.make()
         self.adapter.accept_transcript(event())
