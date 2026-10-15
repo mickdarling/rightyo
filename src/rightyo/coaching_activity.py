@@ -79,6 +79,7 @@ class CoachingActivityAdapter:
         self._seen: dict[str, bytes] = {}
         self._last_sequence = 0
         self._last_end = 0
+        self._latest_utterance: str | None = None
         self._closed = False
 
     def _now(self) -> float:
@@ -158,6 +159,7 @@ class CoachingActivityAdapter:
                 self._seen[turn.utterance_id] = fingerprint
                 self._last_sequence = event["sequence"]
                 self._last_end = turn.end_ms
+                self._latest_utterance = turn.utterance_id
                 self._pending = (saved, now)
                 return {**saved, "turn": dict(saved["turn"])}
             except ContractError:
@@ -174,9 +176,14 @@ class CoachingActivityAdapter:
                 if (
                     activity["session_id"] != self._session_id
                     or activity["generation_id"] != self._generation_id
-                    or self._pending is None
-                    or activity["utterance_id"] != self._pending[0]["turn"]["utterance_id"]
                 ):
+                    raise ContractError("coaching activity has no matching final")
+                utterance = activity["utterance_id"]
+                if utterance != self._latest_utterance and utterance in self._seen:
+                    # A newer final already held this turn as conservative context. Its delayed
+                    # host measurement cannot authorize advice or disturb the newer pending work.
+                    return
+                if self._pending is None or utterance != self._pending[0]["turn"]["utterance_id"]:
                     raise ContractError("coaching activity has no matching final")
                 if now - self._pending[1] >= MAX_ACTIVITY_DELAY_MS / 1000:
                     self._hold()
@@ -224,4 +231,5 @@ class CoachingActivityAdapter:
         with self._lock:
             self._discard()
             self._seen.clear()
+            self._latest_utterance = None
             self._closed = True
