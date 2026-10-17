@@ -211,7 +211,7 @@ class SpeechEvents:
         # videos: only the owner's voice naming this assistant attends, and no follow-ups.
         self._media = False
         # Turns accepted while media mode was on (utterance id -> turn end, pruned by
-        # retention): a decision arriving after the host turned it off still applies it.
+        # retention): the mode each pending turn is decided under (see `_media_for`).
         self._media_turns = {}
         # Owner-voice status (rightyo#164), off by default: the settings, and the last state
         # emitted this session (None, "unrecognized" or "recognized"; each at most once).
@@ -887,8 +887,13 @@ class SpeechEvents:
             self._media = on
 
     def _media_for(self, turn):
-        """Whether media mode applies to `turn`: on now, or on when it was accepted."""
-        return self._media or turn.utterance_id in self._media_turns
+        """Whether media mode applies to `turn`: whether it was on when the turn was accepted.
+
+        Only that snapshot counts (Codex review of #196), so a change while a hosted decision
+        is pending applies to neither direction: a turn heard during the show stays gated after
+        the host turns it off, and a request made just before the owner turns it on still stands.
+        """
+        return turn.utterance_id in self._media_turns
 
     def _media_attends(self, turn, authority):
         """Whether an attend turn passes media mode's bar (see `media`)."""

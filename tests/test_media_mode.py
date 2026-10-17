@@ -79,6 +79,16 @@ class MediaModeTests(unittest.TestCase):
         self.assertEqual([e["type"] for e in events], ["attention"])
         self.assertIs(events[0]["decision"]["media"], True)
 
+    def test_a_request_made_before_it_was_turned_on_still_stands(self):
+        # Codex review of #196: the snapshot works both ways.
+        self.start()
+        current = turn("t1", 0, 900, "What time is it?")
+        self.events.transcript(current, current.end_ms)
+        self.events.media(True)
+        self.events.decision(decided(current, "attend"), current.end_ms + 100)
+        events = [e for e in self.events.drain() if e["type"] in {"attention", "request"}]
+        self.assertEqual([e["type"] for e in events], ["attention", "request"])
+
     def test_turning_it_off_restores_unnamed_attends(self):
         self.start()
         self.events.media(True)
