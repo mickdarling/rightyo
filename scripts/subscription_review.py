@@ -78,6 +78,10 @@ def summary_state(body):
     marker = "<!-- codex-pull-request-review-summary -->\n"
     heading = "\n## Codex Review Summary\n"
     if not body.startswith(marker):
+        if body.lstrip().startswith(
+            ("<!-- codex-pull-request-review-summary", "<!-- codex-review-state")
+        ):
+            raise GateError("Native summary envelope is unsupported")
         return None
     if body.startswith(marker + heading):
         return {}  # Supported legacy envelope; its markdown remains authoritative.
@@ -368,6 +372,8 @@ def freshness_barrier(comments, head, resolve, attest, authorize, persisted=None
         if len(row) != 1:
             raise GateError("Native review activity summary is ambiguous or unsupported")
         if not head.startswith(row[0]) or resolve(row[0]) != head:
+            if state and state["code_review"]["commit_sha"] == head:
+                raise GateError("Current native code state conflicts with its markdown revision")
             continue
         updated = timestamp(comment.get("updated_at"))
         completed = SUMMARY.findall(body)

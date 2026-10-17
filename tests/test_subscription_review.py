@@ -83,7 +83,12 @@ class CompletionTests(unittest.TestCase):
         ):
             item = completion()
             item["body"] = text
-            self.assertIsNone(self.check([item]))
+            if text.startswith("<!-- codex-pull-request-review-summary"):
+                # Authenticated malformed envelope now aborts instead of permitting older evidence.
+                with self.assertRaises(GateError):
+                    self.check([item])
+            else:
+                self.assertIsNone(self.check([item]))
         self.assertIsNone(self.check([]))
 
     def test_copied_verdict_or_wrong_app_identity_cannot_pass(self):

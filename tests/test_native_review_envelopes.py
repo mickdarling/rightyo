@@ -190,7 +190,7 @@ class NativeEnvelopeTests(unittest.TestCase):
 
     def test_findings_stale_resolution_and_graphql_provenance_still_block(self):
         anchor, receipt = wrapped_summary(), wrapped_receipt()
-        self.assertIsNone(
+        with self.assertRaises(GateError):
             clean_completion(
                 HEAD,
                 [anchor, receipt],
@@ -200,7 +200,6 @@ class NativeEnvelopeTests(unittest.TestCase):
                 lambda item, is_summary: True,
                 [reaction()],
             )
-        )
         finding = {"user": receipt["user"], "commit_id": HEAD, "state": "DISMISSED"}
         self.assertIsNone(self.check([anchor, receipt], reviews=[finding]))
         parent = {**finding, "id": 123}
@@ -229,6 +228,42 @@ class NativeEnvelopeTests(unittest.TestCase):
             )
             with patch("scripts.subscription_review.api", return_value={"data": {"node": node}}):
                 self.assertFalse(comment_provenance(item, is_summary))
+
+    def test_current_code_state_cannot_hide_behind_an_older_markdown_row(self):
+        for status, findings in [
+            ("queued", None),
+            ("running", None),
+            ("completed", None),
+            ("completed", True),
+            ("completed", False),
+        ]:
+
+            def edit(state):
+                state["code_review"].update(
+                    status=status, has_any_findings=findings, has_unresolved_findings=findings
+                )
+
+            item = change_state(wrapped_summary(), edit)
+            item["body"] = item["body"].replace(f"`{HEAD[:7]}`", f"`{BASE[:7]}`")
+            with self.subTest(status=status, findings=findings), self.assertRaises(GateError):
+                self.check([wrapped_summary(), completion(), item], reactions=[reaction()])
+
+    def test_summary_like_unsupported_prefixes_cannot_fall_back_to_clean_evidence(self):
+        anchor = wrapped_summary()
+        cases = [
+            " " + anchor["body"],
+            anchor["body"].replace(
+                "codex-pull-request-review-summary", "codex-pull-request-review-summary:v2"
+            ),
+            anchor["body"].replace("<!-- codex-pull-request-review-summary -->\n", ""),
+            anchor["body"].replace(
+                "<!-- codex-pull-request-review-summary -->\n",
+                "<!-- codex-pull-request-review-summary -->",
+            ),
+        ]
+        for body in cases:
+            with self.subTest(body=body[:90]), self.assertRaises(GateError):
+                self.check([anchor, completion(), {**anchor, "body": body}], reactions=[reaction()])
 
 
 if __name__ == "__main__":
