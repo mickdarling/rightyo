@@ -67,6 +67,18 @@ class MediaModeTests(unittest.TestCase):
         self.assertEqual([e["type"] for e in events], ["attention"])
         self.assertNotIn("follow_up", events[0]["decision"])
 
+    def test_a_turn_heard_in_media_mode_keeps_it_when_its_decision_comes_later(self):
+        # Codex review of #196: the hosted decision can arrive after the host turned it off.
+        self.start()
+        self.events.media(True)
+        current = turn("t1", 0, 900, "What time is it?")
+        self.events.transcript(current, current.end_ms)
+        self.events.media(False)
+        self.events.decision(decided(current, "attend"), current.end_ms + 100)
+        events = [e for e in self.events.drain() if e["type"] in {"attention", "request"}]
+        self.assertEqual([e["type"] for e in events], ["attention"])
+        self.assertIs(events[0]["decision"]["media"], True)
+
     def test_turning_it_off_restores_unnamed_attends(self):
         self.start()
         self.events.media(True)

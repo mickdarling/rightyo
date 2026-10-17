@@ -210,6 +210,9 @@ class SpeechEvents:
         # Media mode (hailing-station #551), set by the host while the owner watches TV or
         # videos: only the owner's voice naming this assistant attends, and no follow-ups.
         self._media = False
+        # Turns accepted while media mode was on (utterance id -> turn end, pruned by
+        # retention): a decision arriving after the host turned it off still applies it.
+        self._media_turns = {}
         # Owner-voice status (rightyo#164), off by default: the settings, and the last state
         # emitted this session (None, "unrecognized" or "recognized"; each at most once).
         self._owner_voice = None
@@ -358,6 +361,7 @@ class SpeechEvents:
             self._decided.clear()
             self._roles.clear()
             self._inferred.clear()
+            self._media_turns.clear()
             self._priority = priority
             self._per_turn = (
                 priority is not None
@@ -477,6 +481,9 @@ class SpeechEvents:
             for key, end_ms in list(self._inferred.items()):
                 if end_ms <= cutoff:
                     del self._inferred[key]
+            for key, end_ms in list(self._media_turns.items()):
+                if end_ms <= cutoff:
+                    del self._media_turns[key]
             for key in list(self._superseded):
                 if key not in self._pending:
                     del self._superseded[key]
@@ -578,6 +585,8 @@ class SpeechEvents:
             )
             if inferred and role is not None:
                 self._inferred[turn.utterance_id] = turn.end_ms
+            if self._media:
+                self._media_turns[turn.utterance_id] = turn.end_ms
             self._memory.append(turn, role=role)
             self._seen[turn.utterance_id] = digest
             if turn.end_ms <= self._now - self.retention_ms:
@@ -877,6 +886,10 @@ class SpeechEvents:
         with self._lock:
             self._media = on
 
+    def _media_for(self, turn):
+        """Whether media mode applies to `turn`: on now, or on when it was accepted."""
+        return self._media or turn.utterance_id in self._media_turns
+
     def _media_attends(self, turn, authority):
         """Whether an attend turn passes media mode's bar (see `media`)."""
         named = mentions_name(self._addressing, turn.text)
@@ -1153,7 +1166,7 @@ class SpeechEvents:
         conversation = self._conversation
         if conversation is None or not self._engaged_with(turn):
             return "not_engaged"
-        if self._media:
+        if self._media_for(turn):
             # Media mode: a show's dialogue in the window is never a follow-up.
             return "media"
         if unavailable is not None:
@@ -1339,7 +1352,7 @@ class SpeechEvents:
                 # conversation with them below. Naming this assistant too keeps it ours.
                 evidence["label"] = "ignore"
             if (
-                self._media
+                self._media_for(turn)
                 and evidence["label"] == "attend"
                 and not self._media_attends(turn, authority)
             ):
