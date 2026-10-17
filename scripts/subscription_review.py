@@ -118,10 +118,16 @@ def validate_summary_state(state, head, completed):
             review["has_any_findings"] is True or review["has_unresolved_findings"] is True
         ):
             raise GateError("Native summary reports findings")
-    if completed and any(
-        code[key] is not False for key in ["has_any_findings", "has_unresolved_findings"]
-    ):
-        raise GateError("Native summary completion is inconclusive")
+    if completed:
+        for review in state.values():
+            if review["commit_sha"] == head and (
+                review["status"] != "completed"
+                or any(
+                    review[key] is not False
+                    for key in ["has_any_findings", "has_unresolved_findings"]
+                )
+            ):
+                raise GateError("Native summary completion is inconclusive")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

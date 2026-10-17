@@ -124,6 +124,9 @@ class NativeEnvelopeTests(unittest.TestCase):
                 has_any_findings=True,
                 has_unresolved_findings=False,
             ),
+            lambda s: s["security_review"].update(commit_sha=HEAD, status="running"),
+            lambda s: s["security_review"].update(commit_sha=HEAD, status="queued"),
+            lambda s: s["security_review"].update(commit_sha=HEAD, status="completed"),
         ]
         for edit in edits:
             with self.subTest(edit=edit), self.assertRaises(GateError):
