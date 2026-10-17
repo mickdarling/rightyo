@@ -265,6 +265,24 @@ class NativeEnvelopeTests(unittest.TestCase):
             with self.subTest(body=body[:90]), self.assertRaises(GateError):
                 self.check([anchor, completion(), {**anchor, "body": body}], reactions=[reaction()])
 
+    def test_embedded_duplicate_and_misplaced_metadata_never_falls_back(self):
+        state = wrapped_summary()["body"].splitlines()[1]
+        extras = [state, "<!--codex-review-state:v2 {} -->", "<!-- CODEX-REVIEW-STATE:v2 {} -->"]
+        bodies = [
+            base["body"] + "\n" + extra
+            for base in [summary(), wrapped_summary(), completion(), wrapped_receipt()]
+            for extra in extras
+        ]
+        bodies += [
+            summary()["body"] + "\n<!-- codex-review-receipt:v2 -->",
+            completion()["body"] + "\n<!-- codex-review-receipt:v1 -->",
+            wrapped_summary()["body"] + "\n<!-- codex-pull-request-review-summary -->",
+        ]
+        for body in bodies:
+            item = {**completion(), "id": 44, "body": body}
+            with self.subTest(body=body[-100:]), self.assertRaises(GateError):
+                self.check([wrapped_summary(), completion(), item], reactions=[reaction()])
+
 
 if __name__ == "__main__":
     unittest.main()

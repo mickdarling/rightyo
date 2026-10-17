@@ -59,9 +59,16 @@ class GateError(ValueError):
     """Only public-safe categories are emitted; never response bodies or tokens."""
 
 
+def marker_count(body, name):
+    return len(re.findall(r"<!--\s*" + re.escape(name), body, re.I))
+
+
 def completion_match(body):
     match = COMPLETION.match(body)
-    if body.lstrip().startswith("<!-- codex-review-receipt") and match is None:
+    count = marker_count(body, "codex-review-receipt")
+    if count and (
+        count != 1 or not body.startswith("<!-- codex-review-receipt:v1 -->\n\n") or match is None
+    ):
         raise GateError("Native completion receipt is unsupported")
     return match
 
@@ -77,14 +84,20 @@ def summary_state(body):
     """Recognize bounded envelopes without changing the body used for provenance."""
     marker = "<!-- codex-pull-request-review-summary -->\n"
     heading = "\n## Codex Review Summary\n"
+    summaries = marker_count(body, "codex-pull-request-review-summary")
+    states = marker_count(body, "codex-review-state")
     if not body.startswith(marker):
-        if body.lstrip().startswith(
-            ("<!-- codex-pull-request-review-summary", "<!-- codex-review-state")
-        ):
+        if summaries or states:
             raise GateError("Native summary envelope is unsupported")
         return None
+    if summaries != 1:
+        raise GateError("Native summary envelope is repeated")
     if body.startswith(marker + heading):
+        if states:
+            raise GateError("Legacy summary carries unexpected state metadata")
         return {}  # Supported legacy envelope; its markdown remains authoritative.
+    if states != 1:
+        raise GateError("Native summary state marker is missing or repeated")
     line, _, rest = body[len(marker) :].partition("\n")
     match = re.fullmatch(r"<!-- codex-review-state:v1 ([^\n]{1,4096}) -->", line)
     if not match or not rest.startswith(heading):
