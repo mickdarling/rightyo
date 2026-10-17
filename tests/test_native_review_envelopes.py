@@ -161,6 +161,33 @@ class NativeEnvelopeTests(unittest.TestCase):
         )
         self.assertEqual(candidates, [])
 
+    def test_current_security_state_blocks_even_when_code_row_is_for_another_commit(self):
+        def mixed(status, findings, revision=HEAD):
+            def edit(state):
+                state["code_review"]["commit_sha"] = BASE
+                state["security_review"].update(
+                    commit_sha=revision,
+                    status=status,
+                    has_any_findings=findings,
+                    has_unresolved_findings=findings,
+                )
+
+            item = change_state(wrapped_summary(), edit)
+            item["body"] = item["body"].replace(f"`{HEAD[:7]}`", f"`{BASE[:7]}`")
+            return item
+
+        clean = [wrapped_summary(), completion()]
+        for status, findings in [
+            ("queued", None),
+            ("running", None),
+            ("completed", None),
+            ("completed", True),
+        ]:
+            with self.subTest(status=status, findings=findings), self.assertRaises(GateError):
+                self.check([*clean, mixed(status, findings)], reactions=[reaction()])
+        self.assertIsNotNone(self.check([*clean, mixed("completed", False)]))
+        self.assertIsNotNone(self.check([*clean, mixed("running", None, revision=BASE)]))
+
     def test_findings_stale_resolution_and_graphql_provenance_still_block(self):
         anchor, receipt = wrapped_summary(), wrapped_receipt()
         self.assertIsNone(

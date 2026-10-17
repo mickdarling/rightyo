@@ -179,8 +179,9 @@ positive evidence from the verified connector bot identity and GitHub app, throu
 
 Neither a request, summary alone, reaction alone, copied verdict nor old-head evidence
 passes. The parser supports the legacy text and the connector's versioned v1 receipt and
-summary envelopes. Summary state is bounded, duplicate-free JSON with an exact schema;
-its code-review commit, completion state and clean findings flags must agree with the
+summary envelopes. Summary state is bounded, duplicate-free JSON with an exact schema.
+Current-head security state is checked independently before filtering older code-review rows.
+Its code-review commit, completion state and clean findings flags must agree with the
 independently resolved Markdown. State cannot supply approval by itself. Unknown versions,
 inconsistent or malformed metadata, and current-head findings fail closed. Envelope parsing
 never changes the exact body used for GraphQL edit-provenance validation. This source

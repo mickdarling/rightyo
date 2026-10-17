@@ -137,6 +137,17 @@ def validate_summary_state(state, head, completed):
                 raise GateError("Native summary completion is inconclusive")
 
 
+def validate_security_state(state, head):
+    """Security authority belongs to its own commit, independently of the code row."""
+    if not state or state["security_review"]["commit_sha"] != head:
+        return
+    review = state["security_review"]
+    if review["status"] != "completed" or any(
+        review[key] is not False for key in ["has_any_findings", "has_unresolved_findings"]
+    ):
+        raise GateError("Current native security review is incomplete or reports findings")
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise GateError("GitHub API redirect refused")
@@ -352,6 +363,7 @@ def freshness_barrier(comments, head, resolve, attest, authorize, persisted=None
         state = summary_state(body)
         if state is None:
             continue
+        validate_security_state(state, head)
         row = re.findall(r"(?m)^\|[^\n]*\*\*Code Review\*\*[^\n]*\| `([0-9a-f]{7,40})` \|", body)
         if len(row) != 1:
             raise GateError("Native review activity summary is ambiguous or unsupported")
