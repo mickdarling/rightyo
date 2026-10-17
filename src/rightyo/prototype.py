@@ -1303,6 +1303,19 @@ class PrototypeController:
                 # The decision context sees the reply too (rightyo#153), on the same clock.
                 self._runner.note_reply(phase, self._now_ms())
 
+    def media(self, on: bool) -> None:
+        """Forward the host's media mode (hailing-station #551) to the event publisher.
+
+        Held by the publisher across sessions, so it applies whether or not one is running;
+        ignored without one (the web lab). A malformed value raises before anything is
+        forwarded.
+        """
+        if type(on) is not bool:
+            raise PrototypeError("invalid media mode")
+        with self._lock:
+            if self._events is not None:
+                self._events.media(on)
+
     def _publish(self, method, value, **fields):
         """Run under the controller lock; a broken consumer cancels observation."""
         try:

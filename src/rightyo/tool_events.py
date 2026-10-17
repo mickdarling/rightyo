@@ -207,6 +207,9 @@ class SpeechEvents:
         self._names = False
         # Other agents' names (#161): a turn naming one, and not this assistant, is never ours.
         self._other_agents = None
+        # Media mode (hailing-station #551), set by the host while the owner watches TV or
+        # videos: only the owner's voice naming this assistant attends, and no follow-ups.
+        self._media = False
         # Owner-voice status (rightyo#164), off by default: the settings, and the last state
         # emitted this session (None, "unrecognized" or "recognized"; each at most once).
         self._owner_voice = None
@@ -862,6 +865,23 @@ class SpeechEvents:
             return engaged["until_ms"]
         return max(engaged["until_ms"], replying + MAX_REPLY_HOLD_MS)
 
+    def media(self, on):
+        """The host's media mode (hailing-station #551), on or off; it outlasts sessions.
+
+        While on, an attend needs this assistant's name and, with speaker roles, the
+        owner's authority; every follow-up is refused. Stop phrases and dismissals are
+        unchanged. With no names configured, nothing attends. Emits nothing.
+        """
+        if type(on) is not bool:
+            raise ContractError("invalid media mode")
+        with self._lock:
+            self._media = on
+
+    def _media_attends(self, turn, authority):
+        """Whether an attend turn passes media mode's bar (see `media`)."""
+        named = mentions_name(self._addressing, turn.text)
+        return named and (self._priority is None or authority == "owner")
+
     def reply(self, phase, now_ms):
         """The host's report that the assistant's spoken reply `started` or `ended` (#124).
 
@@ -1133,6 +1153,9 @@ class SpeechEvents:
         conversation = self._conversation
         if conversation is None or not self._engaged_with(turn):
             return "not_engaged"
+        if self._media:
+            # Media mode: a show's dialogue in the window is never a follow-up.
+            return "media"
         if unavailable is not None:
             return "unavailable"
         if evidence["label"] != "uncertain":
@@ -1315,6 +1338,15 @@ class SpeechEvents:
                 # a follow-up or an acknowledgement here, and it ends this assistant's
                 # conversation with them below. Naming this assistant too keeps it ours.
                 evidence["label"] = "ignore"
+            if (
+                self._media
+                and evidence["label"] == "attend"
+                and not self._media_attends(turn, authority)
+            ):
+                # Media mode (hailing-station #551): TV dialogue stays context. An optional
+                # key, like role_status: strict hosts ignore unknown keys.
+                evidence["label"] = "ignore"
+                evidence["media"] = True
             would_attend = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
             # False: no follow-up note; None: a formed follow-up; else the refusal token.
             follow_up_note: str | None | bool = False
