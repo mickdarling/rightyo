@@ -404,7 +404,7 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         help=(
             "with --mode stdin: an inherited file descriptor carrying host JSON lines "
-            '{"reply": "started"} / {"reply": "ended"} (#124)'
+            '{"reply": "started"} / {"reply": "ended"} (#124) and {"media": true|false}'
         ),
     )
     listen.add_argument("--use-jev", action="store_true")
