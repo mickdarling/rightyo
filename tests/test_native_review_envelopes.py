@@ -81,15 +81,19 @@ class NativeEnvelopeTests(unittest.TestCase):
             anchor[field] = receipt[field] = value
             self.assertIsNone(self.check([anchor, receipt], reactions=[reaction()]))
 
-    def test_unknown_repeated_and_malformed_receipt_headers_do_not_pass(self):
+    def test_unsupported_receipts_cannot_fall_back_to_older_clean_evidence(self):
         for prefix in [
             "<!-- codex-review-receipt:v2 -->\n\n",
             "<!-- codex-review-receipt:v1 -->\n",
             "<!-- codex-review-receipt:v1 -->\n\n" * 2,
+            " <!-- codex-review-receipt:v1 -->\n\n",
+            "<!-- codex-review-receipt:v1\n\n",
         ]:
             receipt = completion()
             receipt["body"] = prefix + receipt["body"]
-            self.assertIsNone(self.check([wrapped_summary(), receipt]))
+            for older in [[], [completion()]]:
+                with self.subTest(prefix=prefix, older=bool(older)), self.assertRaises(GateError):
+                    self.check([wrapped_summary(), *older, receipt], reactions=[reaction()])
 
     def test_unknown_malformed_duplicate_and_oversized_state_cannot_resurrect_clean(self):
         anchor = wrapped_summary()

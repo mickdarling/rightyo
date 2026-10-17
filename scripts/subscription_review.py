@@ -59,6 +59,13 @@ class GateError(ValueError):
     """Only public-safe categories are emitted; never response bodies or tokens."""
 
 
+def completion_match(body):
+    match = COMPLETION.match(body)
+    if body.lstrip().startswith("<!-- codex-review-receipt") and match is None:
+        raise GateError("Native completion receipt is unsupported")
+    return match
+
+
 def unique_fields(pairs):
     fields = dict(pairs)
     if len(fields) != len(pairs):
@@ -341,6 +348,7 @@ def freshness_barrier(comments, head, resolve, attest, authorize, persisted=None
             continue
         if not attest(comment, True):
             raise GateError("Native comment edit provenance is invalid")
+        completion_match(body)  # Unsupported receipts must not fall back to older evidence.
         state = summary_state(body)
         if state is None:
             continue
@@ -410,7 +418,7 @@ def review_candidates(
         if not native(comment, require_app=True):
             continue
         body = comment.get("body") or ""
-        match = COMPLETION.match(body)
+        match = completion_match(body)
         summary = False
         if not match:
             if summary_state(body) is None:
