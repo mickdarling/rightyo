@@ -803,7 +803,8 @@ A request is acknowledged when either holds:
 - its attend confidence is at least `min_confidence`. For a direct `attend` that is the
   decision's `confidence`. For a [follow-up](#conversation-mode) it is Jev's attend
   probability, because a follow-up's `confidence` belongs to the `uncertain` choice it
-  was promoted from.
+  was promoted from. A follow-up is held to `follow_up_min_confidence` instead when that
+  is set ([#199](https://github.com/mickdarling/rightyo/issues/199)).
 
 Below the threshold the request is still formed and delivered, so the agent still decides
 whether to reply; only the acknowledgement is withheld. Each decision is also noted on
