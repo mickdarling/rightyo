@@ -363,6 +363,17 @@ the range 0 to 5,000, and 0 turns joining off. A joined turn:
   label, and it is refused together with configured speaker roles, except
   [roles from live speaker identification](#roles-from-live-speaker-identification).
 
+An end-of-turn model's "complete" does not skip the hold for a piece that looks cut off
+mid-request ([#199](https://github.com/mickdarling/rightyo/issues/199)). Such a piece
+ends on an article, connective, filler, modal, possessive or one of the prepositions to,
+of, with, for and at ("Jarvis, add the", "remind me to"), or is one or two words that are
+each a name or a request opener ("Jarvis,", "hey Jarvis", "can you"). It is held as usual,
+so its continuation joins it rather than leaving a fragment to be decided alone. A turn
+ending in a question mark, a stop phrase and a dismissal-shaped turn ("stop it") are
+never held this way. The cost is the usual hold, about two seconds, and only on a turn
+that looks cut off.
+`"turns": {"hold_unfinished": false}` trusts the model as before (default true).
+
 A joined turn spans at most twice `max_utterance_ms` (24 s by default) and 4,000
 characters; a piece that would exceed either starts a new turn. A role is still fixed
 the first time a speaker is emitted, on the joined turn.
