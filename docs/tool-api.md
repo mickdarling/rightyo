@@ -673,11 +673,19 @@ decisions arrive in) forms a request when all of these hold:
 - the decision was not a transient unavailability placeholder, and `owner_only` does not
   exclude the speaker;
 - with `require_cue` ([#199](https://github.com/mickdarling/rightyo/issues/199)), it
-  carries a cue that it continues the exchange. A cue is the assistant's name, the second
-  person ("you", "your"), a word that refers back ("that", "it", "the other one", "again",
-  "instead", "the second one") or an opening that adds or corrects ("and ...", "also ...",
-  "no, ...", "actually ..."). Talk to a pet or a passer-by within the window ("good boy,
-  come here") then stays context however Jev rates it. The diagnostic reason is `no_cue`.
+  carries a cue that it continues the exchange. Precision comes first, so "it", "that",
+  "you" and "no" alone are not cues: they fill talk to pets and passers-by. A cue is any
+  of:
+  - the assistant's name;
+  - a question to it ("can you", "could you", "would you", "will you");
+  - a word that refers back ("again", "instead", "the other one", "the same", "the second");
+  - an action on its result ("play that", "turn it up", "cancel that");
+  - an opening that adds ("and …", "actually …", "what about …", "how about …");
+  - a short adjustment of up to three words ("louder", "next one", "skip").
+
+  Talk to a pet or a passer-by inside the window ("No, sit", "Is that your dog?") then
+  stays context however Jev rates it. The diagnostic reason is `no_cue`. It applies to
+  an appendix too, and a closing is still reported as `closing`.
 
 **Appendices** ([#199](https://github.com/mickdarling/rightyo/issues/199)). With
 `appendix_ms` above 0, the engaged speaker's `uncertain` turn that starts within that long

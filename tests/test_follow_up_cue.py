@@ -14,7 +14,7 @@ NAMES = Addressing.from_dict({"names": ["Jarvis"], "variants": {}})
 
 
 class CueShapeTests(unittest.TestCase):
-    def test_a_name_second_person_reference_or_adding_opener_is_a_cue(self):
+    def test_a_name_a_question_to_the_assistant_a_reference_or_an_addition_is_a_cue(self):
         for text in (
             "Jarvis, louder",
             "can you make it shorter",
@@ -23,12 +23,43 @@ class CueShapeTests(unittest.TestCase):
             "do that again",
             "Actually, Tuesday",
             "the second one",
+            "play that",
+            "turn it up",
+            "what about tomorrow",
+            "how about pizza",
+            "louder",
+            "next one",
+            "skip",
+            "use the same one instead",
         ):
             with self.subTest(text=text):
                 self.assertTrue(follow_up_cued(text, NAMES))
 
-    def test_talk_to_a_pet_or_passer_by_usually_carries_none(self):
-        for text in ("Good boy, come here!", "Sit. Stay.", "Lovely morning", "Drop the ball", ""):
+    def test_talk_to_a_pet_or_a_passer_by_usually_carries_none(self):
+        for text in (
+            "Good boy, come here!",
+            "Sit. Stay.",
+            "Lovely morning",
+            "Drop the ball",
+            "",
+            "No! Bad dog",
+            "No, sit",
+            "Not on the couch",
+            "Leave it",
+            "Come on, drop it",
+            "Go get it!",
+            "Get off that",
+            "Who did this?",
+            "Who's a good boy, you are!",
+            "Is that your dog?",
+            "Does it bite?",
+            "Are you lost?",
+            "Thank you",
+            "See you later",
+            "Good morning to you",
+            "Make way",
+            "Also, nice hat",
+        ):
             with self.subTest(text=text):
                 self.assertFalse(follow_up_cued(text, NAMES))
 
@@ -54,6 +85,21 @@ class RequireCueTests(unittest.TestCase):
         self.assertFalse(self.follow_up("Good boy, come here!", mode))
         self.setUp()
         self.assertTrue(self.follow_up("and eggs too", mode))
+
+    def test_a_closing_is_reported_as_a_closing_not_as_uncued(self):
+        notes = []
+        self.events = SpeechEvents(report=notes.append)
+        self.assertFalse(
+            self.follow_up("that's all", Conversation(window_ms=10000, require_cue=True))
+        )
+        reasons = [note for note in notes if note.startswith("follow_up ")]
+        self.assertIn("reason=closing", reasons[-1])
+
+    def test_the_requirement_applies_to_an_appendix_too(self):
+        mode = Conversation(window_ms=10000, require_cue=True, appendix_ms=5000)
+        self.assertFalse(self.follow_up("sit, good boy", mode))
+        self.setUp()
+        self.assertTrue(self.follow_up("and eggs", mode))
 
     def test_off_by_default_as_before(self):
         self.assertTrue(self.follow_up("Good boy, come here!", Conversation(window_ms=10000)))
