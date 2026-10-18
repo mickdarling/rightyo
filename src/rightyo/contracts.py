@@ -430,10 +430,11 @@ class Conversation:
     another person, on a `closing_phrases` match
     (courtesy words around it are tolerated, `is_closing`), or on a dismissal.
 
-    `appendix_ms` (#199; 0, the default, is off): the engaged speaker's turn starting within
-    this long after their latest request ended is an appendix to it ("... and eggs") and
-    forms a follow-up whatever Jev's label or attend probability, unless its recipient is
-    another person, it names another agent, it is a closing, or media mode holds it back.
+    `appendix_ms` (#199; 0, the default, is off): the engaged speaker's `uncertain` turn
+    starting within this long after their latest direct request ended is an appendix to it
+    ("... and eggs") and needs no follow-up attend probability. Every other follow-up rule
+    applies (a confident `ignore` still never is one), it never names another agent, and
+    each direct request takes at most one appendix.
     """
 
     window_ms: int = DEFAULT_CONVERSATION_WINDOW_MS

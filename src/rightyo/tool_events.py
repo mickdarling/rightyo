@@ -194,6 +194,9 @@ class SpeechEvents:
         # Pending non-owner turns an owner superseded before their decisions arrived,
         # mapped to the owner's utterance: their late decisions never emit a request.
         self._superseded = {}
+        # Per speaker key, the end of their latest direct (non-follow-up) request: the one
+        # appendix it may take (#199) is measured from here, and taking it clears the entry.
+        self._appendix_from = {}
         # "off" without a provider, "ready" with one, "unavailable" after a hosted role
         # question failed, or "rejected" after a provider contract violation; either
         # degrades roles to configured/unknown for the rest of the session.
@@ -298,6 +301,7 @@ class SpeechEvents:
         self._queue_bytes = 0
         self._open.clear()
         self._superseded.clear()
+        self._appendix_from.clear()
         self._delivered.clear()
         self._withdrawn.clear()
 
@@ -1176,12 +1180,13 @@ class SpeechEvents:
             return "media"
         if unavailable is not None:
             return "unavailable"
-        appendix = self._appendix(turn)
-        if evidence["label"] != "uncertain" and not (appendix and evidence["label"] == "ignore"):
+        if evidence["label"] != "uncertain":
             return "label"
         if decision.recipient not in {"system", "unknown"}:
             return "recipient"
-        if not appendix and decision.probabilities["attend"] < self._follow_up_bar(role):
+        if decision.probabilities["attend"] < self._follow_up_bar(role) and not self._appendix(
+            turn
+        ):
             return "below_bar"
         if conversation.is_closing(turn.text):
             # A closing phrase ends the conversation; it is never a request of its own.
@@ -1207,13 +1212,14 @@ class SpeechEvents:
         )
 
     def _appendix(self, turn):
-        """Whether the engaged speaker's `turn` starts within the appendix window after their
-        latest request ended (#199), and names no other agent (their talk is never ours)."""
-        engaged, window = self._engaged, self._conversation.appendix_ms
-        if not window or engaged is None or mentions_name(self._other_agents, turn.text):
+        """Whether the engaged speaker's undecided `turn` starts within the appendix window
+        after their latest direct request ended (#199) and names no other agent. Only a
+        direct request opens the window, so an appendix never opens another."""
+        window = self._conversation.appendix_ms
+        if not window or mentions_name(self._other_agents, turn.text):
             return False
-        latest = max(engaged["from_ms"], engaged.get("revived_over_ms", engaged["from_ms"]))
-        return 0 <= turn.start_ms - latest <= window
+        since = self._appendix_from.get(self._cooldown_key(self._facts(turn)))
+        return since is not None and 0 <= turn.start_ms - since <= window
 
     def _follow_up_bar(self, role):
         """The follow-up attend bar: optionally lower for enrolled owners and trusted (#113)."""
@@ -1661,6 +1667,15 @@ class SpeechEvents:
                         # when another speaker holds the engagement now: decided in order,
                         # such a request would have engaged first and then ended here.
                         self._mark_ended(own, turn)
+            if attended and self._conversation is not None and self._conversation.appendix_ms:
+                own = self._cooldown_key(self._facts(turn))
+                if evidence.get("follow_up"):
+                    # One appendix per direct request (#199): a follow-up never reopens it.
+                    self._appendix_from.pop(own, None)
+                elif own is not None:
+                    self._appendix_from[own] = max(
+                        self._appendix_from.get(own, turn.end_ms), turn.end_ms
+                    )
             if attended:
                 # Any delivered request makes the next reply that request's, so no lapsed
                 # conversation is revived by it (rightyo#158); a request that engages its own

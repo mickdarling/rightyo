@@ -25,18 +25,33 @@ class AppendixTests(unittest.TestCase):
         self.events.decision(decided(current, label, **options), current.end_ms + 100)
         return [e for e in self.events.drain() if e["type"] in {"attention", "request"}]
 
-    def appended(self, start, label="ignore", text="and eggs, two dozen", **options):
-        """Request at 0-900 ms, then a turn starting at `start`; whether it became a request."""
+    def appended(self, start, label="uncertain", text="and eggs, two dozen", **options):
+        """Request at 0-900 ms, then a low-attend turn at `start`; whether it became a request."""
         self.say(turn("t1", 0, 900, "Jarvis, add milk to the shopping list"), "attend")
-        events = self.say(turn("t2", start, start + 800, text, **options), label)
+        attend = {"attend": 0.05} if label == "uncertain" else {}
+        events = self.say(turn("t2", start, start + 800, text, **options), label, **attend)
         requests = [e for e in events if e["type"] == "request"]
         if requests:
             self.assertTrue(requests[0]["decision"]["follow_up"])
         return bool(requests)
 
-    def test_a_quick_continuation_forms_a_follow_up_even_when_jev_would_ignore_it(self):
+    def test_a_quick_continuation_forms_a_follow_up_whatever_its_attend_probability(self):
         self.start()
         self.assertTrue(self.appended(2900))
+
+    def test_a_confident_ignore_is_never_an_appendix(self):
+        self.start()
+        self.assertFalse(self.appended(1500, label="ignore"))
+
+    def test_an_appendix_never_opens_another(self):
+        self.start()
+        self.assertTrue(self.appended(1500))
+        events = self.say(turn("t3", 3000, 3600, "and bread"), "uncertain", attend=0.05)
+        self.assertEqual([e["type"] for e in events], ["attention"])
+        # A new direct request opens a new window.
+        self.say(turn("t4", 4000, 4800, "Jarvis, add flour"), "attend")
+        events = self.say(turn("t5", 5500, 6000, "and sugar"), "uncertain", attend=0.05)
+        self.assertEqual([e["type"] for e in events], ["attention", "request"])
 
     def test_outside_the_window_the_usual_follow_up_rules_apply(self):
         self.start()
@@ -52,7 +67,9 @@ class AppendixTests(unittest.TestCase):
         self.setUp()
         self.start()
         self.say(turn("t1", 0, 900, "Jarvis, add milk to the shopping list"), "attend")
-        events = self.say(turn("t2", 1500, 2300, "and eggs"), "ignore", recipient="other_human")
+        events = self.say(
+            turn("t2", 1500, 2300, "and eggs"), "uncertain", recipient="other_human", attend=0.05
+        )
         self.assertEqual([e["type"] for e in events], ["attention"])
 
     def test_a_closing_or_another_agents_turn_never_appends(self):

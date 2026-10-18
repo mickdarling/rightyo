@@ -662,14 +662,13 @@ decisions arrive in) forms a request when all of these hold:
   exclude the speaker.
 
 **Appendices** ([#199](https://github.com/mickdarling/rightyo/issues/199)). With
-`appendix_ms` above 0, the engaged speaker's turn that starts within that long after their
-latest request ended ("Jarvis, add milk to the list" … "and eggs") is an appendix. It
-forms a follow-up even when Jev's label is `ignore` or its attend probability is below the
-bar, since a quick continuation of a request is rarely meant for anyone else. The other
-conditions above still apply: the recipient is `system` or `unknown`, it is not a
-closing, and `owner_only` does not exclude the speaker. A turn naming another agent, or
-held back by media mode, never is one. The started event's `conversation` object carries
-`appendix_ms` only when it is on.
+`appendix_ms` above 0, the engaged speaker's `uncertain` turn that starts within that long
+after their latest direct request ended ("Jarvis, add milk to the list" … "and eggs") is an
+appendix. It needs no follow-up attend probability, since a quick continuation of a
+request is rarely meant for anyone else. Every other follow-up condition above still
+applies, so a confident `ignore` never is one. A turn naming another agent never is one,
+and each direct request takes at most one appendix: a follow-up never opens a new window.
+The started event's `conversation` object carries `appendix_ms` only when it is on.
 
 A follow-up is still subject to stop phrases, dismissals, owner supersession and the
 dismissal cool-down; one the cool-down holds back is reported as `uncertain` with
