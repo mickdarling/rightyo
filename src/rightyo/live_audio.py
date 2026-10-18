@@ -96,6 +96,9 @@ class LiveConfig:
     # Text predicate for a fragment that must stay a turn of its own and is never joined
     # or held, such as an owner stop phrase matched against a whole turn downstream.
     turn_break: Callable[[str], bool] | None = None
+    # Text predicate for a turn that looks cut off mid-request (#199): when the end-of-turn
+    # model calls it complete, it is held for the merge gap anyway. None trusts the model.
+    turn_unfinished: Callable[[str], bool] | None = None
     # Hold a request-shaped turn at least this long after its last word to observe the
     # post-turn gap (#96); 0, the library default, observes nothing. Joining still uses
     # only `turn_merge_gap_ms`.
@@ -162,6 +165,8 @@ class LiveConfig:
             raise LiveAudioError("Invalid labelled-span observer")
         if self.turn_break is not None and not callable(self.turn_break):
             raise LiveAudioError("Invalid turn break predicate")
+        if self.turn_unfinished is not None and not callable(self.turn_unfinished):
+            raise LiveAudioError("Invalid unfinished-turn predicate")
         if self.end_of_turn is not None and not callable(self.end_of_turn):
             raise LiveAudioError("Invalid end-of-turn model")
         if (
@@ -935,6 +940,7 @@ class LiveProcessor:
             config.turn_break,
             reply_wait_ms=config.reply_wait_ms,
             tail_join_ms=config.tail_join_ms,
+            unfinished=config.turn_unfinished,
         )
 
     @property

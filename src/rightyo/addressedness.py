@@ -197,6 +197,32 @@ def request_shaped(text: str) -> bool:
     return index < len(words) and words[index] in _OPENERS
 
 
+# Words a finished sentence rarely ends on: connectives, articles, prepositions, auxiliaries
+# and pronouns that expect more ("add the", "can you", "and").
+_DANGLING = frozenset(
+    "and um uh the a an to of so but like or if when because with for in on at that this "
+    "i you we can could would should will is are do does did my your our it".split()
+)
+_OPENING = frozenset({"can", "could", "hey", "ok", "okay", "so"})
+
+
+def unfinished_shaped(text: str, addressing: Addressing | None = None) -> bool:
+    """Whether a turn looks cut off mid-request (English, deterministic, approximate, #199).
+
+    True when its last word is a connective, article, preposition, auxiliary or pronoun
+    that expects more, or when it is one or two words that name the assistant or open a
+    request ("Jarvis,", "hey Jarvis", "can you"). A question mark ends a turn ("What time
+    is it?"); other trailing punctuation is ignored, since recognition often ends a
+    fragment with a period.
+    """
+    words = _WORDS.findall(text.lower())
+    if not words or text.rstrip().endswith("?"):
+        return False
+    if words[-1] in _DANGLING:
+        return True
+    return len(words) <= 2 and (words[0] in _OPENING or mentions_name(addressing, text))
+
+
 # Cue phrases of a dismissal, as `normalize_phrase` writes them (apostrophes removed,
 # casefolded). A turn is dismissal-shaped only when one of them opens it (after fillers
 # and an optional short vocative) and nothing but tail words follow, so a request that

@@ -23,6 +23,7 @@ from rightyo.addressedness import (
     dismissal_shaped,
     reply_wait,
     scene_text,
+    unfinished_shaped,
 )
 from rightyo.capture import CaptureError, MacMicrophoneCapture, StdinPcmCapture
 from rightyo.contracts import (
@@ -208,6 +209,10 @@ class PrototypeConfig:
     # The optional `turns` section's `merge_gap_ms` (#73): a same-speaker turn starting
     # within this gap of the previous one is joined before it is emitted or decided.
     turn_merge_gap_ms: int = DEFAULT_TURN_MERGE_GAP_MS
+    # The `turns` section's `hold_unfinished` (#199): a turn that looks cut off mid-request
+    # ("Jarvis, add the") is held for the merge gap even when the end-of-turn model calls
+    # it complete, so its continuation can join it. On by default.
+    turn_hold_unfinished: bool = True
     # The `decision` section's optional `scene` (#96): the setting text given to the
     # decision model. Absent means the single-user pilot default; null turns it off.
     decision_scene: str | None = DEFAULT_SCENE
@@ -330,7 +335,11 @@ class PrototypeConfig:
                 "reply_wait_ms",
                 "edge_attribution_ms",
                 "tail_join_ms",
+                "hold_unfinished",
             }:
+                raise ValueError
+            hold_unfinished = turns.get("hold_unfinished", True)
+            if type(hold_unfinished) is not bool:
                 raise ValueError
             tail = tail_join(turns.get("tail_join_ms", 0))
             edges = turns.get("edge_attribution_ms", 0)
@@ -358,6 +367,7 @@ class PrototypeConfig:
                 decision_max_requests=decision_requests,
                 decision_attend_min_probability=attend_bar,
                 turn_merge_gap_ms=gap,
+                turn_hold_unfinished=hold_unfinished,
                 decision_scene=scene,
                 reply_wait_ms=wait,
                 edge_attribution_ms=edges,
@@ -901,6 +911,11 @@ class PrototypeController:
                     # never absorb one; the defaults apply when roles are off. With
                     # dismissal on (#98), a dismissal-shaped turn is released at once too.
                     turn_break=self._turn_break(),
+                    turn_unfinished=(
+                        (lambda text: unfinished_shaped(text, self.config.addressing))
+                        if self.config.turn_hold_unfinished
+                        else None
+                    ),
                     reply_wait_ms=self.config.reply_wait_ms,
                     on_post_turn_gap=lambda utterance_id, gap: self._observe_gap(
                         generation, utterance_id, gap
