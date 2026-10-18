@@ -151,10 +151,12 @@ value or an invalid `max_requests` is refused with a message naming the rule bef
 An optional `"attend_min_probability"`, a number from 0 to 1, is a stricter bar for attend
 alone: a turn Jev would attend becomes `uncertain` unless Jev's probability for attend is at
 least this ([#199](https://github.com/mickdarling/rightyo/issues/199)). Ignore, recipient,
-dismissal and speaker-role answers keep the usual 0.7 confidence. Absent, attend is decided
-as before. Evaluated on a private hold-out of real turns, 0.9 raised precision from 0.71 to
-0.81 at the same F1 and halved false acts per speech hour. It is accepted only with
-`"provider": "jev"`.
+dismissal and speaker-role answers keep `min_confidence` (0.7 by default). Within a
+conversation window, the engaged speaker's follow-ups are still governed by
+`conversation.follow_up_min_probability`, so a turn below the bar can still form a follow-up
+request there. Absent, attend is decided as before. In an internal evaluation on real turns
+(not published), 0.9 raised precision from 0.71 to 0.81 at the same F1 and halved false acts
+per speech hour. It is accepted only with `"provider": "jev"`.
 
 The flags keep their rules. `--use-jev` without `--allow-hosted` is still refused before the
 file is read, and the file never supplies the missing half. Both flags select Jev even when

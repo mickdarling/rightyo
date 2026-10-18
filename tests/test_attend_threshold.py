@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from test_mvp import answer, turn
 from test_tool import ConfigDecisionTests
@@ -47,6 +48,16 @@ class AttendBarTests(unittest.TestCase):
             "other_human", set(self.request["questions"]["recipient"]["criteria"])
         )
         self.assertEqual(parse_response(raw, self.request, 0.7, 0.9).label, "ignore")
+
+    def test_the_providers_decide_applies_its_bar(self):
+        from rightyo.providers import JevProvider
+
+        state = ReplayRunner(MockProvider())._state(turn())
+        for bar, label in ((None, "attend"), (0.9, "uncertain"), (1, "uncertain"), (0, "attend")):
+            provider = JevProvider(allow_hosted=True, attend_min_probability=bar)
+            canned = response(build_request(state), 0.85)
+            with self.subTest(bar=bar), patch.object(JevProvider, "_send", return_value=canned):
+                self.assertEqual(provider.decide(state).label, label)
 
     def test_the_provider_validates_and_keeps_the_bar(self):
         from rightyo.providers import JevProvider
