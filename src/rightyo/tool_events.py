@@ -48,6 +48,10 @@ DISMISS_SCOPES = {
 MAX_WITHDRAWABLE = 32
 # Speakers whose last explicit conversation end is remembered (#167).
 MAX_ENDED_SPEAKERS = 64
+# The assistant's own playback remembered for the answered gate (#199), and how close to it
+# another speaker's start still counts as its echo rather than a person.
+MAX_PLAYBACKS = 8
+PLAYBACK_MARGIN_MS = 300
 # A bound guest's display name on a `transcript` event (hailing-station #434): the bound
 # HailProtocol's `AmbientOverheard.name` accepts, in Unicode scalars, and the categories it
 # refuses (control, format, surrogate, private use, unassigned, line/paragraph separator).
@@ -197,6 +201,9 @@ class SpeechEvents:
         # Per speaker key, the end of their latest direct (non-follow-up) request: the one
         # appendix it may take (#199) is measured from here, and taking it clears the entry.
         self._appendix_from = {}
+        # Recent [start, end] stream times of the assistant's own playback (end None while
+        # it plays), as the host reports them (#124); bounded.
+        self._playbacks = deque(maxlen=MAX_PLAYBACKS)
         # "off" without a provider, "ready" with one, "unavailable" after a hosted role
         # question failed, or "rejected" after a provider contract violation; either
         # degrades roles to configured/unknown for the rest of the session.
@@ -302,6 +309,7 @@ class SpeechEvents:
         self._open.clear()
         self._superseded.clear()
         self._appendix_from.clear()
+        self._playbacks.clear()
         self._delivered.clear()
         self._withdrawn.clear()
 
@@ -919,6 +927,12 @@ class SpeechEvents:
             if phase not in {"started", "ended"}:
                 raise ContractError("invalid reply phase")
             integer(now_ms, "now_ms")
+            if self._active:
+                # The assistant's own audio, so its echo is never taken for a person's answer.
+                if phase == "started":
+                    self._playbacks.append([now_ms, None])
+                elif self._playbacks and self._playbacks[-1][1] is None:
+                    self._playbacks[-1][1] = now_ms
             if self._active and self._pending_ack is not None:
                 self._answer_ack(phase)
             engaged = self._engaged
@@ -1180,6 +1194,9 @@ class SpeechEvents:
             return "media"
         if unavailable is not None:
             return "unavailable"
+        if evidence.get("answered_by_other"):
+            # Another person answered it within the reply window, unnamed (#199).
+            return "answered"
         if evidence["label"] != "uncertain":
             return "label"
         if decision.recipient not in {"system", "unknown"}:
@@ -1213,6 +1230,20 @@ class SpeechEvents:
         return (
             f"follow_up outcome={outcome} reason={refusal or held or 'passed'}"
             f" attend={attend:.6g} bar={self._follow_up_bar(role):.6g}"
+        )
+
+    def _answered(self, turn, decision, role):
+        """Whether another person's answer withholds `turn` (#199): the pipeline saw a
+        different speaker start within the reply window, no playback of the assistant's own
+        (a reply or acknowledgement the host reported) was running then, so it was not our
+        own audio, and the speaker is not an enrolled owner or trusted speaker, whose
+        requests a guest's quick word never vetoes."""
+        at = decision.answered_at_ms
+        if at is None or (self._per_turn and role in {"owner", "trusted"}):
+            return False
+        return not any(
+            start - PLAYBACK_MARGIN_MS <= at and (end is None or at <= end + PLAYBACK_MARGIN_MS)
+            for start, end in self._playbacks
         )
 
     def _appendix(self, turn):
@@ -1385,6 +1416,12 @@ class SpeechEvents:
                 # key, like role_status: strict hosts ignore unknown keys.
                 evidence["label"] = "ignore"
                 evidence["media"] = True
+            if self._answered(turn, event.decision, current):
+                # Another person answered this unnamed turn at once (#199): it is theirs. An
+                # optional key, like media: strict hosts ignore unknown keys.
+                if evidence["label"] == "attend":
+                    evidence["label"] = "uncertain"
+                evidence["answered_by_other"] = True
             would_attend = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
             # False: no follow-up note; None: a formed follow-up; else the refusal token.
             follow_up_note: str | None | bool = False

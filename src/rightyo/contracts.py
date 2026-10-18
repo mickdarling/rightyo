@@ -647,6 +647,10 @@ class ProviderDecision:
     dismissal_confidence: float | None = None
     # True when the dismissal answer was missing or malformed and degraded to `uncertain`.
     dismissal_malformed: bool = False
+    # With the answered gate on (#199): the stream time a different speaker started within
+    # the reply window after this unnamed turn, or None. The event layer decides whether it
+    # withholds the turn (not while the assistant's own audio was playing then).
+    answered_at_ms: int | None = None
 
     def __post_init__(self) -> None:
         if self.label not in LABELS:

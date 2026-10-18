@@ -6,13 +6,13 @@ import hashlib
 import json
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import wraps
 from threading import RLock
 from typing import Any, Callable
 
+from rightyo.addressedness import mentions_name, scene_text
 from rightyo.addressedness import post_turn_gap as checked_gap
-from rightyo.addressedness import scene_text
 from rightyo.contracts import Addressing, ContractError, DecisionEvent, Turn, identifier
 from rightyo.memory import TranscriptMemory
 from rightyo.providers import DecisionProvider, dismissal_hints
@@ -71,6 +71,7 @@ class ReplayRunner:
         scene: str | None = None,
         post_turn_gaps: bool = False,
         dismissal_phrases: tuple[str, ...] | None = None,
+        other_answered_blocks: bool = False,
     ) -> None:
         if not 1 <= max_context_turns <= 32 or not 4000 <= max_context_chars <= 16000:
             raise ContractError("invalid context budget")
@@ -90,6 +91,10 @@ class ReplayRunner:
         self.scene = scene_text(scene)
         # Whether decision states carry the post-turn gap (#96), observed or not.
         self.post_turn_gaps = post_turn_gaps is True
+        # With the observed gap showing a different speaker answering, an unnamed turn is
+        # theirs to answer, not the assistant's (#199): the decision records when, and the
+        # event layer withholds it.
+        self.other_answered_blocks = other_answered_blocks is True
         # Configured stop phrases sent as hints with the dismissal question (#98); None
         # asks no dismissal question.
         self.dismissal_phrases = (
@@ -266,6 +271,16 @@ class ReplayRunner:
             ),
         }
 
+    def _answered_by_other(self, turn: Turn, gap: dict[str, Any] | None) -> bool:
+        """Whether another speaker answered `turn` within the reply window, unnamed (#199)."""
+        return (
+            self.other_answered_blocks
+            and gap is not None
+            and gap.get("observed") is True
+            and gap.get("following") == "different_speaker"
+            and not mentions_name(self.addressing, turn.text)
+        )
+
     def process(
         self, turn: Turn, post_turn_gap: dict[str, Any] | None = None
     ) -> DecisionEvent | None:
@@ -327,6 +342,9 @@ class ReplayRunner:
                 return None
             self._emitted.add(key)
             self._retain_final(turn, key)
+            if self._answered_by_other(turn, post_turn_gap):
+                answered = turn.end_ms + post_turn_gap["silence_ms"]
+                decision = replace(decision, answered_at_ms=answered)
             return DecisionEvent(
                 turn, decision, turn.revision, provider_ms, (time.perf_counter() - started) * 1000
             )

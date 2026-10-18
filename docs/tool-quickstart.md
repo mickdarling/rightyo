@@ -158,6 +158,21 @@ request there. Absent, attend is decided as before. In an internal evaluation on
 (not published), 0.9 raised precision from 0.71 to 0.81 at the same F1 and halved false acts
 per speech hour. It is accepted only with `"provider": "jev"`.
 
+An optional `"other_answered_blocks": true` makes another person's answer decisive
+([#199](https://github.com/mickdarling/rightyo/issues/199)). A turn that names no
+assistant, and that a different speaker answers within the reply window (the post-turn
+gap's `following` is `different_speaker`), is not attended and never becomes a
+conversation follow-up. Its attention event's `decision` carries `answered_by_other: true`.
+It does not apply when:
+- the host reported the assistant's own playback (a reply or an acknowledgement clip)
+  running when that speech started, since it may be its echo;
+- the turn is an enrolled owner's or trusted speaker's, whose requests a guest's quick
+  word never vetoes.
+
+Two labels the diarizer gives one unenrolled person can still read as a different
+speaker. It needs the post-turn gap (`turns.reply_wait_ms` above 0, the default) and is
+refused without it. Default false.
+
 The flags keep their rules. `--use-jev` without `--allow-hosted` is still refused before the
 file is read, and the file never supplies the missing half. Both flags select Jev even when
 the file names `"mock"`; neither source can switch the other's Jev selection off. With the
