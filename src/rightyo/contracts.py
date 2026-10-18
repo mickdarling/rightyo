@@ -441,6 +441,9 @@ class Conversation:
     follow_up_min_probability: float = DEFAULT_FOLLOW_UP_MIN_PROBABILITY
     closing_phrases: tuple[str, ...] = DEFAULT_CLOSING_PHRASES
     appendix_ms: int = 0
+    # With `require_cue` (#199), a follow-up also needs a cue that it continues the exchange
+    # (`follow_up_cued`): the name, second person, a referring word or an adding opener.
+    require_cue: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -452,6 +455,8 @@ class Conversation:
             raise ContractError("invalid follow-up probability")
         if type(self.appendix_ms) is not int or not 0 <= self.appendix_ms <= MAX_APPENDIX_MS:
             raise ContractError("invalid appendix window")
+        if type(self.require_cue) is not bool:
+            raise ContractError("invalid follow-up cue requirement")
         phrases = self.closing_phrases
         if not isinstance(phrases, tuple) or len(phrases) > MAX_CLOSING_PHRASES:
             raise ContractError("invalid closing phrases")
@@ -489,7 +494,13 @@ class Conversation:
 
     @classmethod
     def from_dict(cls, raw: Any) -> Conversation:
-        allowed = {"window_ms", "follow_up_min_probability", "closing_phrases", "appendix_ms"}
+        allowed = {
+            "window_ms",
+            "follow_up_min_probability",
+            "closing_phrases",
+            "appendix_ms",
+            "require_cue",
+        }
         if not isinstance(raw, dict) or set(raw) - allowed:
             raise ContractError("conversation must be an object with known keys only")
         values = dict(raw)
@@ -508,6 +519,7 @@ class Conversation:
             "closing_phrases": list(self.closing_phrases),
             # An added key, only when on: hosts ignore keys they do not know.
             **({"appendix_ms": self.appendix_ms} if self.appendix_ms else {}),
+            **({"require_cue": True} if self.require_cue else {}),
         }
 
 
