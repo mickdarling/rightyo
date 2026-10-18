@@ -459,7 +459,12 @@ def _choice(raw: Any, options: set[str]) -> tuple[str, float, dict[str, float]]:
     return choice, probability(raw.get("confidence")), probs
 
 
-def parse_response(raw: Any, request: dict[str, Any], min_confidence: float) -> ProviderDecision:
+def parse_response(
+    raw: Any,
+    request: dict[str, Any],
+    min_confidence: float,
+    attend_min_probability: float | None = None,
+) -> ProviderDecision:
     if not isinstance(raw, dict) or raw.get("model") != JEV_MODEL:
         raise ContractError("Jev returned an unexpected model version")
     answers = raw.get("answers")
@@ -482,6 +487,11 @@ def parse_response(raw: Any, request: dict[str, Any], min_confidence: float) -> 
     )
     if confidence < min_confidence or recipient_confidence < min_confidence or conflict:
         label = "uncertain"
+    # An optional, stricter bar for attend alone, on its probability: ignore, recipient,
+    # dismissal and role answers keep `min_confidence`.
+    if label == "attend" and attend_min_probability is not None:
+        if probs["attend"] < attend_min_probability:
+            label = "uncertain"
     if recipient == "unknown":
         label = "uncertain"
     recipient_speaker_id = None
@@ -665,6 +675,7 @@ class JevProvider:
         timeout_seconds: float = 10,
         min_confidence: float = 0.7,
         cancelled: Callable[[], bool] | None = None,
+        attend_min_probability: float | None = None,
     ) -> None:
         if not allow_hosted:
             raise ProviderError("Jev requires explicit --allow-hosted consent to send text/context")
@@ -675,9 +686,12 @@ class JevProvider:
         if not 0 < timeout_seconds <= 30:
             raise ProviderError("timeout must be greater than zero and at most 30 seconds")
         probability(min_confidence)
+        if attend_min_probability is not None:
+            probability(attend_min_probability)
         self.max_requests = max_requests
         self.timeout_seconds = timeout_seconds
         self.min_confidence = min_confidence
+        self.attend_min_probability = attend_min_probability
         self.cancelled = cancelled or (lambda: False)
         self.requests = 0
         # No environment proxies: destination and credentials remain tied to the official endpoint.
@@ -711,7 +725,9 @@ class JevProvider:
             raise ProviderError("Jev returned an unexpected model version")
         decision = None
         try:
-            decision = parse_response(raw, request_body, self.min_confidence)
+            decision = parse_response(
+                raw, request_body, self.min_confidence, self.attend_min_probability
+            )
         except (ValueError, TypeError, KeyError):
             pass
         if decision is None:
