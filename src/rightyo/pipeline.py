@@ -72,6 +72,7 @@ class ReplayRunner:
         post_turn_gaps: bool = False,
         dismissal_phrases: tuple[str, ...] | None = None,
         other_answered_blocks: bool = False,
+        state_log: Callable[[dict[str, Any], Any], None] | None = None,
     ) -> None:
         if not 1 <= max_context_turns <= 32 or not 4000 <= max_context_chars <= 16000:
             raise ContractError("invalid context budget")
@@ -95,6 +96,10 @@ class ReplayRunner:
         # theirs to answer, not the assistant's (#199): the decision records when, and the
         # event layer withholds it.
         self.other_answered_blocks = other_answered_blocks is True
+        if state_log is not None and not callable(state_log):
+            raise ContractError("invalid decision state log")
+        # Opt-in record of each decided turn's exact state and answer (#199).
+        self.state_log = state_log
         # Configured stop phrases sent as hints with the dismissal question (#98); None
         # asks no dismissal question.
         self.dismissal_phrases = (
@@ -345,6 +350,11 @@ class ReplayRunner:
             if self._answered_by_other(turn, post_turn_gap):
                 answered = turn.end_ms + post_turn_gap["silence_ms"]
                 decision = replace(decision, answered_at_ms=answered)
+            if self.state_log is not None:
+                try:
+                    self.state_log(state, decision)
+                except Exception:  # noqa: BLE001 - the record never affects a decision
+                    pass
             return DecisionEvent(
                 turn, decision, turn.revision, provider_ms, (time.perf_counter() - started) * 1000
             )
