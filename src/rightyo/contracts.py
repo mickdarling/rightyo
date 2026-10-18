@@ -21,6 +21,8 @@ DEFAULT_COOLDOWN_MIN_CONFIDENCE = 0.9
 # attend probability an engaged speaker's undecided follow-up needs to become a request.
 DEFAULT_CONVERSATION_WINDOW_MS = 20000
 MAX_CONVERSATION_WINDOW_MS = 120000
+# An appendix (#199) is a quick continuation of a just-formed request; keep it short.
+MAX_APPENDIX_MS = 5000
 DEFAULT_FOLLOW_UP_MIN_PROBABILITY = 0.4
 DEFAULT_CLOSING_PHRASES = (
     "that's all",
@@ -427,11 +429,18 @@ class Conversation:
     ambient when the window lapses, when Jev confidently judges their turn addressed to
     another person, on a `closing_phrases` match
     (courtesy words around it are tolerated, `is_closing`), or on a dismissal.
+
+    `appendix_ms` (#199; 0, the default, is off): the engaged speaker's `uncertain` turn
+    starting within this long after their latest direct request ended is an appendix to it
+    ("... and eggs") and needs no follow-up attend probability. Every other follow-up rule
+    applies (a confident `ignore` still never is one), it never names another agent, and
+    each direct request takes at most one appendix.
     """
 
     window_ms: int = DEFAULT_CONVERSATION_WINDOW_MS
     follow_up_min_probability: float = DEFAULT_FOLLOW_UP_MIN_PROBABILITY
     closing_phrases: tuple[str, ...] = DEFAULT_CLOSING_PHRASES
+    appendix_ms: int = 0
 
     def __post_init__(self) -> None:
         if (
@@ -441,6 +450,8 @@ class Conversation:
             raise ContractError("invalid conversation window")
         if probability(self.follow_up_min_probability) <= 0:
             raise ContractError("invalid follow-up probability")
+        if type(self.appendix_ms) is not int or not 0 <= self.appendix_ms <= MAX_APPENDIX_MS:
+            raise ContractError("invalid appendix window")
         phrases = self.closing_phrases
         if not isinstance(phrases, tuple) or len(phrases) > MAX_CLOSING_PHRASES:
             raise ContractError("invalid closing phrases")
@@ -478,7 +489,7 @@ class Conversation:
 
     @classmethod
     def from_dict(cls, raw: Any) -> Conversation:
-        allowed = {"window_ms", "follow_up_min_probability", "closing_phrases"}
+        allowed = {"window_ms", "follow_up_min_probability", "closing_phrases", "appendix_ms"}
         if not isinstance(raw, dict) or set(raw) - allowed:
             raise ContractError("conversation must be an object with known keys only")
         values = dict(raw)
@@ -495,6 +506,8 @@ class Conversation:
             "window_ms": self.window_ms,
             "follow_up_min_probability": self.follow_up_min_probability,
             "closing_phrases": list(self.closing_phrases),
+            # An added key, only when on: hosts ignore keys they do not know.
+            **({"appendix_ms": self.appendix_ms} if self.appendix_ms else {}),
         }
 
 
