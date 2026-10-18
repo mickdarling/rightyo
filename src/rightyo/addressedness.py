@@ -291,7 +291,7 @@ def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
         or not _REFERRING.isdisjoint(words)
         or any(a in _MODALS and b == "you" for a, b in pairs)
         or any(a in _OUTPUT_VERBS and b in _OBJECTS for a, b in pairs)
-        # One word between ("show me that", "put it on").
+        # One word between ("show me that", "read me this").
         or any(a in _OUTPUT_VERBS and c in _OBJECTS for a, c in zip(words, words[2:]))
         or (len(words) <= 3 and words[0] in _ADJUSTMENTS)
     )
