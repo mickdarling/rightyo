@@ -540,9 +540,15 @@ class Acknowledgement:
 
     min_confidence: float = DEFAULT_ACK_MIN_CONFIDENCE
     dedup_window_ms: int = DEFAULT_ACK_DEDUP_WINDOW_MS
+    # A separate bar for a conversation follow-up's attend probability (#199), so a
+    # mid-confidence follow-up delivered to the agent never plays the instant
+    # acknowledgement. None uses `min_confidence`, as before. A named turn is acknowledged.
+    follow_up_min_confidence: float | None = None
 
     def __post_init__(self) -> None:
         probability(self.min_confidence)
+        if self.follow_up_min_confidence is not None:
+            probability(self.follow_up_min_confidence)
         if (
             type(self.dedup_window_ms) is not int
             or not 0 <= self.dedup_window_ms <= MAX_ACK_DEDUP_WINDOW_MS
@@ -551,7 +557,8 @@ class Acknowledgement:
 
     @classmethod
     def from_dict(cls, raw: Any) -> Acknowledgement:
-        if not isinstance(raw, dict) or set(raw) - {"min_confidence", "dedup_window_ms"}:
+        allowed = {"min_confidence", "dedup_window_ms", "follow_up_min_confidence"}
+        if not isinstance(raw, dict) or set(raw) - allowed:
             raise ContractError("acknowledgement must be an object with known keys only")
         return cls(**raw)
 
@@ -562,6 +569,11 @@ class Acknowledgement:
             "version": 1,
             "min_confidence": self.min_confidence,
             "dedup_window_ms": self.dedup_window_ms,
+            **(
+                {"follow_up_min_confidence": self.follow_up_min_confidence}
+                if self.follow_up_min_confidence is not None
+                else {}
+            ),
         }
 
 
