@@ -128,12 +128,13 @@ def decision_spec(value: Any) -> bool:
             "attend_min_probability",
             "other_answered_blocks",
             "state_log",
+            "request_context",
         }
     ):
         raise DecisionConfigError(
             "The decision section requires exactly the keys provider and allow_hosted, "
             "with an optional max_requests, scene, attend_min_probability, "
-            "other_answered_blocks and state_log"
+            "other_answered_blocks, state_log and request_context"
         )
     provider, allow_hosted = value["provider"], value["allow_hosted"]
     if type(provider) is not str or provider not in DECISION_PROVIDERS:
@@ -162,6 +163,8 @@ def decision_spec(value: Any) -> bool:
             raise DecisionConfigError(
                 "attend_min_probability applies only to the jev decision provider"
             )
+    if "request_context" in value and type(value["request_context"]) is not bool:
+        raise DecisionConfigError("The decision request_context value must be true or false")
     if "other_answered_blocks" in value and type(value["other_answered_blocks"]) is not bool:
         raise DecisionConfigError("The decision other_answered_blocks value must be true or false")
     if "state_log" in value:
@@ -228,6 +231,9 @@ class PrototypeConfig:
     # The section's optional `state_log` (#199): an absolute path where each decided live
     # turn's exact state and answer are appended (transcript text included; `0600`).
     decision_state_log: Path | None = None
+    # The section's optional `request_context` (#199): decision states carry the latest
+    # request formed and how long ago, so a follow-up that refers back to it is recognized.
+    decision_request_context: bool = False
     # The optional `turns` section's `merge_gap_ms` (#73): a same-speaker turn starting
     # within this gap of the previous one is joined before it is emitted or decided.
     turn_merge_gap_ms: int = DEFAULT_TURN_MERGE_GAP_MS
@@ -297,6 +303,7 @@ class PrototypeConfig:
             attend_bar = decision.get("attend_min_probability") if hosted_decisions else None
             answered = bool(has_decision and decision.get("other_answered_blocks", False))
             state_log = decision.get("state_log") if hosted_decisions else None
+            acted = bool(has_decision and decision.get("request_context", False))
             scene = (
                 scene_text(decision.get("scene", DEFAULT_SCENE)) if has_decision else DEFAULT_SCENE
             )
@@ -395,6 +402,7 @@ class PrototypeConfig:
                 decision_attend_min_probability=attend_bar,
                 decision_other_answered_blocks=answered,
                 decision_state_log=None if state_log is None else Path(state_log),
+                decision_request_context=acted,
                 turn_merge_gap_ms=gap,
                 turn_hold_unfinished=hold_unfinished,
                 decision_scene=scene,
@@ -716,6 +724,7 @@ class PrototypeController:
                     if self.config.decision_state_log is None
                     else DecisionStateLog(self.config.decision_state_log, report=self.report)
                 ),
+                request_context=self.config.decision_request_context,
                 dismissal_phrases=(
                     None
                     if self.config.dismissal is None
@@ -1228,6 +1237,7 @@ class PrototypeController:
                                 event,
                                 **({} if unavailable is None else {"unavailable": unavailable}),
                             )
+
             except Exception:
                 enabled = False
                 with self._lock:
@@ -1403,6 +1413,10 @@ class PrototypeController:
                 else fields
             )
             getattr(self._events, method)(value, now_ms=self._now_ms(), **options)
+            runner = self._runner
+            if runner is not None and runner.request_context:
+                # What the assistant last acted on, or None once dismissed (#199).
+                runner.note_request(getattr(self._events, "last_request", None))
         except Exception:
             self._stop.set()
             self._decision_cancel.set()
