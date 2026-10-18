@@ -125,11 +125,13 @@ def decision_spec(value: Any) -> bool:
             "max_requests",
             "scene",
             "attend_min_probability",
+            "other_answered_blocks",
         }
     ):
         raise DecisionConfigError(
             "The decision section requires exactly the keys provider and allow_hosted, "
-            "with an optional max_requests, scene and attend_min_probability"
+            "with an optional max_requests, scene, attend_min_probability and "
+            "other_answered_blocks"
         )
     provider, allow_hosted = value["provider"], value["allow_hosted"]
     if type(provider) is not str or provider not in DECISION_PROVIDERS:
@@ -158,6 +160,8 @@ def decision_spec(value: Any) -> bool:
             raise DecisionConfigError(
                 "attend_min_probability applies only to the jev decision provider"
             )
+    if "other_answered_blocks" in value and type(value["other_answered_blocks"]) is not bool:
+        raise DecisionConfigError("The decision other_answered_blocks value must be true or false")
     if "scene" in value:
         try:
             scene_text(value["scene"])
@@ -206,6 +210,9 @@ class PrototypeConfig:
     # The section's optional `attend_min_probability`: Jev's attend probability an attend
     # needs, above `min_confidence` (evaluation favoured 0.9). None leaves attend as is.
     decision_attend_min_probability: float | None = None
+    # The section's optional `other_answered_blocks` (#199): with the post-turn gap on, an
+    # unnamed turn another speaker answers within the reply window is not attended.
+    decision_other_answered_blocks: bool = False
     # The optional `turns` section's `merge_gap_ms` (#73): a same-speaker turn starting
     # within this gap of the previous one is joined before it is emitted or decided.
     turn_merge_gap_ms: int = DEFAULT_TURN_MERGE_GAP_MS
@@ -273,6 +280,7 @@ class PrototypeConfig:
             # Optional per-session cap on live Jev requests; absent means none (#75).
             decision_requests = decision.get("max_requests") if hosted_decisions else None
             attend_bar = decision.get("attend_min_probability") if hosted_decisions else None
+            answered = bool(has_decision and decision.get("other_answered_blocks", False))
             scene = (
                 scene_text(decision.get("scene", DEFAULT_SCENE)) if has_decision else DEFAULT_SCENE
             )
@@ -347,6 +355,9 @@ class PrototypeConfig:
                 raise ValueError
             gap = merge_gap(turns.get("merge_gap_ms", DEFAULT_TURN_MERGE_GAP_MS))
             wait = reply_wait(turns.get("reply_wait_ms", DEFAULT_REPLY_WAIT_MS))
+            if answered and not wait:
+                # The gate reads the post-turn gap (#199); without it, it would do nothing.
+                raise DecisionConfigError("other_answered_blocks needs turns.reply_wait_ms above 0")
             values = {}
             for name, value in raw.items():
                 if not isinstance(value, str) or not value or not Path(value).is_absolute():
@@ -366,6 +377,7 @@ class PrototypeConfig:
                 hosted_decisions=hosted_decisions,
                 decision_max_requests=decision_requests,
                 decision_attend_min_probability=attend_bar,
+                decision_other_answered_blocks=answered,
                 turn_merge_gap_ms=gap,
                 turn_hold_unfinished=hold_unfinished,
                 decision_scene=scene,
@@ -681,6 +693,7 @@ class PrototypeController:
                 addressing=self.config.addressing,
                 scene=self.config.decision_scene,
                 post_turn_gaps=self.config.reply_wait_ms > 0,
+                other_answered_blocks=self.config.decision_other_answered_blocks,
                 dismissal_phrases=(
                     None
                     if self.config.dismissal is None

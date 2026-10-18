@@ -659,6 +659,10 @@ class ProviderDecision:
     dismissal_confidence: float | None = None
     # True when the dismissal answer was missing or malformed and degraded to `uncertain`.
     dismissal_malformed: bool = False
+    # With the answered gate on (#199): the stream time a different speaker started within
+    # the reply window after this unnamed turn, or None. The event layer decides whether it
+    # withholds the turn (not while the assistant's own audio was playing then).
+    answered_at_ms: int | None = None
 
     def __post_init__(self) -> None:
         if self.label not in LABELS:
@@ -673,6 +677,10 @@ class ProviderDecision:
             probability(self.dismissal_confidence)
         if self.attention_choice is not None and self.attention_choice not in LABELS:
             raise ContractError("invalid raw attention choice")
+        if self.answered_at_ms is not None and (
+            type(self.answered_at_ms) is not int or self.answered_at_ms < 0
+        ):
+            raise ContractError("invalid answered time")
         identifier(self.recipient, "recipient")
         identifier(self.model, "model")
         identifier(self.provider_id, "provider_id")

@@ -707,6 +707,13 @@ The `attention` and `request` events of a follow-up carry `"label": "attend"` an
 `"follow_up": true` in `decision`, beside Jev's unchanged `recipient_kind` and
 `confidence`.
 
+With `decision.other_answered_blocks`
+([#199](https://github.com/mickdarling/rightyo/issues/199); see the
+[tool guide](tool-quickstart.md)), a turn withheld because another person answered it
+carries `"answered_by_other": true` in its `attention` event's `decision`, with
+`"label": "uncertain"`. It is never a follow-up (diagnostic reason `answered`). Hosts
+ignore the key if they do not know it.
+
 **Back to ambient**, with the `reason`:
 - `timeout`: the window lapsed. Stream time is judged at each decided turn, so the event
   is emitted with the next decision after the window, with `at_ms` set to the window end.
