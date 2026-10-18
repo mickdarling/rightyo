@@ -187,6 +187,13 @@ a decision; a disk failing mid-write can leave a short last line, so readers sho
 a last line that does not parse. Clear and Stop do not delete the file: delete it when
 the comparison is done. Each record also carries `answered_at_ms` from
 `other_answered_blocks`. It is accepted only with `"provider": "jev"`.
+An optional `"request_context": true` gives each decision the latest request the assistant
+acted on ([#199](https://github.com/mickdarling/rightyo/issues/199)). The state carries
+`assistant_request`: that request's text (up to 400 characters) and `ms_before`, how long
+before the current turn began it ended, for up to 120 s. Guidance tells Jev that a turn
+continuing, correcting or referring back to it is evidence that it is addressed to the
+assistant. In an internal evaluation (not published), the owner's follow-ups 30 to 120 s
+after a request were the largest group of missed requests. Default false.
 
 The flags keep their rules. `--use-jev` without `--allow-hosted` is still refused before the
 file is read, and the file never supplies the missing half. Both flags select Jev even when

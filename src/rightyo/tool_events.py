@@ -201,6 +201,8 @@ class SpeechEvents:
         # Per speaker key, the end of their latest direct (non-follow-up) request: the one
         # appendix it may take (#199) is measured from here, and taking it clears the entry.
         self._appendix_from = {}
+        # (end_ms, text) of the latest request formed this session, or None (#199).
+        self.last_request = None
         # Recent [start, end] stream times of the assistant's own playback (end None while
         # it plays), as the host reports them (#124); bounded.
         self._playbacks = deque(maxlen=MAX_PLAYBACKS)
@@ -309,6 +311,7 @@ class SpeechEvents:
         self._open.clear()
         self._superseded.clear()
         self._appendix_from.clear()
+        self.last_request = None
         self._playbacks.clear()
         self._delivered.clear()
         self._withdrawn.clear()
@@ -1722,6 +1725,8 @@ class SpeechEvents:
                         self._appendix_from.get(own, turn.end_ms), turn.end_ms
                     )
             if attended:
+                # The latest request formed, for a decision's context (#199).
+                self.last_request = (turn.end_ms, turn.text)
                 # Any delivered request makes the next reply that request's, so no lapsed
                 # conversation is revived by it (rightyo#158); a request that engages its own
                 # speaker replaces the dormant one anyway.
