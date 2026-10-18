@@ -10,6 +10,7 @@ import test_turn_merge
 
 from rightyo.addressedness import CLEAR_REQUESTS_SCENE, DEFAULT_SCENE, MAX_SCENE_CHARS, SCENES
 from rightyo.cli import main
+from rightyo.prototype import PrototypeError
 
 
 class ScenePresetTests(unittest.TestCase):
@@ -17,13 +18,13 @@ class ScenePresetTests(unittest.TestCase):
     setUp = test_turn_merge.DecisionPathTests.setUp
     run_listen = test_turn_merge.DecisionPathTests.run_listen
 
-    def listen_with(self, scene, **extra):
+    def listen_with(self, scene, namespace=argparse.Namespace, **extra):
         """`run_listen` with `--scene` set as the parser would set it."""
 
-        def namespace(**options):
-            return argparse.Namespace(scene=scene, **options)
+        def with_scene(**options):
+            return namespace(scene=scene, **options)
 
-        with patch("test_turn_merge.Namespace", namespace):
+        with patch("test_turn_merge.Namespace", with_scene):
             _, provider = self.run_listen(**extra)
         return provider.states[0].get("scene")
 
@@ -36,6 +37,17 @@ class ScenePresetTests(unittest.TestCase):
         self.assertEqual(self.listen_with(None, decision=jev), "A shared office.")
         self.assertEqual(self.listen_with("clear-requests", decision=jev), CLEAR_REQUESTS_SCENE)
         self.assertEqual(self.listen_with("default", decision=jev), DEFAULT_SCENE)
+        off = {**jev, "scene": None}
+        self.assertIsNone(self.listen_with(None, decision=off))
+        self.assertEqual(self.listen_with("clear-requests", decision=off), CLEAR_REQUESTS_SCENE)
+
+    def test_a_scene_without_jev_decisions_is_refused(self):
+        def namespace(**options):
+            return argparse.Namespace(**{**options, "use_jev": False, "allow_hosted": False})
+
+        mock = {"provider": "mock", "allow_hosted": False}
+        with self.assertRaisesRegex(PrototypeError, "--scene requires Jev"):
+            self.listen_with("clear-requests", namespace=namespace, decision=mock)
 
     def test_the_command_line_accepts_only_the_built_in_names(self):
         base = ["listen", "--config", "c.json", "--mode", "demo"]
@@ -44,6 +56,9 @@ class ScenePresetTests(unittest.TestCase):
                 with patch("sys.stderr"):
                     main(argv)
             self.assertEqual(stopped.exception.code, 2)
+        with patch("rightyo.tool.listen", return_value=0) as listen:
+            self.assertEqual(main([*base, "--scene", "clear-requests"]), 0)
+        self.assertEqual(listen.call_args.args[0].scene, "clear-requests")
 
 
 if __name__ == "__main__":

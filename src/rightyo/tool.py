@@ -252,6 +252,9 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
         # The command line's budget likewise replaces the configuration file's.
         config = replace(config, session_budget_seconds=validate_session_budget(budget))
     scene = getattr(args, "scene", None)
+    if scene is not None and not use_jev:
+        # Only Jev reads the scene; refused rather than silently doing nothing.
+        raise PrototypeError("--scene requires Jev decisions")
     if scene is not None:
         # A built-in scene for this session replaces the configuration file's, like --name.
         config = replace(config, decision_scene=SCENES[scene])
