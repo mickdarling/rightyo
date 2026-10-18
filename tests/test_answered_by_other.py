@@ -10,7 +10,7 @@ from pathlib import Path
 
 from test_conversation import SESSION, decided, turn
 
-from rightyo.contracts import Addressing, Conversation, ProviderDecision
+from rightyo.contracts import Addressing, ContractError, Conversation, ProviderDecision
 from rightyo.pipeline import ReplayRunner
 from rightyo.prototype import DecisionConfigError, PrototypeConfig
 from rightyo.tool_events import SpeechEvents
@@ -29,6 +29,13 @@ class Attending:
 def gap(following):
     silence = 1200 if following == "none" else 400
     return {"observed": True, "window_ms": 1200, "silence_ms": silence, "following": following}
+
+
+class ContractTests(unittest.TestCase):
+    def test_the_answered_time_is_a_nonnegative_integer(self):
+        for bad in (-1, 1.5, "1300", True):
+            with self.subTest(bad=bad), self.assertRaises(ContractError):
+                replace(ATTEND, answered_at_ms=bad)
 
 
 class PipelineTests(unittest.TestCase):
@@ -83,6 +90,23 @@ class EventTests(unittest.TestCase):
         events = self.run_turns(1300, replies=(("started", 1200), ("ended", 2000)))
         self.assertEqual([e["type"] for e in events], ["attention", "request"])
         self.assertNotIn("answered_by_other", events[0]["decision"])
+
+    def test_playback_counts_only_within_its_margin(self):
+        for start, end, withheld in (
+            (1600, 2000, False),
+            (1700, 2000, True),
+            (500, 1000, False),
+            (500, 900, True),
+        ):
+            with self.subTest(start=start, end=end):
+                self.setUp()
+                events = self.run_turns(1300, replies=(("started", start), ("ended", end)))
+                self.assertEqual(len(events) == 1, withheld)
+
+    def test_a_repeated_start_closes_the_open_span_instead_of_covering_all_time(self):
+        replies = (("started", 100), ("started", 200), ("ended", 400))
+        events = self.run_turns(1300, replies=replies)
+        self.assertEqual([e["type"] for e in events], ["attention"])
 
     def test_without_a_recorded_answer_nothing_changes(self):
         events = self.run_turns(None)

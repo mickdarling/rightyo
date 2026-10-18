@@ -165,7 +165,9 @@ gap's `following` is `different_speaker`), is not attended and never becomes a
 conversation follow-up. Its attention event's `decision` carries `answered_by_other: true`.
 It does not apply when:
 - the host reported the assistant's own playback (a reply or an acknowledgement clip)
-  running when that speech started, since it may be its echo;
+  running when that speech started, within 300 ms, since it may be its echo. This guard
+  relies on the host reporting playback promptly through `listen --control-fd`; without
+  it there is no echo guard;
 - the turn is an enrolled owner's or trusted speaker's, whose requests a guest's quick
   word never vetoes.
 

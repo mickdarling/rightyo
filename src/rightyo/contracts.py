@@ -665,6 +665,10 @@ class ProviderDecision:
             probability(self.dismissal_confidence)
         if self.attention_choice is not None and self.attention_choice not in LABELS:
             raise ContractError("invalid raw attention choice")
+        if self.answered_at_ms is not None and (
+            type(self.answered_at_ms) is not int or self.answered_at_ms < 0
+        ):
+            raise ContractError("invalid answered time")
         identifier(self.recipient, "recipient")
         identifier(self.model, "model")
         identifier(self.provider_id, "provider_id")

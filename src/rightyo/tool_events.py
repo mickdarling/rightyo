@@ -930,6 +930,10 @@ class SpeechEvents:
             if self._active:
                 # The assistant's own audio, so its echo is never taken for a person's answer.
                 if phase == "started":
+                    if self._playbacks and self._playbacks[-1][1] is None:
+                        # A host may forward only the last phase of a burst: an unclosed
+                        # span ends where the next begins, so it never covers all time.
+                        self._playbacks[-1][1] = now_ms
                     self._playbacks.append([now_ms, None])
                 elif self._playbacks and self._playbacks[-1][1] is None:
                     self._playbacks[-1][1] = now_ms
