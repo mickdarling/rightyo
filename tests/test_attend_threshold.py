@@ -5,8 +5,8 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+import test_tool
 from test_mvp import answer, turn
-from test_tool import ConfigDecisionTests
 
 from rightyo.pipeline import ReplayRunner
 from rightyo.prototype import DecisionConfigError, PrototypeConfig
@@ -73,7 +73,7 @@ class AttendBarTests(unittest.TestCase):
 
 class AttendBarConfigTests(unittest.TestCase):
     def setUp(self):
-        self.config = ConfigDecisionTests(
+        self.config = test_tool.ConfigDecisionTests(
             "test_config_jev_with_consent_constructs_the_jev_provider"
         )
         self.config.setUp()

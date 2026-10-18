@@ -188,6 +188,17 @@ assistant pilot:
 > assistant.
 
 Describe your own setting when it differs, for example a shared office or a meeting.
+
+`listen --scene NAME` picks a built-in scene for one session, replacing the configuration's
+([#199](https://github.com/mickdarling/rightyo/issues/199)): `default` (above) or
+`clear-requests`, a precision-first scene. In `clear-requests`, only clear requests or
+questions addressed to the assistant count, with or without its name. Thinking aloud,
+narrating a screen, reading text aloud, notes to self, talk between people, talk about the
+assistant and media do not count, and short continuations of a request the assistant just
+acted on still do. In an internal evaluation on real turns (not published), it reached
+precision 0.86 at recall 0.52, so it suits sessions that need few false acts. It is not the
+default. A host chooses it per session. It requires Jev decisions; without them it is refused.
+
 Listener profiles ([#69](https://github.com/mickdarling/rightyo/issues/69)) are the
 general mechanism; the scene is the minimal first step.
 

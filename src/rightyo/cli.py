@@ -10,6 +10,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from rightyo.addressedness import SCENES
 from rightyo.contracts import (
     PROVENANCE,
     Addressing,
@@ -410,6 +411,14 @@ def main(argv: list[str] | None = None) -> int:
     listen.add_argument("--use-jev", action="store_true")
     listen.add_argument("--allow-hosted", action="store_true")
     _add_name_option(listen)
+    listen.add_argument(
+        "--scene",
+        choices=sorted(SCENES),
+        help=(
+            "a built-in scene for this session, replacing the configuration's: default, or "
+            "clear-requests (only clear requests to the assistant; precision first)"
+        ),
+    )
     _add_session_budget_option(listen)
     _add_request_former_option(listen)
     _add_dismissal_option(listen)

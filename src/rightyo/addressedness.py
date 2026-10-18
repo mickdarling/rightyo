@@ -38,6 +38,24 @@ DEFAULT_SCENE = (
     "rather than people in the room. A question or request that no other person answers "
     "is likely meant for the assistant."
 )
+# A precision-first setting (#199): only clear requests to the assistant are addressed to it;
+# thinking aloud, narration, reading aloud, talk about it and media are not. Evaluated on a
+# private hold-out of real turns it raised precision to 0.86 at 0.52 recall, so it is a
+# per-session choice for situations that need few false acts, not the default.
+CLEAR_REQUESTS_SCENE = (
+    "One owner and possibly other people are in the room with an AI assistant listening "
+    "through a device. The assistant acts only on clear requests or questions addressed to "
+    "it, with or without its name. Thinking aloud, narrating what is on a screen, reading "
+    "text or errors aloud, notes to self, talk between people, talk about the assistant in "
+    "the third person, and media playback are not addressed to the assistant. If a person "
+    "present could be the intended recipient, assume they are. A request nobody present "
+    "answers, in a quiet gap, is more likely meant for the assistant. When the assistant has "
+    "just acted or replied, a short continuation from the same speaker that refers back to "
+    'that request ("and the second one too", "no, the other one", "make it shorter", "not '
+    'you", "thanks") is addressed to the assistant. When in doubt, the assistant stays silent.'
+)
+# The built-in scenes `listen --scene` selects by name for one session.
+SCENES = {"default": DEFAULT_SCENE, "clear-requests": CLEAR_REQUESTS_SCENE}
 MAX_SCENE_CHARS = 1000
 
 # How long a request-shaped turn is held after its last word to observe the gap (#96).
