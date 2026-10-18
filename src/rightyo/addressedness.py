@@ -253,15 +253,16 @@ _REFERRING_PAIRS = frozenset(
 # A bare "it", "that" or "this" counts after a verb that acts on the assistant's output.
 _OUTPUT_VERBS = frozenset(
     "turn make change play read repeat send set cancel skip undo save open show fix delete "
-    "add remove move put".split()
+    "add remove move".split()
 )
 _OBJECTS = frozenset({"it", "that", "this", "those", "these", "them"})
 _MODALS = frozenset({"can", "could", "would", "will"})
 # Short adjustments of what the assistant just did ("louder", "next one", "more please").
 _ADJUSTMENTS = frozenset(
-    "louder quieter softer more less another next skip repeat cancel slower faster shorter "
-    "longer bigger"
-    "smaller".split()
+    (
+        "louder quieter softer more less another next skip repeat cancel slower faster "
+        "shorter longer bigger smaller"
+    ).split()
 )
 
 

@@ -36,6 +36,8 @@ class CueShapeTests(unittest.TestCase):
             "repeat",
             "cancel",
             "the other one",
+            "bigger",
+            "smaller",
         ):
             with self.subTest(text=text):
                 self.assertTrue(follow_up_cued(text, NAMES))
@@ -69,6 +71,7 @@ class CueShapeTests(unittest.TestCase):
             "Same to you!",
             "On the other hand",
             "And you!",
+            "Put that down",
         ):
             with self.subTest(text=text):
                 self.assertFalse(follow_up_cued(text, NAMES))
