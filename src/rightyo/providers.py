@@ -277,8 +277,9 @@ GAP_GUIDANCE = (
     "either way."
 )
 REQUEST_GUIDANCE = (
-    " state.assistant_request is the latest request the assistant acted on: its text and "
-    "ms_before, how long before current_turn began it ended. A turn from the same speaker "
+    " state.assistant_request is the latest request the assistant acted on: its text, its "
+    "speaker_id and ms_before, how long before current_turn began it ended. A turn from that "
+    "same speaker "
     'that continues, corrects, narrows or refers back to that request ("and the other one", '
     '"no, Tuesday", "make it shorter") is evidence that current_turn is addressed to the '
     "assistant/system, even with no name. Talk to another person or a pet, or a new topic, "

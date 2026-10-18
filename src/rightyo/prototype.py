@@ -1237,10 +1237,7 @@ class PrototypeController:
                                 event,
                                 **({} if unavailable is None else {"unavailable": unavailable}),
                             )
-                            formed = getattr(self._events, "last_request", None)
-                            if runner.request_context and formed is not None:
-                                # What the assistant last acted on, for later decisions.
-                                runner.note_request(*formed)
+
             except Exception:
                 enabled = False
                 with self._lock:
@@ -1416,6 +1413,10 @@ class PrototypeController:
                 else fields
             )
             getattr(self._events, method)(value, now_ms=self._now_ms(), **options)
+            runner = self._runner
+            if runner is not None and runner.request_context:
+                # What the assistant last acted on, or None once dismissed (#199).
+                runner.note_request(getattr(self._events, "last_request", None))
         except Exception:
             self._stop.set()
             self._decision_cancel.set()

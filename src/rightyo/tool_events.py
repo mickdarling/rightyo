@@ -201,7 +201,8 @@ class SpeechEvents:
         # Per speaker key, the end of their latest direct (non-follow-up) request: the one
         # appendix it may take (#199) is measured from here, and taking it clears the entry.
         self._appendix_from = {}
-        # (end_ms, text) of the latest request formed this session, or None (#199).
+        # (end_ms, text, utterance_id, speaker_id) of the latest request formed this session,
+        # or None, also after a dismissal or an explicit end (#199).
         self.last_request = None
         # Recent [start, end] stream times of the assistant's own playback (end None while
         # it plays), as the host reports them (#124); bounded.
@@ -288,6 +289,13 @@ class SpeechEvents:
             return None
 
     def _emit(self, kind, **fields):
+        if kind == "dismiss" or (
+            kind == "conversation"
+            and fields.get("state") == "ambient"
+            and fields.get("reason") != "timeout"
+        ):
+            # A dismissed, withdrawn or explicitly ended exchange is no context (#199).
+            self.last_request = None
         self._sequence += 1
         payload = self._payload(kind, self._sequence, fields)
         size = self._size(payload)
@@ -1725,8 +1733,9 @@ class SpeechEvents:
                         self._appendix_from.get(own, turn.end_ms), turn.end_ms
                     )
             if attended:
-                # The latest request formed, for a decision's context (#199).
-                self.last_request = (turn.end_ms, turn.text)
+                # The latest request formed, for a decision's context (#199): the heard
+                # words, as past turns carry them, not a former's rewrite.
+                self.last_request = (turn.end_ms, turn.text, turn.utterance_id, turn.speaker_id)
                 # Any delivered request makes the next reply that request's, so no lapsed
                 # conversation is revived by it (rightyo#158); a request that engages its own
                 # speaker replaces the dormant one anyway.

@@ -108,7 +108,7 @@ class ReplayRunner:
         # Whether a decision state carries the latest request formed (#199): what the
         # assistant last acted on, and how long ago, for follow-ups that refer back to it.
         self.request_context = request_context is True
-        self._last_request: tuple[int, str] | None = None
+        self._last_request: tuple[int, str, str, str | None] | None = None
         # Configured stop phrases sent as hints with the dismissal question (#98); None
         # asks no dismissal question.
         self.dismissal_phrases = (
@@ -155,6 +155,7 @@ class ReplayRunner:
         self._history.clear()
         self._last_end_ms = 0
         self._replies.clear()
+        self._last_request = None
 
     @_locked
     def clear(self, *, clear_memory: bool = True) -> None:
@@ -170,6 +171,7 @@ class ReplayRunner:
         self.failed_decisions = 0
         if self.memory is not None and clear_memory:
             self.memory.clear()
+        self._last_request = None
 
     @_locked
     def expire(self, now_ms: int) -> None:
@@ -234,24 +236,43 @@ class ReplayRunner:
                 # An end with no start seen: the reply had begun before this session knew.
                 self._replies.append([now_ms, now_ms])
 
-    def note_request(self, end_ms: int, text: str) -> None:
-        """Record the latest request formed, when its decisions carry it (#199)."""
+    def note_request(self, request: tuple[int, str, str, str | None] | None) -> None:
+        """Record the latest request formed, (end_ms, text, utterance_id, speaker_id), or
+        forget it with None (#199). Only used when decisions carry it."""
         if not self.request_context:
             return
-        if type(end_ms) is not int or not isinstance(text, str):
-            raise ContractError("invalid request context")
         with self._lock:
+            if request is None:
+                self._last_request = None
+                return
+            end_ms, text, utterance_id, speaker_id = request
+            if type(end_ms) is not int or not isinstance(text, str):
+                raise ContractError("invalid request context")
             if self._last_request is None or end_ms >= self._last_request[0]:
-                self._last_request = (end_ms, text[:REQUEST_CONTEXT_CHARS])
+                self._last_request = (
+                    end_ms,
+                    text[:REQUEST_CONTEXT_CHARS],
+                    utterance_id,
+                    speaker_id,
+                )
 
     def _request_state(self, turn: Turn) -> dict[str, Any] | None:
         last = self._last_request
         if last is None:
             return None
-        before = turn.start_ms - last[0]
+        end_ms, text, utterance_id, speaker_id = last
+        if self.memory is not None and utterance_id not in self.memory.retained_ids:
+            # Never outlive the transcript's own retention.
+            return None
+        before = turn.start_ms - end_ms
         if not 0 <= before <= REQUEST_CONTEXT_MS:
             return None
-        return {"ms_before": before, "text": last[1]}
+        # Bounded by REQUEST_CONTEXT_CHARS; `bounded_request` never drops it.
+        return {
+            "ms_before": before,
+            "text": text,
+            "speaker_id": None if self.no_speakers else speaker_id,
+        }
 
     def _reply_state(self, turn: Turn) -> dict[str, Any] | None:
         """`assistant_reply` as it stood when `turn` began, or None when no reply bears on it.

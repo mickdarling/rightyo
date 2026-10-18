@@ -23,10 +23,11 @@ class RunnerTests(unittest.TestCase):
 
     def test_the_latest_request_and_how_long_ago_reach_the_state_and_guidance(self):
         runner = ReplayRunner(Attending(), request_context=True)
-        runner.note_request(900, "Jarvis, add milk to the list")
+        runner.note_request((900, "Jarvis, add milk to the list", "u1", "Speaker A"))
         state = self.state(runner, 30900)
         self.assertEqual(
-            state["assistant_request"], {"ms_before": 30000, "text": "Jarvis, add milk to the list"}
+            state["assistant_request"],
+            {"ms_before": 30000, "text": "Jarvis, add milk to the list", "speaker_id": "Speaker A"},
         )
         request = build_request(state)
         self.assertIn(REQUEST_GUIDANCE, request["questions"]["attention"]["instructions"])
@@ -34,13 +35,13 @@ class RunnerTests(unittest.TestCase):
 
     def test_it_is_bounded_in_time_and_length_and_off_by_default(self):
         runner = ReplayRunner(Attending(), request_context=True)
-        runner.note_request(0, "x" * 1000)
+        runner.note_request((0, "x" * 1000, "u1", None))
         self.assertEqual(
             len(self.state(runner, 100)["assistant_request"]["text"]), REQUEST_CONTEXT_CHARS
         )
         self.assertNotIn("assistant_request", self.state(runner, REQUEST_CONTEXT_MS + 1))
         off = ReplayRunner(Attending())
-        off.note_request(0, "Jarvis, add milk")
+        off.note_request((0, "Jarvis, add milk", "u1", None))
         self.assertNotIn("assistant_request", self.state(off, 100))
         self.assertNotIn(
             REQUEST_GUIDANCE,
@@ -49,11 +50,32 @@ class RunnerTests(unittest.TestCase):
 
     def test_an_older_request_never_replaces_a_newer_one(self):
         runner = ReplayRunner(Attending(), request_context=True)
-        runner.note_request(5000, "newer")
-        runner.note_request(1000, "older")
+        runner.note_request((5000, "newer", "u2", None))
+        runner.note_request((1000, "older", "u1", None))
         self.assertEqual(self.state(runner, 6000)["assistant_request"]["text"], "newer")
         with self.assertRaises(ContractError):
-            runner.note_request("5000", "x")
+            runner.note_request(("5000", "x", "u1", None))
+
+
+class ForgettingTests(unittest.TestCase):
+    def test_none_clear_restart_and_expired_retention_forget_it(self):
+        from rightyo.memory import TranscriptMemory
+
+        memory = TranscriptMemory(retention_ms=60000)
+        runner = ReplayRunner(Attending(), memory=memory, request_context=True)
+        first = turn("t1", 0, 900, "Jarvis, add milk")
+        runner.process(first)
+        runner.note_request((900, "Jarvis, add milk", first.utterance_id, "Speaker A"))
+        later = turn("t2", 30000, 30800, "and eggs")
+        self.assertIn("assistant_request", runner._state(later))
+        runner.expire(90000)
+        self.assertNotIn("assistant_request", runner._state(turn("t3", 90000, 90800, "x")))
+        for forget in (lambda: runner.note_request(None), lambda: runner.clear()):
+            runner.note_request((900, "Jarvis, add milk", "unretained", None))
+            runner.memory = None
+            self.assertIn("assistant_request", runner._state(later))
+            forget()
+            self.assertNotIn("assistant_request", runner._state(later))
 
 
 class EventsTests(unittest.TestCase):
@@ -64,11 +86,54 @@ class EventsTests(unittest.TestCase):
         first = turn("t1", 0, 900, "Jarvis, add milk")
         events.transcript(first, 900)
         events.decision(decided(first, "attend"), 1000)
-        self.assertEqual(events.last_request, (900, "Jarvis, add milk"))
+        self.assertEqual(events.last_request, (900, "Jarvis, add milk", "t1", "Speaker A"))
         ignored = turn("t2", 2000, 2800, "good boy")
         events.transcript(ignored, 2800)
         events.decision(decided(ignored, "ignore"), 2900)
-        self.assertEqual(events.last_request, (900, "Jarvis, add milk"))
+        self.assertEqual(events.last_request, (900, "Jarvis, add milk", "t1", "Speaker A"))
+
+    def test_a_dismissal_forgets_it(self):
+        from rightyo.contracts import Dismissal
+
+        events = SpeechEvents()
+        events.start(
+            SESSION, now_ms=0, conversation=Conversation(window_ms=10000), dismissal=Dismissal()
+        )
+        first = turn("t1", 0, 900, "Jarvis, add milk")
+        events.transcript(first, 900)
+        events.decision(decided(first, "attend"), 1000)
+        self.assertIsNotNone(events.last_request)
+        stop = turn("t2", 2000, 2500, "never mind")
+        events.transcript(stop, 2500)
+        self.assertIsNone(events.last_request)
+
+
+class ControllerTests(unittest.TestCase):
+    def test_listen_hands_each_formed_request_to_the_next_decision(self):
+        from unittest.mock import patch
+
+        import test_tool
+
+        from rightyo.providers import MockProvider
+
+        harness = test_tool.ConfigDecisionTests(
+            "test_config_jev_with_consent_constructs_the_jev_provider"
+        )
+        harness.setUp()
+        self.addCleanup(harness.doCleanups)
+        harness.write({"provider": "jev", "allow_hosted": True, "request_context": True})
+        states = []
+        original = MockProvider.decide
+
+        def recording(provider, state):
+            states.append(state)
+            return original(provider, state)
+
+        with patch.object(MockProvider, "decide", recording):
+            harness.run_listen()
+        self.assertGreaterEqual(len(states), 2)
+        self.assertNotIn("assistant_request", states[0])
+        self.assertEqual(states[1]["assistant_request"]["text"], "Rightyo, tell me what happened.")
 
 
 class ConfigTests(unittest.TestCase):
