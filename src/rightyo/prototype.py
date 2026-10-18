@@ -123,11 +123,12 @@ def decision_spec(value: Any) -> bool:
             "allow_hosted",
             "max_requests",
             "scene",
+            "attend_min_probability",
         }
     ):
         raise DecisionConfigError(
             "The decision section requires exactly the keys provider and allow_hosted, "
-            "with an optional max_requests and scene"
+            "with an optional max_requests, scene and attend_min_probability"
         )
     provider, allow_hosted = value["provider"], value["allow_hosted"]
     if type(provider) is not str or provider not in DECISION_PROVIDERS:
@@ -146,6 +147,16 @@ def decision_spec(value: Any) -> bool:
             )
         if provider != "jev":
             raise DecisionConfigError("max_requests applies only to the jev decision provider")
+    if "attend_min_probability" in value:
+        bar = value["attend_min_probability"]
+        if type(bar) not in {int, float} or not 0 <= bar <= 1:
+            raise DecisionConfigError(
+                "The decision attend_min_probability value must be a number from 0 to 1"
+            )
+        if provider != "jev":
+            raise DecisionConfigError(
+                "attend_min_probability applies only to the jev decision provider"
+            )
     if "scene" in value:
         try:
             scene_text(value["scene"])
@@ -191,6 +202,9 @@ class PrototypeConfig:
     # The section's optional `max_requests`: a per-session Jev request cap for sessions
     # that set none themselves (`listen`). None leaves live sessions uncapped (#75).
     decision_max_requests: int | None = None
+    # The section's optional `attend_min_probability`: Jev's attend probability an attend
+    # needs, above `min_confidence` (evaluation favoured 0.9). None leaves attend as is.
+    decision_attend_min_probability: float | None = None
     # The optional `turns` section's `merge_gap_ms` (#73): a same-speaker turn starting
     # within this gap of the previous one is joined before it is emitted or decided.
     turn_merge_gap_ms: int = DEFAULT_TURN_MERGE_GAP_MS
@@ -253,6 +267,7 @@ class PrototypeConfig:
             hosted_decisions = has_decision and decision_spec(decision)
             # Optional per-session cap on live Jev requests; absent means none (#75).
             decision_requests = decision.get("max_requests") if hosted_decisions else None
+            attend_bar = decision.get("attend_min_probability") if hosted_decisions else None
             scene = (
                 scene_text(decision.get("scene", DEFAULT_SCENE)) if has_decision else DEFAULT_SCENE
             )
@@ -341,6 +356,7 @@ class PrototypeConfig:
                 diarizer=diarizer,
                 hosted_decisions=hosted_decisions,
                 decision_max_requests=decision_requests,
+                decision_attend_min_probability=attend_bar,
                 turn_merge_gap_ms=gap,
                 decision_scene=scene,
                 reply_wait_ms=wait,
@@ -633,6 +649,7 @@ class PrototypeController:
 
             memory = TranscriptMemory(retention_ms=retention * 1000)
             try:
+                bar = self.config.decision_attend_min_probability
                 provider = (
                     self.provider_factory(
                         allow_hosted=True,
@@ -640,6 +657,7 @@ class PrototypeController:
                         timeout_seconds=10,
                         min_confidence=confidence,
                         cancelled=cancelled,
+                        **({} if bar is None else {"attend_min_probability": bar}),
                     )
                     if hosted
                     else MockProvider()
