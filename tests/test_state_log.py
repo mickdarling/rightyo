@@ -57,6 +57,34 @@ class StateLogTests(unittest.TestCase):
         self.assertEqual(len(self.notes), 1)
         self.assertTrue(self.notes[0].startswith("decision_state_log stopped reason="))
 
+    def test_a_file_that_is_not_private_or_has_another_link_is_never_written(self):
+        loose = self.root / "loose.jsonl"
+        loose.write_text("")
+        os.chmod(loose, 0o644)
+        DecisionStateLog(loose, report=self.notes.append)({"x": 1}, ATTEND)
+        self.assertEqual(loose.read_text(), "")
+        other = self.root / "other"
+        other.write_text("")
+        os.chmod(other, 0o600)
+        linked = self.root / "linked.jsonl"
+        os.link(other, linked)
+        DecisionStateLog(linked, report=self.notes.append)({"x": 1}, ATTEND)
+        self.assertEqual(other.read_text(), "")
+        self.assertEqual(self.notes, ["decision_state_log stopped reason=not_a_private_file"] * 2)
+
+    def test_a_path_inside_a_git_checkout_is_refused(self):
+        checkout = self.root / "repo"
+        (checkout / ".git").mkdir(parents=True)
+        with self.assertRaisesRegex(ValueError, "outside the repository"):
+            DecisionStateLog(checkout / "logs" / "states.jsonl")
+
+    def test_the_record_keeps_the_raw_choice_and_the_answered_time(self):
+        from dataclasses import replace
+
+        DecisionStateLog(self.path)({"x": 1}, replace(ATTEND, answered_at_ms=1300))
+        record = json.loads(self.path.read_text())["decision"]
+        self.assertEqual((record["attention_choice"], record["answered_at_ms"]), (None, 1300))
+
     def test_a_failing_log_never_affects_the_decision(self):
         def broken(state, decision):
             raise RuntimeError("disk on fire")
@@ -98,6 +126,10 @@ class StateLogConfigTests(unittest.TestCase):
         for bad in ("states.jsonl", 7, ""):
             with self.subTest(bad=bad), self.assertRaisesRegex(DecisionConfigError, "state_log"):
                 self.load({**jev, "state_log": bad})
+        checkout = Path(self.path.parent) / "repo"
+        (checkout / ".git").mkdir(parents=True)
+        with self.assertRaisesRegex(DecisionConfigError, "outside the repository"):
+            self.load({**jev, "state_log": str(checkout / "states.jsonl")})
         with self.assertRaisesRegex(DecisionConfigError, "only to the jev"):
             self.load({"provider": "mock", "allow_hosted": False, "state_log": "/tmp/x.jsonl"})
 

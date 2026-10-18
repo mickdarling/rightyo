@@ -168,6 +168,10 @@ def decision_spec(value: Any) -> bool:
         log = value["state_log"]
         if type(log) is not str or not log.startswith("/") or "\x00" in log:
             raise DecisionConfigError("The decision state_log value must be an absolute path")
+        if any((parent / ".git").exists() for parent in Path(log).resolve().parents):
+            raise DecisionConfigError(
+                "The decision state_log must be stored outside the repository"
+            )
         if provider != "jev":
             raise DecisionConfigError("state_log applies only to the jev decision provider")
     if "scene" in value:

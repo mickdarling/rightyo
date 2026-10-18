@@ -350,11 +350,13 @@ class ReplayRunner:
             if self._answered_by_other(turn, post_turn_gap):
                 answered = turn.end_ms + post_turn_gap["silence_ms"]
                 decision = replace(decision, answered_at_ms=answered)
-            if self.state_log is not None:
-                try:
-                    self.state_log(state, decision)
-                except Exception:  # noqa: BLE001 - the record never affects a decision
-                    pass
-            return DecisionEvent(
+            result = DecisionEvent(
                 turn, decision, turn.revision, provider_ms, (time.perf_counter() - started) * 1000
             )
+        if self.state_log is not None:
+            # Outside the lock: a slow disk never holds up other turns.
+            try:
+                self.state_log(state, decision)
+            except Exception:  # noqa: BLE001 - the record never affects a decision
+                pass
+        return result

@@ -248,6 +248,11 @@ The confidence slider is an experiment setting, not a calibrated accuracy guaran
 
 ## Context and stopping
 
+Everything here is in memory unless the operator opts in to the
+[decision state log](tool-quickstart.md) (`decision.state_log`, #199). That log writes
+each decided turn's state, including transcript text, to a private local file, and
+nothing in the lab clears it: Clear and Stop leave it in place.
+
 The local transcript retains five minutes by default, configurable from one to ten minutes,
 with retained text capped at 1,000 turns / 1 MiB. These retention caps evict older
 turns. Separately, each session permits at most 1,000 unique finalized turns in total,
