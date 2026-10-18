@@ -678,10 +678,13 @@ decisions arrive in) forms a request when all of these hold:
   of:
   - the assistant's name;
   - a question to it ("can you", "could you", "would you", "will you");
-  - a word that refers back ("again", "instead", "the other one", "the same", "the second");
-  - an action on its result ("play that", "turn it up", "cancel that");
-  - an opening that adds ("and …", "actually …", "what about …", "how about …");
-  - a short adjustment of up to three words ("louder", "next one", "skip").
+  - a reference back ("again", "instead", "the other one", "the same", "the second",
+    "one more"), but not "just a second" or "same to you";
+  - an action on its result ("play that", "turn it up", "show me that");
+  - an opening that adds ("and …" but not "and you", "actually …", "what about …", "how
+    about …");
+  - a short adjustment of up to three words ("louder", "next one", "skip", "repeat",
+    "cancel").
 
   Talk to a pet or a passer-by inside the window ("No, sit", "Is that your dog?") then
   stays context however Jev rates it. The diagnostic reason is `no_cue`. It applies to

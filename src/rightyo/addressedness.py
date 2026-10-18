@@ -235,18 +235,32 @@ def unfinished_shaped(text: str, addressing: Addressing | None = None) -> bool:
 # first: talk to a pet or a passer-by often has "it", "that", "you" or "no" in it ("No,
 # sit", "Is that your dog?"), so those count only in the shapes below.
 _LETTERS = re.compile(r"[a-z]+")
-# Words that refer back to the request or its result, anywhere in the turn.
-_REFERRING = frozenset({"again", "instead", "other", "same", "second", "previous"})
+# Words that refer back to the request or its result, anywhere in the turn; "other",
+# "same", "second" and "first" count only in the phrases below ("just a second", "same to
+# you" and "on the other hand" are everyday talk).
+_REFERRING = frozenset({"again", "instead", "previous"})
+_REFERRING_PAIRS = frozenset(
+    {
+        ("the", "same"),
+        ("the", "second"),
+        ("second", "one"),
+        ("the", "first"),
+        ("first", "one"),
+        ("other", "one"),
+        ("one", "more"),
+    }
+)
 # A bare "it", "that" or "this" counts after a verb that acts on the assistant's output.
 _OUTPUT_VERBS = frozenset(
     "turn make change play read repeat send set cancel skip undo save open show fix delete "
-    "add remove move".split()
+    "add remove move put".split()
 )
 _OBJECTS = frozenset({"it", "that", "this", "those", "these", "them"})
 _MODALS = frozenset({"can", "could", "would", "will"})
 # Short adjustments of what the assistant just did ("louder", "next one", "more please").
 _ADJUSTMENTS = frozenset(
-    "louder quieter softer more less another next skip slower faster shorter longer bigger "
+    "louder quieter softer more less another next skip repeat cancel slower faster shorter "
+    "longer bigger"
     "smaller".split()
 )
 
@@ -265,13 +279,19 @@ def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
     if not words:
         return False
     pairs = list(zip(words, words[1:]))
+    # "And eggs" adds to a request; "and you" is a reply to someone else.
+    adds = words[0] == "and" and len(words) > 1 and words[1] != "you"
     return (
         mentions_name(addressing, text)
-        or words[0] in {"and", "actually"}
+        or adds
+        or words[0] == "actually"
+        or not _REFERRING_PAIRS.isdisjoint(pairs)
         or tuple(words[:2]) in {("what", "about"), ("how", "about")}
         or not _REFERRING.isdisjoint(words)
         or any(a in _MODALS and b == "you" for a, b in pairs)
         or any(a in _OUTPUT_VERBS and b in _OBJECTS for a, b in pairs)
+        # One word between ("show me that", "put it on").
+        or any(a in _OUTPUT_VERBS and c in _OBJECTS for a, c in zip(words, words[2:]))
         or (len(words) <= 3 and words[0] in _ADJUSTMENTS)
     )
 

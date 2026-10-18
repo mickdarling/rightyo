@@ -31,6 +31,11 @@ class CueShapeTests(unittest.TestCase):
             "next one",
             "skip",
             "use the same one instead",
+            "one more time",
+            "show me that one",
+            "repeat",
+            "cancel",
+            "the other one",
         ):
             with self.subTest(text=text):
                 self.assertTrue(follow_up_cued(text, NAMES))
@@ -59,6 +64,11 @@ class CueShapeTests(unittest.TestCase):
             "Good morning to you",
             "Make way",
             "Also, nice hat",
+            "Just a second",
+            "Wait a second",
+            "Same to you!",
+            "On the other hand",
+            "And you!",
         ):
             with self.subTest(text=text):
                 self.assertFalse(follow_up_cued(text, NAMES))
@@ -68,12 +78,12 @@ class RequireCueTests(unittest.TestCase):
     def setUp(self):
         self.events = SpeechEvents()
 
-    def follow_up(self, text, conversation):
+    def follow_up(self, text, conversation, start=5000, attend=0.6):
         self.events.start(SESSION, now_ms=0, conversation=conversation, addressing=NAMES)
         self.events.drain()
         for current, label, extra in (
             (turn("t1", 0, 900, "Jarvis, add milk to the shopping list"), "attend", {}),
-            (turn("t2", 5000, 5800, text), "uncertain", {"attend": 0.6}),
+            (turn("t2", start, start + 800, text), "uncertain", {"attend": attend}),
         ):
             self.events.transcript(current, current.end_ms)
             self.events.decision(decided(current, label, **extra), current.end_ms + 100)
@@ -96,10 +106,11 @@ class RequireCueTests(unittest.TestCase):
         self.assertIn("reason=closing", reasons[-1])
 
     def test_the_requirement_applies_to_an_appendix_too(self):
+        # Below the follow-up bar, inside the appendix window: only the cue decides.
         mode = Conversation(window_ms=10000, require_cue=True, appendix_ms=5000)
-        self.assertFalse(self.follow_up("sit, good boy", mode))
+        self.assertFalse(self.follow_up("sit, good boy", mode, start=1500, attend=0.1))
         self.setUp()
-        self.assertTrue(self.follow_up("and eggs", mode))
+        self.assertTrue(self.follow_up("and eggs", mode, start=1500, attend=0.1))
 
     def test_off_by_default_as_before(self):
         self.assertTrue(self.follow_up("Good boy, come here!", Conversation(window_ms=10000)))
