@@ -646,7 +646,7 @@ of per-turn attention.
 event, no follow-ups, byte-identical fixtures. Turn it on with the configuration's
 `"conversation": {}` object; `session.started` then advertises it as a top-level
 `conversation` object, and a host that accepts that object must accept `conversation`
-events. The object takes four optional keys:
+events. The object takes five optional keys:
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
@@ -654,6 +654,7 @@ events. The object takes four optional keys:
 | `follow_up_min_probability` | 0.4 | above 0, up to 1 | The attend probability an engaged speaker's `uncertain` turn needs to become a follow-up |
 | `closing_phrases` | "that's all", "that's it", "thanks, that's all", "never mind", and so on | up to 16 | Phrases that end the conversation (see [closings](#closings)) |
 | `appendix_ms` | 0 (off) | 0 to 5,000 | How soon after a request ends the same speaker's next turn counts as an appendix to it (see below) |
+| `require_cue` | false | true or false | Whether a follow-up must also carry a cue that it continues the exchange (see below) |
 
 **States.**
 - **Ambient**, the default: a turn forms a request only on a confident `attend`, as
@@ -670,7 +671,13 @@ decisions arrive in) forms a request when all of these hold:
 - its recipient is `system` or `unknown` (never `other_human` or another speaker);
 - it is not a closing phrase;
 - the decision was not a transient unavailability placeholder, and `owner_only` does not
-  exclude the speaker.
+  exclude the speaker;
+- with `require_cue` ([#199](https://github.com/mickdarling/rightyo/issues/199)), it
+  carries a cue that it continues the exchange. A cue is the assistant's name, the second
+  person ("you", "your"), a word that refers back ("that", "it", "the other one", "again",
+  "instead", "the second one") or an opening that adds or corrects ("and ...", "also ...",
+  "no, ...", "actually ..."). Talk to a pet or a passer-by within the window ("good boy,
+  come here") then stays context however Jev rates it. The diagnostic reason is `no_cue`.
 
 **Appendices** ([#199](https://github.com/mickdarling/rightyo/issues/199)). With
 `appendix_ms` above 0, the engaged speaker's `uncertain` turn that starts within that long

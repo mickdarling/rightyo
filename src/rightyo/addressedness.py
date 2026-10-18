@@ -231,6 +231,36 @@ def unfinished_shaped(text: str, addressing: Addressing | None = None) -> bool:
     return all(word in _OPENING for word in rest) and bool(named or rest)
 
 
+# A follow-up's cue that it continues the exchange with the assistant (#199): words that
+# refer back to the request ("the other one", "that", "again"), second person, or an
+# opener that adds to or corrects it ("and", "also", "no, actually").
+_REFERRING = frozenset(
+    "that one other it this those these them second first last again instead too also "
+    "shorter longer same".split()
+)
+_SECOND_PERSON = frozenset({"you", "your", "you're", "youre", "yourself"})
+_FOLLOW_UP_OPENERS = frozenset("and also plus no not actually instead make".split())
+
+
+def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
+    """Whether a turn carries a cue that it continues an exchange with the assistant (#199).
+
+    True when it names the assistant, uses the second person, refers back ("that", "the
+    other one", "again"), or opens by adding to or correcting a request ("and ...", "no,
+    ..."). Talk to a pet or a passer-by ("good boy, come here") usually carries none.
+    English, deterministic, approximate.
+    """
+    words = _WORDS.findall(text.lower())
+    if not words:
+        return False
+    return (
+        words[0] in _FOLLOW_UP_OPENERS
+        or not _REFERRING.isdisjoint(words)
+        or not _SECOND_PERSON.isdisjoint(words)
+        or mentions_name(addressing, text)
+    )
+
+
 # Cue phrases of a dismissal, as `normalize_phrase` writes them (apostrophes removed,
 # casefolded). A turn is dismissal-shaped only when one of them opens it (after fillers
 # and an optional short vocative) and nothing but tail words follow, so a request that

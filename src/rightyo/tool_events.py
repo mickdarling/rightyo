@@ -9,7 +9,7 @@ import unicodedata
 from collections import deque
 from threading import RLock
 
-from rightyo.addressedness import mentions_name
+from rightyo.addressedness import follow_up_cued, mentions_name
 from rightyo.contracts import (
     DISMISSING,
     Acknowledgement,
@@ -1188,6 +1188,10 @@ class SpeechEvents:
             turn
         ):
             return "below_bar"
+        if conversation.require_cue and not follow_up_cued(turn.text, self._addressing):
+            # Talk to a pet or a passer-by in the window carries no cue that it continues
+            # the exchange with the assistant (#199).
+            return "no_cue"
         if conversation.is_closing(turn.text):
             # A closing phrase ends the conversation; it is never a request of its own.
             return "closing"
