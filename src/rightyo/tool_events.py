@@ -292,9 +292,11 @@ class SpeechEvents:
         if kind == "dismiss" or (
             kind == "conversation"
             and fields.get("state") == "ambient"
-            and fields.get("reason") != "timeout"
+            and fields.get("reason") in {"dismissed", "closed"}
         ):
-            # A dismissed, withdrawn or explicitly ended exchange is no context (#199).
+            # A dismissed, withdrawn or explicitly closed exchange is no context (#199).
+            # Talk to another person or a lapsed window keeps it: a follow-up 30 to 120 s
+            # later still refers back. Any dismissal clears it, which errs on the safe side.
             self.last_request = None
         self._sequence += 1
         payload = self._payload(kind, self._sequence, fields)

@@ -192,7 +192,7 @@ acted on ([#199](https://github.com/mickdarling/rightyo/issues/199)). The state 
 `assistant_request`: that request's text (up to 400 characters), its `speaker_id` and
 `ms_before`, how long before the current turn began it ended. That lasts for up to 120 s,
 and never past the transcript's own retention. A dismissal, a withdrawal or an explicit
-end of the conversation forgets it at once. It needs the tool's event stream (`listen`);
+closing of the conversation forgets it at once; talk to another person in between does not. It needs the tool's event stream (`listen`);
 without one it does nothing. Guidance tells Jev that a turn
 continuing, correcting or referring back to it is evidence that it is addressed to the
 assistant. In an internal evaluation (not published), the owner's follow-ups 30 to 120 s

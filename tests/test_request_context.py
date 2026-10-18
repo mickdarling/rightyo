@@ -70,12 +70,12 @@ class ForgettingTests(unittest.TestCase):
         self.assertIn("assistant_request", runner._state(later))
         runner.expire(90000)
         self.assertNotIn("assistant_request", runner._state(turn("t3", 90000, 90800, "x")))
-        for forget in (lambda: runner.note_request(None), lambda: runner.clear()):
-            runner.note_request((900, "Jarvis, add milk", "unretained", None))
-            runner.memory = None
-            self.assertIn("assistant_request", runner._state(later))
+        plain = ReplayRunner(Attending(), request_context=True)
+        for forget in (lambda: plain.note_request(None), lambda: plain.clear()):
+            plain.note_request((900, "Jarvis, add milk", "u1", None))
+            self.assertIn("assistant_request", plain._state(later))
             forget()
-            self.assertNotIn("assistant_request", runner._state(later))
+            self.assertNotIn("assistant_request", plain._state(later))
 
 
 class EventsTests(unittest.TestCase):
@@ -106,6 +106,19 @@ class EventsTests(unittest.TestCase):
         stop = turn("t2", 2000, 2500, "never mind")
         events.transcript(stop, 2500)
         self.assertIsNone(events.last_request)
+
+    def test_talk_to_another_person_keeps_it(self):
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, conversation=Conversation(window_ms=60000))
+        first = turn("t1", 0, 900, "Jarvis, add milk")
+        events.transcript(first, 900)
+        events.decision(decided(first, "attend"), 1000)
+        aside = turn("t2", 3000, 3800, "do we have eggs?")
+        events.transcript(aside, 3800)
+        events.decision(decided(aside, "ignore", recipient="other_human"), 3900)
+        kinds = [(e["type"], e.get("reason")) for e in events.drain()]
+        self.assertIn(("conversation", "other_human"), kinds)
+        self.assertEqual(events.last_request[1], "Jarvis, add milk")
 
 
 class ControllerTests(unittest.TestCase):
