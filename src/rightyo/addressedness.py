@@ -197,30 +197,38 @@ def request_shaped(text: str) -> bool:
     return index < len(words) and words[index] in _OPENERS
 
 
-# Words a finished sentence rarely ends on: connectives, articles, prepositions, auxiliaries
-# and pronouns that expect more ("add the", "can you", "and").
+# Words a finished request rarely ends on: articles, connectives, a few prepositions,
+# fillers, modals and possessives ("add the", "remind me to", "and"). Particles and object
+# pronouns ("turn it on", "do it", "thank you", "play this") end complete commands, so
+# they are left out.
 _DANGLING = frozenset(
-    "and um uh the a an to of so but like or if when because with for in on at that this "
-    "i you we can could would should will is are do does did my your our it".split()
+    "a an the and or but because if when like um uh to of with for at "
+    "can could would should will my your our".split()
 )
-_OPENING = frozenset({"can", "could", "hey", "ok", "okay", "so"})
+# Words that open a request and may come alone, or beside a name, before it.
+_OPENING = frozenset({"can", "could", "you", "hey", "so", "um", "uh"})
 
 
 def unfinished_shaped(text: str, addressing: Addressing | None = None) -> bool:
     """Whether a turn looks cut off mid-request (English, deterministic, approximate, #199).
 
-    True when its last word is a connective, article, preposition, auxiliary or pronoun
-    that expects more, or when it is one or two words that name the assistant or open a
-    request ("Jarvis,", "hey Jarvis", "can you"). A question mark ends a turn ("What time
-    is it?"); other trailing punctuation is ignored, since recognition often ends a
-    fragment with a period.
+    True when its last word is an article, connective, preposition, filler, modal or
+    possessive that expects more, or when it is one or two words, each a name of the
+    assistant or a request opener ("Jarvis,", "hey Jarvis", "can you"). A question mark
+    ends a turn ("What time is it?"); other trailing punctuation is ignored, since
+    recognition often ends a fragment with a period.
     """
     words = _WORDS.findall(text.lower())
     if not words or text.rstrip().endswith("?"):
         return False
     if words[-1] in _DANGLING:
         return True
-    return len(words) <= 2 and (words[0] in _OPENING or mentions_name(addressing, text))
+    if len(words) > 2:
+        return False
+    # A bare name or opener, or one beside the other ("hey Jarvis"), but not "Jarvis stop".
+    named = [word for word in words if mentions_name(addressing, word)]
+    rest = [word for word in words if word not in named]
+    return all(word in _OPENING for word in rest) and bool(named or rest)
 
 
 # Cue phrases of a dismissal, as `normalize_phrase` writes them (apostrophes removed,

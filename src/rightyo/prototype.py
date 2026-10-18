@@ -791,6 +791,20 @@ class PrototypeController:
             return stop
         return lambda text: stop(text) or dismissal_shaped(text)
 
+    def _turn_unfinished(self):
+        """The predicate for turns held despite end-of-turn's "complete" (#199), or None.
+
+        A stop phrase or a dismissal-shaped turn ("stop it", "forget it") is never held,
+        whether or not natural dismissal is on, so a stop is never delayed or joined.
+        """
+        if not self.config.turn_hold_unfinished:
+            return None
+        stop = (self.config.speakers or SpeakerPriority()).is_stop_phrase
+        addressing = self.config.addressing
+        return lambda text: (
+            not stop(text) and not dismissal_shaped(text) and unfinished_shaped(text, addressing)
+        )
+
     def _observe_gap(self, generation: int, utterance_id: str, gap: dict[str, Any]) -> None:
         """Keep a turn's observed post-turn gap until its decision takes it (#96)."""
         with self._lock:
@@ -911,11 +925,7 @@ class PrototypeController:
                     # never absorb one; the defaults apply when roles are off. With
                     # dismissal on (#98), a dismissal-shaped turn is released at once too.
                     turn_break=self._turn_break(),
-                    turn_unfinished=(
-                        (lambda text: unfinished_shaped(text, self.config.addressing))
-                        if self.config.turn_hold_unfinished
-                        else None
-                    ),
+                    turn_unfinished=self._turn_unfinished(),
                     reply_wait_ms=self.config.reply_wait_ms,
                     on_post_turn_gap=lambda utterance_id, gap: self._observe_gap(
                         generation, utterance_id, gap
