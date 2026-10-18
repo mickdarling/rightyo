@@ -783,12 +783,13 @@ on with the configuration's `"acknowledgement": {}` object; `session.started` th
 advertises it as a top-level `acknowledgement` object,
 `{"version": 1, "min_confidence": 0.7, "dedup_window_ms": 8000}`, and every `request`
 carries a boolean `acknowledge`. A host that accepts that object plays its acknowledgement
-only for a request whose `acknowledge` is true. The object takes two optional keys:
+only for a request whose `acknowledge` is true. The object takes three optional keys:
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
 | `min_confidence` | 0.7 | 0 to 1 | The attend confidence an unnamed request needs to be acknowledged; 0 acknowledges every request |
 | `dedup_window_ms` | 8000 | 0 to 60,000 | How long after an acknowledged request a later one goes unacknowledged unless its answer has started (below); 0 turns this off |
+| `follow_up_min_confidence` | none (uses `min_confidence`) | 0 to 1 | The attend probability a [conversation follow-up](#conversation-mode) needs to be acknowledged ([#199](https://github.com/mickdarling/rightyo/issues/199)); a named follow-up is still acknowledged |
 
 A request is acknowledged when either holds:
 - its turn uses a configured name or variant (see [forms of address](#transport-and-lifecycle));

@@ -1744,7 +1744,11 @@ class SpeechEvents:
         follow_up = evidence.get("follow_up") is True
         score = decision.probabilities["attend"] if follow_up else decision.confidence
         named = mentions_name(self._addressing, turn.text)
-        acknowledge = named or score >= gate.min_confidence
+        bar = gate.min_confidence
+        if follow_up and gate.follow_up_min_confidence is not None:
+            # A follow-up's own, usually stricter, bar (#199).
+            bar = gate.follow_up_min_confidence
+        acknowledge = named or score >= bar
         reason = "named" if named else "confident" if acknowledge else "low_confidence"
         pending = self._pending_ack
         if acknowledge and pending is not None and turn.start_ms < pending["until_ms"]:
@@ -1755,7 +1759,7 @@ class SpeechEvents:
         # The diagnostic note is content-free: labels and numbers, never text or ids.
         note = (
             f"ack outcome={'ack' if acknowledge else 'skip'} reason={reason}"
-            f" attend_confidence={score:.2f} min={gate.min_confidence:.2f}"
+            f" attend_confidence={score:.2f} min={bar:.2f}"
             f" follow_up={'true' if follow_up else 'false'}"
         )
         return {"acknowledge": acknowledge}, note
