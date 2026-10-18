@@ -2,7 +2,7 @@
 
 The local Mac lab ships explicit microphone capture with Start/Stop controls. Startup is idle; capture and hosted transcript decisions each require deliberate controls. Supplied-file replay remains available. Continuous observation must be visibly indicated, stoppable, and memory bounded. See [the prototype guide](docs/prototype.md) for retention, loopback authentication, process cancellation, and platform limits.
 
-Default: no recording, no private transcript logging, no external inference requests. Dataset collection requires consent and a retention/deletion policy. Store sensitive evaluation material outside the checkout; ignore rules are defense in depth, not a substitute for inspection before commit.
+Default: no recording, no private transcript logging, no external inference requests. The one opt-in exception is the decision state log (`decision.state_log`, #199). It writes transcript text only to a private (`0600`, singly linked, non-symlink) file the operator names outside any Git checkout, and Clear or Stop never delete it. Dataset collection requires consent and a retention/deletion policy. Store sensitive evaluation material outside the checkout; ignore rules are defense in depth, not a substitute for inspection before commit.
 
 Remote audio must use authenticated encrypted transport and an authorized source. A hosted inference backend requires explicit configuration of its destination and data handling. No silent fallback to hosted processing is permitted.
 

@@ -70,6 +70,7 @@ from rightyo.speech_backends import (
     transcriber_spec,
     utterance_local_labels,
 )
+from rightyo.state_log import DecisionStateLog
 from rightyo.turn_merge import DEFAULT_TURN_MERGE_GAP_MS, merge_gap, tail_join
 
 BROWSER_LEASE_SECONDS = 15
@@ -126,12 +127,13 @@ def decision_spec(value: Any) -> bool:
             "scene",
             "attend_min_probability",
             "other_answered_blocks",
+            "state_log",
         }
     ):
         raise DecisionConfigError(
             "The decision section requires exactly the keys provider and allow_hosted, "
-            "with an optional max_requests, scene, attend_min_probability and "
-            "other_answered_blocks"
+            "with an optional max_requests, scene, attend_min_probability, "
+            "other_answered_blocks and state_log"
         )
     provider, allow_hosted = value["provider"], value["allow_hosted"]
     if type(provider) is not str or provider not in DECISION_PROVIDERS:
@@ -162,6 +164,16 @@ def decision_spec(value: Any) -> bool:
             )
     if "other_answered_blocks" in value and type(value["other_answered_blocks"]) is not bool:
         raise DecisionConfigError("The decision other_answered_blocks value must be true or false")
+    if "state_log" in value:
+        log = value["state_log"]
+        if type(log) is not str or not log.startswith("/") or "\x00" in log:
+            raise DecisionConfigError("The decision state_log value must be an absolute path")
+        if any((parent / ".git").exists() for parent in Path(log).resolve().parents):
+            raise DecisionConfigError(
+                "The decision state_log must be stored outside the repository"
+            )
+        if provider != "jev":
+            raise DecisionConfigError("state_log applies only to the jev decision provider")
     if "scene" in value:
         try:
             scene_text(value["scene"])
@@ -213,6 +225,9 @@ class PrototypeConfig:
     # The section's optional `other_answered_blocks` (#199): with the post-turn gap on, an
     # unnamed turn another speaker answers within the reply window is not attended.
     decision_other_answered_blocks: bool = False
+    # The section's optional `state_log` (#199): an absolute path where each decided live
+    # turn's exact state and answer are appended (transcript text included; `0600`).
+    decision_state_log: Path | None = None
     # The optional `turns` section's `merge_gap_ms` (#73): a same-speaker turn starting
     # within this gap of the previous one is joined before it is emitted or decided.
     turn_merge_gap_ms: int = DEFAULT_TURN_MERGE_GAP_MS
@@ -281,6 +296,7 @@ class PrototypeConfig:
             decision_requests = decision.get("max_requests") if hosted_decisions else None
             attend_bar = decision.get("attend_min_probability") if hosted_decisions else None
             answered = bool(has_decision and decision.get("other_answered_blocks", False))
+            state_log = decision.get("state_log") if hosted_decisions else None
             scene = (
                 scene_text(decision.get("scene", DEFAULT_SCENE)) if has_decision else DEFAULT_SCENE
             )
@@ -378,6 +394,7 @@ class PrototypeConfig:
                 decision_max_requests=decision_requests,
                 decision_attend_min_probability=attend_bar,
                 decision_other_answered_blocks=answered,
+                decision_state_log=None if state_log is None else Path(state_log),
                 turn_merge_gap_ms=gap,
                 turn_hold_unfinished=hold_unfinished,
                 decision_scene=scene,
@@ -694,6 +711,11 @@ class PrototypeController:
                 scene=self.config.decision_scene,
                 post_turn_gaps=self.config.reply_wait_ms > 0,
                 other_answered_blocks=self.config.decision_other_answered_blocks,
+                state_log=(
+                    None
+                    if self.config.decision_state_log is None
+                    else DecisionStateLog(self.config.decision_state_log, report=self.report)
+                ),
                 dismissal_phrases=(
                     None
                     if self.config.dismissal is None

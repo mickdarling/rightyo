@@ -175,6 +175,19 @@ Two labels the diarizer gives one unenrolled person can still read as a differen
 speaker. It needs the post-turn gap (`turns.reply_wait_ms` above 0, the default) and is
 refused without it. Default false.
 
+An optional `"state_log": "/absolute/path.jsonl"` keeps a local record of each decided
+live turn ([#199](https://github.com/mickdarling/rightyo/issues/199)), so live decisions
+can be compared turn by turn with offline runs. Each line holds the exact bounded state
+sent to Jev and its answer (label, choice, recipient, confidence, probabilities, model).
+**The state contains transcript text**, so the log is off unless named, and a path inside
+a Git checkout is refused. The file is created `0600`. Writing stops for good, with one
+content-free `decision_state_log stopped` note, if the file is a symlink, someone else's,
+readable by others, or hard-linked, or once it reaches 50 MB. A failed write never affects
+a decision; a disk failing mid-write can leave a short last line, so readers should skip
+a last line that does not parse. Clear and Stop do not delete the file: delete it when
+the comparison is done. Each record also carries `answered_at_ms` from
+`other_answered_blocks`. It is accepted only with `"provider": "jev"`.
+
 The flags keep their rules. `--use-jev` without `--allow-hosted` is still refused before the
 file is read, and the file never supplies the missing half. Both flags select Jev even when
 the file names `"mock"`; neither source can switch the other's Jev selection off. With the
