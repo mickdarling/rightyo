@@ -1176,11 +1176,12 @@ class SpeechEvents:
             return "media"
         if unavailable is not None:
             return "unavailable"
-        if evidence["label"] != "uncertain":
+        appendix = self._appendix(turn)
+        if evidence["label"] != "uncertain" and not (appendix and evidence["label"] == "ignore"):
             return "label"
         if decision.recipient not in {"system", "unknown"}:
             return "recipient"
-        if decision.probabilities["attend"] < self._follow_up_bar(role):
+        if not appendix and decision.probabilities["attend"] < self._follow_up_bar(role):
             return "below_bar"
         if conversation.is_closing(turn.text):
             # A closing phrase ends the conversation; it is never a request of its own.
@@ -1204,6 +1205,15 @@ class SpeechEvents:
             f"follow_up outcome={outcome} reason={refusal or held or 'passed'}"
             f" attend={attend:.6g} bar={self._follow_up_bar(role):.6g}"
         )
+
+    def _appendix(self, turn):
+        """Whether the engaged speaker's `turn` starts within the appendix window after their
+        latest request ended (#199), and names no other agent (their talk is never ours)."""
+        engaged, window = self._engaged, self._conversation.appendix_ms
+        if not window or engaged is None or mentions_name(self._other_agents, turn.text):
+            return False
+        latest = max(engaged["from_ms"], engaged.get("revived_over_ms", engaged["from_ms"]))
+        return 0 <= turn.start_ms - latest <= window
 
     def _follow_up_bar(self, role):
         """The follow-up attend bar: optionally lower for enrolled owners and trusted (#113)."""

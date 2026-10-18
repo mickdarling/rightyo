@@ -635,13 +635,14 @@ of per-turn attention.
 event, no follow-ups, byte-identical fixtures. Turn it on with the configuration's
 `"conversation": {}` object; `session.started` then advertises it as a top-level
 `conversation` object, and a host that accepts that object must accept `conversation`
-events. The object takes three optional keys:
+events. The object takes four optional keys:
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
 | `window_ms` | 20,000 | 1,000 to 120,000 | How long after a request turn ends its speaker stays engaged |
 | `follow_up_min_probability` | 0.4 | above 0, up to 1 | The attend probability an engaged speaker's `uncertain` turn needs to become a follow-up |
 | `closing_phrases` | "that's all", "that's it", "thanks, that's all", "never mind", and so on | up to 16 | Phrases that end the conversation (see [closings](#closings)) |
+| `appendix_ms` | 0 (off) | 0 to 5,000 | How soon after a request ends the same speaker's next turn counts as an appendix to it (see below) |
 
 **States.**
 - **Ambient**, the default: a turn forms a request only on a confident `attend`, as
@@ -659,6 +660,16 @@ decisions arrive in) forms a request when all of these hold:
 - it is not a closing phrase;
 - the decision was not a transient unavailability placeholder, and `owner_only` does not
   exclude the speaker.
+
+**Appendices** ([#199](https://github.com/mickdarling/rightyo/issues/199)). With
+`appendix_ms` above 0, the engaged speaker's turn that starts within that long after their
+latest request ended ("Jarvis, add milk to the list" … "and eggs") is an appendix. It
+forms a follow-up even when Jev's label is `ignore` or its attend probability is below the
+bar, since a quick continuation of a request is rarely meant for anyone else. The other
+conditions above still apply: the recipient is `system` or `unknown`, it is not a
+closing, and `owner_only` does not exclude the speaker. A turn naming another agent, or
+held back by media mode, never is one. The started event's `conversation` object carries
+`appendix_ms` only when it is on.
 
 A follow-up is still subject to stop phrases, dismissals, owner supersession and the
 dismissal cool-down; one the cool-down holds back is reported as `uncertain` with
