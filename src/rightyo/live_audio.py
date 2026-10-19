@@ -15,6 +15,7 @@ import base64
 import contextlib
 import ctypes
 import inspect
+import io
 import json
 import math
 import os
@@ -677,58 +678,124 @@ def _terminate(process: subprocess.Popen) -> None:
         pass
 
 
+def _recognizer_pipes(
+    process: subprocess.Popen, packet: bytes, config: LiveConfig, deadline: float
+) -> bytes:
+    """Pump WAV/JSON concurrently; retain only the response cap and drain the rest."""
+    if process.stdin is None or process.stdout is None:
+        raise LiveAudioError("Local recognizer failed")
+    raw = bytearray()
+    overflow = False
+    sent = 0
+
+    def remaining() -> float:
+        if config.cancelled is not None and config.cancelled():
+            raise LiveAudioError("Audio session was stopped")
+        duration = deadline - time.monotonic()
+        if duration <= 0:
+            raise subprocess.TimeoutExpired("local recognizer", config.timeout_seconds)
+        return duration
+
+    os.set_blocking(process.stdin.fileno(), False)
+    os.set_blocking(process.stdout.fileno(), False)
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdin, selectors.EVENT_WRITE)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while selector.get_map():
+            events = selector.select(min(0.05, remaining()))
+            remaining()
+            for key, _ in events:
+                try:
+                    if key.fileobj is process.stdin:
+                        sent += os.write(key.fd, packet[sent : sent + 65536])
+                        if sent == len(packet):
+                            selector.unregister(process.stdin)
+                            process.stdin.close()
+                    else:
+                        chunk = os.read(key.fd, 65536)
+                        if not chunk:
+                            selector.unregister(process.stdout)
+                            process.stdout.close()
+                            continue
+                        room = MAX_RESPONSE_BYTES - len(raw)
+                        raw.extend(chunk[:room])
+                        overflow |= len(chunk) > room
+                except BlockingIOError:
+                    continue
+        while process.poll() is None:
+            duration = remaining()
+            try:
+                process.wait(timeout=min(0.05, duration))
+            except subprocess.TimeoutExpired:
+                continue
+    remaining()
+    if process.returncode != 0:
+        raise LiveAudioError("Local recognizer failed")
+    if overflow:
+        raise LiveAudioError("Local recognizer exceeded output limit")
+    return bytes(raw)
+
+
 def _transcribe(
     config: LiveConfig,
     pcm: bytes,
     register: Callable[[subprocess.Popen], None] | None = None,
 ) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="rightyo-live-asr-") as directory:
-        audio = Path(directory) / "utterance.wav"
-        with wave.open(str(audio), "wb") as target:
+    if config.cancelled is not None and config.cancelled():
+        raise LiveAudioError("Audio session was stopped")
+    with io.BytesIO() as buffer:
+        with wave.open(buffer, "wb") as target:
             target.setnchannels(1)
             target.setsampwidth(2)
             target.setframerate(SAMPLE_RATE)
             target.writeframes(pcm)
-        output = Path(directory) / "transcript"
+        packet = buffer.getvalue()
+    # Preserve private runtime isolation, but never put speech or transcripts in this directory.
+    with tempfile.TemporaryDirectory(prefix="rightyo-live-asr-") as directory:
         try:
+            deadline = time.monotonic() + config.timeout_seconds
             process = subprocess.Popen(
                 [
                     str(Path(config.whisper_executable).resolve()),
                     "--model",
                     str(Path(config.whisper_model).resolve()),
                     "--file",
-                    str(audio),
+                    "-",
                     "--output-json-full",
                     "--output-file",
-                    str(output),
+                    "-",
                     "--no-prints",
                     "--max-context",
                     "0",
                     "--suppress-nst",
                 ],
                 cwd=directory,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
+                bufsize=0,
                 env={"PATH": os.defpath, "HOME": directory, "TMPDIR": directory},
             )
             try:
                 if register is not None:
                     register(process)
-                if process.wait(timeout=config.timeout_seconds) != 0:
-                    raise LiveAudioError("Local recognizer failed")
+                raw = _recognizer_pipes(process, packet, config, deadline)
             finally:
-                _terminate(process)
-            with output.with_suffix(".json").open("rb") as source:
-                raw = source.read(MAX_RESPONSE_BYTES + 1)
-            if len(raw) > MAX_RESPONSE_BYTES:
-                raise LiveAudioError("Local recognizer exceeded output limit")
+                try:
+                    _terminate(process)
+                finally:
+                    if process.stdin is not None:
+                        process.stdin.close()
+                    if process.stdout is not None:
+                        process.stdout.close()
             document = json.loads(raw)
             if not isinstance(document, dict):
                 raise ValueError
             return document
         except subprocess.TimeoutExpired:
             raise LiveAudioError("Local recognizer timed out") from None
+        except LiveAudioError:
+            raise
         except (OSError, subprocess.CalledProcessError, ValueError, RecursionError):
             raise LiveAudioError("Local recognizer failed") from None
 
@@ -830,7 +897,7 @@ def _counted_units(
 
 
 class WhisperCppTranscriber:
-    """The default `Transcriber`: the pinned whisper.cpp CLI on a temporary WAV file."""
+    """The default `Transcriber`: pinned whisper.cpp with WAV/JSON held in pipes."""
 
     recognizer_id = "whisper.cpp-live-window"
 
