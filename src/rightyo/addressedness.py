@@ -272,7 +272,7 @@ _REQUEST_VERBS = frozenset(
     (
         "run check search open close write create draft summarize summarise review update "
         "list explain call email text message remind schedule book read pause resume "
-        "send add remove delete"
+        "send add remove delete fix"
     ).split()
 )
 # Courtesy and transition words that may come before the opening verb ("please run ...").
@@ -290,8 +290,8 @@ def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
     back ("the other one", "again", "instead"); acts on the result ("play that", "turn it
     up"); opens by adding to it ("and ...", "what about ...", "how about ...", "actually
     ..."); is a short adjustment ("louder", "next one"); opens a request of three or more
-    words with a request verb ("run the review"); says "please" beside a verb that acts
-    for the user or a modal ("please have it fix both"); or corrects it ("you mean ...",
+    words with a request verb ("run the review"); says "please" beside a request verb or
+    a modal ("please have it fix both"); or corrects it ("you mean ...",
     "I meant ..."). Talk to a pet or a passer-by
     ("No, sit", "Is that your dog?") usually carries none. English, deterministic,
     approximate; contractions are split ("that's" is "that s").
@@ -303,7 +303,6 @@ def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
     # "And eggs" adds to a request; "and you" is a reply to someone else.
     adds = words[0] == "and" and len(words) > 1 and words[1] != "you"
     lead = next((word for word in words if word not in _VERB_LEAD), "")
-    acting = _REQUEST_VERBS | _OUTPUT_VERBS | _MODALS
     return (
         mentions_name(addressing, text)
         or adds
@@ -317,7 +316,7 @@ def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
         or any(a in _OUTPUT_VERBS and c in _OBJECTS for a, c in zip(words, words[2:]))
         or (len(words) <= 3 and words[0] in _ADJUSTMENTS)
         or (len(words) >= 3 and lead in _REQUEST_VERBS and "your" not in words)
-        or ("please" in words and not acting.isdisjoint(words))
+        or ("please" in words and not (_REQUEST_VERBS | _MODALS).isdisjoint(words))
         or any(
             pair in _CORRECTIONS and (index == 0 or words[index - 1] not in {"do", "what"})
             for index, pair in enumerate(pairs)

@@ -690,7 +690,7 @@ decisions arrive in) forms a request when all of these hold:
     as "run", "check", "open", "review" or "send", after an optional "please", "okay",
     "now", "so" or "alright" ("Run the weekly review"). Pet-command and everyday verbs
     such as "drop", "put", "get", "come", "show", "play" and "tell" are not on the list;
-  - "please" beside a request verb, an output verb or "can", "could", "would" or "will"
+  - "please" beside a request verb or "can", "could", "would" or "will"
     ("please have it fix both"), but not "Sit down please";
   - a correction ("you mean …", "I meant …"), but not "what do you mean" or "No, I said
     sit".

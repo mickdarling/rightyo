@@ -96,6 +96,10 @@ class CueShapeTests(unittest.TestCase):
             "Play with your toy",
             "Tell me about your day",
             "Call your mom back",
+            "Please play nice",
+            "Please move, buddy",
+            "Please turn around",
+            "Please don't make a mess",
         ):
             with self.subTest(text=text):
                 self.assertFalse(follow_up_cued(text, NAMES))
