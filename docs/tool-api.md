@@ -188,6 +188,17 @@ assistant pilot:
 > assistant.
 
 Describe your own setting when it differs, for example a shared office or a meeting.
+
+`listen --scene NAME` picks a built-in scene for one session, replacing the configuration's
+([#199](https://github.com/mickdarling/rightyo/issues/199)): `default` (above) or
+`clear-requests`, a precision-first scene. In `clear-requests`, only clear requests or
+questions addressed to the assistant count, with or without its name. Thinking aloud,
+narrating a screen, reading text aloud, notes to self, talk between people, talk about the
+assistant and media do not count, and short continuations of a request the assistant just
+acted on still do. In an internal evaluation on real turns (not published), it reached
+precision 0.86 at recall 0.52, so it suits sessions that need few false acts. It is not the
+default. A host chooses it per session. It requires Jev decisions; without them it is refused.
+
 Listener profiles ([#69](https://github.com/mickdarling/rightyo/issues/69)) are the
 general mechanism; the scene is the minimal first step.
 
@@ -351,6 +362,17 @@ the range 0 to 5,000, and 0 turns joining off. A joined turn:
   never extended this way. Overlap is still never joined, nothing joins a held turn without a
   label, and it is refused together with configured speaker roles, except
   [roles from live speaker identification](#roles-from-live-speaker-identification).
+
+An end-of-turn model's "complete" does not skip the hold for a piece that looks cut off
+mid-request ([#199](https://github.com/mickdarling/rightyo/issues/199)). Such a piece
+ends on an article, connective, filler, modal, possessive or one of the prepositions to,
+of, with, for and at ("Jarvis, add the", "remind me to"), or is one or two words that are
+each a name or a request opener ("Jarvis,", "hey Jarvis", "can you"). It is held as usual,
+so its continuation joins it rather than leaving a fragment to be decided alone. A turn
+ending in a question mark, a stop phrase and a dismissal-shaped turn ("stop it") are
+never held this way. The cost is the usual hold, about two seconds, and only on a turn
+that looks cut off.
+`"turns": {"hold_unfinished": false}` trusts the model as before (default true).
 
 A joined turn spans at most twice `max_utterance_ms` (24 s by default) and 4,000
 characters; a piece that would exceed either starts a new turn. A role is still fixed
@@ -624,13 +646,16 @@ of per-turn attention.
 event, no follow-ups, byte-identical fixtures. Turn it on with the configuration's
 `"conversation": {}` object; `session.started` then advertises it as a top-level
 `conversation` object, and a host that accepts that object must accept `conversation`
-events. The object takes three optional keys:
+events. The object takes seven optional keys:
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
 | `window_ms` | 20,000 | 1,000 to 120,000 | How long after a request turn ends its speaker stays engaged |
 | `follow_up_min_probability` | 0.4 | above 0, up to 1 | The attend probability an engaged speaker's `uncertain` turn needs to become a follow-up |
 | `closing_phrases` | "that's all", "that's it", "thanks, that's all", "never mind", and so on | up to 16 | Phrases that end the conversation (see [closings](#closings)) |
+| `appendix_ms` | 0 (off) | 0 to 5,000 | How soon after a request ends the same speaker's next turn counts as an appendix to it (see below) |
+| `require_cue` | false | true or false | Whether a follow-up must also carry a cue that it continues the exchange (see below) |
+| `cue_min_attend` | absent (off) | above 0 to 1 | With `require_cue`, the attend probability at which a follow-up needs no cue |
 
 **States.**
 - **Ambient**, the default: a turn forms a request only on a confident `attend`, as
@@ -647,7 +672,44 @@ decisions arrive in) forms a request when all of these hold:
 - its recipient is `system` or `unknown` (never `other_human` or another speaker);
 - it is not a closing phrase;
 - the decision was not a transient unavailability placeholder, and `owner_only` does not
-  exclude the speaker.
+  exclude the speaker;
+- with `require_cue` ([#199](https://github.com/mickdarling/rightyo/issues/199)), it
+  carries a cue that it continues the exchange. Precision comes first, so "it", "that",
+  "you" and "no" alone are not cues: they fill talk to pets and passers-by. A cue is any
+  of:
+  - the assistant's name;
+  - a question to it ("can you", "could you", "would you", "will you");
+  - a reference back ("again", "instead", "the other one", "the same", "the second",
+    "one more"), but not "just a second" or "same to you";
+  - an action on its result ("play that", "turn it up", "show me that");
+  - an opening that adds ("and …" but not "and you", "actually …", "what about …", "how
+    about …");
+  - a short adjustment of up to three words ("louder", "next one", "skip", "repeat",
+    "cancel");
+  - a request of three or more words, without "your", that opens with a request verb such
+    as "run", "check", "open", "review" or "send", after an optional "please", "okay",
+    "now", "so" or "alright" ("Run the weekly review"). Pet-command and everyday verbs
+    such as "drop", "put", "get", "come", "show", "play" and "tell" are not on the list;
+  - "please" beside a request verb or "can", "could", "would" or "will"
+    ("please have it fix both"), but not "Sit down please";
+  - a correction ("you mean …", "I meant …"), but not "what do you mean" or "No, I said
+    sit".
+
+  With `cue_min_attend` set, a follow-up whose attend probability reaches it needs no cue.
+  It only matters above `follow_up_min_probability`, which is checked first.
+
+  Talk to a pet or a passer-by inside the window ("No, sit", "Is that your dog?") then
+  stays context however Jev rates it. The diagnostic reason is `no_cue`. It applies to
+  an appendix too, and a closing is still reported as `closing`.
+
+**Appendices** ([#199](https://github.com/mickdarling/rightyo/issues/199)). With
+`appendix_ms` above 0, the engaged speaker's `uncertain` turn that starts within that long
+after their latest direct request ended ("Jarvis, add milk to the list" … "and eggs") is an
+appendix. It needs no follow-up attend probability, since a quick continuation of a
+request is rarely meant for anyone else. Every other follow-up condition above still
+applies, so a confident `ignore` never is one. A turn naming another agent never is one,
+and each direct request takes at most one appendix: a follow-up never opens a new window.
+The started event's `conversation` object carries `appendix_ms` only when it is on.
 
 A follow-up is still subject to stop phrases, dismissals, owner supersession and the
 dismissal cool-down; one the cool-down holds back is reported as `uncertain` with
@@ -656,6 +718,13 @@ dismissal cool-down; one the cool-down holds back is reported as `uncertain` wit
 The `attention` and `request` events of a follow-up carry `"label": "attend"` and
 `"follow_up": true` in `decision`, beside Jev's unchanged `recipient_kind` and
 `confidence`.
+
+With `decision.other_answered_blocks`
+([#199](https://github.com/mickdarling/rightyo/issues/199); see the
+[tool guide](tool-quickstart.md)), a turn withheld because another person answered it
+carries `"answered_by_other": true` in its `attention` event's `decision`, with
+`"label": "uncertain"`. It is never a follow-up (diagnostic reason `answered`). Hosts
+ignore the key if they do not know it.
 
 **Back to ambient**, with the `reason`:
 - `timeout`: the window lapsed. Stream time is judged at each decided turn, so the event
@@ -733,19 +802,21 @@ on with the configuration's `"acknowledgement": {}` object; `session.started` th
 advertises it as a top-level `acknowledgement` object,
 `{"version": 1, "min_confidence": 0.7, "dedup_window_ms": 8000}`, and every `request`
 carries a boolean `acknowledge`. A host that accepts that object plays its acknowledgement
-only for a request whose `acknowledge` is true. The object takes two optional keys:
+only for a request whose `acknowledge` is true. The object takes three optional keys:
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
 | `min_confidence` | 0.7 | 0 to 1 | The attend confidence an unnamed request needs to be acknowledged; 0 acknowledges every request |
 | `dedup_window_ms` | 8000 | 0 to 60,000 | How long after an acknowledged request a later one goes unacknowledged unless its answer has started (below); 0 turns this off |
+| `follow_up_min_confidence` | none (uses `min_confidence`) | 0 to 1 | The attend probability a [conversation follow-up](#conversation-mode) needs to be acknowledged ([#199](https://github.com/mickdarling/rightyo/issues/199)); a named follow-up is still acknowledged |
 
 A request is acknowledged when either holds:
 - its turn uses a configured name or variant (see [forms of address](#transport-and-lifecycle));
 - its attend confidence is at least `min_confidence`. For a direct `attend` that is the
   decision's `confidence`. For a [follow-up](#conversation-mode) it is Jev's attend
   probability, because a follow-up's `confidence` belongs to the `uncertain` choice it
-  was promoted from.
+  was promoted from. A follow-up is held to `follow_up_min_confidence` instead when that
+  is set ([#199](https://github.com/mickdarling/rightyo/issues/199)).
 
 Below the threshold the request is still formed and delivered, so the agent still decides
 whether to reply; only the acknowledgement is withheld. Each decision is also noted on

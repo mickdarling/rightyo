@@ -10,6 +10,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from rightyo.addressedness import SCENES
 from rightyo.contracts import (
     PROVENANCE,
     Addressing,
@@ -404,7 +405,7 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         help=(
             "with --mode stdin: an inherited file descriptor carrying host JSON lines "
-            '{"reply": "started"} / {"reply": "ended"} (#124)'
+            '{"reply": "started"} / {"reply": "ended"} (#124) and {"media": true|false}'
         ),
     )
     listen.add_argument("--use-jev", action="store_true")
@@ -420,6 +421,14 @@ def main(argv: list[str] | None = None) -> int:
         help="with --coaching: bounded authored JSON suggestions keyed by final utterance ID",
     )
     _add_name_option(listen)
+    listen.add_argument(
+        "--scene",
+        choices=sorted(SCENES),
+        help=(
+            "a built-in scene for this session, replacing the configuration's: default, or "
+            "clear-requests (only clear requests to the assistant; precision first)"
+        ),
+    )
     _add_session_budget_option(listen)
     _add_request_former_option(listen)
     _add_dismissal_option(listen)

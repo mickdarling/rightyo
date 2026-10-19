@@ -11,6 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TextIO
 
+from rightyo.addressedness import SCENES
 from rightyo.cli import (
     addressing_from_args,
     dismissal_from_args,
@@ -175,7 +176,8 @@ MAX_CONTROL_LINE = 256
 def _read_control(fd: int, controller) -> None:
     """Forward the host's reply reports to the session until EOF (#124).
 
-    Bounded lines of `{"reply": "started"}` or `{"reply": "ended"}`; anything else is
+    Bounded lines of `{"reply": "started"}` or `{"reply": "ended"}`, and the host's media
+    mode `{"media": true}` or `{"media": false}` (hailing-station #551); anything else is
     reported on stderr (content-free) and skipped. The reader never ends the session.
     """
     try:
@@ -204,9 +206,12 @@ def _read_control(fd: int, controller) -> None:
 def _apply_control(line: bytes, controller) -> None:
     try:
         message = json.loads(line)
-        if not isinstance(message, dict) or set(message) != {"reply"}:
+        if not isinstance(message, dict) or set(message) not in ({"reply"}, {"media"}):
             raise ValueError
-        controller.reply(message["reply"])
+        if "media" in message:
+            controller.media(message["media"])
+        else:
+            controller.reply(message["reply"])
     except (ValueError, TypeError, AttributeError, PrototypeError):
         _stderr("invalid control line; skipped")
 
@@ -246,6 +251,13 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
     if budget is not None:
         # The command line's budget likewise replaces the configuration file's.
         config = replace(config, session_budget_seconds=validate_session_budget(budget))
+    scene = getattr(args, "scene", None)
+    if scene is not None and not use_jev:
+        # Only Jev reads the scene; refused rather than silently doing nothing.
+        raise PrototypeError("--scene requires Jev decisions")
+    if scene is not None:
+        # A built-in scene for this session replaces the configuration file's, like --name.
+        config = replace(config, decision_scene=SCENES[scene])
     forming = forming_from_args(args)
     if forming is not None:
         # The command-line former replaces the configuration file's, like --name.

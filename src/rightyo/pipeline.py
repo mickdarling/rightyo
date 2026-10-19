@@ -6,17 +6,21 @@ import hashlib
 import json
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import wraps
 from threading import RLock
 from typing import Any, Callable
 
+from rightyo.addressedness import mentions_name, scene_text
 from rightyo.addressedness import post_turn_gap as checked_gap
-from rightyo.addressedness import scene_text
 from rightyo.contracts import Addressing, ContractError, DecisionEvent, Turn, identifier
 from rightyo.memory import TranscriptMemory
 from rightyo.providers import DecisionProvider, dismissal_hints
 
+# How long after the latest request formed a turn still carries it as context (#199), and
+# how much of its text.
+REQUEST_CONTEXT_MS = 120000
+REQUEST_CONTEXT_CHARS = 400
 # How long after the assistant's spoken reply a turn still carries it as context (rightyo#153).
 REPLY_CONTEXT_MS = 60_000
 # Reply intervals kept for that, two integers each. Only this cap evicts them, never their age,
@@ -71,6 +75,9 @@ class ReplayRunner:
         scene: str | None = None,
         post_turn_gaps: bool = False,
         dismissal_phrases: tuple[str, ...] | None = None,
+        other_answered_blocks: bool = False,
+        state_log: Callable[[dict[str, Any], Any], None] | None = None,
+        request_context: bool = False,
     ) -> None:
         if not 1 <= max_context_turns <= 32 or not 4000 <= max_context_chars <= 16000:
             raise ContractError("invalid context budget")
@@ -90,6 +97,18 @@ class ReplayRunner:
         self.scene = scene_text(scene)
         # Whether decision states carry the post-turn gap (#96), observed or not.
         self.post_turn_gaps = post_turn_gaps is True
+        # With the observed gap showing a different speaker answering, an unnamed turn is
+        # theirs to answer, not the assistant's (#199): the decision records when, and the
+        # event layer withholds it.
+        self.other_answered_blocks = other_answered_blocks is True
+        if state_log is not None and not callable(state_log):
+            raise ContractError("invalid decision state log")
+        # Opt-in record of each decided turn's exact state and answer (#199).
+        self.state_log = state_log
+        # Whether a decision state carries the latest request formed (#199): what the
+        # assistant last acted on, and how long ago, for follow-ups that refer back to it.
+        self.request_context = request_context is True
+        self._last_request: tuple[int, str, str, str | None] | None = None
         # Configured stop phrases sent as hints with the dismissal question (#98); None
         # asks no dismissal question.
         self.dismissal_phrases = (
@@ -136,6 +155,7 @@ class ReplayRunner:
         self._history.clear()
         self._last_end_ms = 0
         self._replies.clear()
+        self._last_request = None
 
     @_locked
     def clear(self, *, clear_memory: bool = True) -> None:
@@ -151,6 +171,7 @@ class ReplayRunner:
         self.failed_decisions = 0
         if self.memory is not None and clear_memory:
             self.memory.clear()
+        self._last_request = None
 
     @_locked
     def expire(self, now_ms: int) -> None:
@@ -215,6 +236,44 @@ class ReplayRunner:
                 # An end with no start seen: the reply had begun before this session knew.
                 self._replies.append([now_ms, now_ms])
 
+    def note_request(self, request: tuple[int, str, str, str | None] | None) -> None:
+        """Record the latest request formed, (end_ms, text, utterance_id, speaker_id), or
+        forget it with None (#199). Only used when decisions carry it."""
+        if not self.request_context:
+            return
+        with self._lock:
+            if request is None:
+                self._last_request = None
+                return
+            end_ms, text, utterance_id, speaker_id = request
+            if type(end_ms) is not int or not isinstance(text, str):
+                raise ContractError("invalid request context")
+            if self._last_request is None or end_ms >= self._last_request[0]:
+                self._last_request = (
+                    end_ms,
+                    text[:REQUEST_CONTEXT_CHARS],
+                    utterance_id,
+                    speaker_id,
+                )
+
+    def _request_state(self, turn: Turn) -> dict[str, Any] | None:
+        last = self._last_request
+        if last is None:
+            return None
+        end_ms, text, utterance_id, speaker_id = last
+        if self.memory is not None and utterance_id not in self.memory.retained_ids:
+            # Never outlive the transcript's own retention.
+            return None
+        before = turn.start_ms - end_ms
+        if not 0 <= before <= REQUEST_CONTEXT_MS:
+            return None
+        # Bounded by REQUEST_CONTEXT_CHARS; `bounded_request` never drops it.
+        return {
+            "ms_before": before,
+            "text": text,
+            "speaker_id": None if self.no_speakers else speaker_id,
+        }
+
     def _reply_state(self, turn: Turn) -> dict[str, Any] | None:
         """`assistant_reply` as it stood when `turn` began, or None when no reply bears on it.
 
@@ -260,11 +319,24 @@ class ReplayRunner:
             **({"post_turn_gap": checked_gap(gap)} if self.post_turn_gaps else {}),
             **({} if (reply := self._reply_state(turn)) is None else {"assistant_reply": reply}),
             **(
+                {} if (acted := self._request_state(turn)) is None else {"assistant_request": acted}
+            ),
+            **(
                 {}
                 if self.dismissal_phrases is None
                 else {"dismissal": {"stop_phrases": list(self.dismissal_phrases)}}
             ),
         }
+
+    def _answered_by_other(self, turn: Turn, gap: dict[str, Any] | None) -> bool:
+        """Whether another speaker answered `turn` within the reply window, unnamed (#199)."""
+        return (
+            self.other_answered_blocks
+            and gap is not None
+            and gap.get("observed") is True
+            and gap.get("following") == "different_speaker"
+            and not mentions_name(self.addressing, turn.text)
+        )
 
     def process(
         self, turn: Turn, post_turn_gap: dict[str, Any] | None = None
@@ -327,6 +399,16 @@ class ReplayRunner:
                 return None
             self._emitted.add(key)
             self._retain_final(turn, key)
-            return DecisionEvent(
+            if self._answered_by_other(turn, post_turn_gap):
+                answered = turn.end_ms + post_turn_gap["silence_ms"]
+                decision = replace(decision, answered_at_ms=answered)
+            result = DecisionEvent(
                 turn, decision, turn.revision, provider_ms, (time.perf_counter() - started) * 1000
             )
+        if self.state_log is not None:
+            # Outside the lock: a slow disk never holds up other turns.
+            try:
+                self.state_log(state, decision)
+            except Exception:  # noqa: BLE001 - the record never affects a decision
+                pass
+        return result
