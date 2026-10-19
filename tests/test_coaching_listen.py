@@ -389,6 +389,29 @@ class CoachingListenTests(unittest.TestCase):
         self.assert_terminal(child, "stopped")
         self.assert_no_actions(child)
 
+    def test_batched_finals_discard_stale_activity_and_advise_only_latest(self):
+        child = self.child(
+            utterances=["Authored first turn.", "Authored second turn."],
+            suggestions={"live-1": ADVICE, "live-2": "A second authored suggestion."},
+        )
+        child.enable()
+        child.audio(PCM_TURN * 2)
+        child.next(
+            lambda event: event.get("type") == "transcript"
+            and event["turn"]["utterance_id"] == "live-2"
+        )
+        for _ in range(3):
+            child.activity()
+        child.activity(utterance="live-2")
+        advice = child.next(lambda event: event.get("type") == "coaching_advice")
+        self.assertEqual(advice["text"], "A second authored suggestion.")
+        self.assertIsNone(child.process.poll())
+        child.process.stdin.close()
+        child.exited(0)
+        self.assertEqual(sum(event.get("type") == "coaching_advice" for event in child.events), 1)
+        self.assert_terminal(child, "stopped")
+        self.assert_no_actions(child)
+
     def test_missing_host_activity_never_admits_mock_advice(self):
         child = self.child()
         child.enable()

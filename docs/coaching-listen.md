@@ -68,8 +68,12 @@ These are the exact fields. Session/generation are canonical UUIDs; utterance ID
 the existing bounded Turn identifier grammar (1–96 ASCII `[A-Za-z0-9_. -]`). Pause
 is an integer 0–60,000 ms; flags are booleans. Match the actual final ID, child scope,
 and current qualification. Receipt must be strictly less than 2,000 ms after the
-final. One final may await activity; speculative, duplicate, stale, unknown or
-mismatched measurements are rejected. A new final immediately cancels old advice.
+final. One final may await activity. When a newer accepted final supersedes a known
+earlier final, delayed activity for that earlier ID is discarded within the same
+still-qualified session/generation. It cannot authorize advice, alter current pending
+work or extend a receipt deadline. This handles multiple finals reaching the host in
+one batch. Unknown/future IDs, wrong scope, expired/revoked qualification and duplicate
+activity for the latest final remain errors. A new final immediately cancels old advice.
 Missing measurements preserve a conservative context turn with no permission to
 speak. Speaker names/roles and quoted controls remain untrusted transcript content.
 The host measures owner activity/playback and silence; RightyO never derives them
