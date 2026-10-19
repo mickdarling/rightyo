@@ -646,7 +646,7 @@ of per-turn attention.
 event, no follow-ups, byte-identical fixtures. Turn it on with the configuration's
 `"conversation": {}` object; `session.started` then advertises it as a top-level
 `conversation` object, and a host that accepts that object must accept `conversation`
-events. The object takes seven optional keys:
+events. The object takes eight optional keys:
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
@@ -656,6 +656,7 @@ events. The object takes seven optional keys:
 | `appendix_ms` | 0 (off) | 0 to 5,000 | How soon after a request ends the same speaker's next turn counts as an appendix to it (see below) |
 | `require_cue` | false | true or false | Whether a follow-up must also carry a cue that it continues the exchange (see below) |
 | `cue_min_attend` | absent (off) | above 0 to 1 | With `require_cue`, the attend probability at which a follow-up needs no cue |
+| `continuation_cue` | false | true or false | With `require_cue`, whether the requester continuing after a reply needs no cue (see below) |
 
 **States.**
 - **Ambient**, the default: a turn forms a request only on a confident `attend`, as
@@ -697,6 +698,15 @@ decisions arrive in) forms a request when all of these hold:
 
   With `cue_min_attend` set, a follow-up whose attend probability reaches it needs no cue.
   It only matters above `follow_up_min_probability`, which is checked first.
+
+  With `continuation_cue` ([#213](https://github.com/mickdarling/rightyo/issues/213)), the
+  engaged speaker's own turn needs no cue once the assistant has begun replying to their
+  latest request, when Jev's raw attention choice was `attend`. It may start while that
+  reply still plays. So the speaker can carry on with the whole message, not just answer a
+  question. Another speaker's turn or an unlabelled one never continues, and until the
+  reply begins, or once the conversation lapses or ends, a cue is needed as before. A
+  request it forms waits for its own reply in turn. The started event's `conversation`
+  object carries `continuation_cue` only when it is on.
 
   Talk to a pet or a passer-by inside the window ("No, sit", "Is that your dog?") then
   stays context however Jev rates it. The diagnostic reason is `no_cue`. It applies to

@@ -533,6 +533,10 @@ class Conversation:
     # With `require_cue`, a follow-up whose attend probability reaches `cue_min_attend`
     # (#199; None, the default, is off) needs no cue: Jev is already fairly sure of it.
     cue_min_attend: float | None = None
+    # With `require_cue`, `continuation_cue` (#213) lets the engaged speaker's own turn that
+    # Jev chose to attend, starting once the assistant has begun replying, continue the
+    # exchange without a cue: their whole message is answered, not just a "yes".
+    continuation_cue: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -548,6 +552,8 @@ class Conversation:
             raise ContractError("invalid follow-up cue requirement")
         if self.cue_min_attend is not None and probability(self.cue_min_attend) <= 0:
             raise ContractError("invalid follow-up cue bypass")
+        if type(self.continuation_cue) is not bool:
+            raise ContractError("invalid continuation cue")
         phrases = self.closing_phrases
         if not isinstance(phrases, tuple) or len(phrases) > MAX_CLOSING_PHRASES:
             raise ContractError("invalid closing phrases")
@@ -592,6 +598,7 @@ class Conversation:
             "appendix_ms",
             "require_cue",
             "cue_min_attend",
+            "continuation_cue",
         }
         if not isinstance(raw, dict) or set(raw) - allowed:
             raise ContractError("conversation must be an object with known keys only")
@@ -613,6 +620,7 @@ class Conversation:
             **({"appendix_ms": self.appendix_ms} if self.appendix_ms else {}),
             **({"require_cue": True} if self.require_cue else {}),
             **({"cue_min_attend": self.cue_min_attend} if self.cue_min_attend is not None else {}),
+            **({"continuation_cue": True} if self.continuation_cue else {}),
         }
 
 
