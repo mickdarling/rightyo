@@ -101,6 +101,7 @@ class TurnMerger:
         reply_wait_ms: int = 0,
         shaped: Callable[[str], bool] = request_shaped,
         tail_join_ms: int = 0,
+        unfinished: Callable[[str], bool] | None = None,
     ):
         self.gap_ms = merge_gap(gap_ms)
         self.tail_join_ms = tail_join(tail_join_ms)
@@ -111,6 +112,9 @@ class TurnMerger:
         if breaks_turn is not None and not callable(breaks_turn):
             raise ValueError("invalid turn break predicate")
         self.breaks_turn = breaks_turn
+        if unfinished is not None and not callable(unfinished):
+            raise ValueError("invalid unfinished-turn predicate")
+        self.unfinished = unfinished
         if type(max_span_ms) is not int or max_span_ms < 1:
             raise ValueError("invalid turn merge span")
         self.max_span_ms = max_span_ms
@@ -170,7 +174,9 @@ class TurnMerger:
         `complete` means an end-of-turn model judged the speaker finished (#117): the
         fragment, or the turn it joins, is emitted at once instead of being held, and its
         post-turn gap is unobserved. A fragment held before it is still released first,
-        with this one as its following speech.
+        with this one as its following speech. When the `unfinished` predicate says the
+        text looks cut off mid-request (#199), `complete` is set aside and the turn is held
+        as usual, so its continuation can still join it.
         """
         if self.breaks_turn is not None and self.breaks_turn(fragment["text"]):
             # A stop phrase must stay a whole turn of its own to be recognized downstream.
@@ -179,6 +185,8 @@ class TurnMerger:
             return
         if self._continues(fragment):
             held = self._held
+            joined = held["text"] + " " + fragment["text"]
+            complete = complete and not self._looks_unfinished(joined)
             if fragment["speaker"] is None or fragment.get("inferred"):
                 # A tail join, or a piece with edge-attributed words: the joined turn's
                 # label is partly inferred, which roles must know (#137). Absent otherwise.
@@ -201,11 +209,15 @@ class TurnMerger:
                 self.flush()
             return
         self._release(fragment)
+        complete = complete and not self._looks_unfinished(fragment["text"])
         hold = 0 if complete else self._hold_for(fragment)
         if hold:
             self._held, self._hold_ms, self._heard_ms = dict(fragment), hold, None
         else:
             self.emit(dict(fragment))
+
+    def _looks_unfinished(self, text: str) -> bool:
+        return self.unfinished is not None and self.unfinished(text)
 
     def heard(self, start_ms: int) -> None:
         """Record speech detected at `start_ms` (voice activity), with or without text.

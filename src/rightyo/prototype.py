@@ -23,6 +23,7 @@ from rightyo.addressedness import (
     dismissal_shaped,
     reply_wait,
     scene_text,
+    unfinished_shaped,
 )
 from rightyo.capture import CaptureError, MacMicrophoneCapture, StdinPcmCapture
 from rightyo.contracts import (
@@ -70,6 +71,7 @@ from rightyo.speech_backends import (
     transcriber_spec,
     utterance_local_labels,
 )
+from rightyo.state_log import DecisionStateLog
 from rightyo.turn_merge import DEFAULT_TURN_MERGE_GAP_MS, merge_gap, tail_join
 
 BROWSER_LEASE_SECONDS = 15
@@ -124,11 +126,16 @@ def decision_spec(value: Any) -> bool:
             "allow_hosted",
             "max_requests",
             "scene",
+            "attend_min_probability",
+            "other_answered_blocks",
+            "state_log",
+            "request_context",
         }
     ):
         raise DecisionConfigError(
             "The decision section requires exactly the keys provider and allow_hosted, "
-            "with an optional max_requests and scene"
+            "with an optional max_requests, scene, attend_min_probability, "
+            "other_answered_blocks, state_log and request_context"
         )
     provider, allow_hosted = value["provider"], value["allow_hosted"]
     if type(provider) is not str or provider not in DECISION_PROVIDERS:
@@ -147,6 +154,30 @@ def decision_spec(value: Any) -> bool:
             )
         if provider != "jev":
             raise DecisionConfigError("max_requests applies only to the jev decision provider")
+    if "attend_min_probability" in value:
+        bar = value["attend_min_probability"]
+        if type(bar) not in {int, float} or not 0 <= bar <= 1:
+            raise DecisionConfigError(
+                "The decision attend_min_probability value must be a number from 0 to 1"
+            )
+        if provider != "jev":
+            raise DecisionConfigError(
+                "attend_min_probability applies only to the jev decision provider"
+            )
+    if "request_context" in value and type(value["request_context"]) is not bool:
+        raise DecisionConfigError("The decision request_context value must be true or false")
+    if "other_answered_blocks" in value and type(value["other_answered_blocks"]) is not bool:
+        raise DecisionConfigError("The decision other_answered_blocks value must be true or false")
+    if "state_log" in value:
+        log = value["state_log"]
+        if type(log) is not str or not log.startswith("/") or "\x00" in log:
+            raise DecisionConfigError("The decision state_log value must be an absolute path")
+        if any((parent / ".git").exists() for parent in Path(log).resolve().parents):
+            raise DecisionConfigError(
+                "The decision state_log must be stored outside the repository"
+            )
+        if provider != "jev":
+            raise DecisionConfigError("state_log applies only to the jev decision provider")
     if "scene" in value:
         try:
             scene_text(value["scene"])
@@ -192,9 +223,25 @@ class PrototypeConfig:
     # The section's optional `max_requests`: a per-session Jev request cap for sessions
     # that set none themselves (`listen`). None leaves live sessions uncapped (#75).
     decision_max_requests: int | None = None
+    # The section's optional `attend_min_probability`: Jev's attend probability an attend
+    # needs, above `min_confidence` (evaluation favoured 0.9). None leaves attend as is.
+    decision_attend_min_probability: float | None = None
+    # The section's optional `other_answered_blocks` (#199): with the post-turn gap on, an
+    # unnamed turn another speaker answers within the reply window is not attended.
+    decision_other_answered_blocks: bool = False
+    # The section's optional `state_log` (#199): an absolute path where each decided live
+    # turn's exact state and answer are appended (transcript text included; `0600`).
+    decision_state_log: Path | None = None
+    # The section's optional `request_context` (#199): decision states carry the latest
+    # request formed and how long ago, so a follow-up that refers back to it is recognized.
+    decision_request_context: bool = False
     # The optional `turns` section's `merge_gap_ms` (#73): a same-speaker turn starting
     # within this gap of the previous one is joined before it is emitted or decided.
     turn_merge_gap_ms: int = DEFAULT_TURN_MERGE_GAP_MS
+    # The `turns` section's `hold_unfinished` (#199): a turn that looks cut off mid-request
+    # ("Jarvis, add the") is held for the merge gap even when the end-of-turn model calls
+    # it complete, so its continuation can join it. On by default.
+    turn_hold_unfinished: bool = True
     # The `decision` section's optional `scene` (#96): the setting text given to the
     # decision model. Absent means the single-user pilot default; null turns it off.
     decision_scene: str | None = DEFAULT_SCENE
@@ -267,6 +314,10 @@ class PrototypeConfig:
                 raise ValueError
             # Optional per-session cap on live Jev requests; absent means none (#75).
             decision_requests = decision.get("max_requests") if hosted_decisions else None
+            attend_bar = decision.get("attend_min_probability") if hosted_decisions else None
+            answered = bool(has_decision and decision.get("other_answered_blocks", False))
+            state_log = decision.get("state_log") if hosted_decisions else None
+            acted = bool(has_decision and decision.get("request_context", False))
             scene = (
                 scene_text(decision.get("scene", DEFAULT_SCENE)) if has_decision else DEFAULT_SCENE
             )
@@ -330,7 +381,11 @@ class PrototypeConfig:
                 "reply_wait_ms",
                 "edge_attribution_ms",
                 "tail_join_ms",
+                "hold_unfinished",
             }:
+                raise ValueError
+            hold_unfinished = turns.get("hold_unfinished", True)
+            if type(hold_unfinished) is not bool:
                 raise ValueError
             tail = tail_join(turns.get("tail_join_ms", 0))
             edges = turns.get("edge_attribution_ms", 0)
@@ -338,6 +393,9 @@ class PrototypeConfig:
                 raise ValueError
             gap = merge_gap(turns.get("merge_gap_ms", DEFAULT_TURN_MERGE_GAP_MS))
             wait = reply_wait(turns.get("reply_wait_ms", DEFAULT_REPLY_WAIT_MS))
+            if answered and not wait:
+                # The gate reads the post-turn gap (#199); without it, it would do nothing.
+                raise DecisionConfigError("other_answered_blocks needs turns.reply_wait_ms above 0")
             values = {}
             for name, value in raw.items():
                 if not isinstance(value, str) or not value or not Path(value).is_absolute():
@@ -356,7 +414,12 @@ class PrototypeConfig:
                 diarizer=diarizer,
                 hosted_decisions=hosted_decisions,
                 decision_max_requests=decision_requests,
+                decision_attend_min_probability=attend_bar,
+                decision_other_answered_blocks=answered,
+                decision_state_log=None if state_log is None else Path(state_log),
+                decision_request_context=acted,
                 turn_merge_gap_ms=gap,
+                turn_hold_unfinished=hold_unfinished,
                 decision_scene=scene,
                 reply_wait_ms=wait,
                 edge_attribution_ms=edges,
@@ -666,6 +729,7 @@ class PrototypeController:
 
             memory = TranscriptMemory(retention_ms=retention * 1000)
             try:
+                bar = self.config.decision_attend_min_probability
                 provider = (
                     self.provider_factory(
                         allow_hosted=True,
@@ -673,6 +737,7 @@ class PrototypeController:
                         timeout_seconds=10,
                         min_confidence=confidence,
                         cancelled=cancelled,
+                        **({} if bar is None else {"attend_min_probability": bar}),
                     )
                     if hosted
                     else MockProvider()
@@ -686,6 +751,13 @@ class PrototypeController:
                 addressing=self.config.addressing,
                 scene=self.config.decision_scene,
                 post_turn_gaps=self.config.reply_wait_ms > 0,
+                other_answered_blocks=self.config.decision_other_answered_blocks,
+                state_log=(
+                    None
+                    if self.config.decision_state_log is None
+                    else DecisionStateLog(self.config.decision_state_log, report=self.report)
+                ),
+                request_context=self.config.decision_request_context,
                 dismissal_phrases=(
                     None
                     if self.config.dismissal is None
@@ -796,6 +868,20 @@ class PrototypeController:
         if self.config.dismissal is None:
             return stop
         return lambda text: stop(text) or dismissal_shaped(text)
+
+    def _turn_unfinished(self):
+        """The predicate for turns held despite end-of-turn's "complete" (#199), or None.
+
+        A stop phrase or a dismissal-shaped turn ("stop it", "forget it") is never held,
+        whether or not natural dismissal is on, so a stop is never delayed or joined.
+        """
+        if not self.config.turn_hold_unfinished:
+            return None
+        stop = (self.config.speakers or SpeakerPriority()).is_stop_phrase
+        addressing = self.config.addressing
+        return lambda text: (
+            not stop(text) and not dismissal_shaped(text) and unfinished_shaped(text, addressing)
+        )
 
     def _observe_gap(self, generation: int, utterance_id: str, gap: dict[str, Any]) -> None:
         """Keep a turn's observed post-turn gap until its decision takes it (#96)."""
@@ -917,6 +1003,7 @@ class PrototypeController:
                     # never absorb one; the defaults apply when roles are off. With
                     # dismissal on (#98), a dismissal-shaped turn is released at once too.
                     turn_break=self._turn_break(),
+                    turn_unfinished=self._turn_unfinished(),
                     reply_wait_ms=self.config.reply_wait_ms,
                     on_post_turn_gap=lambda utterance_id, gap: self._observe_gap(
                         generation, utterance_id, gap
@@ -1184,6 +1271,7 @@ class PrototypeController:
                                 event,
                                 **({} if unavailable is None else {"unavailable": unavailable}),
                             )
+
             except Exception:
                 enabled = False
                 with self._lock:
@@ -1337,6 +1425,19 @@ class PrototypeController:
                 # The decision context sees the reply too (rightyo#153), on the same clock.
                 self._runner.note_reply(phase, self._now_ms())
 
+    def media(self, on: bool) -> None:
+        """Forward the host's media mode (hailing-station #551) to the event publisher.
+
+        Held by the publisher across sessions, so it applies whether or not one is running;
+        ignored without one (the web lab). A malformed value raises before anything is
+        forwarded.
+        """
+        if type(on) is not bool:
+            raise PrototypeError("invalid media mode")
+        with self._lock:
+            if self._events is not None:
+                self._events.media(on)
+
     def _publish(self, method, value, **fields):
         """Run under the controller lock; a broken consumer cancels observation."""
         try:
@@ -1346,6 +1447,10 @@ class PrototypeController:
                 else fields
             )
             getattr(self._events, method)(value, now_ms=self._now_ms(), **options)
+            runner = self._runner
+            if runner is not None and runner.request_context:
+                # What the assistant last acted on, or None once dismissed (#199).
+                runner.note_request(getattr(self._events, "last_request", None))
         except Exception:
             self._stop.set()
             self._decision_cancel.set()

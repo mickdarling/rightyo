@@ -76,7 +76,8 @@ cool-down), with optional `window_ms`, `cooldown_ms` and `cooldown_min_confidenc
 off when absent. An optional `"conversation": {}` object turns on
 [conversation mode](tool-api.md#conversation-mode) (#82): engaged follow-ups after a
 request and the `conversation` event, with optional `window_ms`,
-`follow_up_min_probability` and `closing_phrases`; it is off when absent. An optional
+`follow_up_min_probability`, `closing_phrases`, `appendix_ms`, `require_cue` and
+`cue_min_attend`; it is off when absent. An optional
 `"acknowledgement": {}` object turns on [acknowledgement gating](tool-api.md#acknowledgement-gating)
 (#132): each request carries `acknowledge`, true only when the turn uses a configured name
 or its attend confidence reaches `min_confidence` (default 0.7, 0 to 1), so the host skips
@@ -247,6 +248,11 @@ Attention is then unavailable, rather than fabricated. There are no automatic re
 The confidence slider is an experiment setting, not a calibrated accuracy guarantee.
 
 ## Context and stopping
+
+Everything here is in memory unless the operator opts in to the
+[decision state log](tool-quickstart.md) (`decision.state_log`, #199). That log writes
+each decided turn's state, including transcript text, to a private local file, and
+nothing in the lab clears it: Clear and Stop leave it in place.
 
 The local transcript retains five minutes by default, configurable from one to ten minutes,
 with retained text capped at 1,000 turns / 1 MiB. These retention caps evict older
