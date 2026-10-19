@@ -43,7 +43,7 @@ class CueShapeTests(unittest.TestCase):
             "OK, open the budget sheet",
             "Could we do the blue one, please",
             "Hold on, you mean the cheaper plan?",
-            "No, I said Thursday",
+            "Yes, please have it fix both",
             "I meant the other folder",
         ):
             with self.subTest(text=text):
@@ -85,6 +85,17 @@ class CueShapeTests(unittest.TestCase):
             "Drop it, please",
             "Give me the ball",
             "Look at me",
+            "No, I said sit",
+            "I said drop it",
+            "Get off the couch please",
+            "Sit down please buddy",
+            "Please stop barking at him",
+            "Leave it, please, now",
+            "What do you mean?",
+            "Show me your paw",
+            "Play with your toy",
+            "Tell me about your day",
+            "Call your mom back",
         ):
             with self.subTest(text=text):
                 self.assertFalse(follow_up_cued(text, NAMES))

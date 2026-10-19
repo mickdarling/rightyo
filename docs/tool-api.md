@@ -646,7 +646,7 @@ of per-turn attention.
 event, no follow-ups, byte-identical fixtures. Turn it on with the configuration's
 `"conversation": {}` object; `session.started` then advertises it as a top-level
 `conversation` object, and a host that accepts that object must accept `conversation`
-events. The object takes five optional keys:
+events. The object takes seven optional keys:
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
@@ -686,14 +686,17 @@ decisions arrive in) forms a request when all of these hold:
     about …");
   - a short adjustment of up to three words ("louder", "next one", "skip", "repeat",
     "cancel");
-  - a request of three or more words that opens with a request verb such as "run",
-    "check", "open", "review", "send" or "tell", after an optional "please", "okay",
-    "now", "so" or "alright" ("Run the weekly review"). Pet-command verbs such as "drop",
-    "put", "get" and "come" are not on the list;
-  - "please" in a turn of four or more words;
-  - a correction ("you mean …", "I meant …", "I said …", "I asked …").
+  - a request of three or more words, without "your", that opens with a request verb such
+    as "run", "check", "open", "review" or "send", after an optional "please", "okay",
+    "now", "so" or "alright" ("Run the weekly review"). Pet-command and everyday verbs
+    such as "drop", "put", "get", "come", "show", "play" and "tell" are not on the list;
+  - "please" beside a request verb, an output verb or "can", "could", "would" or "will"
+    ("please have it fix both"), but not "Sit down please";
+  - a correction ("you mean …", "I meant …"), but not "what do you mean" or "No, I said
+    sit".
 
   With `cue_min_attend` set, a follow-up whose attend probability reaches it needs no cue.
+  It only matters above `follow_up_min_probability`, which is checked first.
 
   Talk to a pet or a passer-by inside the window ("No, sit", "Is that your dog?") then
   stays context however Jev rates it. The diagnostic reason is `no_cue`. It applies to

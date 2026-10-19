@@ -52,9 +52,9 @@ MAX_ENDED_SPEAKERS = 64
 # another speaker's start still counts as its echo rather than a person.
 MAX_PLAYBACKS = 8
 PLAYBACK_MARGIN_MS = 300
-# A request of at most this many words, starting this soon after the latest one ended, by
-# the same or an unidentified speaker, is a tag on it ("right?"), so the latest request in a
-# decision's context stays the one it tags (#199).
+# A request of at most this many words, without a name, starting this soon after the latest
+# one ended, by the same or an unidentified speaker, is a tag on it ("right?"), so the latest
+# request in a decision's context stays the one it tags (#199).
 TAG_MAX_WORDS = 2
 TAG_MS = 10_000
 # A bound guest's display name on a `transcript` event (hailing-station #434): the bound
@@ -1254,6 +1254,7 @@ class SpeechEvents:
         return (
             last is not None
             and len(turn.text.split()) <= TAG_MAX_WORDS
+            and not mentions_name(self._addressing, turn.text)
             and 0 <= turn.start_ms - last[0] <= TAG_MS
             and turn.speaker_id in {None, last[3]}
         )

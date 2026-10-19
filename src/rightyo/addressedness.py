@@ -265,19 +265,22 @@ _ADJUSTMENTS = frozenset(
     ).split()
 )
 # Verbs that open a request to the assistant ("Run the review", "Check my calendar") when
-# the turn has at least three words. Verbs of pet commands and everyday talk ("drop", "make",
-# "put", "get", "go", "come", "leave", "look", "give") are left out.
+# the turn has at least three words and no "your" ("Call your mom back" is to a person).
+# Verbs of pet commands and everyday talk ("drop", "make", "put", "get", "go", "come",
+# "leave", "look", "give", "show", "play", "tell") are left out.
 _REQUEST_VERBS = frozenset(
     (
         "run check search open close write create draft summarize summarise review update "
-        "list explain call email text message remind schedule book read play pause resume "
-        "send add remove delete tell show"
+        "list explain call email text message remind schedule book read pause resume "
+        "send add remove delete"
     ).split()
 )
 # Courtesy and transition words that may come before the opening verb ("please run ...").
 _VERB_LEAD = frozenset("please ok okay now so alright".split())
-# A correction of what the assistant just said or did ("you mean $134", "I said Tuesday").
-_CORRECTIONS = frozenset({("you", "mean"), ("i", "meant"), ("i", "said"), ("i", "asked")})
+# A correction of what the assistant just said ("you mean $134", "I meant the other one").
+# "I said ..." is left out: "No, I said sit" is how a dog is told twice. "What do you mean"
+# and "do you mean" ask a person.
+_CORRECTIONS = frozenset({("you", "mean"), ("i", "meant")})
 
 
 def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
@@ -287,8 +290,9 @@ def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
     back ("the other one", "again", "instead"); acts on the result ("play that", "turn it
     up"); opens by adding to it ("and ...", "what about ...", "how about ...", "actually
     ..."); is a short adjustment ("louder", "next one"); opens a request of three or more
-    words with a request verb ("run the review"); says "please" in four or more words; or
-    corrects it ("you mean ...", "I said ..."). Talk to a pet or a passer-by
+    words with a request verb ("run the review"); says "please" beside a verb that acts
+    for the user or a modal ("please have it fix both"); or corrects it ("you mean ...",
+    "I meant ..."). Talk to a pet or a passer-by
     ("No, sit", "Is that your dog?") usually carries none. English, deterministic,
     approximate; contractions are split ("that's" is "that s").
     """
@@ -299,6 +303,7 @@ def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
     # "And eggs" adds to a request; "and you" is a reply to someone else.
     adds = words[0] == "and" and len(words) > 1 and words[1] != "you"
     lead = next((word for word in words if word not in _VERB_LEAD), "")
+    acting = _REQUEST_VERBS | _OUTPUT_VERBS | _MODALS
     return (
         mentions_name(addressing, text)
         or adds
@@ -311,9 +316,12 @@ def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
         # One word between ("show me that", "read me this").
         or any(a in _OUTPUT_VERBS and c in _OBJECTS for a, c in zip(words, words[2:]))
         or (len(words) <= 3 and words[0] in _ADJUSTMENTS)
-        or (len(words) >= 3 and lead in _REQUEST_VERBS)
-        or (len(words) >= 4 and "please" in words)
-        or not _CORRECTIONS.isdisjoint(pairs)
+        or (len(words) >= 3 and lead in _REQUEST_VERBS and "your" not in words)
+        or ("please" in words and not acting.isdisjoint(words))
+        or any(
+            pair in _CORRECTIONS and (index == 0 or words[index - 1] not in {"do", "what"})
+            for index, pair in enumerate(pairs)
+        )
     )
 
 
