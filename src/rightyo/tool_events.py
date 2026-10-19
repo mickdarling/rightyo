@@ -9,7 +9,7 @@ import unicodedata
 from collections import deque
 from threading import RLock
 
-from rightyo.addressedness import mentions_name
+from rightyo.addressedness import follow_up_cued, mentions_name
 from rightyo.contracts import (
     DISMISSING,
     Acknowledgement,
@@ -48,6 +48,15 @@ DISMISS_SCOPES = {
 MAX_WITHDRAWABLE = 32
 # Speakers whose last explicit conversation end is remembered (#167).
 MAX_ENDED_SPEAKERS = 64
+# The assistant's own playback remembered for the answered gate (#199), and how close to it
+# another speaker's start still counts as its echo rather than a person.
+MAX_PLAYBACKS = 8
+PLAYBACK_MARGIN_MS = 300
+# A request of at most this many words, without a name, starting this soon after the latest
+# one ended, by the same or an unidentified speaker, is a tag on it ("right?"), so the latest
+# request in a decision's context stays the one it tags (#199).
+TAG_MAX_WORDS = 2
+TAG_MS = 10_000
 # A bound guest's display name on a `transcript` event (hailing-station #434): the bound
 # HailProtocol's `AmbientOverheard.name` accepts, in Unicode scalars, and the categories it
 # refuses (control, format, surrogate, private use, unassigned, line/paragraph separator).
@@ -199,6 +208,15 @@ class SpeechEvents:
         # Pending non-owner turns an owner superseded before their decisions arrived,
         # mapped to the owner's utterance: their late decisions never emit a request.
         self._superseded = {}
+        # Per speaker key, the end of their latest direct (non-follow-up) request: the one
+        # appendix it may take (#199) is measured from here, and taking it clears the entry.
+        self._appendix_from = {}
+        # (end_ms, text, utterance_id, speaker_id) of the latest request formed this session,
+        # or None, also after a dismissal or an explicit end (#199).
+        self.last_request = None
+        # Recent [start, end] stream times of the assistant's own playback (end None while
+        # it plays), as the host reports them (#124); bounded.
+        self._playbacks = deque(maxlen=MAX_PLAYBACKS)
         # "off" without a provider, "ready" with one, "unavailable" after a hosted role
         # question failed, or "rejected" after a provider contract violation; either
         # degrades roles to configured/unknown for the rest of the session.
@@ -212,6 +230,12 @@ class SpeechEvents:
         self._names = False
         # Other agents' names (#161): a turn naming one, and not this assistant, is never ours.
         self._other_agents = None
+        # Media mode (hailing-station #551), set by the host while the owner watches TV or
+        # videos: only the owner's voice naming this assistant attends, and no follow-ups.
+        self._media = False
+        # Turns accepted while media mode was on (utterance id -> turn end, pruned by
+        # retention): the mode each pending turn is decided under (see `_media_for`).
+        self._media_turns = {}
         # Owner-voice status (rightyo#164), off by default: the settings, and the last state
         # emitted this session (None, "unrecognized" or "recognized"; each at most once).
         self._owner_voice = None
@@ -275,6 +299,15 @@ class SpeechEvents:
             return None
 
     def _emit(self, kind, **fields):
+        if kind == "dismiss" or (
+            kind == "conversation"
+            and fields.get("state") == "ambient"
+            and fields.get("reason") in {"dismissed", "closed"}
+        ):
+            # A dismissed, withdrawn or explicitly closed exchange is no context (#199).
+            # Talk to another person or a lapsed window keeps it: a follow-up 30 to 120 s
+            # later still refers back. Any dismissal clears it, which errs on the safe side.
+            self.last_request = None
         self._sequence += 1
         payload = self._payload(kind, self._sequence, fields)
         size = self._size(payload)
@@ -297,6 +330,9 @@ class SpeechEvents:
         self._queue_bytes = 0
         self._open.clear()
         self._superseded.clear()
+        self._appendix_from.clear()
+        self.last_request = None
+        self._playbacks.clear()
         self._delivered.clear()
         self._withdrawn.clear()
 
@@ -362,6 +398,7 @@ class SpeechEvents:
             self._decided.clear()
             self._roles.clear()
             self._inferred.clear()
+            self._media_turns.clear()
             self._priority = priority
             self._per_turn = (
                 priority is not None
@@ -481,6 +518,9 @@ class SpeechEvents:
             for key, end_ms in list(self._inferred.items()):
                 if end_ms <= cutoff:
                     del self._inferred[key]
+            for key, end_ms in list(self._media_turns.items()):
+                if end_ms <= cutoff:
+                    del self._media_turns[key]
             for key in list(self._superseded):
                 if key not in self._pending:
                     del self._superseded[key]
@@ -582,6 +622,8 @@ class SpeechEvents:
             )
             if inferred and role is not None:
                 self._inferred[turn.utterance_id] = turn.end_ms
+            if self._media:
+                self._media_turns[turn.utterance_id] = turn.end_ms
             if self._retain_transcripts:
                 self._memory.append(turn, role=role)
             self._seen[turn.utterance_id] = digest
@@ -870,6 +912,32 @@ class SpeechEvents:
             return engaged["until_ms"]
         return max(engaged["until_ms"], replying + MAX_REPLY_HOLD_MS)
 
+    def media(self, on):
+        """The host's media mode (hailing-station #551), on or off; it outlasts sessions.
+
+        While on, an attend needs this assistant's name and, with speaker roles, the
+        owner's authority; every follow-up is refused. Stop phrases and dismissals are
+        unchanged. With no names configured, nothing attends. Emits nothing.
+        """
+        if type(on) is not bool:
+            raise ContractError("invalid media mode")
+        with self._lock:
+            self._media = on
+
+    def _media_for(self, turn):
+        """Whether media mode applies to `turn`: whether it was on when the turn was accepted.
+
+        Only that snapshot counts (Codex review of #196), so a change while a hosted decision
+        is pending applies to neither direction: a turn heard during the show stays gated after
+        the host turns it off, and a request made just before the owner turns it on still stands.
+        """
+        return turn.utterance_id in self._media_turns
+
+    def _media_attends(self, turn, authority):
+        """Whether an attend turn passes media mode's bar (see `media`)."""
+        named = mentions_name(self._addressing, turn.text)
+        return named and (self._priority is None or authority == "owner")
+
     def reply(self, phase, now_ms):
         """The host's report that the assistant's spoken reply `started` or `ended` (#124).
 
@@ -885,6 +953,16 @@ class SpeechEvents:
             if phase not in {"started", "ended"}:
                 raise ContractError("invalid reply phase")
             integer(now_ms, "now_ms")
+            if self._active:
+                # The assistant's own audio, so its echo is never taken for a person's answer.
+                if phase == "started":
+                    if self._playbacks and self._playbacks[-1][1] is None:
+                        # A host may forward only the last phase of a burst: an unclosed
+                        # span ends where the next begins, so it never covers all time.
+                        self._playbacks[-1][1] = now_ms
+                    self._playbacks.append([now_ms, None])
+                elif self._playbacks and self._playbacks[-1][1] is None:
+                    self._playbacks[-1][1] = now_ms
             if self._active and self._pending_ack is not None:
                 self._answer_ack(phase)
             engaged = self._engaged
@@ -1141,21 +1219,53 @@ class SpeechEvents:
         conversation = self._conversation
         if conversation is None or not self._engaged_with(turn):
             return "not_engaged"
+        if self._media_for(turn):
+            # Media mode: a show's dialogue in the window is never a follow-up.
+            return "media"
         if unavailable is not None:
             return "unavailable"
+        if evidence.get("answered_by_other"):
+            # Another person answered it within the reply window, unnamed (#199).
+            return "answered"
         if evidence["label"] != "uncertain":
             return "label"
         if decision.recipient not in {"system", "unknown"}:
             return "recipient"
-        if decision.probabilities["attend"] < self._follow_up_bar(role):
+        if decision.probabilities["attend"] < self._follow_up_bar(role) and not self._appendix(
+            turn
+        ):
             return "below_bar"
         if conversation.is_closing(turn.text):
             # A closing phrase ends the conversation; it is never a request of its own.
             return "closing"
+        if (
+            conversation.require_cue
+            and not self._cue_waived(decision)
+            and not follow_up_cued(turn.text, self._addressing)
+        ):
+            # Talk to a pet or a passer-by in the window carries no cue that it continues
+            # the exchange with the assistant (#199). It applies to an appendix too.
+            return "no_cue"
         if role is not None and self._priority.priority.owner_only and role != "owner":
             # Owner-only mode never lets another speaker's turn become a request.
             return "owner_only"
         return None
+
+    def _cue_waived(self, decision):
+        """Whether Jev's attend probability reaches the conversation's `cue_min_attend`."""
+        bar = self._conversation.cue_min_attend
+        return bar is not None and decision.probabilities["attend"] >= bar
+
+    def _is_tag(self, turn):
+        """Whether a request is a short tag on the latest one ("right?"), not its own (#199)."""
+        last = self.last_request
+        return (
+            last is not None
+            and len(turn.text.split()) <= TAG_MAX_WORDS
+            and not mentions_name(self._addressing, turn.text)
+            and 0 <= turn.start_ms - last[0] <= TAG_MS
+            and turn.speaker_id in {None, last[3]}
+        )
 
     def _follow_up_note(self, refusal, held, role, decision):
         """The content-free diagnostic for an engaged speaker's undecided turn (#153): the
@@ -1171,6 +1281,30 @@ class SpeechEvents:
             f"follow_up outcome={outcome} reason={refusal or held or 'passed'}"
             f" attend={attend:.6g} bar={self._follow_up_bar(role):.6g}"
         )
+
+    def _answered(self, turn, decision, role):
+        """Whether another person's answer withholds `turn` (#199): the pipeline saw a
+        different speaker start within the reply window, no playback of the assistant's own
+        (a reply or acknowledgement the host reported) was running then, so it was not our
+        own audio, and the speaker is not an enrolled owner or trusted speaker, whose
+        requests a guest's quick word never vetoes."""
+        at = decision.answered_at_ms
+        if at is None or (self._per_turn and role in {"owner", "trusted"}):
+            return False
+        return not any(
+            start - PLAYBACK_MARGIN_MS <= at and (end is None or at <= end + PLAYBACK_MARGIN_MS)
+            for start, end in self._playbacks
+        )
+
+    def _appendix(self, turn):
+        """Whether the engaged speaker's undecided `turn` starts within the appendix window
+        after their latest direct request ended (#199) and names no other agent. Only a
+        direct request opens the window, so an appendix never opens another."""
+        window = self._conversation.appendix_ms
+        if not window or mentions_name(self._other_agents, turn.text):
+            return False
+        since = self._appendix_from.get(self._cooldown_key(self._facts(turn)))
+        return since is not None and 0 <= turn.start_ms - since <= window
 
     def _follow_up_bar(self, role):
         """The follow-up attend bar: optionally lower for enrolled owners and trusted (#113)."""
@@ -1323,6 +1457,21 @@ class SpeechEvents:
                 # a follow-up or an acknowledgement here, and it ends this assistant's
                 # conversation with them below. Naming this assistant too keeps it ours.
                 evidence["label"] = "ignore"
+            if (
+                self._media_for(turn)
+                and evidence["label"] == "attend"
+                and not self._media_attends(turn, authority)
+            ):
+                # Media mode (hailing-station #551): TV dialogue stays context. An optional
+                # key, like role_status: strict hosts ignore unknown keys.
+                evidence["label"] = "ignore"
+                evidence["media"] = True
+            if self._answered(turn, event.decision, current):
+                # Another person answered this unnamed turn at once (#199): it is theirs. An
+                # optional key, like media: strict hosts ignore unknown keys.
+                if evidence["label"] == "attend":
+                    evidence["label"] = "uncertain"
+                evidence["answered_by_other"] = True
             would_attend = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
             # False: no follow-up note; None: a formed follow-up; else the refusal token.
             follow_up_note: str | None | bool = False
@@ -1609,7 +1758,26 @@ class SpeechEvents:
                         # when another speaker holds the engagement now: decided in order,
                         # such a request would have engaged first and then ended here.
                         self._mark_ended(own, turn)
+            if attended and self._conversation is not None and self._conversation.appendix_ms:
+                own = self._cooldown_key(self._facts(turn))
+                if evidence.get("follow_up"):
+                    # One appendix per direct request (#199): a follow-up never reopens it.
+                    self._appendix_from.pop(own, None)
+                elif own is not None:
+                    self._appendix_from[own] = max(
+                        self._appendix_from.get(own, turn.end_ms), turn.end_ms
+                    )
             if attended:
+                # The latest request formed, for a decision's context (#199): the heard
+                # words, as past turns carry them, not a former's rewrite. A short tag on
+                # it ("right?") leaves it in place.
+                if not self._is_tag(turn):
+                    self.last_request = (
+                        turn.end_ms,
+                        turn.text,
+                        turn.utterance_id,
+                        turn.speaker_id,
+                    )
                 # Any delivered request makes the next reply that request's, so no lapsed
                 # conversation is revived by it (rightyo#158); a request that engages its own
                 # speaker replaces the dormant one anyway.
@@ -1673,7 +1841,11 @@ class SpeechEvents:
         follow_up = evidence.get("follow_up") is True
         score = decision.probabilities["attend"] if follow_up else decision.confidence
         named = mentions_name(self._addressing, turn.text)
-        acknowledge = named or score >= gate.min_confidence
+        bar = gate.min_confidence
+        if follow_up and gate.follow_up_min_confidence is not None:
+            # A follow-up's own, usually stricter, bar (#199).
+            bar = gate.follow_up_min_confidence
+        acknowledge = named or score >= bar
         reason = "named" if named else "confident" if acknowledge else "low_confidence"
         pending = self._pending_ack
         if acknowledge and pending is not None and turn.start_ms < pending["until_ms"]:
@@ -1684,7 +1856,7 @@ class SpeechEvents:
         # The diagnostic note is content-free: labels and numbers, never text or ids.
         note = (
             f"ack outcome={'ack' if acknowledge else 'skip'} reason={reason}"
-            f" attend_confidence={score:.2f} min={gate.min_confidence:.2f}"
+            f" attend_confidence={score:.2f} min={bar:.2f}"
             f" follow_up={'true' if follow_up else 'false'}"
         )
         return {"acknowledge": acknowledge}, note
