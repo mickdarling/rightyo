@@ -6,6 +6,11 @@ test rig; the embedding application owns controls, capture and private playback.
 This implementation qualifies software using authored ASR and advice. It does not
 establish real conversation quality, enrolled owner identity or private device safety.
 
+The separate [compiled-goal and active-operation contract](coaching-operations.md)
+is pure groundwork for #178. It is not yet connected to this producer, its trusted
+control descriptor, providers or UI. Finite authored-catalog selection is not
+freeform goal compilation or generative advice.
+
 ## Process boundary
 
 ```sh
