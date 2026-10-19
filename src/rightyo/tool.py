@@ -290,8 +290,14 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
             output=output,
             use_jev=use_jev,
         )
-    if getattr(args, "coaching_mock_suggestions", None) is not None:
-        raise PrototypeError("--coaching-mock-suggestions requires --coaching")
+    if (
+        getattr(args, "coaching_mock_suggestions", None) is not None
+        or getattr(args, "coaching_provider", "mock") != "mock"
+        or getattr(args, "coaching_allow_hosted_text", False)
+        or getattr(args, "coaching_max_requests", None) is not None
+        or getattr(args, "coaching_advice_catalog", None) is not None
+    ):
+        raise PrototypeError("coaching provider options require --coaching")
     controller = controller_factory(config, event_publisher=events, **consent)
     # Signal handlers are installed only by this explicit foreground operation.
     previous = None

@@ -73,6 +73,10 @@ For continuous host composition, [the coaching listener](docs/coaching-listen.md
 documents opt-in raw PCM input, separate trusted controls and an executable authored
 speech backend. It requires no model assets for synthetic qualification; actual
 recognition/coaching quality and private hardware behavior remain unvalidated.
+Mock advice is the default. A separately consented Jev provider can select bounded
+locally authored catalog suggestions; its credential/HTTPS path is qualified with
+fakes, and hosted usefulness/latency remain unvalidated. See the listener guide for
+the separate consent and request-budget requirements.
 
 See [the coaching guide](docs/conversation-coaching.md) for the replay and library
 adapter, and [the wire contract](docs/coaching-wire-v1.md) for the host boundary. This

@@ -156,6 +156,17 @@ class CoachWork:
     current: Turn
     pause_ms: int
     request_id: str
+    # Internal monotonic deadline of the original qualification, never model/wire data.
+    # Authored providers may ignore None; real providers require an explicit deadline.
+    deadline: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.deadline is not None and (
+            type(self.deadline) not in (int, float)
+            or not math.isfinite(self.deadline)
+            or self.deadline < 0
+        ):
+            raise ContractError("invalid coaching work deadline")
 
 
 class CoachProvider(Protocol):
@@ -496,7 +507,14 @@ class CoachingSession:
                 or self._context[-1][1].turn is not turn
             ):
                 return
-            work = CoachWork(self._profile, self._snapshot(), turn, pause_ms, str(uuid4()))
+            work = CoachWork(
+                self._profile,
+                self._snapshot(),
+                turn,
+                pause_ms,
+                str(uuid4()),
+                deadline=lease.deadline,
+            )
             ticket = _Ticket(
                 self._session,
                 self._destination,
