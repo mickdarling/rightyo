@@ -700,11 +700,12 @@ decisions arrive in) forms a request when all of these hold:
   It only matters above `follow_up_min_probability`, which is checked first.
 
   With `continuation_cue` ([#213](https://github.com/mickdarling/rightyo/issues/213)), the
-  engaged speaker's own turn needs no cue once the assistant has begun replying to their
-  latest request, when Jev's raw attention choice was `attend`. It may start while that
-  reply still plays. So the speaker can carry on with the whole message, not just answer a
-  question. Another speaker's turn or an unlabelled one never continues, and until the
-  reply begins, or once the conversation lapses or ends, a cue is needed as before. A
+  engaged speaker's own turn needs no cue once the assistant has begun replying to the
+  latest request (an acknowledgement clip the host reports counts as the reply beginning),
+  when Jev's raw attention choice was `attend`. It may start while that reply still plays.
+  So the speaker can carry on with the whole message, not just answer a question. Another
+  speaker's turn or an unlabelled one never continues, and until the reply begins, or once
+  the conversation lapses or ends (until a reply revives it), a cue is needed as before. A
   request it forms waits for its own reply in turn. The started event's `conversation`
   object carries `continuation_cue` only when it is on.
 

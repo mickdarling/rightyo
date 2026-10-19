@@ -1289,8 +1289,9 @@ class SpeechEvents:
 
     def _continues(self, turn, decision):
         """Whether the engaged speaker's own turn continues the exchange (#213): with
-        `continuation_cue` on, it starts once the assistant began replying to their latest
-        request, even over that reply, and Jev chose to attend it. The caller has already
+        `continuation_cue` on, it starts once the assistant began replying to the latest
+        request (an acknowledgement clip's report counts), even over that reply, and Jev
+        chose to attend it. The caller has already
         checked it is the engaged speaker's, inside the window; an unattributed turn or
         another speaker's never is."""
         replied = self._replied_at
