@@ -1404,13 +1404,16 @@ class PrototypeController:
         self._closed.set()
         self.stop()
 
-    def reply(self, phase: str) -> None:
+    def reply(self, phase: str, *, asked: bool = False) -> None:
         """Forward the host's report that a spoken reply `started` or `ended` (#124).
 
-        Timed by this session's own stream clock when it arrives; ignored when no session
-        is running. A malformed phase raises before anything is forwarded.
+        `asked`: an ended reply ended with a question to the owner (#199). Timed by this
+        session's own stream clock when it arrives; ignored when no session is running. A
+        malformed phase raises before anything is forwarded.
         """
-        if phase not in {"started", "ended"}:
+        if phase not in {"started", "ended"} or type(asked) is not bool:
+            raise PrototypeError("invalid reply phase")
+        if asked and phase != "ended":
             raise PrototypeError("invalid reply phase")
         with self._lock:
             if (
@@ -1420,7 +1423,7 @@ class PrototypeController:
                 or self._phase not in {"listening", "replaying", "finishing"}
             ):
                 return
-            self._publish("reply", phase)
+            self._publish("reply", phase, **({"asked": True} if asked else {}))
             if self._runner is not None:
                 # The decision context sees the reply too (rightyo#153), on the same clock.
                 self._runner.note_reply(phase, self._now_ms())

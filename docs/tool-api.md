@@ -765,7 +765,11 @@ never counts as a follow-up (a closing is the one such turn that ends an engagem
 are timed from the end of the assistant's spoken reply when the host reports it. With
 `listen --mode stdin --control-fd N`, the host writes JSON lines `{"reply": "started"}`
 and `{"reply": "ended"}` to inherited descriptor N, and RightyO stamps each with its own
-stream clock on arrival. While engaged, a playing reply holds the window open (bounded
+stream clock on arrival. An ended reply that asked the owner a question may say so:
+`{"reply": "ended", "asked": true}` ([#199](https://github.com/mickdarling/rightyo/issues/199)).
+Until the next reply starts, a follow-up that opens as an answer ("yes", "yeah", "sure",
+"no", "okay", "go ahead", "do it", "sounds good") then carries its own cue under
+`require_cue`. Every other follow-up rule still applies. While engaged, a playing reply holds the window open (bounded
 at 180 s if its end never comes), and its end restarts the window from that moment. A
 report after the window lapsed first emits the `ambient` `timeout` event, then **revives**
 that speaker's engagement from the report's time if it lapsed by timeout within the last

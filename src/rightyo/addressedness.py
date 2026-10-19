@@ -283,6 +283,22 @@ _VERB_LEAD = frozenset("please ok okay now so alright".split())
 _CORRECTIONS = frozenset({("you", "mean"), ("i", "meant")})
 
 
+# How an answer to the assistant's own question opens ("Yes, do both", "Go ahead") (#199).
+_ANSWER_WORDS = frozenset("yes yeah yep yup sure no nope okay ok".split())
+_ANSWER_PAIRS = frozenset({("go", "ahead"), ("do", "it"), ("sounds", "good")})
+
+
+def answer_shaped(text: str) -> bool:
+    """Whether a turn opens as an answer to a yes/no question (English, approximate, #199).
+
+    True when its first word is "yes", "yeah", "yep", "yup", "sure", "no", "nope", "okay"
+    or "ok", or it opens "go ahead", "do it" or "sounds good". Only meaningful right after
+    the assistant asked the owner a question; contractions are split as in `follow_up_cued`.
+    """
+    words = _LETTERS.findall(text.lower())
+    return bool(words) and (words[0] in _ANSWER_WORDS or tuple(words[:2]) in _ANSWER_PAIRS)
+
+
 def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
     """Whether a turn carries a cue that it continues an exchange with the assistant (#199).
 
