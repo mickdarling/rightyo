@@ -444,6 +444,9 @@ class Conversation:
     # With `require_cue` (#199), a follow-up also needs a cue that it continues the exchange
     # (`follow_up_cued`): the name, second person, a referring word or an adding opener.
     require_cue: bool = False
+    # With `require_cue`, a follow-up whose attend probability reaches `cue_min_attend`
+    # (#199; None, the default, is off) needs no cue: Jev is already fairly sure of it.
+    cue_min_attend: float | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -457,6 +460,8 @@ class Conversation:
             raise ContractError("invalid appendix window")
         if type(self.require_cue) is not bool:
             raise ContractError("invalid follow-up cue requirement")
+        if self.cue_min_attend is not None and probability(self.cue_min_attend) <= 0:
+            raise ContractError("invalid follow-up cue bypass")
         phrases = self.closing_phrases
         if not isinstance(phrases, tuple) or len(phrases) > MAX_CLOSING_PHRASES:
             raise ContractError("invalid closing phrases")
@@ -500,6 +505,7 @@ class Conversation:
             "closing_phrases",
             "appendix_ms",
             "require_cue",
+            "cue_min_attend",
         }
         if not isinstance(raw, dict) or set(raw) - allowed:
             raise ContractError("conversation must be an object with known keys only")
@@ -520,6 +526,7 @@ class Conversation:
             # An added key, only when on: hosts ignore keys they do not know.
             **({"appendix_ms": self.appendix_ms} if self.appendix_ms else {}),
             **({"require_cue": True} if self.require_cue else {}),
+            **({"cue_min_attend": self.cue_min_attend} if self.cue_min_attend is not None else {}),
         }
 
 

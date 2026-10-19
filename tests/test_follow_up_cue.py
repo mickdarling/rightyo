@@ -38,6 +38,13 @@ class CueShapeTests(unittest.TestCase):
             "the other one",
             "bigger",
             "smaller",
+            "Run the weekly report, please.",
+            "Please check the garden forecast",
+            "OK, open the budget sheet",
+            "Could we do the blue one, please",
+            "Hold on, you mean the cheaper plan?",
+            "Yes, please have it fix both",
+            "I meant the other folder",
         ):
             with self.subTest(text=text):
                 self.assertTrue(follow_up_cued(text, NAMES))
@@ -72,6 +79,27 @@ class CueShapeTests(unittest.TestCase):
             "On the other hand",
             "And you!",
             "Put that down",
+            "Run!",
+            "Play nice",
+            "Sit down, please",
+            "Drop it, please",
+            "Give me the ball",
+            "Look at me",
+            "No, I said sit",
+            "I said drop it",
+            "Get off the couch please",
+            "Sit down please buddy",
+            "Please stop barking at him",
+            "Leave it, please, now",
+            "What do you mean?",
+            "Show me your paw",
+            "Play with your toy",
+            "Tell me about your day",
+            "Call your mom back",
+            "Please play nice",
+            "Please move, buddy",
+            "Please turn around",
+            "Please don't make a mess",
         ):
             with self.subTest(text=text):
                 self.assertFalse(follow_up_cued(text, NAMES))
@@ -114,6 +142,24 @@ class RequireCueTests(unittest.TestCase):
         self.assertFalse(self.follow_up("sit, good boy", mode, start=1500, attend=0.1))
         self.setUp()
         self.assertTrue(self.follow_up("and eggs", mode, start=1500, attend=0.1))
+
+    def test_a_strong_attend_needs_no_cue_when_the_bypass_is_set(self):
+        mode = Conversation(window_ms=10000, require_cue=True, cue_min_attend=0.75)
+        self.assertTrue(self.follow_up("The blue folder", mode, attend=0.8))
+        self.setUp()
+        self.assertFalse(self.follow_up("The blue folder", mode, attend=0.7))
+        self.setUp()
+        # Without the bypass, the same strong attend still needs a cue.
+        plain = Conversation(window_ms=10000, require_cue=True)
+        self.assertFalse(self.follow_up("The blue folder", plain, attend=0.8))
+
+    def test_the_bypass_is_validated_and_advertised_only_when_set(self):
+        for bad in (0, 1.5, "0.8", True):
+            with self.subTest(bad=bad), self.assertRaises(ContractError):
+                Conversation(cue_min_attend=bad)
+        self.assertEqual(Conversation.from_dict({"cue_min_attend": 0.75}).cue_min_attend, 0.75)
+        self.assertEqual(Conversation(cue_min_attend=0.75).to_dict()["cue_min_attend"], 0.75)
+        self.assertNotIn("cue_min_attend", Conversation().to_dict())
 
     def test_off_by_default_as_before(self):
         self.assertTrue(self.follow_up("Good boy, come here!", Conversation(window_ms=10000)))

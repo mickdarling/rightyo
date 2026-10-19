@@ -10,7 +10,7 @@ from pathlib import Path
 from test_answered_by_other import Attending
 from test_conversation import SESSION, decided, turn
 
-from rightyo.contracts import ContractError, Conversation
+from rightyo.contracts import Addressing, ContractError, Conversation
 from rightyo.pipeline import REQUEST_CONTEXT_CHARS, REQUEST_CONTEXT_MS, ReplayRunner
 from rightyo.prototype import DecisionConfigError, PrototypeConfig
 from rightyo.providers import REQUEST_GUIDANCE, build_request
@@ -91,6 +91,30 @@ class EventsTests(unittest.TestCase):
         events.transcript(ignored, 2800)
         events.decision(decided(ignored, "ignore"), 2900)
         self.assertEqual(events.last_request, (900, "Jarvis, add milk", "t1", "Speaker A"))
+
+    def request(self, events, current, at):
+        events.transcript(current, current.end_ms)
+        events.decision(decided(current, "attend"), at)
+
+    def test_a_short_tag_on_the_latest_request_leaves_it_in_place(self):
+        events = SpeechEvents()
+        names = Addressing.from_dict({"names": ["Jarvis"], "variants": {}})
+        events.start(
+            SESSION, now_ms=0, conversation=Conversation(window_ms=60000), addressing=names
+        )
+        self.request(events, turn("t1", 0, 900, "Jarvis, is the plan forty dollars"), 1000)
+        self.request(events, turn("t2", 1500, 1900, "right?", speaker=None), 2000)
+        self.assertEqual(events.last_request[1], "Jarvis, is the plan forty dollars")
+        # A longer request, a later one or another known speaker's replaces it.
+        self.request(events, turn("t3", 3000, 3900, "Jarvis, add eggs too"), 4000)
+        self.assertEqual(events.last_request[1], "Jarvis, add eggs too")
+        # A named short request inside the tag window is a request of its own.
+        self.request(events, turn("t4", 5000, 5400, "Jarvis, weather"), 5500)
+        self.assertEqual(events.last_request[1], "Jarvis, weather")
+        self.request(events, turn("t6", 20000, 20400, "louder"), 20500)
+        self.assertEqual(events.last_request[1], "louder")
+        self.request(events, turn("t5", 21000, 21400, "Jarvis, skip", speaker="Speaker B"), 21500)
+        self.assertEqual(events.last_request[1], "Jarvis, skip")
 
     def test_a_dismissal_forgets_it(self):
         from rightyo.contracts import Dismissal

@@ -76,7 +76,8 @@ cool-down), with optional `window_ms`, `cooldown_ms` and `cooldown_min_confidenc
 off when absent. An optional `"conversation": {}` object turns on
 [conversation mode](tool-api.md#conversation-mode) (#82): engaged follow-ups after a
 request and the `conversation` event, with optional `window_ms`,
-`follow_up_min_probability` and `closing_phrases`; it is off when absent. An optional
+`follow_up_min_probability`, `closing_phrases`, `appendix_ms`, `require_cue` and
+`cue_min_attend`; it is off when absent. An optional
 `"acknowledgement": {}` object turns on [acknowledgement gating](tool-api.md#acknowledgement-gating)
 (#132): each request carries `acknowledge`, true only when the turn uses a configured name
 or its attend confidence reaches `min_confidence` (default 0.7, 0 to 1), so the host skips
