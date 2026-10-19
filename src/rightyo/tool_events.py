@@ -159,7 +159,12 @@ class SpeechEvents:
     releases pending plaintext; a normal end preserves already queued delivery.
     """
 
-    def __init__(self, *, retention_ms=300000, max_pending=128, report=None):
+    def __init__(
+        self, *, retention_ms=300000, max_pending=128, report=None, retain_transcripts=True
+    ):
+        if type(retain_transcripts) is not bool:
+            raise ContractError("invalid transcript retention setting")
+        self._retain_transcripts = retain_transcripts
         # At least five: one open request plus the owner's transcript, attention and
         # request, with a terminal slot, so the static and dynamic override bounds agree.
         integer(max_pending, "max_pending", 5)
@@ -364,6 +369,8 @@ class SpeechEvents:
             integer(now_ms, "now_ms")
             if type(attention_enabled) is not bool:
                 raise ContractError("invalid attention capability")
+            if not self._retain_transcripts and attention_enabled:
+                raise ContractError("attention requires transcript retention")
             if other_agents is not None and not isinstance(other_agents, Addressing):
                 raise ContractError("invalid other agents")
             if addressing is not None and not isinstance(addressing, Addressing):
@@ -617,7 +624,8 @@ class SpeechEvents:
                 self._inferred[turn.utterance_id] = turn.end_ms
             if self._media:
                 self._media_turns[turn.utterance_id] = turn.end_ms
-            self._memory.append(turn, role=role)
+            if self._retain_transcripts:
+                self._memory.append(turn, role=role)
             self._seen[turn.utterance_id] = digest
             if turn.end_ms <= self._now - self.retention_ms:
                 return

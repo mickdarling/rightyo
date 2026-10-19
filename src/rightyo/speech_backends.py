@@ -21,6 +21,7 @@ import socket
 import ssl
 import threading
 import time
+import unicodedata
 import urllib.parse
 import wave
 from typing import Any, Callable
@@ -40,8 +41,13 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_AUDIO_MS = 16000  # the largest utterance window plus the diarizer's margin
 DEEPGRAM_ENDPOINT = "https://api.deepgram.com/v1/listen"
 DEEPGRAM_DIARIZE_MODELS = ("latest", "v1", "v2")
-TRANSCRIBER_KINDS = ("whisper.cpp", "hosted-openai-compatible")
-DIARIZER_KINDS = ("nemotron.cpp", "hosted-deepgram")
+SYNTHETIC_KIND = "synthetic-authored"
+MAX_SYNTHETIC_UTTERANCES = 32
+MAX_SYNTHETIC_TEXT_CHARS = 1024
+MAX_SYNTHETIC_SCRIPT_BYTES = 16384
+MAX_SYNTHETIC_AUDIO_MS = 900000
+TRANSCRIBER_KINDS = ("whisper.cpp", "hosted-openai-compatible", SYNTHETIC_KIND)
+DIARIZER_KINDS = ("nemotron.cpp", "hosted-deepgram", SYNTHETIC_KIND)
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
 _LANGUAGE = re.compile(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?")
 _UNSAFE = re.compile(r"[^A-Za-z0-9_. -]")
@@ -67,6 +73,103 @@ MIN_TRANSPORT_SECONDS = 0.1  # the least a nearly exhausted budget gives the tra
 
 class HostedSpeechError(LiveAudioError):
     """Sanitized hosted-backend failure: no audio, transcript, URL or credential content."""
+
+
+def _authored_script(value: Any) -> list[str]:
+    """A finite authored transcript script; never text decoded from the input audio."""
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_SYNTHETIC_UTTERANCES:
+        raise LiveAudioError("Invalid synthetic authored script")
+    if any(
+        not isinstance(text, str)
+        or not text.strip()
+        or len(text) > MAX_SYNTHETIC_TEXT_CHARS
+        or any(unicodedata.category(char).startswith("C") for char in text)
+        or any(char in "\u2028\u2029" for char in text)
+        for text in value
+    ):
+        raise LiveAudioError("Invalid synthetic authored script")
+    encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    if len(encoded) > MAX_SYNTHETIC_SCRIPT_BYTES:
+        raise LiveAudioError("Synthetic authored script exceeds its byte budget")
+    return list(value)
+
+
+def _synthetic_source(config: LiveConfig) -> None:
+    # Defense in depth: callers bypassing PrototypeController still cannot use this
+    # mock to label real speech or reach a native/provider fallback.
+    if config.provenance != "synthetic":
+        raise LiveAudioError("Synthetic speech backends require synthetic audio provenance")
+
+
+class SyntheticAuthoredTranscriber:
+    """Consume one authored text per real PCM utterance, with no recognition claim.
+
+    Framing and endpointing remain LiveProcessor's work. The script never cycles;
+    extra utterances fail closed rather than fabricating another transcript.
+    """
+
+    recognizer_id = "synthetic-authored-v1"
+
+    def __init__(self, config: LiveConfig, utterances: list[str]):
+        _synthetic_source(config)
+        self._utterances = tuple(_authored_script(utterances))
+        self._index = 0
+        self._cancelled = config.cancelled
+
+    def transcribe(self, pcm: bytes, register=None) -> list[dict[str, Any]]:
+        if self._cancelled is not None and self._cancelled():
+            raise LiveAudioError("Synthetic speech processing was cancelled")
+        if (
+            not isinstance(pcm, bytes)
+            or not pcm
+            or len(pcm) % 2
+            or len(pcm) > MAX_AUDIO_MS * BYTES_PER_MS
+        ):
+            raise LiveAudioError("Invalid synthetic utterance audio")
+        if self._index >= len(self._utterances):
+            raise LiveAudioError("Synthetic authored script exhausted")
+        text = self._utterances[self._index]
+        self._index += 1
+        return [{"text": text, "start_ms": 0, "end_ms": len(pcm) // BYTES_PER_MS}]
+
+
+class SyntheticAuthoredDiarizer:
+    """One explicitly synthetic speaker covering received PCM, without retaining audio.
+
+    This constant-space mock does not detect speakers or imply diarization quality.
+    Its finite stream ceiling matches the coaching session's maximum lifetime.
+    """
+
+    diarizer_id = "synthetic-authored-v1"
+    speaker_provenance = "authored-fixture"
+
+    def __init__(self, config: LiveConfig):
+        _synthetic_source(config)
+        self._received_bytes = 0
+        self._cancelled = config.cancelled
+        self.closed = False
+
+    def push(self, pcm: bytes) -> None:
+        if self.closed or (self._cancelled is not None and self._cancelled()):
+            raise LiveAudioError("Synthetic speech processing was cancelled")
+        if not isinstance(pcm, bytes) or len(pcm) % 2 or len(pcm) > 32000:
+            raise LiveAudioError("Invalid synthetic stream audio")
+        if self._received_bytes + len(pcm) > MAX_SYNTHETIC_AUDIO_MS * BYTES_PER_MS:
+            raise LiveAudioError("Synthetic stream exceeded its audio budget")
+        self._received_bytes += len(pcm)
+
+    def segments(self) -> list[dict[str, Any]]:
+        if self.closed:
+            return []
+        until = self._received_bytes // BYTES_PER_MS
+        return [] if until == 0 else [{"start_ms": 0, "end_ms": until, "speaker": 1}]
+
+    def finish(self) -> list[dict[str, Any]]:
+        return self.segments()
+
+    def close(self) -> None:
+        self.closed = True
+        self._received_bytes = 0
 
 
 class _ReadDeadline(Exception):
@@ -987,9 +1090,12 @@ def transcriber_spec(value: Any) -> dict[str, Any]:
         {
             "whisper.cpp": set(),
             "hosted-openai-compatible": {"endpoint", "model", "language", "timeout_seconds"},
+            SYNTHETIC_KIND: {"utterances"},
         },
     )
-    if spec["kind"] == "hosted-openai-compatible":
+    if spec["kind"] == SYNTHETIC_KIND:
+        spec["utterances"] = _authored_script(spec.get("utterances"))
+    elif spec["kind"] == "hosted-openai-compatible":
         spec["endpoint"] = _https_endpoint(spec.get("endpoint"), "Hosted transcriber")
         spec["model"] = _name(spec.get("model"), "hosted transcriber model")
         spec["timeout_seconds"] = _timeout(spec.get("timeout_seconds", 30))
@@ -1010,6 +1116,7 @@ def diarizer_spec(value: Any) -> dict[str, Any]:
         {
             "nemotron.cpp": set(),
             "hosted-deepgram": {"endpoint", "model", "diarize_model", "timeout_seconds"},
+            SYNTHETIC_KIND: set(),
         },
     )
     if spec["kind"] == "hosted-deepgram":
@@ -1028,6 +1135,10 @@ def is_hosted(spec: dict[str, Any]) -> bool:
     return spec["kind"].startswith("hosted-")
 
 
+def is_synthetic(spec: dict[str, Any]) -> bool:
+    return spec["kind"] == SYNTHETIC_KIND
+
+
 def utterance_local_labels(spec: dict[str, Any]) -> bool:
     """Whether the selected diarizer's labels hold only within one utterance.
 
@@ -1041,6 +1152,8 @@ def utterance_local_labels(spec: dict[str, Any]) -> bool:
 
 def transcriber_id(spec: dict[str, Any]) -> str:
     """The `recognizer_id` the selected transcriber stamps on turns (display-safe)."""
+    if is_synthetic(spec):
+        return SyntheticAuthoredTranscriber.recognizer_id
     if spec["kind"] == "hosted-openai-compatible":
         return provenance_id("hosted-openai-compatible", _name(spec["model"], "model"))
     return WhisperCppTranscriber.recognizer_id
@@ -1053,6 +1166,8 @@ def diarizer_id(spec: dict[str, Any]) -> str:
     metadata may name a more specific resolved model, which is not surfaced here because
     the id is advertised when the session starts, before any request.
     """
+    if is_synthetic(spec):
+        return SyntheticAuthoredDiarizer.diarizer_id
     if spec["kind"] == "hosted-deepgram":
         model = _name(spec["model"], "model")
         version = spec["diarize_model"]
@@ -1074,12 +1189,17 @@ def speech_summary(transcriber: dict[str, Any], diarizer: dict[str, Any]) -> dic
     }
 
 
-_DIARIZERS = {"nemotron.cpp": NemotronCppDiarizer, "hosted-deepgram": DeepgramDiarizer}
+_DIARIZERS = {
+    "nemotron.cpp": NemotronCppDiarizer,
+    "hosted-deepgram": DeepgramDiarizer,
+    SYNTHETIC_KIND: SyntheticAuthoredDiarizer,
+}
 SERVICE_NAMES = {
     "whisper.cpp": "Whisper (configured model)",
     "nemotron.cpp": "Nemotron 3 (configured GGUF)",
     "hosted-openai-compatible": "OpenAI-compatible hosted",
     "hosted-deepgram": "Deepgram hosted",
+    SYNTHETIC_KIND: "Authored synthetic mock (no speech recognition)",
 }
 
 
@@ -1106,6 +1226,8 @@ def transcriber_factory(
     spec = transcriber_spec(spec)
     if spec["kind"] == "whisper.cpp":
         return None
+    if is_synthetic(spec):
+        return lambda config: SyntheticAuthoredTranscriber(config, spec["utterances"])
 
     def build(config: LiveConfig) -> Transcriber:
         return OpenAICompatibleTranscriber(
@@ -1127,6 +1249,8 @@ def diarizer_factory(
     spec = diarizer_spec(spec)
     if spec["kind"] == "nemotron.cpp":
         return None
+    if is_synthetic(spec):
+        return SyntheticAuthoredDiarizer
 
     def build(config: LiveConfig) -> Diarizer:
         return DeepgramDiarizer(

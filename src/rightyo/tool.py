@@ -267,7 +267,8 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
         # file's `dismissal` section keeps its own values.
         config = replace(config, dismissal=dismissal_from_args(args))
     # Stdout carries the events; acknowledgement-gating notes (#132) go to stderr.
-    events = SpeechEvents(report=_stderr)
+    coaching = getattr(args, "coaching", False)
+    events = SpeechEvents(report=None if coaching else _stderr, retain_transcripts=not coaching)
     consent = {"allow_hosted_speech": True} if config.hosted_speech else {}
     # Content-free session notes (end-of-turn scores, capture, shadow speaker
     # identification) go to stderr in every mode.
@@ -277,6 +278,20 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
         consent["audio_provenance"] = provenance
     # Host opt-ins from the environment (rightyo#164); absent, nothing changes.
     consent.update(host_options())
+    if getattr(args, "coaching", False):
+        from rightyo.coaching_listen import run
+
+        return run(
+            args,
+            config=config,
+            events=events,
+            consent=consent,
+            controller_factory=controller_factory,
+            output=output,
+            use_jev=use_jev,
+        )
+    if getattr(args, "coaching_mock_suggestions", None) is not None:
+        raise PrototypeError("--coaching-mock-suggestions requires --coaching")
     controller = controller_factory(config, event_publisher=events, **consent)
     # Signal handlers are installed only by this explicit foreground operation.
     previous = None
