@@ -220,6 +220,9 @@ class SpeechEvents:
         # Stream time the latest reply ended with a question to the owner (#199), or None;
         # cleared when the next reply starts.
         self._asked_at = None
+        # Stream time the assistant began replying to the latest request (#213), or None;
+        # cleared with the question, but a later reply to the same request keeps it.
+        self._replied_at = None
         # "off" without a provider, "ready" with one, "unavailable" after a hosted role
         # question failed, or "rejected" after a provider contract violation; either
         # degrades roles to configured/unknown for the rest of the session.
@@ -337,6 +340,7 @@ class SpeechEvents:
         self.last_request = None
         self._playbacks.clear()
         self._asked_at = None
+        self._replied_at = None
         self._delivered.clear()
         self._withdrawn.clear()
 
@@ -964,6 +968,10 @@ class SpeechEvents:
             integer(now_ms, "now_ms")
             if self._active:
                 self._asked_at = now_ms if asked else None
+                if self._replied_at is None:
+                    # The first phase reported since the request: a host may forward only
+                    # a reply's end, and then it had begun by then.
+                    self._replied_at = now_ms
             if self._active:
                 # The assistant's own audio, so its echo is never taken for a person's answer.
                 if phase == "started":
@@ -1103,6 +1111,7 @@ class SpeechEvents:
             self._engaged = None
             # A question belongs to its conversation (#199); a revival starts a new reply.
             self._asked_at = None
+            self._replied_at = None
             self._dormant = {"engaged": engaged, "at_ms": self._window_end(engaged)}
             self._emit(
                 "conversation",
@@ -1150,6 +1159,7 @@ class SpeechEvents:
             return
         speaker_id = self._engaged["speaker_id"]
         self._asked_at = None
+        self._replied_at = None
         self._mark_ended(self._engaged["key"], turn)
         self._engaged = None
         # An explicit end is never revived by a later reply.
@@ -1257,6 +1267,7 @@ class SpeechEvents:
             and not self._cue_waived(decision)
             and not follow_up_cued(turn.text, self._addressing)
             and not self._answers_question(turn)
+            and not self._continues(turn, decision)
         ):
             # Talk to a pet or a passer-by in the window carries no cue that it continues
             # the exchange with the assistant (#199). It applies to an appendix too.
@@ -1275,6 +1286,21 @@ class SpeechEvents:
         """Whether a turn starting after a reply that asked the owner a question answers it."""
         asked = self._asked_at
         return asked is not None and turn.start_ms >= asked and answer_shaped(turn.text)
+
+    def _continues(self, turn, decision):
+        """Whether the engaged speaker's own turn continues the exchange (#213): with
+        `continuation_cue` on, it starts once the assistant began replying to the latest
+        request (an acknowledgement clip's report counts), even over that reply, and Jev
+        chose to attend it. The caller has already
+        checked it is the engaged speaker's, inside the window; an unattributed turn or
+        another speaker's never is."""
+        replied = self._replied_at
+        return (
+            self._conversation.continuation_cue
+            and replied is not None
+            and turn.start_ms >= replied
+            and (decision.attention_choice or decision.label) == "attend"
+        )
 
     def _is_tag(self, turn):
         """Whether a request is a short tag on the latest one ("right?"), not its own (#199)."""
@@ -1791,8 +1817,9 @@ class SpeechEvents:
                 # The latest request formed, for a decision's context (#199): the heard
                 # words, as past turns carry them, not a former's rewrite. A short tag on
                 # it ("right?") leaves it in place. Any request answers or replaces the
-                # assistant's question.
+                # assistant's question; the next reply answers this request.
                 self._asked_at = None
+                self._replied_at = None
                 if not self._is_tag(turn):
                     self.last_request = (
                         turn.end_ms,
