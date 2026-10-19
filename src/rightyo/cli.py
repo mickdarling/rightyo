@@ -433,6 +433,10 @@ def main(argv: list[str] | None = None) -> int:
     _add_speaker_options(tool_replay)
     _add_request_former_option(tool_replay)
     _add_dismissal_option(tool_replay)
+    coach_replay = commands.add_parser(
+        "coach-replay", help="emit coaching JSONL from an authored synthetic fixture"
+    )
+    coach_replay.add_argument("--input", type=Path, required=True)
     _add_enroll_parser(commands)
     args = parser.parse_args(argv)
     if args.command == "enroll":
@@ -440,6 +444,10 @@ def main(argv: list[str] | None = None) -> int:
 
         return run(args)
     try:
+        if args.command == "coach-replay":
+            from rightyo.coach_replay import run
+
+            return run(args)
         if args.command in {"listen", "tool-replay"}:
             from rightyo.prototype import PrototypeError
             from rightyo.tool import listen, replay
