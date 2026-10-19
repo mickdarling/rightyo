@@ -92,6 +92,24 @@ class EventsTests(unittest.TestCase):
         events.decision(decided(ignored, "ignore"), 2900)
         self.assertEqual(events.last_request, (900, "Jarvis, add milk", "t1", "Speaker A"))
 
+    def request(self, events, current, at):
+        events.transcript(current, current.end_ms)
+        events.decision(decided(current, "attend"), at)
+
+    def test_a_short_tag_on_the_latest_request_leaves_it_in_place(self):
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, conversation=Conversation(window_ms=60000))
+        self.request(events, turn("t1", 0, 900, "Jarvis, is the plan forty dollars"), 1000)
+        self.request(events, turn("t2", 1500, 1900, "right?", speaker=None), 2000)
+        self.assertEqual(events.last_request[1], "Jarvis, is the plan forty dollars")
+        # A longer request, a later one or another known speaker's replaces it.
+        self.request(events, turn("t3", 3000, 3900, "Jarvis, add eggs too"), 4000)
+        self.assertEqual(events.last_request[1], "Jarvis, add eggs too")
+        self.request(events, turn("t4", 20000, 20400, "Jarvis, louder"), 20500)
+        self.assertEqual(events.last_request[1], "Jarvis, louder")
+        self.request(events, turn("t5", 21000, 21400, "Jarvis, skip", speaker="Speaker B"), 21500)
+        self.assertEqual(events.last_request[1], "Jarvis, skip")
+
     def test_a_dismissal_forgets_it(self):
         from rightyo.contracts import Dismissal
 

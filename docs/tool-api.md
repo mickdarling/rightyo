@@ -655,6 +655,7 @@ events. The object takes five optional keys:
 | `closing_phrases` | "that's all", "that's it", "thanks, that's all", "never mind", and so on | up to 16 | Phrases that end the conversation (see [closings](#closings)) |
 | `appendix_ms` | 0 (off) | 0 to 5,000 | How soon after a request ends the same speaker's next turn counts as an appendix to it (see below) |
 | `require_cue` | false | true or false | Whether a follow-up must also carry a cue that it continues the exchange (see below) |
+| `cue_min_attend` | absent (off) | above 0 to 1 | With `require_cue`, the attend probability at which a follow-up needs no cue |
 
 **States.**
 - **Ambient**, the default: a turn forms a request only on a confident `attend`, as
@@ -684,7 +685,15 @@ decisions arrive in) forms a request when all of these hold:
   - an opening that adds ("and …" but not "and you", "actually …", "what about …", "how
     about …");
   - a short adjustment of up to three words ("louder", "next one", "skip", "repeat",
-    "cancel").
+    "cancel");
+  - a request of three or more words that opens with a request verb such as "run",
+    "check", "open", "review", "send" or "tell", after an optional "please", "okay",
+    "now", "so" or "alright" ("Run the weekly review"). Pet-command verbs such as "drop",
+    "put", "get" and "come" are not on the list;
+  - "please" in a turn of four or more words;
+  - a correction ("you mean …", "I meant …", "I said …", "I asked …").
+
+  With `cue_min_attend` set, a follow-up whose attend probability reaches it needs no cue.
 
   Talk to a pet or a passer-by inside the window ("No, sit", "Is that your dog?") then
   stays context however Jev rates it. The diagnostic reason is `no_cue`. It applies to

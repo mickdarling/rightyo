@@ -264,6 +264,20 @@ _ADJUSTMENTS = frozenset(
         "shorter longer bigger smaller"
     ).split()
 )
+# Verbs that open a request to the assistant ("Run the review", "Check my calendar") when
+# the turn has at least three words. Verbs of pet commands and everyday talk ("drop", "make",
+# "put", "get", "go", "come", "leave", "look", "give") are left out.
+_REQUEST_VERBS = frozenset(
+    (
+        "run check search open close write create draft summarize summarise review update "
+        "list explain call email text message remind schedule book read play pause resume "
+        "send add remove delete tell show"
+    ).split()
+)
+# Courtesy and transition words that may come before the opening verb ("please run ...").
+_VERB_LEAD = frozenset("please ok okay now so alright".split())
+# A correction of what the assistant just said or did ("you mean $134", "I said Tuesday").
+_CORRECTIONS = frozenset({("you", "mean"), ("i", "meant"), ("i", "said"), ("i", "asked")})
 
 
 def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
@@ -272,7 +286,9 @@ def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
     True when it names the assistant; asks the assistant ("can you", "could you"); refers
     back ("the other one", "again", "instead"); acts on the result ("play that", "turn it
     up"); opens by adding to it ("and ...", "what about ...", "how about ...", "actually
-    ..."); or is a short adjustment ("louder", "next one"). Talk to a pet or a passer-by
+    ..."); is a short adjustment ("louder", "next one"); opens a request of three or more
+    words with a request verb ("run the review"); says "please" in four or more words; or
+    corrects it ("you mean ...", "I said ..."). Talk to a pet or a passer-by
     ("No, sit", "Is that your dog?") usually carries none. English, deterministic,
     approximate; contractions are split ("that's" is "that s").
     """
@@ -282,6 +298,7 @@ def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
     pairs = list(zip(words, words[1:]))
     # "And eggs" adds to a request; "and you" is a reply to someone else.
     adds = words[0] == "and" and len(words) > 1 and words[1] != "you"
+    lead = next((word for word in words if word not in _VERB_LEAD), "")
     return (
         mentions_name(addressing, text)
         or adds
@@ -294,6 +311,9 @@ def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
         # One word between ("show me that", "read me this").
         or any(a in _OUTPUT_VERBS and c in _OBJECTS for a, c in zip(words, words[2:]))
         or (len(words) <= 3 and words[0] in _ADJUSTMENTS)
+        or (len(words) >= 3 and lead in _REQUEST_VERBS)
+        or (len(words) >= 4 and "please" in words)
+        or not _CORRECTIONS.isdisjoint(pairs)
     )
 
 

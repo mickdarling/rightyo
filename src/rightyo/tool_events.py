@@ -52,6 +52,11 @@ MAX_ENDED_SPEAKERS = 64
 # another speaker's start still counts as its echo rather than a person.
 MAX_PLAYBACKS = 8
 PLAYBACK_MARGIN_MS = 300
+# A request of at most this many words, starting this soon after the latest one ended, by
+# the same or an unidentified speaker, is a tag on it ("right?"), so the latest request in a
+# decision's context stays the one it tags (#199).
+TAG_MAX_WORDS = 2
+TAG_MS = 10_000
 # A bound guest's display name on a `transcript` event (hailing-station #434): the bound
 # HailProtocol's `AmbientOverheard.name` accepts, in Unicode scalars, and the categories it
 # refuses (control, format, surrogate, private use, unassigned, line/paragraph separator).
@@ -1225,7 +1230,11 @@ class SpeechEvents:
         if conversation.is_closing(turn.text):
             # A closing phrase ends the conversation; it is never a request of its own.
             return "closing"
-        if conversation.require_cue and not follow_up_cued(turn.text, self._addressing):
+        if (
+            conversation.require_cue
+            and not self._cue_waived(decision)
+            and not follow_up_cued(turn.text, self._addressing)
+        ):
             # Talk to a pet or a passer-by in the window carries no cue that it continues
             # the exchange with the assistant (#199). It applies to an appendix too.
             return "no_cue"
@@ -1233,6 +1242,21 @@ class SpeechEvents:
             # Owner-only mode never lets another speaker's turn become a request.
             return "owner_only"
         return None
+
+    def _cue_waived(self, decision):
+        """Whether Jev's attend probability reaches the conversation's `cue_min_attend`."""
+        bar = self._conversation.cue_min_attend
+        return bar is not None and decision.probabilities["attend"] >= bar
+
+    def _is_tag(self, turn):
+        """Whether a request is a short tag on the latest one ("right?"), not its own (#199)."""
+        last = self.last_request
+        return (
+            last is not None
+            and len(turn.text.split()) <= TAG_MAX_WORDS
+            and 0 <= turn.start_ms - last[0] <= TAG_MS
+            and turn.speaker_id in {None, last[3]}
+        )
 
     def _follow_up_note(self, refusal, held, role, decision):
         """The content-free diagnostic for an engaged speaker's undecided turn (#153): the
@@ -1736,8 +1760,15 @@ class SpeechEvents:
                     )
             if attended:
                 # The latest request formed, for a decision's context (#199): the heard
-                # words, as past turns carry them, not a former's rewrite.
-                self.last_request = (turn.end_ms, turn.text, turn.utterance_id, turn.speaker_id)
+                # words, as past turns carry them, not a former's rewrite. A short tag on
+                # it ("right?") leaves it in place.
+                if not self._is_tag(turn):
+                    self.last_request = (
+                        turn.end_ms,
+                        turn.text,
+                        turn.utterance_id,
+                        turn.speaker_id,
+                    )
                 # Any delivered request makes the next reply that request's, so no lapsed
                 # conversation is revived by it (rightyo#158); a request that engages its own
                 # speaker replaces the dormant one anyway.
