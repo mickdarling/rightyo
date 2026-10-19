@@ -176,8 +176,9 @@ MAX_CONTROL_LINE = 256
 def _read_control(fd: int, controller) -> None:
     """Forward the host's reply reports to the session until EOF (#124).
 
-    Bounded lines of `{"reply": "started"}` or `{"reply": "ended"}`, and the host's media
-    mode `{"media": true}` or `{"media": false}` (hailing-station #551); anything else is
+    Bounded lines of `{"reply": "started"}` or `{"reply": "ended"}` (an ended reply may add
+    `"asked": true` when it ended with a question, #199), and the host's media mode
+    `{"media": true}` or `{"media": false}` (hailing-station #551); anything else is
     reported on stderr (content-free) and skipped. The reader never ends the session.
     """
     try:
@@ -206,10 +207,18 @@ def _read_control(fd: int, controller) -> None:
 def _apply_control(line: bytes, controller) -> None:
     try:
         message = json.loads(line)
-        if not isinstance(message, dict) or set(message) not in ({"reply"}, {"media"}):
+        if not isinstance(message, dict) or set(message) not in (
+            {"reply"},
+            {"reply", "asked"},
+            {"media"},
+        ):
             raise ValueError
         if "media" in message:
             controller.media(message["media"])
+        elif "asked" in message:
+            if message["reply"] != "ended" or type(message["asked"]) is not bool:
+                raise ValueError
+            controller.reply("ended", asked=message["asked"])
         else:
             controller.reply(message["reply"])
     except (ValueError, TypeError, AttributeError, PrototypeError):

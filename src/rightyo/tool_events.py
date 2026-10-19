@@ -9,7 +9,7 @@ import unicodedata
 from collections import deque
 from threading import RLock
 
-from rightyo.addressedness import follow_up_cued, mentions_name
+from rightyo.addressedness import answer_shaped, follow_up_cued, mentions_name
 from rightyo.contracts import (
     DISMISSING,
     Acknowledgement,
@@ -217,6 +217,9 @@ class SpeechEvents:
         # Recent [start, end] stream times of the assistant's own playback (end None while
         # it plays), as the host reports them (#124); bounded.
         self._playbacks = deque(maxlen=MAX_PLAYBACKS)
+        # Stream time the latest reply ended with a question to the owner (#199), or None;
+        # cleared when the next reply starts.
+        self._asked_at = None
         # "off" without a provider, "ready" with one, "unavailable" after a hosted role
         # question failed, or "rejected" after a provider contract violation; either
         # degrades roles to configured/unknown for the rest of the session.
@@ -333,6 +336,7 @@ class SpeechEvents:
         self._appendix_from.clear()
         self.last_request = None
         self._playbacks.clear()
+        self._asked_at = None
         self._delivered.clear()
         self._withdrawn.clear()
 
@@ -938,7 +942,7 @@ class SpeechEvents:
         named = mentions_name(self._addressing, turn.text)
         return named and (self._priority is None or authority == "owner")
 
-    def reply(self, phase, now_ms):
+    def reply(self, phase, now_ms, asked=False):
         """The host's report that the assistant's spoken reply `started` or `ended` (#124).
 
         While engaged, a playing reply holds the window open, and its end restarts the
@@ -947,12 +951,19 @@ class SpeechEvents:
 
         With acknowledgement gating on, a reply that starts after an acknowledgement's own
         clip has ended answers it (#122), so the next request may be acknowledged again.
+        `asked` (#199): the reply ended with a question to the owner, so an answer-shaped
+        follow-up ("yes", "go ahead") carries its own cue until the next reply starts.
+
         Emits nothing.
         """
         with self._lock:
-            if phase not in {"started", "ended"}:
+            if phase not in {"started", "ended"} or type(asked) is not bool:
+                raise ContractError("invalid reply phase")
+            if asked and phase != "ended":
                 raise ContractError("invalid reply phase")
             integer(now_ms, "now_ms")
+            if self._active:
+                self._asked_at = now_ms if asked else None
             if self._active:
                 # The assistant's own audio, so its echo is never taken for a person's answer.
                 if phase == "started":
@@ -1090,6 +1101,8 @@ class SpeechEvents:
         engaged = self._engaged
         if engaged is not None and now_ms >= self._window_end(engaged):
             self._engaged = None
+            # A question belongs to its conversation (#199); a revival starts a new reply.
+            self._asked_at = None
             self._dormant = {"engaged": engaged, "at_ms": self._window_end(engaged)}
             self._emit(
                 "conversation",
@@ -1136,6 +1149,7 @@ class SpeechEvents:
             # it ended the conversation that request has since moved past, not this one.
             return
         speaker_id = self._engaged["speaker_id"]
+        self._asked_at = None
         self._mark_ended(self._engaged["key"], turn)
         self._engaged = None
         # An explicit end is never revived by a later reply.
@@ -1242,6 +1256,7 @@ class SpeechEvents:
             conversation.require_cue
             and not self._cue_waived(decision)
             and not follow_up_cued(turn.text, self._addressing)
+            and not self._answers_question(turn)
         ):
             # Talk to a pet or a passer-by in the window carries no cue that it continues
             # the exchange with the assistant (#199). It applies to an appendix too.
@@ -1255,6 +1270,11 @@ class SpeechEvents:
         """Whether Jev's attend probability reaches the conversation's `cue_min_attend`."""
         bar = self._conversation.cue_min_attend
         return bar is not None and decision.probabilities["attend"] >= bar
+
+    def _answers_question(self, turn):
+        """Whether a turn starting after a reply that asked the owner a question answers it."""
+        asked = self._asked_at
+        return asked is not None and turn.start_ms >= asked and answer_shaped(turn.text)
 
     def _is_tag(self, turn):
         """Whether a request is a short tag on the latest one ("right?"), not its own (#199)."""
@@ -1770,7 +1790,9 @@ class SpeechEvents:
             if attended:
                 # The latest request formed, for a decision's context (#199): the heard
                 # words, as past turns carry them, not a former's rewrite. A short tag on
-                # it ("right?") leaves it in place.
+                # it ("right?") leaves it in place. Any request answers or replaces the
+                # assistant's question.
+                self._asked_at = None
                 if not self._is_tag(turn):
                     self.last_request = (
                         turn.end_ms,
