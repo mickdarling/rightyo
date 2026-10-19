@@ -1101,6 +1101,8 @@ class SpeechEvents:
         engaged = self._engaged
         if engaged is not None and now_ms >= self._window_end(engaged):
             self._engaged = None
+            # A question belongs to its conversation (#199); a revival starts a new reply.
+            self._asked_at = None
             self._dormant = {"engaged": engaged, "at_ms": self._window_end(engaged)}
             self._emit(
                 "conversation",
@@ -1147,6 +1149,7 @@ class SpeechEvents:
             # it ended the conversation that request has since moved past, not this one.
             return
         speaker_id = self._engaged["speaker_id"]
+        self._asked_at = None
         self._mark_ended(self._engaged["key"], turn)
         self._engaged = None
         # An explicit end is never revived by a later reply.
@@ -1787,7 +1790,9 @@ class SpeechEvents:
             if attended:
                 # The latest request formed, for a decision's context (#199): the heard
                 # words, as past turns carry them, not a former's rewrite. A short tag on
-                # it ("right?") leaves it in place.
+                # it ("right?") leaves it in place. Any request answers or replaces the
+                # assistant's question.
+                self._asked_at = None
                 if not self._is_tag(turn):
                     self.last_request = (
                         turn.end_ms,

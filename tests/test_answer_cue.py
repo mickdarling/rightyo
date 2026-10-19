@@ -71,6 +71,43 @@ class AnswerCueTests(unittest.TestCase):
     def test_talk_after_the_question_that_is_no_answer_still_needs_a_cue(self):
         self.assertFalse(self.follow_up("Good boy, sit", asked=True))
 
+    def requests(self, steps):
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, conversation=MODE, addressing=NAMES)
+        for step in steps:
+            if step[0] == "reply":
+                events.reply(step[1], step[2], **step[3])
+            else:
+                _, name, start, end, text, label, attend = step
+                current = turn(name, start, end, text)
+                events.transcript(current, end)
+                events.decision(decided(current, label, attend=attend), end + 100)
+        return [e["turn"]["text"] for e in events.drain() if e["type"] == "request"]
+
+    def test_a_question_does_not_outlive_its_conversation(self):
+        asked = [
+            ("turn", "t1", 0, 900, "Jarvis, tidy the shared folder", "attend", None),
+            ("reply", "started", 2000, {}),
+            ("reply", "ended", 4000, {"asked": True}),
+        ]
+        pet = ("turn", "t3", 305000, 305800, "Okay buddy, dinner time", "uncertain", 0.6)
+        # Lapsed, then a new named request that got no spoken reply.
+        renewed = ("turn", "t2", 300000, 300900, "Jarvis, lights off", "attend", None)
+        self.assertEqual(self.requests([*asked, renewed, pet])[-1], "Jarvis, lights off")
+        # Ended by a closing inside the window, then the same.
+        closing = ("turn", "c1", 6000, 6500, "that's all, thanks", "uncertain", 0.6)
+        self.assertEqual(self.requests([*asked, closing, renewed, pet])[-1], "Jarvis, lights off")
+
+    def test_the_answer_itself_uses_the_question_up(self):
+        steps = [
+            ("turn", "t1", 0, 900, "Jarvis, tidy the shared folder", "attend", None),
+            ("reply", "started", 2000, {}),
+            ("reply", "ended", 4000, {"asked": True}),
+            ("turn", "t2", 6000, 6800, "Yes, keep both", "uncertain", 0.6),
+            ("turn", "t3", 9000, 9800, "Okay buddy, sit", "uncertain", 0.6),
+        ]
+        self.assertEqual(self.requests(steps)[-1], "Yes, keep both")
+
     def test_asked_only_rides_on_an_ended_reply(self):
         events = SpeechEvents()
         events.start(SESSION, now_ms=0, conversation=MODE)
