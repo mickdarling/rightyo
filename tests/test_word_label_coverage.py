@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 
 from test_edge_attribution import SPEECH, WORDS, Timeline, Units
+from test_turn_merge import SILENCE, VOICE, audio
 
 from rightyo.contracts import SpeakerPriority
 from rightyo.live_audio import FRAME_BYTES, LiveAudioError, LiveConfig, LiveProcessor, _attribute
@@ -21,6 +22,9 @@ from rightyo.prototype import PrototypeConfig, PrototypeError
 OWNER, OTHER = 1, 2
 ROLES = SpeakerPriority.from_dict({"owner": ["Speaker A"]})
 WAKE = (" Jarvis.", 0, 1000)
+# A second of silence, then speech: the utterance opens one pre-roll (240 ms) early.
+LEAD = audio((SILENCE, 1000), (VOICE, 400), (SILENCE, 2000))
+START = 760
 
 
 def run(units, timeline, coverage):
@@ -83,6 +87,59 @@ class OneWordTurnTests(unittest.TestCase):
         self.assertEqual(run(Units(WAKE), timeline, 0.5)[0][1], None)
 
 
+class CarriedOverSegmentTests(unittest.TestCase):
+    """A late speaker switch must not hand the next person's word to the earlier speaker."""
+
+    def run_lead(self, units, timeline, *, edges=0, coverage=0.5):
+        turns, inferred = [], []
+        config = LiveConfig(
+            "coverage-lead-test",
+            provenance="causal-replay",
+            transcriber=units,
+            diarizer=timeline,
+            word_label_coverage=coverage,
+            edge_attribution_ms=edges,
+            on_inferred=inferred.append,
+        )
+        processor = LiveProcessor(config, turns.append)
+        for offset in range(0, len(LEAD), FRAME_BYTES * 10):
+            processor.push_pcm16(LEAD[offset : offset + FRAME_BYTES * 10])
+        processor.finish()
+        self.assertEqual(turns[0].start_ms - units.units[0]["start_ms"], START)
+        return [(turn.text, turn.speaker_id) for turn in turns], [
+            turn.utterance_id in inferred for turn in turns
+        ]
+
+    def test_an_earlier_speakers_segment_running_on_does_not_label_a_guest_word(self):
+        # The owner's segment runs to 1,250 ms; the guest's word is 1,050-1,350 ms and
+        # their own segment has not arrived. 2/3 of the word is under the owner's segment.
+        word = Units((" Jarvis.", 1050 - START, 1350 - START))
+        turns, _ = self.run_lead(word, Timeline((0, 1250, OWNER)))
+        self.assertEqual(turns, [("Jarvis.", None)])
+
+    def test_the_owners_own_word_in_the_utterance_is_still_labelled(self):
+        word = Units((" Jarvis.", 1050 - START, 1350 - START))
+        turns, inferred = self.run_lead(word, Timeline((1100, 1300, OWNER)))
+        self.assertEqual(turns, [("Jarvis.", "Speaker A")])
+        self.assertEqual(inferred, [False])
+
+    def test_edge_attribution_from_a_coverage_label_stays_inferred(self):
+        words = Units(
+            (" Jarvis,", 1050 - START, 1250 - START), (" please.", 1300 - START, 1380 - START)
+        )
+        turns, inferred = self.run_lead(words, Timeline((1080, 1200, OWNER)), edges=200)
+        self.assertEqual(turns, [("Jarvis, please.", "Speaker A")])
+        self.assertEqual(inferred, [True])
+
+    def test_two_speakers_without_strict_labels_stay_two_turns(self):
+        words = Units(
+            (" Jarvis.", 1000 - START, 1200 - START), (" Hello.", 1250 - START, 1390 - START)
+        )
+        timeline = Timeline((1020, 1180, OWNER), (1270, 1380, OTHER))
+        turns, _ = self.run_lead(words, timeline)
+        self.assertEqual(turns, [("Jarvis.", "Speaker A"), ("Hello.", "Speaker B")])
+
+
 class MultiWordTurnTests(unittest.TestCase):
     def test_a_turn_with_a_strictly_labelled_word_is_unchanged(self):
         # "down" and "a bit." run past the segment and stay unlabelled, as before.
@@ -118,7 +175,7 @@ class ConfigTests(unittest.TestCase):
         return PrototypeConfig.load(self.path)
 
     def test_default_and_values(self):
-        self.assertEqual(self.load().word_label_coverage, 0.5)
+        self.assertEqual(self.load().word_label_coverage, 0)
         self.assertEqual(self.load(word_label_coverage=0).word_label_coverage, 0)
         self.assertEqual(self.load(word_label_coverage=0.75).word_label_coverage, 0.75)
         for value in (-0.1, 1.5, True, "0.5", None):

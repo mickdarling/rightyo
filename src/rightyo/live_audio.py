@@ -137,10 +137,12 @@ class LiveConfig:
     # Coverage labelling (0 = off; #220). When no word of an utterance has a speaker under
     # the strict rule (each word covered throughout by exactly one speaker), as with a
     # one-word turn whose timestamps run past the timeline segment, a word that only one
-    # speaker's segments touch takes that speaker when they cover at least this fraction
-    # of it. An observation of the timeline, not an inference: no word is labelled with a
-    # speaker absent from it, and two speakers in a word still leave it unlabelled. Only for
-    # `diarization-timeline`; utterances with any strictly labelled word are unchanged.
+    # speaker's segments starting inside the utterance touch takes that speaker when they
+    # cover at least this fraction of it. A segment carried over from before the utterance
+    # never counts, since a late speaker switch can stretch it over the next person's word.
+    # Two speakers in a word still leave it unlabelled. Only for `diarization-timeline`;
+    # utterances with any strictly labelled word are unchanged. The labels are not marked
+    # inferred; edge attribution from them is, as usual.
     word_label_coverage: float = 0.0
     # Tail join (opt-in, 0 = off; #129). Also an inference: an unlabelled, non-overlapping
     # turn starting within this many milliseconds of a held labelled turn's end joins it
@@ -1177,8 +1179,12 @@ class LiveProcessor:
             and not any(entry[3] is not None for entry in attributed)
         ):
             # No word has a strict label (#220): let one speaker's coverage label them.
+            # Only segments that start inside this utterance (pre-roll included) count: a
+            # streaming diarizer switches speaker late, so an earlier speaker's segment can
+            # run on over the next person's first word before their own segment arrives.
+            own = [segment for segment in relevant if segment["start_ms"] >= offset]
             for entry in attributed:
-                entry[3:] = _attribute(entry[1], entry[2], relevant, coverage)
+                entry[3:] = _attribute(entry[1], entry[2], own, coverage)
         inferred: set[int] = set()
         if self.config.edge_attribution_ms and provenance == "diarization-timeline":
             inferred = _attribute_edges(attributed, relevant, self.config.edge_attribution_ms)

@@ -202,8 +202,8 @@ def validate_session_budget(value: Any) -> int | None:
 
 
 # One speaker's share of a word that labels it when no word of the utterance is
-# otherwise labelled (#220).
-DEFAULT_WORD_LABEL_COVERAGE = 0.5
+# otherwise labelled (#220). Off until validated live; 0.5 is the suggested value.
+DEFAULT_WORD_LABEL_COVERAGE = 0
 
 
 @dataclass(frozen=True)

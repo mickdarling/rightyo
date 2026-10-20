@@ -42,7 +42,7 @@ of a name, for example `"variants": {"Hailing Station": ["Haling Station"]}`; se
 `"turns": {"merge_gap_ms": 2000}` sets how long a finalized turn waits for a continuation
 by the same speaker before it is emitted and decided (default 2,000 ms, 0 to 5,000, 0
 off); see [joined turns](tool-api.md#joined-turns), which also covers
-`word_label_coverage` (default 0.5, 0 off) for one-word turns left without a speaker
+`word_label_coverage` (default 0, off; 0.5 suggested) for one-word turns left without a speaker
 (#220). The same object's `reply_wait_ms`
 (default 1,200 ms, 0 to 3,000, 0 off) sets how long a question or request is held to
 observe the [post-turn gap](tool-api.md#scene-and-post-turn-gap). The same object's
