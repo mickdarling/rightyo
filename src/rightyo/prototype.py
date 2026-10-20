@@ -72,7 +72,12 @@ from rightyo.speech_backends import (
     utterance_local_labels,
 )
 from rightyo.state_log import DecisionStateLog
-from rightyo.turn_merge import DEFAULT_TURN_MERGE_GAP_MS, merge_gap, tail_join
+from rightyo.turn_merge import (
+    DEFAULT_TURN_MERGE_GAP_MS,
+    complete_hold,
+    merge_gap,
+    tail_join,
+)
 
 BROWSER_LEASE_SECONDS = 15
 # Jev requests per demo session unless the session or configuration sets a cap. Live
@@ -242,6 +247,12 @@ class PrototypeConfig:
     # ("Jarvis, add the") is held for the merge gap even when the end-of-turn model calls
     # it complete, so its continuation can join it. On by default.
     turn_hold_unfinished: bool = True
+    # The `turns` section's `complete_hold_ms`, `collapse_restarts` and
+    # `bridge_backchannels` (#216): see `LiveConfig`. All off by default: the hold delays
+    # every complete request, and the other two only act with it or change a turn's text.
+    turn_complete_hold_ms: int = 0
+    turn_collapse_restarts: bool = False
+    turn_bridge_backchannels: bool = False
     # The `decision` section's optional `scene` (#96): the setting text given to the
     # decision model. Absent means the single-user pilot default; null turns it off.
     decision_scene: str | None = DEFAULT_SCENE
@@ -382,11 +393,17 @@ class PrototypeConfig:
                 "edge_attribution_ms",
                 "tail_join_ms",
                 "hold_unfinished",
+                "complete_hold_ms",
+                "collapse_restarts",
+                "bridge_backchannels",
             }:
                 raise ValueError
             hold_unfinished = turns.get("hold_unfinished", True)
-            if type(hold_unfinished) is not bool:
+            restarts = turns.get("collapse_restarts", False)
+            bridge = turns.get("bridge_backchannels", False)
+            if type(hold_unfinished) is not bool or {type(restarts), type(bridge)} != {bool}:
                 raise ValueError
+            hold_complete = complete_hold(turns.get("complete_hold_ms", 0))
             tail = tail_join(turns.get("tail_join_ms", 0))
             edges = turns.get("edge_attribution_ms", 0)
             if type(edges) is not int or not 0 <= edges <= 2000 or edges % 20:
@@ -420,6 +437,9 @@ class PrototypeConfig:
                 decision_request_context=acted,
                 turn_merge_gap_ms=gap,
                 turn_hold_unfinished=hold_unfinished,
+                turn_complete_hold_ms=hold_complete,
+                turn_collapse_restarts=restarts,
+                turn_bridge_backchannels=bridge,
                 decision_scene=scene,
                 reply_wait_ms=wait,
                 edge_attribution_ms=edges,
@@ -1022,6 +1042,9 @@ class PrototypeController:
                     end_of_turn=end_of_turn.score if end_of_turn is not None else None,
                     edge_attribution_ms=self.config.edge_attribution_ms,
                     tail_join_ms=self.config.tail_join_ms,
+                    turn_complete_hold_ms=self.config.turn_complete_hold_ms,
+                    turn_collapse_restarts=self.config.turn_collapse_restarts,
+                    turn_bridge_backchannels=self.config.turn_bridge_backchannels,
                     end_of_turn_threshold=settings.threshold if settings else 0.5,
                     end_of_turn_silence_ms=settings.silence_ms if settings else 200,
                 ),

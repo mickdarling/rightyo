@@ -41,7 +41,9 @@ of a name, for example `"variants": {"Hailing Station": ["Haling Station"]}`; se
 [name variants](tool-api.md#transport-and-lifecycle). An optional
 `"turns": {"merge_gap_ms": 2000}` sets how long a finalized turn waits for a continuation
 by the same speaker before it is emitted and decided (default 2,000 ms, 0 to 5,000, 0
-off); see [joined turns](tool-api.md#joined-turns). The same object's `reply_wait_ms`
+off); see [joined turns](tool-api.md#joined-turns), which also covers `complete_hold_ms`,
+`collapse_restarts` and `bridge_backchannels` for one thought split into several
+requests (#216). The same object's `reply_wait_ms`
 (default 1,200 ms, 0 to 3,000, 0 off) sets how long a question or request is held to
 observe the [post-turn gap](tool-api.md#scene-and-post-turn-gap). The same object's
 `edge_attribution_ms` (default 0, off; 0 to 2,000 in 20 ms steps) turns on edge
