@@ -29,6 +29,29 @@ fragment into a `Turn` and assigns its utterance id at that moment, so ids stay
 unique and in emission order, and a joined turn reports the first fragment's start and
 the last fragment's end.
 
+Three opt-in refinements address one thought split into several requests (#216):
+
+- `complete_hold_ms` holds a `diarization-timeline` turn the end-of-turn model called
+  complete for that long after its last word, so a pause the model misjudged can still be
+  joined by the same labelled speaker's continuation. Only a labelled continuation of the
+  same speaker joins it (one with edge-attributed words counts, marked `inferred` as on
+  the gap path); tail join never reaches it, so an unattributed fragment is never merged
+  into it. When no one speaks within the hold it costs the hold minus the silence already
+  waited at finalization, and nothing at 0; like any hold, it lasts until an utterance
+  opened within it is finalized (at most `max_utterance_ms`), whoever is speaking.
+- `collapse_restarts` drops a restart when a continuation joins a complete-held turn:
+  when it opens by repeating the held turn's last three or more words, at least two of
+  them different ("... put the milk on" + "put the milk on the list."), the repeated
+  words are kept once. A repeated single word ("no no no") is never collapsed.
+- `bridge_backchannels` keeps the held turn held across another or an unattributed
+  speaker's short backchannel ("mm", "yeah"; see `backchannel_shaped`), after Pipecat's
+  user backchannel frames: the speaker's next fragment can still join, and the
+  backchannel is emitted as its own turn right after the held turn, so out of time
+  order: its `start_ms` may fall inside the joined turn. Only a backchannel after the
+  held turn's last word counts as the speech that followed it. Any other speech by
+  another speaker releases the held turn as before, so turns never join across a speaker
+  change.
+
 This is a fixed-gap first step towards the wait/yield end-of-turn decision of #84, not
 an adaptive model.
 
@@ -50,7 +73,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from .addressedness import observe_gap, reply_wait, request_shaped
+from .addressedness import backchannel_shaped, observe_gap, reply_wait, request_shaped
 from .contracts import MAX_TEXT_CHARS
 
 # A continuation that starts within this many milliseconds of the held fragment's last
@@ -81,6 +104,42 @@ def tail_join(value: Any) -> int:
     return value
 
 
+# A complete-judged turn's hold (#216) delays every complete request; keep it short.
+MAX_COMPLETE_HOLD_MS = 3000
+# A restart repeats at least this many of the held turn's last words (#216).
+MIN_RESTART_WORDS = 3
+
+
+def complete_hold(value: Any) -> int:
+    """A validated hold in milliseconds for a turn judged complete: 0 turns it off."""
+    if type(value) is not int or not 0 <= value <= MAX_COMPLETE_HOLD_MS:
+        raise ValueError("invalid complete hold")
+    return value
+
+
+def _word_key(token: str) -> str:
+    return "".join(ch for ch in token.lower() if ch.isalnum())
+
+
+def join_restart(held: str, continuation: str) -> str:
+    """`held` and `continuation` joined, with a restart's repeated words kept once (#216).
+
+    When the continuation opens with the held text's last `MIN_RESTART_WORDS` or more
+    words (ignoring case and punctuation), at least two of them different, those words
+    are dropped from the held text; the longest such repeat wins. Otherwise the two are
+    joined by a space, so a repeated word ("no no no") is never collapsed.
+    """
+    tokens = held.split()
+    keys = [_word_key(token) for token in tokens]
+    following = [_word_key(token) for token in continuation.split()]
+    for size in range(min(len(keys), len(following)), MIN_RESTART_WORDS - 1, -1):
+        tail = keys[-size:]
+        if all(tail) and len(set(tail)) > 1 and tail == following[:size]:
+            kept = " ".join(tokens[:-size])
+            return f"{kept} {continuation}" if kept else continuation
+    return held + " " + continuation
+
+
 class TurnMerger:
     """Single-owner, synchronous; the caller supplies the stream clock.
 
@@ -102,9 +161,17 @@ class TurnMerger:
         shaped: Callable[[str], bool] = request_shaped,
         tail_join_ms: int = 0,
         unfinished: Callable[[str], bool] | None = None,
+        complete_hold_ms: int = 0,
+        collapse_restarts: bool = False,
+        bridge_backchannels: bool = False,
     ):
         self.gap_ms = merge_gap(gap_ms)
         self.tail_join_ms = tail_join(tail_join_ms)
+        self.complete_hold_ms = complete_hold(complete_hold_ms)
+        if type(collapse_restarts) is not bool or type(bridge_backchannels) is not bool:
+            raise ValueError("invalid turn merge option")
+        self.collapse_restarts = collapse_restarts
+        self.bridge_backchannels = bridge_backchannels
         self.reply_wait_ms = reply_wait(reply_wait_ms)
         if not callable(shaped):
             raise ValueError("invalid request shape predicate")
@@ -124,6 +191,10 @@ class TurnMerger:
         self._hold_ms = 0
         # The earliest speech the caller detected after the held fragment, in stream ms.
         self._heard_ms: int | None = None
+        # Whether the held turn was judged complete and is held only by `complete_hold_ms`.
+        self._held_complete = False
+        # Backchannels bridged while the turn is held, emitted right after it (#216).
+        self._bridged: list[dict[str, Any]] = []
 
     @property
     def holding(self) -> bool:
@@ -144,11 +215,14 @@ class TurnMerger:
             return False
         if self._joinable(fragment):
             # The same speaker continuing after a pause.
-            gap = self.gap_ms
+            gap = max(self.gap_ms, self.complete_hold_ms) if self._held_complete else self.gap_ms
             same = (fragment["speaker"], fragment["speaker_provenance"]) == (
                 held["speaker"],
                 held["speaker_provenance"],
             )
+        elif self._held_complete:
+            # A turn judged complete only takes the same labelled speaker's continuation.
+            return False
         else:
             # Tail join (#129): an unattributed, non-overlapping tail takes the held
             # speaker. Overlap is never joined. Only session-stable timeline labels are
@@ -183,9 +257,12 @@ class TurnMerger:
             self._release(fragment)
             self.emit(dict(fragment))
             return
+        if self._bridges(fragment):
+            self._bridged.append(dict(fragment))
+            return
         if self._continues(fragment):
             held = self._held
-            joined = held["text"] + " " + fragment["text"]
+            joined = self._join_text(held["text"], fragment["text"], self._held_complete)
             complete = complete and not self._looks_unfinished(joined)
             if fragment["speaker"] is None or fragment.get("inferred"):
                 # A tail join, or a piece with edge-attributed words: the joined turn's
@@ -197,12 +274,20 @@ class TurnMerger:
                     *held.get("labelled_spans", ()),
                     *fragment.get("labelled_spans", ()),
                 ]
-            held["text"] = held["text"] + " " + fragment["text"]
+            held["text"] = joined
             held["end_ms"] = max(held["end_ms"], fragment["end_ms"])
             self._hold_ms = self._hold_for(held)
+            self._held_complete = False
             # Detected speech up to now belonged to the continuation just joined.
             self._heard_ms = None
-            if complete or (self.breaks_turn is not None and self.breaks_turn(held["text"])):
+            # Backchannels bridged so far fall inside the joined turn: none followed it.
+            for backchannel in self._bridged:
+                backchannel["inside"] = True
+            if complete and self.complete_hold_ms and not self._breaks(held["text"]):
+                # Judged complete again: wait the short hold for a further piece.
+                self._hold_ms, self._held_complete = self.complete_hold_ms, True
+                return
+            if complete or self._breaks(held["text"]):
                 # The recognizer split the stop phrase itself ("never" + "mind"): emit
                 # the joined phrase now so no later fragment can join and hide it. A
                 # turn judged complete is not held for a continuation either.
@@ -210,11 +295,45 @@ class TurnMerger:
             return
         self._release(fragment)
         complete = complete and not self._looks_unfinished(fragment["text"])
-        hold = 0 if complete else self._hold_for(fragment)
+        held_complete = (
+            complete
+            and bool(self.complete_hold_ms)
+            and self._joinable(fragment)
+            # Utterance-local labels never match the next utterance's: no join is possible.
+            and fragment["speaker_provenance"] == "diarization-timeline"
+        )
+        if held_complete:
+            hold = self.complete_hold_ms
+        else:
+            hold = 0 if complete else self._hold_for(fragment)
         if hold:
             self._held, self._hold_ms, self._heard_ms = dict(fragment), hold, None
+            self._held_complete = held_complete
         else:
             self.emit(dict(fragment))
+
+    def _breaks(self, text: str) -> bool:
+        return self.breaks_turn is not None and self.breaks_turn(text)
+
+    def _join_text(self, held: str, continuation: str, onto_complete: bool) -> str:
+        if self.collapse_restarts and onto_complete:
+            return join_restart(held, continuation)
+        return held + " " + continuation
+
+    def _bridges(self, fragment: dict[str, Any]) -> bool:
+        """Whether a fragment is another or an unattributed speaker's backchannel that
+        leaves the held turn held (#216). A stop phrase never is (`offer` checks it first),
+        nor is overlap; the held turn must be labelled, so it can still be continued."""
+        held = self._held
+        return (
+            self.bridge_backchannels
+            and held is not None
+            and self._joinable(held)
+            and not fragment["overlap"]
+            and fragment["speaker"] != held["speaker"]
+            and fragment["start_ms"] - held["end_ms"] <= max(self.gap_ms, self._hold_ms)
+            and backchannel_shaped(fragment["text"])
+        )
 
     def _looks_unfinished(self, text: str) -> bool:
         return self.unfinished is not None and self.unfinished(text)
@@ -256,6 +375,8 @@ class TurnMerger:
         """Emit the held fragment, with the gap observed up to `following` when enabled."""
         held, self._held = self._held, None
         heard, self._heard_ms = self._heard_ms, None
+        held_complete, self._held_complete = self._held_complete, False
+        bridged, self._bridged = self._bridged, []
         if held is None:
             return
         if following is None and quiet and heard is not None:
@@ -271,10 +392,19 @@ class TurnMerger:
             # The following speech began at its detected onset, before its first retained
             # token: measure the gap from there, and classify the speaker from the fragment.
             following = {**following, "start_ms": heard}
-        if self.reply_wait_ms and (following is not None or quiet):
+        after = [b for b in bridged if not b.pop("inside", False)]
+        if after and (following is None or after[0]["start_ms"] < following["start_ms"]):
+            # A backchannel after the turn's last word was the speech that followed it.
+            following = after[0]
+        if self.reply_wait_ms and not held_complete and (following is not None or quiet):
+            # A turn judged complete keeps an unobserved gap, as without the hold.
             held["post_turn_gap"] = observe_gap(held, following, self._hold_ms)
         self.emit(held)
+        for backchannel in bridged:
+            self.emit(backchannel)
 
     def discard(self) -> None:
         self._held = None
         self._heard_ms = None
+        self._held_complete = False
+        self._bridged = []

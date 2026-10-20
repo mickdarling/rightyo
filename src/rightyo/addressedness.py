@@ -209,6 +209,27 @@ _DANGLING = frozenset(
 _OPENING = frozenset({"can", "could", "you", "hey", "so", "um", "uh"})
 
 
+# A listener's short acknowledgement while someone else holds the floor (#216): "mm",
+# "yeah", "uh-huh". After Pipecat's user backchannel frames, it is not a turn of its own
+# that ends the speaker's; the turn merger may bridge it. "yes", "sure", "okay" and
+# "right" are left out: they are often real answers or consent.
+_BACKCHANNEL = frozenset("mm mmm mhm hmm hm uh huh uhhuh yeah aha ah oh".split())
+MAX_BACKCHANNEL_WORDS = 3
+_LETTERS_ONLY = re.compile(r"[a-z]+")
+
+
+def backchannel_shaped(text: str) -> bool:
+    """Whether a turn is only a short backchannel ("mm", "yeah", "uh-huh", "mm-hmm").
+
+    At most three words, each a backchannel token; a question mark ("yeah?") asks for a
+    reply and is not one. English, deterministic, approximate.
+    """
+    if text.rstrip().endswith("?"):
+        return False
+    words = _LETTERS_ONLY.findall(text.lower())
+    return 0 < len(words) <= MAX_BACKCHANNEL_WORDS and all(w in _BACKCHANNEL for w in words)
+
+
 def unfinished_shaped(text: str, addressing: Addressing | None = None) -> bool:
     """Whether a turn looks cut off mid-request (English, deterministic, approximate, #199).
 
