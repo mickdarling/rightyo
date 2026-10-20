@@ -374,6 +374,24 @@ never held this way. The cost is the usual hold, about two seconds, and only on 
 that looks cut off.
 `"turns": {"hold_unfinished": false}` trusts the model as before (default true).
 
+A word gets a speaker only when the diarizer timeline covers it throughout with exactly
+one speaker. The timeline trails the audio and word timestamps run slightly past it, so a
+one-word turn ("Jarvis.") often had no labelled word at all and came back with no speaker
+and an `unknown` role ([#220](https://github.com/mickdarling/rightyo/issues/220)). With
+`"turns": {"word_label_coverage": 0.5}` (default 0, off; 0 to 1), when no word of an
+utterance has a speaker under that strict rule, a word that only one speaker's segments
+touch takes that speaker if they cover at least that fraction of it. This changes which
+turns carry a speaker, and so their roles: such a turn was `unknown` before. Only
+segments that start inside the utterance (pre-roll included) count. A streaming
+diarizer switches speaker late, so a segment carried over from earlier speech can run on
+over the next person's first word before their own segment arrives; that word stays
+unlabelled. Two speakers in a word still leave it unlabelled, and an utterance with any
+strictly labelled word is unchanged. The label comes from the timeline, so a word on
+another speaker's own track gets that speaker, but it is only as good as the
+diarizer's segment boundaries inside the utterance. Coverage labels are not marked
+inferred; edge attribution from them is, as usual. It applies to
+`diarization-timeline` only.
+
 The end-of-turn model can also call a mid-thought pause complete when the first piece
 does not look cut off, so one thought becomes two or three requests
 ([#216](https://github.com/mickdarling/rightyo/issues/216)). Three `turns` options help:
