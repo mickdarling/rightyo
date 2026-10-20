@@ -143,8 +143,8 @@ class LiveConfig:
     # One thought split into several turns (#216; see `TurnMerger`). Hold a turn the
     # end-of-turn model called complete this long after its last word for the same
     # labelled speaker's continuation (0, the default, emits it at once); keep a restart's
-    # repeated words once when joining; and keep a held turn held across another or an
-    # unattributed speaker's short backchannel. All off by default.
+    # repeated words once when a continuation joins such a turn; and keep a held turn held
+    # across another or an unattributed speaker's short backchannel. All off by default.
     turn_complete_hold_ms: int = 0
     turn_collapse_restarts: bool = False
     turn_bridge_backchannels: bool = False

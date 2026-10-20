@@ -70,9 +70,9 @@ class Script:
 
 
 A, B = "Speaker A", "Speaker B"
-SENTENCE = "For the plan, it matters that we show what the new tool will offer."
-PARTIAL = "along with what the old tool already"
-RESTART = "along with what the old tool already does with plugins."
+SENTENCE = "Please add eggs and bread to the shopping list for Saturday."
+PARTIAL = "and put the milk on"
+RESTART = "and put the milk on the list too."
 
 
 class RestartJoinTests(unittest.TestCase):
@@ -80,8 +80,14 @@ class RestartJoinTests(unittest.TestCase):
         self.assertEqual(join_restart(f"{SENTENCE} {PARTIAL}", RESTART), f"{SENTENCE} {RESTART}")
         # Case and punctuation do not hide the repeat; a whole-fragment restart replaces it.
         self.assertEqual(
-            join_restart("Along with what, the old tool", "along with what the old tool does."),
-            "along with what the old tool does.",
+            join_restart("And put, the milk on", "and put the milk on the list."),
+            "and put the milk on the list.",
+        )
+
+    def test_a_repeated_single_word_is_never_collapsed(self):
+        self.assertEqual(
+            join_restart("no no no", "no no no, don't send it."),
+            "no no no no no no, don't send it.",
         )
 
     def test_fewer_than_three_repeated_words_are_kept(self):
@@ -93,12 +99,22 @@ class RestartJoinTests(unittest.TestCase):
 
 class BackchannelShapeTests(unittest.TestCase):
     def test_short_acknowledgements_are_backchannels(self):
-        for text in ("mm", "Mm-hmm.", "yeah", "Uh-huh.", "okay sure", "Right.", "yep yep"):
+        for text in ("mm", "Mm-hmm.", "yeah", "Uh-huh.", "oh yeah", "hmm"):
             with self.subTest(text=text):
                 self.assertTrue(backchannel_shaped(text))
 
     def test_questions_and_content_are_not(self):
-        for text in ("yeah?", "Yeah, I disagree.", "okay let's go", "no", "", "Stop."):
+        for text in (
+            "yeah?",
+            "Yeah, I disagree.",
+            "okay",
+            "sure",
+            "Right.",
+            "yes",
+            "no",
+            "",
+            "Stop.",
+        ):
             with self.subTest(text=text):
                 self.assertFalse(backchannel_shaped(text))
 
@@ -118,16 +134,16 @@ class SplitThoughtTests(unittest.TestCase):
 
     def test_two_complete_halves_with_a_short_pause_become_one_turn(self):
         # The first half ends cleanly, the model calls both complete, 300 ms apart.
-        first = "Let's do the careful fix for the parser issue we found."
-        second = "a change that joins the pieces."
+        first = "Check the weather for the picnic on Sunday."
+        second = "and the wind at the lake."
         script = Script(complete_hold_ms=1500).run(
             [(A, first, 0, 7300, True), (A, second, 300, 2150, True)]
         )
         self.assertEqual(script.texts, [f"{first} {second}"])
 
     def test_a_long_halved_turn_after_a_misjudged_pause_becomes_one_turn(self):
-        first = "For the notes on the shared document, including the words that matter,"
-        second = "rather than a filter that just blocks everything."
+        first = "When the forecast mentions rain, including light showers in the morning,"
+        second = "remind me to bring the umbrella."
         script = Script(complete_hold_ms=1500).run(
             [(A, first, 0, 14950, True), (A, second, 90, 3080, True)]
         )
@@ -145,6 +161,54 @@ class SplitThoughtTests(unittest.TestCase):
             [(A, PARTIAL, 0, 4000, True), (A, RESTART, 10000, 4200, True)]
         )
         self.assertEqual(script.texts, [PARTIAL, RESTART])
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    def test_a_backchannel_inside_a_joined_turn_is_not_its_following_speech(self):
+        script = Script(reply_wait_ms=3000, bridge_backchannels=True).run(
+            [
+                (A, "Add the", 0, 1000, False),
+                (B, "mm", 200, 200, True),
+                (A, "milk to the list.", 200, 1400, False),
+            ]
+        )
+        self.assertEqual(script.texts, ["Add the milk to the list.", "mm"])
+        self.assertEqual(script.emitted[0][1]["post_turn_gap"]["following"], "none")
+
+    def test_a_backchannel_after_the_turn_still_follows_it(self):
+        script = Script(reply_wait_ms=3000, bridge_backchannels=True).run(
+            [(A, "Add milk to the list.", 0, 1400, False), (B, "mm", 300, 200, True)]
+        )
+        self.assertEqual(script.texts, ["Add milk to the list.", "mm"])
+        self.assertNotEqual(script.emitted[0][1]["post_turn_gap"]["following"], "none")
+
+    def test_defaults_never_collapse_a_repeat_on_a_gap_join(self):
+        emitted = []
+        merger = TurnMerger(2000, 24000, emitted.append)
+        merger.offer(fragment("Add the milk to the list", 0, 1000))
+        merger.offer(fragment("add the milk to the list today.", 1500, 2500), complete=True)
+        self.assertEqual(
+            [turn["text"] for turn in emitted],
+            ["Add the milk to the list add the milk to the list today."],
+        )
+
+    def test_a_restart_is_collapsed_only_onto_a_complete_held_turn(self):
+        gap = Script().run([(A, PARTIAL, 0, 2000, False), (A, RESTART, 300, 2000, True)])
+        self.assertEqual(gap.texts, [f"{PARTIAL} {RESTART}"])
+        held = Script(complete_hold_ms=1500).run(
+            [(A, PARTIAL, 0, 2000, True), (A, RESTART, 300, 2000, True)]
+        )
+        self.assertEqual(held.texts, [RESTART])
+
+    def test_utterance_local_labels_are_not_held(self):
+        emitted = []
+        merger = TurnMerger(2000, 24000, emitted.append, complete_hold_ms=1500)
+        piece = {
+            **fragment("Book the room.", 0, 2000),
+            "speaker_provenance": "diarization-utterance",
+        }
+        merger.offer(piece, complete=True)
+        self.assertEqual([turn["text"] for turn in emitted], ["Book the room."])
 
 
 class LatencyTests(unittest.TestCase):
@@ -265,11 +329,11 @@ class ConfigTests(unittest.TestCase):
     def test_defaults_and_parsing(self):
         config = self.load()
         self.assertEqual(config.turn_complete_hold_ms, 0)
-        self.assertTrue(config.turn_collapse_restarts)
-        self.assertFalse(config.turn_bridge_backchannels)
-        config = self.load(complete_hold_ms=1500, collapse_restarts=False, bridge_backchannels=True)
-        self.assertEqual(config.turn_complete_hold_ms, 1500)
         self.assertFalse(config.turn_collapse_restarts)
+        self.assertFalse(config.turn_bridge_backchannels)
+        config = self.load(complete_hold_ms=1500, collapse_restarts=True, bridge_backchannels=True)
+        self.assertEqual(config.turn_complete_hold_ms, 1500)
+        self.assertTrue(config.turn_collapse_restarts)
         self.assertTrue(config.turn_bridge_backchannels)
 
     def test_invalid_values_are_refused(self):

@@ -378,21 +378,30 @@ The end-of-turn model can also call a mid-thought pause complete when the first 
 does not look cut off, so one thought becomes two or three requests
 ([#216](https://github.com/mickdarling/rightyo/issues/216)). Three `turns` options help:
 
-- `complete_hold_ms` (default 0, off; 0 to 3,000) holds a turn the model called complete
-  for that long after its last word. Only the same labelled speaker's continuation joins
-  it; an unlabelled piece never does, even with tail join. Since the turn is finalized
-  after `end_of_turn.silence_ms` of silence, it delays every complete request by about
-  the hold minus that silence (900 ms for a 1,500 ms hold at 600 ms), and a joined turn by
-  the same after its last piece. Its post-turn gap stays unobserved.
-- `collapse_restarts` (default true) keeps a restart's repeated words once when joining:
-  a piece that opens with the held turn's last three or more words ("... what the tool
-  already" + "what the tool already does.") replaces them rather than repeating them.
+- `complete_hold_ms` (default 0, off; 0 to 3,000) holds a `diarization-timeline` turn
+  the model called complete for that long after its last word. Only the same labelled
+  speaker's continuation joins it (edge-attributed words count, marked inferred); an
+  unlabelled piece never does, even with tail join. Since the turn is finalized after
+  `end_of_turn.silence_ms` of silence, when no one speaks within the hold it delays every
+  complete request by about the hold minus that silence (900 ms for a 1,500 ms hold at
+  600 ms), and a joined turn by the same after its last piece. If anyone starts speaking
+  within the hold, the turn waits until that utterance is finalized, up to
+  `max_utterance_ms`. A barge-in that is not a stop phrase or dismissal-shaped ("wait,
+  actually ...") is delayed by the hold too. Its post-turn gap stays unobserved.
+- `collapse_restarts` (default false) keeps a restart's repeated words once when a
+  continuation joins a complete-held turn: a piece that opens with the held turn's last
+  three or more words, at least two of them different ("... put the milk on" + "put the
+  milk on the list."), replaces them rather than repeating them. A repeated single word
+  ("no no no") is never collapsed.
 - `bridge_backchannels` (default false), after Pipecat's user backchannel frames, keeps
   a held turn held across another or an unlabelled speaker's short backchannel ("mm",
-  "yeah", "uh-huh"; at most three such words, no question mark), so the speaker's next
-  piece can still join. The backchannel is emitted as its own turn right after the held
-  turn. Any other speech by someone else releases the held turn, so turns never join
-  across a change of speaker.
+  "yeah", "uh-huh"; at most three such words, no question mark; "yes", "sure", "okay" and
+  "right" are answers, not backchannels), so the speaker's next piece can still join.
+  The backchannel is emitted as its own turn right after the held turn, so out of time
+  order (its utterance id follows the joined turn's, though it started inside it). It
+  counts as the speech after the turn only when it came after the turn's last word.
+  Any other speech by someone else releases the held turn, so turns never join across a
+  change of speaker.
 
 A joined turn spans at most twice `max_utterance_ms` (24 s by default) and 4,000
 characters; a piece that would exceed either starts a new turn. A role is still fixed

@@ -248,11 +248,10 @@ class PrototypeConfig:
     # it complete, so its continuation can join it. On by default.
     turn_hold_unfinished: bool = True
     # The `turns` section's `complete_hold_ms`, `collapse_restarts` and
-    # `bridge_backchannels` (#216): see `LiveConfig`. The hold is off by default (it
-    # delays every complete request); a restart is collapsed by default (it only changes
-    # a join's text); bridging is off by default.
+    # `bridge_backchannels` (#216): see `LiveConfig`. All off by default: the hold delays
+    # every complete request, and the other two only act with it or change a turn's text.
     turn_complete_hold_ms: int = 0
-    turn_collapse_restarts: bool = True
+    turn_collapse_restarts: bool = False
     turn_bridge_backchannels: bool = False
     # The `decision` section's optional `scene` (#96): the setting text given to the
     # decision model. Absent means the single-user pilot default; null turns it off.
@@ -400,7 +399,7 @@ class PrototypeConfig:
             }:
                 raise ValueError
             hold_unfinished = turns.get("hold_unfinished", True)
-            restarts = turns.get("collapse_restarts", True)
+            restarts = turns.get("collapse_restarts", False)
             bridge = turns.get("bridge_backchannels", False)
             if type(hold_unfinished) is not bool or {type(restarts), type(bridge)} != {bool}:
                 raise ValueError
