@@ -134,6 +134,14 @@ class LiveConfig:
     # it but withhold owner authority from such a turn (`on_inferred`, #137). Only for
     # `diarization-timeline`.
     edge_attribution_ms: int = 0
+    # Coverage labelling (0 = off; #220). When no word of an utterance has a speaker under
+    # the strict rule (each word covered throughout by exactly one speaker), as with a
+    # one-word turn whose timestamps run past the timeline segment, a word that only one
+    # speaker's segments touch takes that speaker when they cover at least this fraction
+    # of it. An observation of the timeline, not an inference: no word is labelled with a
+    # speaker absent from it, and two speakers in a word still leave it unlabelled. Only for
+    # `diarization-timeline`; utterances with any strictly labelled word are unchanged.
+    word_label_coverage: float = 0.0
     # Tail join (opt-in, 0 = off; #129). Also an inference: an unlabelled, non-overlapping
     # turn starting within this many milliseconds of a held labelled turn's end joins it
     # and takes its speaker (see `TurnMerger`). Edge attribution only reaches words near
@@ -167,6 +175,12 @@ class LiveConfig:
             raise LiveAudioError("Invalid turn break predicate")
         if self.turn_unfinished is not None and not callable(self.turn_unfinished):
             raise LiveAudioError("Invalid unfinished-turn predicate")
+        if (
+            type(self.word_label_coverage) not in (int, float)
+            or not math.isfinite(self.word_label_coverage)
+            or not 0 <= self.word_label_coverage <= 1
+        ):
+            raise LiveAudioError("Invalid word label coverage")
         if self.end_of_turn is not None and not callable(self.end_of_turn):
             raise LiveAudioError("Invalid end-of-turn model")
         if (
@@ -538,7 +552,16 @@ class NemotronCppDiarizer:
 _Diarizer = NemotronCppDiarizer
 
 
-def _attribute(start: int, end: int, timeline: list[dict[str, Any]]) -> tuple[str | None, bool]:
+def _attribute(
+    start: int, end: int, timeline: list[dict[str, Any]], min_coverage: float = 0.0
+) -> tuple[str | None, bool]:
+    """The speaker of the word spanning `start`..`end`, and whether speakers overlap in it.
+
+    By default the word must be covered throughout by exactly one speaker. With
+    `min_coverage` above 0 (#220), uncovered slack at its edges is allowed: a word that
+    only one speaker's segments touch is theirs when they cover at least that fraction of
+    it. Two speakers in the word still leave it unlabelled.
+    """
     relevant = [s for s in timeline if s["start_ms"] < end and s["end_ms"] > start]
     edges = sorted(
         {start, end}
@@ -546,11 +569,15 @@ def _attribute(start: int, end: int, timeline: list[dict[str, Any]]) -> tuple[st
     )
     speakers = set()
     ambiguous = overlap = False
+    covered = 0
     for left, right in zip(edges, edges[1:]):
         active = {s["speaker"] for s in relevant if s["start_ms"] < right and s["end_ms"] > left}
         overlap |= len(active) > 1
         ambiguous |= len(active) != 1
+        covered += right - left if len(active) == 1 else 0
         speakers.update(active)
+    if ambiguous and min_coverage > 0 and not overlap and len(speakers) == 1 and end > start:
+        ambiguous = covered < min_coverage * (end - start)
     if ambiguous or len(speakers) != 1:
         return None, overlap
     # Native channels are arrival-ordered and persist for the whole session.
@@ -1143,6 +1170,15 @@ class LiveProcessor:
         for unit in units:
             start, end = unit["start_ms"] + offset, unit["end_ms"] + offset
             attributed.append([unit, start, end, *_attribute(start, end, relevant)])
+        coverage = self.config.word_label_coverage
+        if (
+            coverage
+            and provenance == "diarization-timeline"
+            and not any(entry[3] is not None for entry in attributed)
+        ):
+            # No word has a strict label (#220): let one speaker's coverage label them.
+            for entry in attributed:
+                entry[3:] = _attribute(entry[1], entry[2], relevant, coverage)
         inferred: set[int] = set()
         if self.config.edge_attribution_ms and provenance == "diarization-timeline":
             inferred = _attribute_edges(attributed, relevant, self.config.edge_attribution_ms)

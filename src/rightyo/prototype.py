@@ -201,6 +201,11 @@ def validate_session_budget(value: Any) -> int | None:
     return value
 
 
+# One speaker's share of a word that labels it when no word of the utterance is
+# otherwise labelled (#220).
+DEFAULT_WORD_LABEL_COVERAGE = 0.5
+
+
 @dataclass(frozen=True)
 class PrototypeConfig:
     # Native assets are required only by native backends; explicit mocks need none.
@@ -254,6 +259,9 @@ class PrototypeConfig:
     # The `turns` section's `tail_join_ms` (#129): joining an unlabelled tail into the
     # held labelled turn (see `LiveConfig.tail_join_ms`); 0, the default, is off.
     tail_join_ms: int = 0
+    # The `turns` section's `word_label_coverage` (#220): see
+    # `LiveConfig.word_label_coverage`; 0 turns it off.
+    word_label_coverage: float = DEFAULT_WORD_LABEL_COVERAGE
     # The optional `dismissal` section (#98): natural dismissal and the `dismiss` event.
     # Absent means off; `{}` turns it on with the defaults.
     dismissal: Dismissal | None = None
@@ -382,12 +390,16 @@ class PrototypeConfig:
                 "edge_attribution_ms",
                 "tail_join_ms",
                 "hold_unfinished",
+                "word_label_coverage",
             }:
                 raise ValueError
             hold_unfinished = turns.get("hold_unfinished", True)
             if type(hold_unfinished) is not bool:
                 raise ValueError
             tail = tail_join(turns.get("tail_join_ms", 0))
+            coverage = turns.get("word_label_coverage", DEFAULT_WORD_LABEL_COVERAGE)
+            if type(coverage) not in (int, float) or not 0 <= coverage <= 1:
+                raise ValueError
             edges = turns.get("edge_attribution_ms", 0)
             if type(edges) is not int or not 0 <= edges <= 2000 or edges % 20:
                 raise ValueError
@@ -424,6 +436,7 @@ class PrototypeConfig:
                 reply_wait_ms=wait,
                 edge_attribution_ms=edges,
                 tail_join_ms=tail,
+                word_label_coverage=coverage,
                 dismissal=dismissal,
                 end_of_turn=end_of_turn,
                 conversation=conversation,
@@ -1022,6 +1035,7 @@ class PrototypeController:
                     end_of_turn=end_of_turn.score if end_of_turn is not None else None,
                     edge_attribution_ms=self.config.edge_attribution_ms,
                     tail_join_ms=self.config.tail_join_ms,
+                    word_label_coverage=self.config.word_label_coverage,
                     end_of_turn_threshold=settings.threshold if settings else 0.5,
                     end_of_turn_silence_ms=settings.silence_ms if settings else 200,
                 ),

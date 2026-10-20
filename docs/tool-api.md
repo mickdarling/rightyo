@@ -374,6 +374,19 @@ never held this way. The cost is the usual hold, about two seconds, and only on 
 that looks cut off.
 `"turns": {"hold_unfinished": false}` trusts the model as before (default true).
 
+A word gets a speaker only when the diarizer timeline covers it throughout with exactly
+one speaker. The timeline trails the audio and word timestamps run slightly past it, so a
+one-word turn ("Jarvis.") often had no labelled word at all and came back with no speaker
+and an `unknown` role ([#220](https://github.com/mickdarling/rightyo/issues/220)). With
+`"turns": {"word_label_coverage": 0.5}` (the `listen` default; 0 off, 0 to 1), when no
+word of an utterance has a speaker under that strict rule, a word that only one speaker's
+segments touch takes that speaker if they cover at least that fraction of it. Two
+speakers in a word still leave it unlabelled, and an utterance with any strictly
+labelled word is unchanged. It labels only with a speaker the timeline shows in the word,
+so it is not an inference like edge attribution: a word on another speaker's track gets
+that speaker, never the owner's. The `LiveConfig.word_label_coverage` library default is
+0 (off). It applies to `diarization-timeline` only.
+
 A joined turn spans at most twice `max_utterance_ms` (24 s by default) and 4,000
 characters; a piece that would exceed either starts a new turn. A role is still fixed
 the first time a speaker is emitted, on the joined turn.
