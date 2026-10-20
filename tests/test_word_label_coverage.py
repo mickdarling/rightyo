@@ -117,6 +117,21 @@ class CarriedOverSegmentTests(unittest.TestCase):
         turns, _ = self.run_lead(word, Timeline((0, 1250, OWNER)))
         self.assertEqual(turns, [("Jarvis.", None)])
 
+    def test_a_carried_over_guest_segment_blocks_a_fresh_owner_label(self):
+        word = Units((" Jarvis.", 1050 - START, 1350 - START))
+        turns, _ = self.run_lead(word, Timeline((0, 1120, OTHER), (1130, 1400, OWNER)))
+        self.assertEqual(turns, [("Jarvis.", None)])
+
+    def test_a_carried_over_owner_segment_blocks_a_fresh_guest_label(self):
+        word = Units((" Jarvis.", 1050 - START, 1350 - START))
+        turns, _ = self.run_lead(word, Timeline((0, 1120, OWNER), (1130, 1400, OTHER)))
+        self.assertEqual(turns, [("Jarvis.", None)])
+
+    def test_a_carried_over_segment_of_the_same_speaker_does_not_block(self):
+        word = Units((" Jarvis.", 1050 - START, 1350 - START))
+        turns, _ = self.run_lead(word, Timeline((0, 1060, OWNER), (1130, 1400, OWNER)))
+        self.assertEqual(turns, [("Jarvis.", "Speaker A")])
+
     def test_the_owners_own_word_in_the_utterance_is_still_labelled(self):
         word = Units((" Jarvis.", 1050 - START, 1350 - START))
         turns, inferred = self.run_lead(word, Timeline((1100, 1300, OWNER)))

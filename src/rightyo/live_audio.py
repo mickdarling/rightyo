@@ -1201,9 +1201,20 @@ class LiveProcessor:
             # Only segments that start inside this utterance (pre-roll included) count: a
             # streaming diarizer switches speaker late, so an earlier speaker's segment can
             # run on over the next person's first word before their own segment arrives.
+            # A carried-over segment may still block a label: any other speaker touching
+            # the word, carried over or not, leaves it unlabelled.
             own = [segment for segment in relevant if segment["start_ms"] >= offset]
             for entry in attributed:
-                entry[3:] = _attribute(entry[1], entry[2], own, coverage)
+                # The overlap flag stays the strict pass's, over every segment.
+                start, end = entry[1], entry[2]
+                label = _attribute(start, end, own, coverage)[0]
+                touching = {
+                    "Speaker " + _speaker_label(segment["speaker"])
+                    for segment in relevant
+                    if segment["start_ms"] < end and segment["end_ms"] > start
+                }
+                if label is not None and touching == {label}:
+                    entry[3] = label
         inferred: set[int] = set()
         if self.config.edge_attribution_ms and provenance == "diarization-timeline":
             inferred = _attribute_edges(attributed, relevant, self.config.edge_attribution_ms)
