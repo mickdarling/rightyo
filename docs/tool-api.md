@@ -382,7 +382,9 @@ and an `unknown` role ([#220](https://github.com/mickdarling/rightyo/issues/220)
 utterance has a speaker under that strict rule, a word that only one speaker's segments
 touch takes that speaker if they cover at least that fraction of it. This changes which
 turns carry a speaker, and so their roles: such a turn was `unknown` before. Only
-segments that start inside the utterance (pre-roll included) count. A streaming
+segments that start inside the utterance (pre-roll included) can grant a label; a
+segment carried over from earlier speech still blocks one if it belongs to another
+speaker. A streaming
 diarizer switches speaker late, so a segment carried over from earlier speech can run on
 over the next person's first word before their own segment arrives; that word stays
 unlabelled. Two speakers in a word still leave it unlabelled, and an utterance with any
