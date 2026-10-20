@@ -32,7 +32,7 @@ from typing import Any, Callable
 from .addressedness import reply_wait
 from .contracts import PROVENANCE, Turn, identifier, utterance_scoped_speaker
 from .providers import Diarizer, Transcriber
-from .turn_merge import TurnMerger, merge_gap, tail_join
+from .turn_merge import TurnMerger, complete_hold, merge_gap, tail_join
 
 SAMPLE_RATE = 16000
 FRAME_BYTES = 640  # 20 ms of mono signed little-endian PCM16
@@ -140,6 +140,14 @@ class LiveConfig:
     # the speaker's timeline segment; this catches the rest of a trailing piece. Refused
     # with session-label roles, and reported through `on_inferred`, like edge attribution.
     tail_join_ms: int = 0
+    # One thought split into several turns (#216; see `TurnMerger`). Hold a turn the
+    # end-of-turn model called complete this long after its last word for the same
+    # labelled speaker's continuation (0, the default, emits it at once); keep a restart's
+    # repeated words once when joining; and keep a held turn held across another or an
+    # unattributed speaker's short backchannel. All off by default.
+    turn_complete_hold_ms: int = 0
+    turn_collapse_restarts: bool = False
+    turn_bridge_backchannels: bool = False
     end_of_turn_threshold: float = 0.5
     end_of_turn_silence_ms: int = 200
 
@@ -157,6 +165,14 @@ class LiveConfig:
             tail_join(self.tail_join_ms)
         except ValueError:
             raise LiveAudioError("Invalid tail join window") from None
+        try:
+            complete_hold(self.turn_complete_hold_ms)
+        except ValueError:
+            raise LiveAudioError("Invalid complete hold") from None
+        if type(self.turn_collapse_restarts) is not bool or (
+            type(self.turn_bridge_backchannels) is not bool
+        ):
+            raise LiveAudioError("Invalid turn merge option")
         if self.on_post_turn_gap is not None and not callable(self.on_post_turn_gap):
             raise LiveAudioError("Invalid post-turn gap observer")
         if self.on_inferred is not None and not callable(self.on_inferred):
@@ -941,6 +957,9 @@ class LiveProcessor:
             reply_wait_ms=config.reply_wait_ms,
             tail_join_ms=config.tail_join_ms,
             unfinished=config.turn_unfinished,
+            complete_hold_ms=config.turn_complete_hold_ms,
+            collapse_restarts=config.turn_collapse_restarts,
+            bridge_backchannels=config.turn_bridge_backchannels,
         )
 
     @property

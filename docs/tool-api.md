@@ -374,6 +374,26 @@ never held this way. The cost is the usual hold, about two seconds, and only on 
 that looks cut off.
 `"turns": {"hold_unfinished": false}` trusts the model as before (default true).
 
+The end-of-turn model can also call a mid-thought pause complete when the first piece
+does not look cut off, so one thought becomes two or three requests
+([#216](https://github.com/mickdarling/rightyo/issues/216)). Three `turns` options help:
+
+- `complete_hold_ms` (default 0, off; 0 to 3,000) holds a turn the model called complete
+  for that long after its last word. Only the same labelled speaker's continuation joins
+  it; an unlabelled piece never does, even with tail join. Since the turn is finalized
+  after `end_of_turn.silence_ms` of silence, it delays every complete request by about
+  the hold minus that silence (900 ms for a 1,500 ms hold at 600 ms), and a joined turn by
+  the same after its last piece. Its post-turn gap stays unobserved.
+- `collapse_restarts` (default true) keeps a restart's repeated words once when joining:
+  a piece that opens with the held turn's last three or more words ("... what the tool
+  already" + "what the tool already does.") replaces them rather than repeating them.
+- `bridge_backchannels` (default false), after Pipecat's user backchannel frames, keeps
+  a held turn held across another or an unlabelled speaker's short backchannel ("mm",
+  "yeah", "uh-huh"; at most three such words, no question mark), so the speaker's next
+  piece can still join. The backchannel is emitted as its own turn right after the held
+  turn. Any other speech by someone else releases the held turn, so turns never join
+  across a change of speaker.
+
 A joined turn spans at most twice `max_utterance_ms` (24 s by default) and 4,000
 characters; a piece that would exceed either starts a new turn. A role is still fixed
 the first time a speaker is emitted, on the joined turn.
