@@ -143,8 +143,10 @@ class PcmRing:
             return pcm, start > want_start or end < want_end
 
     def clear(self) -> None:
+        """Drop all held audio; the ring is then exactly a fresh ring of its size (#226)."""
         with self._lock:
             self._buffer.clear()
+            self._start = 0
 
 
 @dataclass

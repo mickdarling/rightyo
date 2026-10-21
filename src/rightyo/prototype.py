@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hmac
+import inspect
 import json
 import math
 import queue
@@ -552,6 +553,27 @@ class PrototypeConfig:
             ) from None
 
 
+def _takes_keyword(factory: Any, name: str) -> bool:
+    """Whether `factory` accepts the keyword argument `name` (#226).
+
+    True when its signature names it as a keyword parameter or takes `**kwargs`, and also
+    when the signature cannot be read, so such a factory is called exactly as before.
+    `inspect.signature` follows `functools.wraps`, so a wrapper that accepts `ring_ms`
+    around a function that does not counts as ring-less: the ring is not applied, and the
+    note says so.
+    """
+    try:
+        parameters = inspect.signature(factory).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    keyword = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or (parameter.name == name and parameter.kind in keyword)
+        for parameter in parameters
+    )
+
+
 def _no_report(_message: str) -> None:
     """The diagnostic sink when a session has no channel (the lab)."""
 
@@ -1046,14 +1068,23 @@ class PrototypeController:
             # With roles on (step 4b) it runs without a diagnostic channel too (the lab).
             report = self.report if self.report is not None else _no_report
             options = {} if self.input_route is None else {"route": self.input_route}
-            # A configured ring length (#226); the default passes nothing, as before.
+            # A configured ring length (#226); the default passes nothing, as before. A
+            # provider that takes no `ring_ms` runs with its own ring, and a note says so.
+            ring_not_applied = False
             if self.config.speaker_ring_ms != RING_MS:
-                options["ring_ms"] = self.config.speaker_ring_ms
+                if _takes_keyword(self.speaker_id_factory, "ring_ms"):
+                    options["ring_ms"] = self.config.speaker_ring_ms
+                else:
+                    ring_not_applied = True
             shadow = self.speaker_id_factory(settings, report=report, **options)
             shadow.start()
             if roles is not None:
                 # Turns read the bindings from here on; until now every label is unknown.
                 roles.source = shadow
+            if ring_not_applied:
+                # Content-free and best-effort: speaker ID stays on either way.
+                with contextlib.suppress(Exception):
+                    report("audio_retention speaker_ring not applied: provider takes no ring_ms")
             return shadow
         except Exception:
             if self.report is not None:

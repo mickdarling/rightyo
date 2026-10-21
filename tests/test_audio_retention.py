@@ -2,12 +2,14 @@
 
 Synthetic data only: authored tones and zero bytes generated in the test, stand-in
 processors and diarizers, and a ctypes stand-in for the native library. No model,
-microphone, recorded voice, native inference or hosted call is used, and nothing is
-written but the test's own temporary configuration.
+microphone, recorded voice, native inference or hosted call is used. Nothing is written
+but the test's own temporary files: its configuration and, for `StartupNoteTests`, a short
+synthetic tone WAV, both in a temporary directory that is cleaned up, as in other tests.
 """
 
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import os
@@ -26,6 +28,7 @@ from test_live_audio import _as_dicts, _native_stream, _session_timeline
 from test_live_speaker_id import RATE, TurnEveryTwoSeconds, tone
 
 import rightyo
+from rightyo import prototype
 from rightyo.live_audio import (
     BYTES_PER_MS,
     MAX_RESPONSE_BYTES,
@@ -245,6 +248,28 @@ class RingTests(unittest.TestCase):
                 ring.resize(value)
         self.assertEqual(ring.max_bytes, 2000 * BYTES_PER_MS)  # a refused resize changes nothing
 
+    def test_a_cleared_ring_behaves_exactly_like_a_fresh_one(self):
+        def exercise(ring):
+            results = []
+            for second in range(5):
+                ring.append(bytes([second + 1]) * (1000 * BYTES_PER_MS))
+                results.append(ring.span(0, 1000))
+                results.append(ring.span(second * 1000, (second + 1) * 1000))
+            results.append(ring.span(0, 5000))
+            return results, ring.max_bytes, ring._start, bytes(ring._buffer)
+
+        used = PcmRing(3000)
+        for _ in range(7):  # past its length, so its start offset has moved on
+            used.append(bytes([9]) * (1000 * BYTES_PER_MS))
+        self.assertGreater(used._start, 0)
+        used.clear()
+        fresh = PcmRing(3000)
+        self.assertEqual(
+            (used._start, used._buffer, used.max_bytes), (0, bytearray(), fresh.max_bytes)
+        )
+        self.assertEqual(used.span(0, 1000), fresh.span(0, 1000))
+        self.assertEqual(exercise(used), exercise(fresh))
+
     def test_the_identifier_builds_its_ring_from_the_configured_length(self):
         settings = SpeakerIdConfig(Path("/synthetic/python"), Path("/synthetic/model"), live=True)
         shadow = ShadowSpeakerId(settings, ring_ms=speaker_ring_ms(600000))
@@ -449,8 +474,13 @@ class StartupNoteTests(unittest.TestCase):
             audio.setframerate(RATE)
             audio.writeframes(tone(4.0))
 
-    def listen(self, retention):
-        """Run `listen` on a demo with live identification; the notes, configs and rings."""
+    def listen(self, retention, shadow=None, sink=None):
+        """Run `listen` on a demo with live identification; the notes, configs and rings.
+
+        `shadow` replaces the stand-in speaker-ID factory, and `sink`, given `listen`'s
+        report channel, returns the one the controller gets; the whole stderr is kept in
+        `self.stderr`.
+        """
         path = self.root / "config.json"
         document = {
             **{key: str(self.asset) for key in LOCAL},
@@ -466,7 +496,7 @@ class StartupNoteTests(unittest.TestCase):
             configs.append(config)
             return TurnEveryTwoSeconds(config, on_turn)
 
-        def shadow(settings, *, report, **options):
+        def stand_in(settings, *, report, **options):
             rings.append(options.get("ring_ms"))
             identifier = MagicMock()
             identifier.binding.return_value = None
@@ -476,11 +506,11 @@ class StartupNoteTests(unittest.TestCase):
             return PrototypeController(
                 loaded,
                 event_publisher=event_publisher,
-                report=report,
+                report=report if sink is None else sink(report),
                 processor_factory=processor,
                 capture_factory=MagicMock(side_effect=AssertionError("no microphone")),
                 provider_factory=MagicMock(side_effect=AssertionError("no hosted")),
-                speaker_id_factory=shadow,
+                speaker_id_factory=stand_in if shadow is None else shadow,
             )
 
         args = Namespace(
@@ -488,6 +518,7 @@ class StartupNoteTests(unittest.TestCase):
         )
         with patch("sys.stderr", io.StringIO()) as errors:
             self.assertEqual(listen(args, output=io.StringIO(), controller_factory=factory), 0)
+        self.stderr = errors.getvalue()
         notes = [
             line.removeprefix("rightyo: ")
             for line in errors.getvalue().splitlines()
@@ -512,6 +543,133 @@ class StartupNoteTests(unittest.TestCase):
                 self.assertEqual([config.timeline_window_ms for config in configs], [window * 1000])
                 # The default ring passes nothing, so an identifier sees no new argument.
                 self.assertEqual(rings, [None if ring == 60 else ring * 1000])
+
+    def test_a_provider_without_ring_ms_keeps_speaker_id_on_and_notes_it(self):
+        started = []
+
+        def ringless(settings, *, report):
+            identifier = MagicMock()
+            identifier.binding.return_value = None
+            identifier.start.side_effect = lambda: started.append(True)
+            return identifier
+
+        retention = {"speaker_ring_seconds": 600}
+        notes, _, _ = self.listen(retention, shadow=ringless)
+        self.assertEqual(started, [True])  # built without the ring and started
+        self.assertNotIn("speaker_id unavailable", self.stderr)
+        self.assertEqual(
+            notes,
+            [
+                "audio_retention speaker_ring_s=600 timeline_window_s=60",
+                "audio_retention speaker_ring not applied: provider takes no ring_ms",
+            ],
+        )
+        # The default ring passes nothing and so has nothing to note.
+        started.clear()
+        notes, _, _ = self.listen(None, shadow=ringless)
+        self.assertEqual(started, [True])
+        self.assertEqual(notes, ["audio_retention speaker_ring_s=60 timeline_window_s=60"])
+
+    def test_a_provider_that_takes_ring_ms_receives_the_configured_value(self):
+        received = []
+
+        def ringed(settings, *, report, ring_ms=RING_MS):
+            received.append(ring_ms)
+            identifier = MagicMock()
+            identifier.binding.return_value = None
+            return identifier
+
+        class Ringed:  # a class factory is read through its constructor's signature
+            def __init__(self, settings, *, report, ring_ms=RING_MS):
+                received.append(ring_ms)
+
+            def start(self):
+                pass
+
+            def binding(self, *_args, **_kwargs):
+                return None
+
+            def audio(self, _pcm):
+                pass
+
+            def turn(self, _turn, **_details):
+                pass
+
+            def close(self, **_options):
+                pass
+
+        for factory in (ringed, Ringed):
+            received.clear()
+            with self.subTest(factory=factory):
+                notes, _, _ = self.listen({"speaker_ring_seconds": 600}, shadow=factory)
+                self.assertEqual(received, [600000])
+                self.assertNotIn("speaker_id unavailable", self.stderr)
+                self.assertEqual(notes, ["audio_retention speaker_ring_s=600 timeline_window_s=60"])
+
+    def test_a_provider_that_fails_otherwise_still_turns_speaker_id_off(self):
+        def broken(settings, *, report):
+            raise TypeError("synthetic failure")
+
+        notes, _, _ = self.listen({"speaker_ring_seconds": 600}, shadow=broken)
+        self.assertIn("speaker_id unavailable; shadow identification off", self.stderr)
+        self.assertEqual(notes, ["audio_retention speaker_ring_s=600 timeline_window_s=60"])
+
+    def test_an_unreadable_signature_calls_the_factory_with_the_ring_as_before(self):
+        received = []
+
+        def opaque(settings, *, report, **options):
+            received.append(options.get("ring_ms"))
+            identifier = MagicMock()
+            identifier.binding.return_value = None
+            return identifier
+
+        signature = inspect.signature
+        for error in (ValueError, TypeError):
+
+            def unreadable(target, *args, error=error, **kwargs):
+                # Only the factory's signature is unreadable; anything else reads as usual.
+                if target is opaque:
+                    raise error("synthetic unreadable signature")
+                return signature(target, *args, **kwargs)
+
+            received.clear()
+            with self.subTest(error=error):
+                with patch.object(prototype.inspect, "signature", side_effect=unreadable) as read:
+                    notes, _, _ = self.listen({"speaker_ring_seconds": 600}, shadow=opaque)
+                self.assertIn(opaque, [call.args[0] for call in read.call_args_list])
+                # Called exactly as a factory that names `ring_ms` is, and nothing is noted.
+                self.assertEqual(received, [600000])
+                self.assertNotIn("speaker_id unavailable", self.stderr)
+                self.assertEqual(notes, ["audio_retention speaker_ring_s=600 timeline_window_s=60"])
+
+    def test_a_failing_report_sink_never_turns_speaker_id_off(self):
+        identifiers = []
+
+        def ringless(settings, *, report):
+            identifier = MagicMock()
+            identifier.binding.return_value = None
+            identifiers.append(identifier)
+            return identifier
+
+        def failing(report):
+            def sink(message):
+                if "not applied" in message:
+                    raise OSError("synthetic broken report channel")
+                report(message)
+
+            return sink
+
+        notes, _, _ = self.listen({"speaker_ring_seconds": 600}, shadow=ringless, sink=failing)
+        self.assertNotIn("speaker_id unavailable", self.stderr)
+        self.assertEqual(notes, ["audio_retention speaker_ring_s=600 timeline_window_s=60"])
+        self.assertEqual(len(identifiers), 1)
+        (identifier,) = identifiers
+        # The session kept its identifier: started once, fed the audio and the turns, and
+        # closed at the end, never left started but unused or unclosed.
+        identifier.start.assert_called_once_with()
+        self.assertTrue(identifier.audio.called)
+        self.assertTrue(identifier.turn.called)
+        identifier.close.assert_called_once()
 
 
 if __name__ == "__main__":

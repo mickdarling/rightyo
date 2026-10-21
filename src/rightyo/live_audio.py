@@ -57,8 +57,10 @@ TIMELINE_WINDOW_MS = 60000
 # 1,560,025 bytes (74%).
 MIN_TIMELINE_WINDOW_MS = 30000
 MAX_TIMELINE_WINDOW_MS = 100000
-# Per-response bound for any backend, derived from the window: three segments for each
-# native 10 ms frame (a 60 s window holds 6,000 frames, so 18,000 segments).
+# Per-response bound for any backend, derived from the window: an enforced cap of 300
+# segments per second (three for each native 10 ms frame; a 60 s window holds 6,000 frames,
+# so 18,000 segments). It is RightyO's limit, not a native guarantee: a response over it
+# fails closed with a sanitized error rather than being truncated.
 TIMELINE_SEGMENTS_PER_SECOND = 300
 # The bound for the default window, kept for callers that name it.
 MAX_TIMELINE_SEGMENTS = TIMELINE_WINDOW_MS // 1000 * TIMELINE_SEGMENTS_PER_SECOND

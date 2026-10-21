@@ -152,8 +152,9 @@ For example `"audio_retention": {"speaker_ring_seconds": 120, "timeline_window_s
 A value out of range or not a whole number is refused when the configuration loads, with
 an error that names the rule; nothing is clamped. Both buffers stay in memory and are
 never written. The values are read when RightyO starts, so a change takes effect at the
-next restart. Each session logs them once on stderr, in seconds only:
-`audio_retention speaker_ring_s=120 timeline_window_s=90`.
+next restart. Each `listen` session logs them once on stderr, in seconds only:
+`audio_retention speaker_ring_s=120 timeline_window_s=90`. The lab has no report channel
+and logs nothing.
 
 An optional `"decision": {"provider": "jev", "allow_hosted": true}` is the file form of
 `listen --use-jev --allow-hosted`, for hosts that start `listen` with a fixed argument list.
