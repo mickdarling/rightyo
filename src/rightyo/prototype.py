@@ -558,6 +558,9 @@ def _takes_keyword(factory: Any, name: str) -> bool:
 
     True when its signature names it as a keyword parameter or takes `**kwargs`, and also
     when the signature cannot be read, so such a factory is called exactly as before.
+    `inspect.signature` follows `functools.wraps`, so a wrapper that accepts `ring_ms`
+    around a function that does not counts as ring-less: the ring is not applied, and the
+    note says so.
     """
     try:
         parameters = inspect.signature(factory).parameters.values()
