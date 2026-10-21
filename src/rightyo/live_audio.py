@@ -43,14 +43,49 @@ MAX_SPEAKER = 702  # "Speaker A" .. "Speaker ZZ"; native streams use 1..8
 # The native stream returns only segments ending within this trailing window of pushed
 # audio. An utterance spans at most `max_utterance_ms` (<= 15 s, pre-roll included), so
 # every segment that can overlap one is inside it with a wide margin, and per-utterance
-# transfer and attribution stay constant however long the session runs (#54).
+# transfer and attribution stay constant however long the session runs (#54). This is the
+# default; `LiveConfig.timeline_window_ms` sets a session's window (#226).
 TIMELINE_WINDOW_MS = 60000
-# Per-response bound for any backend: a 60 s window holds 6,000 native 10 ms frames.
-MAX_TIMELINE_SEGMENTS = 18000
+# The window's bounds, in whole seconds (#226). The lower bound is twice the longest
+# utterance: a shorter window could drop a segment that still overlaps the open utterance,
+# leaving its words unlabelled or, with edge attribution, labelled as a neighbour. The upper
+# bound keeps the worst-case native response under `MAX_RESPONSE_BYTES`, since the worker
+# returns the whole window as one JSON line: each segment `{"start_ms":S,"end_ms":E,
+# "speaker":N},` is 36 bytes plus its two timestamps, so even 16-digit timestamps (a stream
+# of over 30,000 years) give 68 bytes, and 100 s allows 30,000 segments: 30,000 x 68 + 25 =
+# 2,040,025 bytes, under 2,097,152. A 10-hour session's 8-digit timestamps give 52 bytes and
+# 1,560,025 bytes (74%).
+MIN_TIMELINE_WINDOW_MS = 30000
+MAX_TIMELINE_WINDOW_MS = 100000
+# Per-response bound for any backend, derived from the window: three segments for each
+# native 10 ms frame (a 60 s window holds 6,000 frames, so 18,000 segments).
+TIMELINE_SEGMENTS_PER_SECOND = 300
+# The bound for the default window, kept for callers that name it.
+MAX_TIMELINE_SEGMENTS = TIMELINE_WINDOW_MS // 1000 * TIMELINE_SEGMENTS_PER_SECOND
 
 
 class LiveAudioError(ValueError):
     """Sanitized failure: never embeds paths, PCM, transcripts, or native logs."""
+
+
+def timeline_window(value: Any) -> int:
+    """`value` when it is a valid timeline window in milliseconds (#226), else an error.
+
+    A whole number of seconds from `MIN_TIMELINE_WINDOW_MS` to `MAX_TIMELINE_WINDOW_MS`
+    inclusive; nothing is clamped.
+    """
+    if (
+        type(value) is not int
+        or not MIN_TIMELINE_WINDOW_MS <= value <= MAX_TIMELINE_WINDOW_MS
+        or value % 1000
+    ):
+        raise LiveAudioError("Invalid timeline window")
+    return value
+
+
+def timeline_segment_limit(window_ms: int) -> int:
+    """The most segments one diarizer response may hold for a window (#226)."""
+    return timeline_window(window_ms) // 1000 * TIMELINE_SEGMENTS_PER_SECOND
 
 
 def _is_backend_instance(value: Any, method: str) -> bool:
@@ -160,9 +195,14 @@ class LiveConfig:
     turn_bridge_backchannels: bool = False
     end_of_turn_threshold: float = 0.5
     end_of_turn_silence_ms: int = 200
+    # The trailing window of the diarizer timeline returned for attribution (#226), and
+    # with it the per-response segment bound (`timeline_segment_limit`). Memory only; set at
+    # session start and never changed during it. The native worker receives it at launch.
+    timeline_window_ms: int = TIMELINE_WINDOW_MS
 
     def __post_init__(self) -> None:
         identifier(self.session_id, "session_id")
+        timeline_window(self.timeline_window_ms)
         try:
             merge_gap(self.turn_merge_gap_ms)
         except ValueError:
@@ -288,7 +328,15 @@ class _Segment(ctypes.Structure):
 class _NativeStream:
     """Used in the isolated child only; never call it concurrently."""
 
-    def __init__(self, library: str, model_path: str):
+    # The stream's window and its segment bound (#226): set per instance from the window
+    # the worker was launched with; these class values are the defaults.
+    window_ms = TIMELINE_WINDOW_MS
+    max_segments = MAX_TIMELINE_SEGMENTS
+
+    def __init__(self, library: str, model_path: str, window_ms: int = TIMELINE_WINDOW_MS):
+        # Validated before anything is loaded: the worker never trusts its argument.
+        self.window_ms = timeline_window(window_ms)
+        self.max_segments = timeline_segment_limit(self.window_ms)
         self.lib = ctypes.CDLL(library)
         self.model = ctypes.c_void_p()
         self.stream = ctypes.c_void_p()
@@ -374,7 +422,7 @@ class _NativeStream:
         # Segment times must lie within audio actually pushed (plus one second of
         # native lookahead/rounding); the bound follows the stream, not a fixed ceiling.
         horizon = self.pushed_bytes / (BYTES_PER_MS * 1000) + 1
-        cutoff_ms = self.pushed_bytes // BYTES_PER_MS - TIMELINE_WINDOW_MS
+        cutoff_ms = self.pushed_bytes // BYTES_PER_MS - self.window_ms
         result, latest = [], None
         for segment in output[: count.value]:
             start, end = segment.start_time, segment.end_time
@@ -399,7 +447,7 @@ class _NativeStream:
         # stays non-empty (it decides `speaker_provenance`); it overlaps no utterance.
         if not result and latest is not None:
             result.append(latest)
-        if len(result) > MAX_TIMELINE_SEGMENTS:
+        if len(result) > self.max_segments:
             raise LiveAudioError("Invalid local diarizer result")
         return result
 
@@ -412,7 +460,29 @@ class _NativeStream:
             self.model = ctypes.c_void_p()
 
 
-def _native_worker(library: str, model: str) -> int:
+def _response_line(response: dict[str, Any]) -> str:
+    """One worker response exactly as it crosses the pipe: compact JSON and a newline."""
+    return json.dumps(response, separators=(",", ":")) + "\n"
+
+
+def _worker_window(text: Any) -> int | None:
+    """The `--native-worker` window argument as milliseconds, or None when invalid (#226).
+
+    Only the canonical decimal form of a valid window (`timeline_window`) is accepted: no
+    sign, spaces, leading zeros or fraction, and nothing outside the bounds.
+    """
+    if not isinstance(text, str) or not (text.isascii() and text.isdigit()) or len(text) > 7:
+        return None
+    value = int(text)
+    if str(value) != text:
+        return None
+    try:
+        return timeline_window(value)
+    except LiveAudioError:
+        return None
+
+
+def _native_worker(library: str, model: str, window_ms: int = TIMELINE_WINDOW_MS) -> int:
     # Preserve a protocol-only descriptor before redirecting every native log.
     protocol = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
     with open(os.devnull, "wb") as sink:
@@ -420,7 +490,7 @@ def _native_worker(library: str, model: str) -> int:
         os.dup2(sink.fileno(), 2)
     native = None
     try:
-        native = _NativeStream(library, model)
+        native = _NativeStream(library, model, window_ms)
         protocol.write('{"ok":true}\n')
         while True:
             line = sys.stdin.buffer.readline(64000)
@@ -443,7 +513,7 @@ def _native_worker(library: str, model: str) -> int:
                 break
             else:
                 raise LiveAudioError("Invalid native command")
-            protocol.write(json.dumps(response, separators=(",", ":")) + "\n")
+            protocol.write(_response_line(response))
         return 0
     except Exception:
         protocol.write('{"ok":false}\n')
@@ -458,8 +528,10 @@ class NemotronCppDiarizer:
     """The default `Diarizer`: one persistent native stream in a private subprocess.
 
     Speaker channels are arrival-ordered and stable for the whole session. Each
-    `segments`/`finish` call returns only the trailing `TIMELINE_WINDOW_MS` of the
-    timeline, so there is no session-length segment limit.
+    `segments`/`finish` call returns only the trailing `LiveConfig.timeline_window_ms`
+    of the timeline (`TIMELINE_WINDOW_MS` by default), so there is no session-length
+    segment limit. The worker receives the window as its last argument and validates it
+    again.
     """
 
     diarizer_id = "nemotron.cpp v3-streaming"
@@ -469,6 +541,7 @@ class NemotronCppDiarizer:
             raise LiveAudioError("Explicit existing runtimes and models are required")
         self.timeout = config.timeout_seconds
         self.cancelled = config.cancelled if config.cancelled is not None else (lambda: False)
+        self.window_ms = timeline_window(config.timeline_window_ms)
         self._check_cancelled()
         source = str(Path(__file__).resolve().parent.parent)
         self.process = subprocess.Popen(
@@ -479,6 +552,7 @@ class NemotronCppDiarizer:
                 "--native-worker",
                 str(Path(config.diarization_library).resolve()),
                 str(Path(config.diarization_model).resolve()),
+                str(self.window_ms),
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -683,16 +757,19 @@ def _speaker_label(number: int) -> str:
     return letters
 
 
-def _check_timeline(timeline: Any, received_ms: int) -> None:
+def _check_timeline(
+    timeline: Any, received_ms: int, max_segments: int = MAX_TIMELINE_SEGMENTS
+) -> None:
     """Enforce the `Diarizer` contract at the common boundary, whatever the backend.
 
-    A list of at most `MAX_TIMELINE_SEGMENTS` dicts (one call's window, not the
-    session), each with integer `0 <= start_ms <= end_ms` within the audio received so
-    far plus one second of lookahead (the native stream's own bound) and a positive
-    integer `speaker` no greater than `MAX_SPEAKER`. Order is not required: attribution
-    intersects intervals and the native ABI promises none.
+    A list of at most `max_segments` dicts (one call's window, not the session; the
+    processor passes the bound derived from its configured window), each with integer
+    `0 <= start_ms <= end_ms` within the audio received so far plus one second of
+    lookahead (the native stream's own bound) and a positive integer `speaker` no greater
+    than `MAX_SPEAKER`. Order is not required: attribution intersects intervals and the
+    native ABI promises none.
     """
-    if not isinstance(timeline, list) or len(timeline) > MAX_TIMELINE_SEGMENTS:
+    if not isinstance(timeline, list) or len(timeline) > max_segments:
         raise LiveAudioError("Invalid diarizer timeline")
     horizon = received_ms + 1000
     for segment in timeline:
@@ -961,6 +1038,8 @@ class LiveProcessor:
         self._diarizer: Diarizer = _select(
             config.diarizer, lambda value: _Diarizer(value), config, "push"
         )
+        # The per-response segment bound for this session's timeline window (#226).
+        self._timeline_limit = timeline_segment_limit(config.timeline_window_ms)
         self._partial = bytearray()
         self._pre_roll: deque[bytes] = deque(maxlen=config.pre_roll_ms // 20)
         self._utterance = bytearray()
@@ -1146,7 +1225,7 @@ class LiveProcessor:
         self._complete = False
         if not self._utterance:
             return
-        _check_timeline(timeline, self._received_ms)
+        _check_timeline(timeline, self._received_ms, self._timeline_limit)
         pcm = bytes(self._utterance)
         offset = self._utterance_start
         self._utterance.clear()
@@ -1330,6 +1409,10 @@ class LiveProcessor:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "--native-worker":
-        raise SystemExit(_native_worker(sys.argv[2], sys.argv[3]))
+    # `--native-worker LIBRARY MODEL [WINDOW_MS]`: without the window the default applies.
+    if len(sys.argv) in (4, 5) and sys.argv[1] == "--native-worker":
+        window = _worker_window(sys.argv[4]) if len(sys.argv) == 5 else TIMELINE_WINDOW_MS
+        if window is None:
+            raise SystemExit(2)
+        raise SystemExit(_native_worker(sys.argv[2], sys.argv[3], window))
     raise SystemExit(2)

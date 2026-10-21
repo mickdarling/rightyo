@@ -44,7 +44,9 @@ and `--allow-hosted`, or the configuration file's
 transcript context to Jev and emit attention/request events. Stop with Ctrl-C; restart with a fresh session ID. The stream
 contains transcript text: pipe it to a local consumer and avoid logging real conversations.
 See [the tool guide](docs/tool-quickstart.md) for the event contract, Hailing Station handoff,
-limits, and contribution checks. Replies, acknowledgement voices, routing, and tool
+limits, and contribution checks. The configuration's optional `audio_retention` object sets
+how much audio is kept in memory for speaker identification and attribution (60 s each by
+default; see [the prototype guide](docs/prototype.md)); a change takes effect at restart. Replies, acknowledgement voices, routing, and tool
 execution belong to the consuming application.
 
 ## Enroll speakers locally

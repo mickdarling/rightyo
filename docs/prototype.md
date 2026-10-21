@@ -130,6 +130,31 @@ budget's worth of audio is processed. In replay/demo mode the budget is the exac
 boundary: the replay is trimmed there however slowly it processes, and the wall clock
 does not apply. Demo audio whose length equals the budget exactly ends `cancelled`
 (budget reached) rather than `complete`.
+
+An optional `"audio_retention"` object ([#226](https://github.com/mickdarling/rightyo/issues/226))
+sets how much audio RightyO keeps in memory, with two independent keys. Both are whole
+seconds and both default to 60, the fixed value before:
+
+- `speaker_ring_seconds` (10 to 600): how much of the session's PCM
+  [live speaker identification](speaker-enrollment.md#shadow-identification-in-live-sessions)
+  keeps to cut each turn's audio from. It costs memory only: PCM16 at 16 kHz is 32 KB/s,
+  so about 19 MB at 600 s. A shorter ring clips the audio of long turns (counted as
+  `clipped`).
+- `timeline_window_seconds` (30 to 100): how far back the diarizer's speaker timeline is
+  returned at each utterance for attribution. It also sets the per-response segment bound,
+  300 segments per second of window (18,000 at 60 s). The lower bound is twice the longest
+  utterance (15 s), so no segment that overlaps an open utterance is dropped. The upper
+  bound keeps the native diarizer worker's reply inside its 2 MiB pipe limit: the worker
+  returns the whole window as one JSON line, and at 100 s its worst case is 30,000
+  segments of at most 68 bytes each, 2,040,025 bytes.
+
+For example `"audio_retention": {"speaker_ring_seconds": 120, "timeline_window_seconds": 90}`.
+A value out of range or not a whole number is refused when the configuration loads, with
+an error that names the rule; nothing is clamped. Both buffers stay in memory and are
+never written. The values are read when RightyO starts, so a change takes effect at the
+next restart. Each session logs them once on stderr, in seconds only:
+`audio_retention speaker_ring_s=120 timeline_window_s=90`.
+
 An optional `"decision": {"provider": "jev", "allow_hosted": true}` is the file form of
 `listen --use-jev --allow-hosted`, for hosts that start `listen` with a fixed argument list.
 Both keys are required and strictly typed; `"provider": "jev"` without
@@ -266,7 +291,8 @@ reach it well within a long ambient session. Reaching 1,000 turns stops processi
 an explicit message to start a new session, preserving valid history until expiry or Stop.
 The native diarizer returns only the trailing 60 seconds of its speaker timeline at each
 utterance (an utterance spans at most 15 seconds), so it imposes no session-length limit
-([#54](https://github.com/mickdarling/rightyo/issues/54)).
+([#54](https://github.com/mickdarling/rightyo/issues/54)). The configuration's
+`audio_retention.timeline_window_seconds` sets that window from 30 to 100 seconds.
 The whole turn overlapping the time boundary is retained and its overlap is reported. Ignore and uncertain decisions remain in local context: a later
 request can refer to the preceding discussion. Copy context produces speaker-labelled text
 for manual use downstream, including unknown-speaker and overlap indications.
