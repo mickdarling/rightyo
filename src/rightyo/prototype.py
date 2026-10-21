@@ -41,11 +41,22 @@ from rightyo.contracts import (
 )
 from rightyo.credentials import CredentialError
 from rightyo.live_audio import (
+    MAX_TIMELINE_WINDOW_MS,
+    MIN_TIMELINE_WINDOW_MS,
+    TIMELINE_WINDOW_MS,
     LiveAudioError,
     LiveConfig,
     LiveProcessor,
+    timeline_window,
 )
-from rightyo.live_speaker_id import EnrolledRoles, ShadowSpeakerId
+from rightyo.live_speaker_id import (
+    MAX_RING_MS,
+    MIN_RING_MS,
+    RING_MS,
+    EnrolledRoles,
+    ShadowSpeakerId,
+    speaker_ring_ms,
+)
 from rightyo.memory import MemorySessionLimitError, TranscriptMemory
 from rightyo.pipeline import ReplayRunner
 from rightyo.providers import (
@@ -112,7 +123,48 @@ class DecisionConfigError(PrototypeError):
     """An invalid `decision` section; its message names the rule rather than a value."""
 
 
+class RetentionConfigError(PrototypeError):
+    """An invalid `audio_retention` section; its message names the rule, never the value."""
+
+
 DECISION_PROVIDERS = ("mock", "jev")
+AUDIO_RETENTION_KEYS = frozenset({"speaker_ring_seconds", "timeline_window_seconds"})
+
+
+def audio_retention_spec(value: Any) -> tuple[int, int]:
+    """The `audio_retention` section (#226) as (speaker ring ms, timeline window ms).
+
+    Both keys are optional and independent; an absent key keeps its 60 s default. Each is
+    a whole number of seconds within its bounds, and anything else is refused, never
+    clamped. Memory only: neither buffer is ever written, and a change applies when
+    RightyO next starts.
+    """
+    if not isinstance(value, dict) or not set(value) <= AUDIO_RETENTION_KEYS:
+        raise RetentionConfigError(
+            "The audio_retention section must be an object with only the optional keys "
+            "speaker_ring_seconds and timeline_window_seconds"
+        )
+    ring = value.get("speaker_ring_seconds", RING_MS // 1000)
+    window = value.get("timeline_window_seconds", TIMELINE_WINDOW_MS // 1000)
+    try:
+        if type(ring) is not int:
+            raise ValueError
+        ring_ms = speaker_ring_ms(ring * 1000)
+    except ValueError:
+        raise RetentionConfigError(
+            "The audio_retention speaker_ring_seconds value must be a whole number of "
+            f"seconds from {MIN_RING_MS // 1000} to {MAX_RING_MS // 1000}"
+        ) from None
+    try:
+        if type(window) is not int:
+            raise LiveAudioError("Invalid timeline window")
+        window_ms = timeline_window(window * 1000)
+    except LiveAudioError:
+        raise RetentionConfigError(
+            "The audio_retention timeline_window_seconds value must be a whole number of "
+            f"seconds from {MIN_TIMELINE_WINDOW_MS // 1000} to {MAX_TIMELINE_WINDOW_MS // 1000}"
+        ) from None
+    return ring_ms, window_ms
 
 
 def decision_spec(value: Any) -> bool:
@@ -292,6 +344,12 @@ class PrototypeConfig:
     # per-label scores on stderr, with no change to turns, roles or events. With
     # `"roles": true` as well (step 4b), bound labels carry their enrolled role.
     speaker_id: SpeakerIdConfig | None = None
+    # The optional `audio_retention` section (#226), memory only and fixed for the process:
+    # how much session PCM live speaker identification keeps to cut turns from, and the
+    # trailing diarizer timeline window used for attribution (see `LiveConfig`). Both
+    # default to 60 s and are independent.
+    speaker_ring_ms: int = RING_MS
+    timeline_window_ms: int = TIMELINE_WINDOW_MS
 
     @property
     def voiceprint_roles(self) -> bool:
@@ -360,6 +418,7 @@ class PrototypeConfig:
                 "acknowledgement",
                 "speaker_id",
                 "other_agents",
+                "audio_retention",
                 "microphone_helper",
                 *LOCAL_ASSETS,
             }
@@ -394,6 +453,7 @@ class PrototypeConfig:
             speaker_id = raw.pop("speaker_id", None)
             if speaker_id is not None:
                 speaker_id = SpeakerIdConfig.from_dict(speaker_id)
+            ring_ms, window_ms = audio_retention_spec(raw.pop("audio_retention", {}))
             turns = raw.pop("turns", {})
             if not isinstance(turns, dict) or set(turns) - {
                 "merge_gap_ms",
@@ -462,6 +522,8 @@ class PrototypeConfig:
                 conversation=conversation,
                 acknowledgement=acknowledgement,
                 speaker_id=speaker_id,
+                speaker_ring_ms=ring_ms,
+                timeline_window_ms=window_ms,
             )
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
@@ -482,7 +544,7 @@ class PrototypeConfig:
                 # none named every voice would be a participant, which is a mistake.
                 raise ValueError
             return config
-        except DecisionConfigError:
+        except (DecisionConfigError, RetentionConfigError):
             raise
         except (OSError, ValueError, TypeError, UnicodeError, RecursionError):
             raise PrototypeError(
@@ -859,6 +921,14 @@ class PrototypeController:
                 if self.owner_voice is not None and not voiceprint and self.report is not None:
                     with contextlib.suppress(Exception):
                         self.report("owner_voice off: speaker identification roles are not on")
+            if self.report is not None:
+                # The in-memory audio retention in force (#226): seconds only, once per
+                # session (one per `listen` process); best-effort, like every note.
+                with contextlib.suppress(Exception):
+                    self.report(
+                        f"audio_retention speaker_ring_s={self.config.speaker_ring_ms // 1000}"
+                        f" timeline_window_s={self.config.timeline_window_ms // 1000}"
+                    )
             threading.Thread(
                 target=self._decide,
                 args=(generation, stop, work, runner, hosted),
@@ -975,8 +1045,11 @@ class PrototypeController:
         try:
             # With roles on (step 4b) it runs without a diagnostic channel too (the lab).
             report = self.report if self.report is not None else _no_report
-            route = {} if self.input_route is None else {"route": self.input_route}
-            shadow = self.speaker_id_factory(settings, report=report, **route)
+            options = {} if self.input_route is None else {"route": self.input_route}
+            # A configured ring length (#226); the default passes nothing, as before.
+            if self.config.speaker_ring_ms != RING_MS:
+                options["ring_ms"] = self.config.speaker_ring_ms
+            shadow = self.speaker_id_factory(settings, report=report, **options)
             shadow.start()
             if roles is not None:
                 # Turns read the bindings from here on; until now every label is unknown.
@@ -1061,6 +1134,7 @@ class PrototypeController:
                     turn_bridge_backchannels=self.config.turn_bridge_backchannels,
                     end_of_turn_threshold=settings.threshold if settings else 0.5,
                     end_of_turn_silence_ms=settings.silence_ms if settings else 200,
+                    timeline_window_ms=self.config.timeline_window_ms,
                 ),
                 lambda turn: self._turn(generation, work, memory, shadow, turn),
             )

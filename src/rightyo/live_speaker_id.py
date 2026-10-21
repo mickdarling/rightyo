@@ -24,7 +24,8 @@ Embedding runs on a dedicated worker thread behind a small bounded queue, never 
 audio thread: when the worker is busy, a turn is dropped and counted. A worker that fails
 is reported once and switches shadow identification off for the rest of the session; the
 live session itself never stalls or fails because of it. Audio is never written: the ring
-holds at most `RING_MS` of PCM in memory and is cleared when the session ends.
+holds at most `RING_MS` of PCM in memory by default (`audio_retention.speaker_ring_seconds`
+sets it, #226) and is cleared when the session ends.
 """
 
 from __future__ import annotations
@@ -44,8 +45,12 @@ from rightyo.speaker_id import SAMPLE_RATE, SpeakerEmbedder, SpeakerIdConfig
 
 BYTES_PER_MS = 32  # mono PCM16 at 16 kHz
 # A finalized turn spans at most two utterance windows (2 x 15 s) and may be emitted a few
-# seconds after its end (merge gap, reply wait), so a minute of audio covers any turn.
+# seconds after its end (merge gap, reply wait), so a minute of audio covers any turn. This
+# is the default; the configuration may set 10 to 600 s (#226), memory only: PCM16 at
+# 16 kHz is 32 KB/s, about 19 MB at 600 s. A shorter ring clips long turns (counted).
 RING_MS = 60000
+MIN_RING_MS = 10000
+MAX_RING_MS = 600000
 QUEUE_SIZE = 4
 CLOSE_DRAIN_SECONDS = 3.0
 # The input route kinds a host may name for diagnostics (rightyo#164): exactly
@@ -77,11 +82,31 @@ def input_route(value: Any) -> str | None:
     return value if isinstance(value, str) and value in INPUT_ROUTES else None
 
 
+def speaker_ring_ms(value: Any) -> int:
+    """`value` when it is a valid configured ring length in milliseconds (#226).
+
+    A whole number of seconds from `MIN_RING_MS` to `MAX_RING_MS` inclusive; anything else
+    raises ValueError, and nothing is clamped.
+    """
+    if type(value) is not int or not MIN_RING_MS <= value <= MAX_RING_MS or value % 1000:
+        raise ValueError("Invalid speaker ring length")
+    return value
+
+
+def _ring_bytes(max_ms: Any) -> int:
+    if type(max_ms) is not int or max_ms < 1:
+        raise ValueError("Invalid ring length")
+    return max_ms * BYTES_PER_MS
+
+
 class PcmRing:
-    """The last `max_ms` of session PCM, addressed by stream milliseconds; memory only."""
+    """The last `max_ms` of session PCM, addressed by stream milliseconds; memory only.
+
+    `max_bytes` is the one place its size is held; `resize` changes it (#226).
+    """
 
     def __init__(self, max_ms: int = RING_MS):
-        self.max_bytes = max_ms * BYTES_PER_MS
+        self.max_bytes = _ring_bytes(max_ms)
         self._buffer = bytearray()
         self._start = 0  # stream byte offset of `_buffer[0]`
         self._lock = threading.Lock()
@@ -89,11 +114,22 @@ class PcmRing:
     def append(self, pcm: bytes) -> None:
         with self._lock:
             self._buffer.extend(pcm)
-            excess = len(self._buffer) - self.max_bytes
-            if excess > 0:
-                excess += excess % 2  # keep sample alignment
-                del self._buffer[:excess]
-                self._start += excess
+            self._trim()
+
+    def resize(self, max_ms: int) -> None:
+        """Hold the last `max_ms` from now on; a shrink drops the oldest audio at once."""
+        max_bytes = _ring_bytes(max_ms)
+        with self._lock:
+            self.max_bytes = max_bytes
+            self._trim()
+
+    def _trim(self) -> None:
+        # Called with the lock held.
+        excess = len(self._buffer) - self.max_bytes
+        if excess > 0:
+            excess += excess % 2  # keep sample alignment
+            del self._buffer[:excess]
+            self._start += excess
 
     def span(self, start_ms: int, end_ms: int) -> tuple[bytes, bool]:
         """The PCM for `[start_ms, end_ms)` that is still held, and whether it was clipped."""

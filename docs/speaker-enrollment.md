@@ -147,7 +147,10 @@ What it does:
 
 - Each finalized turn with a session speaker label from the diarizer timeline (`Speaker A`)
   is scored. RightyO keeps the last 60 s of the session's audio in memory to cut the turn's
-  audio from; nothing is written, and the buffer is cleared when the session ends.
+  audio from; nothing is written, and the buffer is cleared when the session ends. The
+  configuration's `"audio_retention": {"speaker_ring_seconds": 120}` sets that length from
+  10 to 600 s (about 19 MB at 600 s); a change takes effect when RightyO restarts (see
+  [the prototype guide](prototype.md)).
 - Only the parts of the turn's span that the diarizer timeline gave that label, and no
   other speaker, are used (#148). Audio the timeline left unlabelled, gave to someone else,
   or marked as overlap is left out, even inside the turn. Those parts are joined and
@@ -192,7 +195,7 @@ The session also logs `speaker_id start enrolled=N` at start, and at the end one
 `speaker_id final label=…` line per label and a `speaker_id summary` line counting offered,
 scored, short, overlapping, dropped, clipped, inferred and unsegmented turns, and the
 total `labelled_ms` taken from the buffer (clipped: part of the audio was already outside
-the 60 s buffer; inferred: the turn had inferred-label words, and was scored on its
+the buffer, 60 s unless `speaker_ring_seconds` sets it; inferred: the turn had inferred-label words, and was scored on its
 labelled parts only; unsegmented: the timeline gave the label no part of the turn, so it
 was not scored). When a session ends, turns still queued are scored if the
 stream ended normally, but that is best effort: `listen` stops the session moments after
