@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import json
@@ -29,8 +30,55 @@ from rightyo.memory import TranscriptMemory
 from rightyo.providers import ConfiguredPriorityProvider, ProviderError
 
 MAX_EVENT_BYTES = 1200000
-# The duck-mode control version advertised on `started` (hailing-station #735).
-DUCK_VERSION = 1
+# The duck-mode control version advertised on `started` (hailing-station #735). Version 2
+# is privacy mode, which keeps nothing: a host enters it only for a child advertising 2+.
+DUCK_VERSION = 2
+# Privacy mode's local phrases (hailing-station #735 S-1), as filler-free word tuples. The
+# exit needs a configured name and the owner; the status works for anyone, named or not;
+# the entry is the host's (S-2) and is only released as a whole turn here.
+PRIVACY_EXIT = (
+    ("i'm", "back"),
+    ("i", "am", "back"),
+    ("start", "listening"),
+    ("privacy", "off"),
+    ("privacy", "mode", "off"),
+)
+PRIVACY_STATUS = (
+    ("what", "mode", "am", "i", "in"),
+    ("are", "you", "recording"),
+    ("are", "you", "listening"),
+)
+PRIVACY_ENTRY = (
+    ("stop", "recording"),
+    ("stop", "listening"),
+    ("privacy", "mode"),
+    ("go", "private"),
+)
+# Words dropped anywhere before matching, so "um, ok Jarvis, so I'm back" still matches.
+PRIVACY_FILLER = frozenset(
+    {
+        "um",
+        "umm",
+        "uh",
+        "uhm",
+        "er",
+        "erm",
+        "ah",
+        "hmm",
+        "mm",
+        "oh",
+        "ok",
+        "okay",
+        "so",
+        "hey",
+        "well",
+        "please",
+    }
+)
+# A lone name fragment ("Jarvis,") and an exit said this soon after it are one named exit.
+PRIVACY_SPLIT_NAME_MS = 4000
+# What `_seen` holds for a turn heard in privacy: never a digest of its words.
+PRIVATE_DIGEST = b""
 # Duck-mode spans remembered per session; beyond this many the oldest two are merged into
 # one, which can only make more turns count as heard in duck mode. They are never pruned by
 # retention: a held or joined turn can start well before the retention cutoff it ends after.
@@ -111,6 +159,65 @@ def speaker_name(value):
     ):
         return None
     return value
+
+
+def _privacy_words(text):
+    """`text` as lowercase words of letters and apostrophes, with filler dropped."""
+    cleaned = "".join(c if c.isalpha() or c == "'" else " " for c in text.replace("\u2019", "'"))
+    return [word for word in cleaned.lower().split() if word not in PRIVACY_FILLER]
+
+
+def _negated(words, at):
+    """Whether "don't" or "do not" comes in the three words before `at`."""
+    before = words[max(0, at - 3) : at]
+    return any(
+        word in {"don't", "dont"} or (word == "do" and before[index + 1 : index + 2] == ["not"])
+        for index, word in enumerate(before)
+    )
+
+
+def _phrase_at(words, at, phrases):
+    return any(tuple(words[at : at + len(phrase)]) == phrase for phrase in phrases)
+
+
+def _phrase_in(words, phrases):
+    """Whether one of `phrases` appears anywhere in `words`, not negated."""
+    return any(
+        _phrase_at(words, at, phrases) and not _negated(words, at) for at in range(len(words))
+    )
+
+
+def privacy_phrase(text, addressing):
+    """Which of privacy mode's local phrases `text` holds (hailing-station #735 S-1).
+
+    A set of: "exit" (a configured name or variant of up to three words, then an exit
+    phrase), "rest" (the turn starts with an exit phrase, for a split name), "name" (the
+    turn is only a name), "status" (named or not) and "entry". Case, punctuation and
+    filler are ignored, and the phrase may come anywhere in the turn; "don't" or "do not"
+    in the three words before it (before the name, for the exit) means no match. Nothing
+    is kept: the words exist only inside this call.
+    """
+    words = _privacy_words(text)
+    kinds = set()
+    if addressing is not None:
+        if words and addressing.name_for(" ".join(words)) is not None:
+            kinds.add("name")
+        for at in range(len(words)):
+            for width in range(1, 4):
+                if (
+                    at + width < len(words)
+                    and addressing.name_for(" ".join(words[at : at + width])) is not None
+                    and _phrase_at(words, at + width, PRIVACY_EXIT)
+                    and not _negated(words, at)
+                ):
+                    kinds.add("exit")
+    if _phrase_at(words, 0, PRIVACY_EXIT):
+        kinds.add("rest")
+    if _phrase_in(words, PRIVACY_STATUS):
+        kinds.add("status")
+    if _phrase_in(words, PRIVACY_ENTRY):
+        kinds.add("entry")
+    return frozenset(kinds)
 
 
 def _role_state(record):
@@ -260,10 +367,16 @@ class SpeechEvents:
         # Turns accepted while media mode was on (utterance id -> turn end, pruned by
         # retention): the mode each pending turn is decided under (see `_media_for`).
         self._media_turns = {}
-        # Duck mode (hailing-station #735), set by the host while the owner thinks out loud:
-        # transcripts as usual, but a turn heard while it is on is never decided (see
-        # `duck`). Like media mode it outlasts sessions.
+        # Privacy mode (internally duck, v2; hailing-station #735 S-1), set by the host: a
+        # turn heard while it is on is never emitted, decided or kept, and is matched only
+        # for the local exit and status phrases (see `duck`). Like media mode it outlasts
+        # sessions.
         self._duck = False
+        # The stream time a lone name fragment heard in privacy ended (a split exit), or
+        # None; a time only, never the words.
+        self._private_name_end = None
+        # Counts only, reported when privacy goes off: turns discarded, matcher failures.
+        self._private_counts = {"discarded": 0, "exit": 0, "status": 0, "failed": 0}
         # This session's duck-mode spans, [on_ms, off_ms or None] in stream time, bounded by
         # MAX_DUCK_SPANS: a turn overlapping one was heard in duck mode (`heard_ducked`).
         self._duck_spans = []
@@ -437,6 +550,7 @@ class SpeechEvents:
             self._media_turns.clear()
             # A new session's stream clock starts again; a mode still on covers all of it.
             self._duck_spans = [[0, None]] if self._duck else []
+            self._private_name_end = None
             self._priority = priority
             self._per_turn = (
                 priority is not None
@@ -525,9 +639,10 @@ class SpeechEvents:
                     if acknowledgement is None
                     else {"acknowledgement": acknowledgement.to_dict()}
                 ),
-                # And for duck mode (hailing-station #735), when the producer takes the
-                # `{"duck": true|false}` control (live `listen`, not replay): a host enters
-                # duck mode only for a child that advertised this object.
+                # And for privacy mode (internally duck, hailing-station #735), when the
+                # producer takes the `{"duck": true|false}` control (live `listen`, not
+                # replay): a host enters it only for a child that advertised version 2+, and
+                # must then accept `privacy` events, which are never emitted without it.
                 **({"duck": {"version": DUCK_VERSION}} if duck else {}),
             )
 
@@ -639,6 +754,15 @@ class SpeechEvents:
                 raise ContractError("invalid inferred-label flag")
             integer(now_ms, "now_ms")
             self.expire(max(now_ms, turn.end_ms))
+            if self.heard_ducked(turn):
+                # Privacy mode (hailing-station #735 S-1): matched locally, then dropped. No
+                # transcript, no memory, no decision, no digest of the words.
+                if turn.utterance_id not in self._seen:
+                    if len(self._seen) >= 1000:
+                        raise ContractError("event session turn budget exceeded")
+                    self._seen[turn.utterance_id] = PRIVATE_DIGEST
+                    self._private(turn, inferred)
+                return
             digest = hashlib.sha256(
                 json.dumps(turn.to_dict(), sort_keys=True).encode("utf-8")
             ).digest()
@@ -666,15 +790,12 @@ class SpeechEvents:
                 self._inferred[turn.utterance_id] = turn.end_ms
             if self._media:
                 self._media_turns[turn.utterance_id] = turn.end_ms
-            # Heard in duck mode (hailing-station #735): emitted, but never decided and never
-            # part of a later decision's or request's context.
-            ducked = self.heard_ducked(turn)
-            if self._retain_transcripts and not ducked:
+            if self._retain_transcripts:
                 self._memory.append(turn, role=role)
             self._seen[turn.utterance_id] = digest
             if turn.end_ms <= self._now - self.retention_ms:
                 return
-            if expect_decision and self._attention_enabled and not ducked:
+            if expect_decision and self._attention_enabled:
                 size = len(encode_json(context))
                 if len(self._pending) >= 32 or self._pending_bytes + size > MAX_PENDING_BYTES:
                     self._clear_content()
@@ -970,16 +1091,17 @@ class SpeechEvents:
             self._media = on
 
     def duck(self, on, *, now_ms):
-        """The host's duck mode (hailing-station #735), on or off; it outlasts sessions.
+        """The host's privacy mode (internally duck, v2; hailing-station #735), on or off;
+        it outlasts sessions.
 
         `now_ms` is the stream time it changed, on the received-audio clock turns are timed
         in, and is required (#238): a default to the latest event time could drift from it. A
-        turn heard in duck mode (`heard_ducked`) is still emitted as a `transcript` with
-        its role, but never held for a decision: no attention, request, follow-up,
-        acknowledgement or conversation event comes of it, the controller asks no hosted
-        decision for it, and it is kept out of every later context. The stop-phrase fast
-        path is unchanged. A turn accepted before it was turned on and heard before it is
-        still decided. Emits nothing.
+        turn heard in privacy (`heard_ducked`) keeps nothing (see `_private`): no
+        `transcript`, attention, request, follow-up, acknowledgement or conversation event,
+        no memory or context, and no hosted decision or role question. Only a local match
+        of the exit and status phrases may emit a content-free `privacy` event, and an exact
+        stop phrase a playback-only `dismiss`. A turn accepted before it was turned on and
+        heard before it is still decided. Emits nothing; turning it off reports counts only.
         """
         if type(on) is not bool:
             raise ContractError("invalid duck mode")
@@ -994,7 +1116,88 @@ class SpeechEvents:
             elif not on and self._duck and self._duck_spans and self._duck_spans[-1][1] is None:
                 # The off edge is exclusive (see `heard_ducked`); [t, t] covers nothing.
                 self._duck_spans[-1][1] = max(at, self._duck_spans[-1][0])
+            if not on and self._duck:
+                self._private_name_end = None
+                counts, self._private_counts = (
+                    self._private_counts,
+                    dict.fromkeys(self._private_counts, 0),
+                )
+                if self._report is not None:
+                    # Counts only, never words, ids or speakers.
+                    with contextlib.suppress(Exception):
+                        self._report(
+                            "privacy off: "
+                            + " ".join(f"{key}={value}" for key, value in counts.items())
+                        )
             self._duck = on
+
+    def _private(self, turn, inferred):
+        """Match a turn heard in privacy against the local phrases, then drop it.
+
+        Called with the lock held. Emits at most one content-free event: `privacy` with
+        `action` "exit" (a named exit by the owner, whose label is not inferred) or
+        "status" (anyone), or for an exact stop phrase, with natural dismissal on, a
+        `dismiss` limited to playback that withdraws nothing. A matcher failure counts and
+        matches nothing; its exception, which might carry the words, never leaves here.
+        """
+        self._private_counts["discarded"] += 1
+        try:
+            kinds = privacy_phrase(turn.text, self._addressing)
+            stop = self._dismissal is not None and self._stop_rules.is_stop_phrase(turn.text)
+        except Exception:  # noqa: BLE001 - the words must never reach an error or a log
+            kinds, stop = frozenset(), False
+            self._private_counts["failed"] += 1
+        split, self._private_name_end = self._private_name_end, None
+        if "name" in kinds:
+            self._private_name_end = turn.end_ms
+            return
+        named = "exit" in kinds or (
+            "rest" in kinds
+            and split is not None
+            and 0 <= turn.start_ms - split <= PRIVACY_SPLIT_NAME_MS
+        )
+        role = self._private_role(turn)
+        # An inferred label never exercises authority (#137).
+        authority = "unknown" if inferred and role in {"owner", "trusted"} else role
+        if named and authority == "owner":
+            self._private_counts["exit"] += 1
+            self._emit("privacy", action="exit")
+        elif "status" in kinds:
+            self._private_counts["status"] += 1
+            self._emit("privacy", action="status")
+        elif stop and self._authority(authority) is not None:
+            # Stops a reply still playing; changes nothing heard before or during privacy.
+            self._emit(
+                "dismiss",
+                utterance_id=turn.utterance_id,
+                speech_end_ms=turn.end_ms,
+                speaker_id=turn.speaker_id,
+                **({} if role is None else {"role": role}),
+                scope=["playback"],
+                withdrawn_request_ids=[],
+                reason="stop-phrase",
+                confidence=None,
+            )
+
+    def _private_role(self, turn):
+        """A private turn's role by local rules only: never a hosted role question, never
+        fixed for the speaker, and with live identification looked up without side
+        effects. None without roles; never raises."""
+        if self._priority is None:
+            return None
+        try:
+            if self._per_turn:
+                lookup = getattr(self._priority, "role_of", None) or self._priority.role_for
+                return speaker_role(lookup(turn))
+            if turn.speaker_id is None:
+                return "unknown"
+            return (
+                self._roles.get(turn.speaker_id)
+                or self._priority.priority.configured_role(turn.speaker_id)
+                or "unknown"
+            )
+        except Exception:  # noqa: BLE001 - identification never fails the session
+            return "unknown"
 
     def heard_ducked(self, turn):
         """Whether `turn` was heard in duck mode: it is on now (a turn accepted while it is

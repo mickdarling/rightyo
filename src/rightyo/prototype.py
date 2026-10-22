@@ -85,6 +85,7 @@ from rightyo.speech_backends import (
     utterance_local_labels,
 )
 from rightyo.state_log import DecisionStateLog
+from rightyo.tool_events import privacy_phrase
 from rightyo.turn_merge import (
     DEFAULT_TURN_MERGE_GAP_MS,
     complete_hold,
@@ -593,84 +594,6 @@ def _takes_keyword(factory: Any, name: str) -> bool:
     )
 
 
-# Hailing Station's whole-turn duck-mode phrases (hailing-station #735, `VoiceDuck` in
-# #783). The host matches them only as a whole named owner turn, so the turn merger
-# releases them alone, like a stop phrase: an exit joined onto the owner's thinking aloud
-# would leave duck mode on until its auto-end. The exit only while ducking and the entry
-# only while not, so outside duck mode nothing changes for an exit-shaped turn. Keep in
-# step with the host's sets.
-DUCK_ENTRY = frozenset(
-    {
-        "duck mode",
-        "duck mode on",
-        "let me think out loud",
-        "i'm going to think out loud",
-        "think out loud with me",
-    }
-)
-DUCK_EXIT = frozenset(
-    {
-        "duck mode off",
-        "end duck mode",
-        "done thinking",
-        "i'm done thinking",
-        "done thinking out loud",
-    }
-)
-DUCK_GREETINGS = frozenset({"hey", "ok", "okay"})
-# The host's short cues while ducking (hailing-station #735 H-3 and H-4), named or not:
-# matched only while duck mode is on, so outside it "what do you think" can still take a
-# continuation. Never the unnamed entry or exit: a lone wake word ("Jarvis,") must still
-# join "done thinking" (#230). Keep in step with the host's cue tables.
-DUCK_CUES = frozenset(
-    {"what do you think", "play that back", "mute", "are you still listening", "discard that"}
-)
-
-
-def _duck_words(text: str, addressing: Addressing | None) -> tuple[str, bool]:
-    """`text` trimmed as the host trims a duck phrase, and whether it named the assistant.
-
-    Words of letters and apostrophes, lowercased; a trailing "please", one leading
-    greeting, a configured name or variant of up to three words, then a "please" dropped.
-    """
-    cleaned = "".join(c if c.isalpha() or c == "'" else " " for c in text.replace("\u2019", "'"))
-    words = cleaned.lower().split()
-    while words and words[-1] == "please":
-        words.pop()
-    if words and words[0] in DUCK_GREETINGS:
-        words = words[1:]
-    width = None
-    if addressing is not None:
-        width = next(
-            (
-                size
-                for size in range(1, 4)
-                if size < len(words) and addressing.name_for(" ".join(words[:size])) is not None
-            ),
-            None,
-        )
-    if width is not None:
-        words = words[width:]
-    if words and words[0] == "please":
-        words = words[1:]
-    return " ".join(words), width is not None
-
-
-def duck_phrase_shaped(text: str, addressing: Addressing | None, ducking: bool) -> bool:
-    """Whether `text` is a whole named duck-mode exit while `ducking` ("Jarvis, done
-    thinking"), or a whole named entry while not.
-
-    The name is required, as the host requires it; without names, nothing is one.
-    """
-    phrase, named = _duck_words(text, addressing)
-    return named and phrase in (DUCK_EXIT if ducking else DUCK_ENTRY)
-
-
-def duck_cue_shaped(text: str, addressing: Addressing | None) -> bool:
-    """Whether `text` is a whole duck-mode cue ("what do you think?"), named or not."""
-    return _duck_words(text, addressing)[0] in DUCK_CUES
-
-
 def _no_report(_message: str) -> None:
     """The diagnostic sink when a session has no channel (the lab)."""
 
@@ -1035,13 +958,16 @@ class PrototypeController:
                     acknowledgement=self.config.acknowledgement,
                     other_agents=self.config.other_agents,
                     **({} if self.owner_voice is None else {"owner_voice": self.owner_voice}),
-                    # Duck mode (hailing-station #735): the live controller takes the
-                    # control, so a publisher that holds it advertises it, unless its host
-                    # control channel does not carry the line (a coaching listener).
+                    # Privacy mode (internally duck, hailing-station #735): the live
+                    # controller takes the control, so a publisher that holds it advertises
+                    # it, unless its host control channel does not carry the line (a
+                    # coaching listener), or a hosted speech backend would still be sent the
+                    # audio heard while private (S-1, fail closed: the host then refuses).
                     **(
                         {"duck": True}
                         if getattr(self._events, "duck_control", False) is True
                         and callable(getattr(self._events, "duck", None))
+                        and not self._hosted_speech()
                         else {}
                     ),
                 )
@@ -1073,10 +999,11 @@ class PrototypeController:
         with self._lock:
             if generation != self._generation or self._stop.is_set():
                 return
-            # Duck mode (hailing-station #735), judged by when the turn was heard (see
-            # `SpeechEvents.heard_ducked`): the turn is still published, but no hosted
-            # decision is ever asked for it, and it is kept out of the memory every later
-            # decision's context is read from.
+            # Privacy mode (internally duck, hailing-station #735 S-1), judged by when the
+            # turn was heard (see `SpeechEvents.heard_ducked`): no hosted decision is ever
+            # asked for it and it is kept out of the memory every later decision's context
+            # is read from. It is still passed to the publisher, which only matches it for
+            # the local exit and status phrases and emits no transcript (`_private`).
             heard_ducked = getattr(self._events, "heard_ducked", None)
             ducked = callable(heard_ducked) and heard_ducked(turn) is True
             if self.retain_transcripts and not ducked:
@@ -1102,10 +1029,11 @@ class PrototypeController:
     def _turn_break(self):
         """The predicate for turns that are never joined or held (#89, #98).
 
-        With names configured, a whole named duck-mode exit while the publisher is in duck
-        mode, or entry while it is not (hailing-station #735), and while in duck mode a
-        whole duck cue ("what do you think?"), so the host can match them on the live
-        transcript.
+        Privacy mode (internally duck, hailing-station #735 S-1): while it is on, a piece
+        holding a named exit or a status question, so the owner pause never delays the way
+        back in; while it is off, a piece holding an entry phrase ("stop recording", "stop
+        listening", "privacy mode", "go private"), so the host's safety matcher sees it at
+        once. Matched loosely, as `privacy_phrase` does; nothing is kept.
         """
         stop = (self.config.speakers or SpeakerPriority()).is_stop_phrase
         addressing = self.config.addressing
@@ -1118,10 +1046,11 @@ class PrototypeController:
         def breaks(text: str) -> bool:
             if stop(text) or (dismissal and dismissal_shaped(text)):
                 return True
-            ducked = ducking()
-            return duck_phrase_shaped(text, addressing, ducked) or (
-                ducked and duck_cue_shaped(text, addressing)
-            )
+            try:
+                kinds = privacy_phrase(text, addressing)
+            except Exception:  # noqa: BLE001 - the words must never reach an error or a log
+                return False
+            return bool(kinds & ({"exit", "status"} if ducking() else {"entry"}))
 
         return breaks
 
@@ -1515,9 +1444,16 @@ class PrototypeController:
             if self._audio_started is None:
                 self._audio_started = time.monotonic()
             self._phase = "listening" if self._live() else "replaying"
+            # Read with the clock under the lock, so a change stamped after this chunk
+            # never leaves a chunk heard in privacy in the speaker ring.
+            private = self._private_audio()
         if shadow is not None:
             # Before the processor, so a turn it finalizes on this chunk finds its audio.
-            shadow.audio(pcm)
+            # In privacy mode (hailing-station #735 S-1) the speaker ring keeps silence of
+            # the same length instead: its stream offsets stay aligned, and none of the
+            # audio heard while private is retained. Identification then relies on the
+            # bindings made before; a private turn is never voiceprint evidence.
+            shadow.audio(bytes(len(pcm)) if private else pcm)
         processor.push_pcm16(pcm)
         if boundary:
             # The budget discards the open utterance, but a turn already finalized and
@@ -1529,6 +1465,17 @@ class PrototypeController:
                 if generation == self._generation:
                     self._budget_reached = True
         return not boundary
+
+    def _hosted_speech(self) -> bool:
+        """Whether the configured transcriber or diarizer sends audio to a hosted service."""
+        return any(
+            spec["kind"].startswith("hosted-")
+            for spec in (self.config.transcriber, self.config.diarizer)
+        )
+
+    def _private_audio(self) -> bool:
+        """Whether privacy mode is on now, as the publisher holds it."""
+        return getattr(self._events, "ducked", False) is True
 
     def _decide(self, generation, stop, work, runner, hosted):
         enabled = hosted

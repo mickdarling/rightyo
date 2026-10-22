@@ -16,6 +16,7 @@ import wave
 from argparse import Namespace
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from rightyo.addressedness import observe_gap, request_shaped
 from rightyo.contracts import MAX_TEXT_CHARS, Addressing, SpeakerPriority
@@ -1679,9 +1680,16 @@ class DecisionPathTests(unittest.TestCase):
         )
 
     def test_a_live_session_advertises_the_duck_control(self):
-        # Hailing Station enters duck mode only for a child that advertised it (#735 R-2).
+        # Hailing Station enters privacy mode (internally duck) only for a child that
+        # advertised version 2, which keeps nothing (#735 S-1).
         events, _ = self.run_listen()
-        self.assertEqual(events[0]["duck"], {"version": 1})
+        self.assertEqual(events[0]["duck"], {"version": 2})
+
+    def test_a_hosted_speech_backend_never_advertises_privacy_mode(self):
+        # Hosted speech would still be sent the audio heard while private (#735 S-1).
+        with mock.patch.object(PrototypeController, "_hosted_speech", return_value=True):
+            events, _ = self.run_listen()
+        self.assertNotIn("duck", events[0])
 
     def test_without_merging_the_same_speech_takes_two_decisions(self):
         events, provider = self.run_listen(turns={"merge_gap_ms": 0})

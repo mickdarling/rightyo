@@ -488,7 +488,7 @@ a turn:
 
 A guest, a participant, an unknown speaker, an unlabelled piece and an overlapping piece
 keep the defaults, and with `owner_pause_ms` 0 nothing changes. A stop phrase, a
-dismissal-shaped piece or a named [duck-mode entry or exit](#duck-mode) is still never held: it
+dismissal-shaped piece or a [privacy-mode phrase](#released-at-once) is still never held: it
 releases the held owner turn and follows at once. Another speaker's turn still releases the held owner turn (a backchannel with
 `bridge_backchannels` still bridges it), tail join keeps its own window, a piece that
 looks cut off is held the owner pause rather than the merge gap, and a lone wake word
@@ -1187,86 +1187,135 @@ to another person). Without the question (the #96 request), 9 of the 20 dismissa
 attended and would have been delivered as requests. These are authored
 lines, not recordings; the PR records the tables.
 
-## Duck mode
+## Privacy mode (internally `duck`, v2)
 
-Duck mode ([hailing-station #735](https://github.com/mickdarling/hailing-station/issues/735))
-is for the owner thinking out loud: the host keeps the owner's turns and asks the
-assistant only when the owner cues it. A live `listen` session's `started` event
-advertises it as a separate top-level object beside the capability set,
-`"duck": {"version": 1}`; a host enters duck mode only for a child that advertised it.
-`tool-replay` takes no control and does not advertise it, so the authored fixtures are
-unchanged. Neither does `listen --coaching`: its control descriptor carries only coaching
-records and refuses any other line. With `listen --mode stdin --control-fd N` the
-host turns it on and off with the JSON lines `{"duck": true}` and `{"duck": false}`,
-beside the reply lines above and media mode's `{"media": true|false}`
+Privacy mode ([hailing-station #735](https://github.com/mickdarling/hailing-station/issues/735))
+keeps nothing. While it is on, rightyo emits no content and keeps no memory or audio of
+what it hears. The speech recognizer still runs in memory, but its text is used only to
+match the way back in, locally, and is then dropped. "Stop recording", "stop listening"
+and "privacy mode" all mean this one state.
+
+The wire name stays `duck`. A live `listen` session's `started` event advertises it as a
+separate top-level object beside the capability set, `"duck": {"version": 2}`. Version 2
+means "keeps nothing"; version 1 still emitted transcripts. A host enters privacy mode
+only for a child that advertised version 2 or higher, and a host that accepts the object
+must accept `privacy` events, which are never emitted without it. `tool-replay` takes no
+control and does not advertise it, so the authored fixtures are unchanged. Neither does
+`listen --coaching`: its control descriptor carries only coaching records and refuses
+any other line. Nor does a session with a hosted transcriber or diarizer, which would
+still be sent the audio heard while private: the host then refuses privacy mode and says
+why (fail closed). With `listen --mode stdin --control-fd N` the host turns it on and off
+with the JSON lines `{"duck": true}` and `{"duck": false}`, beside the reply lines above
+and media mode's `{"media": true|false}`
 ([hailing-station #551](https://github.com/mickdarling/hailing-station/issues/551)). A
 non-boolean value or any other key is a malformed line: skipped with a content-free
 stderr note, like any other.
 
-Speech **heard** in duck mode is judged by when it was heard, not when it is released.
+### What a private turn produces
+
+A turn heard in privacy mode:
+
+- is never emitted: no `transcript`, `attention`, `request`, follow-up,
+  acknowledgement or `conversation` event, and no event carrying its words;
+- is never decided: no hosted decision is asked for it (no Jev request), and no hosted
+  role question either. Its role is read locally (configured roles, or live
+  identification's current binding, looked up without side effects) and is never fixed
+  for the speaker;
+- is never kept: not in the publisher's or the controller's transcript memory, so it is
+  never context for a later decision or request, and not even as a digest for duplicate
+  detection;
+- is matched once against the phrases below, and then dropped.
+
+The only events a private turn can produce carry no words:
+
+```json
+{"schema_version": 1, "type": "privacy", "session_id": "…", "sequence": 7, "emitted_at_ms": 51200, "action": "exit"}
+{"schema_version": 1, "type": "privacy", "session_id": "…", "sequence": 8, "emitted_at_ms": 53900, "action": "status"}
+```
+
+- **`action: "exit"`**: the enrolled owner named the assistant and asked to come back:
+  "<name>, I'm back" (or "I am back"), "<name>, start listening", "<name>, privacy off"
+  (or "privacy mode off"). It needs a configured name or variant of up to three words,
+  directly followed by the phrase, and the owner role, resolved as the turn's published
+  role would be. A turn whose label is partly inferred never has it. Without roles, or
+  without names, there is no exit by voice. rightyo does not leave privacy mode itself:
+  the host decides and sends `{"duck": false}`.
+- **`action: "status"`**: anyone asked "what mode am I in", "are you recording" or "are
+  you listening", with or without the name. The host answers from its own state.
+- **`dismiss`**, with natural dismissal on: an exact stop phrase still stops playback (a
+  reply still playing, or a confirmation clip), so the owner keeps that safety control.
+  It is limited to `scope: ["playback"]`, withdraws nothing, ends no engagement and emits
+  no `conversation` event. Its fields are ids, times, the role and `reason:
+  "stop-phrase"`, as for any `dismiss`; it carries no text.
+
+When a turn matches both, the exit wins over the status, and either wins over a stop.
+Everything else produces nothing.
+
+The phrases match loosely: anywhere in the turn, ignoring case, punctuation and filler
+("um", "uh", "ok", "okay", "so", "hey", "well", "please" and similar). A lone name
+fragment ("Jarvis,"), followed within 4 seconds by a turn that starts with an exit
+phrase, counts as one named exit, provided no other private turn comes between them.
+"Don't" or "do not" in the three words before the phrase (before the name, for the exit)
+means no match. The text exists only for the length of the match; a matcher failure
+counts, matches nothing, and its exception, which might carry the words, never leaves
+the matcher.
+
+### Audio and logs
+
+The live speaker-identification ring (`audio_retention.speaker_ring_seconds`) receives
+silence of the same length for every chunk received while privacy is on, so none of that
+audio is retained and its stream offsets stay aligned. A private turn is therefore never
+voiceprint evidence, and the exit relies on bindings made before privacy started. The
+local recognizer, diarizer and end-of-turn model still hear the audio in order to run:
+the open utterance's PCM, and the temporary WAV the whisper.cpp transcriber reads, which
+is deleted when that transcription ends. Nothing else keeps or writes audio, and there is
+no debug dump. Logs carry
+counts only: when privacy goes off, one stderr note
+`privacy off: discarded=N exit=N status=N failed=N`.
+
+### Judged by when it was heard
+
+Speech heard in privacy mode is judged by when it was heard, not when it is released.
 Each change is stamped, when its control line arrives, with the received-audio clock that
 turns are timed in (never the wall clock, which runs ahead of it for good after lost
-audio), and a turn counts as heard in duck
-mode when it is accepted while the mode is on, or when its `[start_ms, end_ms]` overlaps a
-span the mode was on. The on edge is inclusive and the off edge exclusive: the off is
-stamped at or after the end of all audio received by then, so speech heard in duck mode
-starts before it, and speech starting at it was heard after. A span turned on and off
-with no audio between (a new session that starts in duck mode and is turned off before
-any audio) covers nothing. A turn the merger held across the off edge (the merge gap or the
-[owner pause](#joined-turns)), a continuation joined to a piece said in duck mode, a
+audio), and a turn counts as heard in privacy mode when it is accepted while the mode is
+on, or when its `[start_ms, end_ms]` overlaps a span the mode was on. The on edge is
+inclusive and the off edge exclusive: the off is stamped at or after the end of all
+audio received by then, so speech heard in privacy mode starts before it, and speech
+starting at it was heard after. A span turned on and off with no audio between (a new
+session that starts in privacy mode and is turned off before any audio) covers nothing.
+A turn the merger held across the off edge (the merge gap or the
+[owner pause](#joined-turns)), a continuation joined to a piece said in privacy mode, a
 bridged backchannel and a tail join all count, and so does speech said before the mode
-went on that is joined with speech said during it. A session's spans are kept for the
-whole session, at most 64; beyond that the oldest two are merged into one, which can only
-widen them.
+went on that is joined with speech said during it: none of it is ever emitted. A
+session's spans are kept for the whole session, at most 64; beyond that the oldest two
+are merged into one, which can only widen them.
 
-A turn heard in duck mode:
+A turn heard and accepted before the mode went on is still decided and may still form a
+request. The mode is held across sessions, like media mode, and emits nothing when it
+changes; a session that starts with it on counts from its start. The host keeps privacy
+and media mode exclusive. After `{"duck": false}`, normal behaviour resumes for speech
+heard after the off, with nothing from the private window in memory or context. Speech
+between the owner's spoken exit and the host's `{"duck": false}` was heard in privacy
+mode, so it is dropped, and the owner repeats a request said in that moment.
 
-- is still emitted as a `transcript` with its role, the owner's and anyone else's, so
-  the host can keep the owner's;
-- is never decided: no hosted decision is asked for it (no Jev request), and no
-  `attention`, `request`, follow-up, acknowledgement or `conversation` event comes of it;
-- is never context: it is kept out of the transcript memory that later decisions (the
-  hosted decision's context) and later requests' `context` are read from, so neither a
-  guest's turn nor the owner's thinking reaches the assistant after the mode ends. The
-  host's own owner-only buffer is the only place it is kept.
+### Released at once
 
-The exact stop phrases still dismiss at once (natural dismissal's fast path), so the
-owner can still stop a reply that is playing; that dismissal also ends an open engagement,
-as always. A model-judged dismissal needs a decision, so in duck mode only the exact stop
-phrases dismiss. An engagement already open is otherwise left to lapse as usual. A turn
-heard and accepted before the mode went on is still decided and may still form a request.
+The turn merger releases these phrases on their own and at once, as it does a stop
+phrase, so the [owner pause](#joined-turns) never holds them or joins them onto other
+speech:
 
-The mode is held across sessions, like media mode, and emits nothing when it changes; a
-session that starts with it on counts from its start. The host keeps duck and media mode
-exclusive; if both were on, nothing would be decided. Turning it off restores decisions
-for speech heard after the off. Speech between the owner's spoken exit and the host's
-`{"duck": false}` was heard in duck mode, so it stays undecided: the off point is when
-that line arrives, so speech that starts in the second or two between the spoken exit and
-it is treated as heard in duck mode (failing closed), and the owner repeats a request said
-in that moment.
+- while privacy is on, a piece holding a named exit or a status question;
+- while it is off, a piece holding an entry phrase ("stop recording", "stop listening",
+  "privacy mode", "go private"), matched loosely and with the same negation guard, so
+  the host's safety matcher (hailing-station #735 S-2) sees it in its own `transcript`
+  without waiting. Entering privacy mode is the host's decision; rightyo only releases
+  the turn.
 
-The host matches its spoken entry and exit only as a whole named owner turn. With
-`addressing` names configured, the turn merger therefore releases them on their own and
-at once, as it does a stop phrase, so the owner pause never joins the exit onto the
-owner's thinking. A named exit is released this way only while duck mode is on, and a
-named entry only while it is off, so outside duck mode an exit-shaped turn joins as
-before. The phrases are the host's (`VoiceDuck`, hailing-station #783): a configured name
-or variant, then an entry ("duck mode", "duck mode on", "let me think out loud", "I'm
-going to think out loud", "think out loud with me") or an exit ("duck mode off", "end
-duck mode", "done thinking", "I'm done thinking", "done thinking out loud"), with an
-optional leading "hey", "ok" or "okay" and an optional "please". The unnamed phrase is
-never released alone, so a lone wake word ("Jarvis," then "done thinking.") still joins
-it ([#230](https://github.com/mickdarling/rightyo/issues/230)) and the joined turn is
-released at once.
-
-While duck mode is on, the host's short cues are released the same way, with or without a
-name: "what do you think", "play that back", "mute", "are you still listening" and
-"discard that". A cue is therefore emitted as its own `transcript` at once rather than
-after the owner pause. Outside duck mode they join as usual. The host's cue tables land
-in hailing-station #735 H-3 and H-4; these lists must be kept in step with them. A longer
-cue ("what was I saying about…") is not matched here and is merged like any other speech,
-and a phrase the recognizer did not finalize separately from other speech is still one
-turn.
+A lone wake word still joins the owner's following piece
+([#230](https://github.com/mickdarling/rightyo/issues/230)), and the joined turn is
+released at once. The version 1 phrase sets ("duck mode…", "think out loud", "done
+thinking") and the cues ("what do you think", "play that back", …) are gone.
 
 ## Request forming
 
