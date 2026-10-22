@@ -149,6 +149,21 @@ class TurnReportTests(unittest.TestCase):
         self.assertEqual(lengths["2000-3000ms"]["turns"], 1)
         self.assertEqual(lengths["3000-6000ms"]["turns"], 1)
 
+    def test_a_logged_score_equal_to_a_threshold_is_ambiguous_not_above(self):
+        # Notes are logged to three decimals: 0.600 may truly be 0.5996.
+        lines = [
+            "rightyo: speaker_id start enrolled=1\n",
+            note("Speaker A", 4000, 0.600, "bound"),
+            note("Speaker A", 4000, 0.601, "bound"),
+            note("Speaker A", 4000, 0.450, "bound"),
+            note("Speaker A", 4000, 0.599, "bound"),
+        ]
+        owner = harness.turn_report(harness.parse_notes(lines)[0])["owner_turns"]
+        self.assertEqual(owner["at_or_above_bind"], 0.25)
+        self.assertEqual(owner["ambiguous_at_bind"], 1)
+        self.assertEqual(owner["at_or_above_tentative"], 0.75)
+        self.assertEqual(owner["ambiguous_at_tentative"], 1)
+
     def test_only_allowlisted_routes_reach_the_report(self):
         lines = [
             "rightyo: speaker_id start enrolled=1\n",
@@ -178,6 +193,25 @@ class NegativeReportTests(unittest.TestCase):
         self.assertEqual(far["3s"]["at_or_above_tentative"], 0.0)
         # The half-second clip is too short for any segment or a whole-clip score.
         self.assertEqual(far["whole"]["count"], 1)
+
+    def test_nothing_shorter_than_the_configured_minimum_is_scored(self):
+        clips = [("g", tone(7.0, 9000)), ("g", tone(1.5, 9000))]
+        report = harness.negative_report(
+            clips, loudness_embedder, OWNER, durations=(1.0, 3.0), min_seconds=2.0
+        )
+        group = report["groups"]["g"]
+        self.assertEqual(report["lengths_below_min_turn"], ["1s"])
+        self.assertNotIn("1s", group)
+        self.assertEqual(group["3s"]["count"], 2)
+        # The 1.5 s clip is under the 2 s minimum: only the 7 s clip is scored whole.
+        self.assertEqual(group["whole"]["count"], 1)
+
+    def test_exact_scores_keep_at_or_above_for_negatives(self):
+        report = harness.negative_report(
+            [("g", tone(3.0, 9000))], lambda pcm: OWNER, OWNER, durations=(3.0,)
+        )
+        self.assertEqual(report["groups"]["g"]["3s"]["at_or_above_bind"], 1.0)
+        self.assertNotIn("ambiguous_at_bind", report["groups"]["g"]["3s"])
 
     def test_segments_come_from_trimmed_speech_capped_at_30_seconds(self):
         pause = array("h", bytes(2 * 3 * RATE))

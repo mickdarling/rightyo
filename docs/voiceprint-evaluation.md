@@ -246,6 +246,10 @@ voices other than the owner. It changes nothing in the pipeline.
   - Each note's score is against that note's closest identifier. Only scores against the
     owner's print enter the quantiles; the rest are counted. With one enrolled print, every
     score is against the owner's.
+  - Notes log scores to three decimals, so a logged score equal to a threshold may truly be
+    just under it. Those are counted apart (`ambiguous_at_bind`, `ambiguous_at_tentative`),
+    and only scores logged above a threshold count as at or above it. `negatives` uses
+    full-precision scores.
   - The report breaks scores and misses down by speech length, input route and position.
     Position counts only scored turns. Routes are limited to RightyO's allowlisted tokens, and
     `unrecorded` mixes every session from before routes were logged.
@@ -256,7 +260,9 @@ voices other than the owner. It changes nothing in the pipeline.
     12 s segments, at most 8 per clip, plus the whole trimmed clip.
   - Each piece's mean of window embeddings is compared by cosine with the owner's voiceprint
     made with the same model.
-  - The 1 s segments assume the default `min_turn_seconds` of 1.0.
+  - As live, nothing shorter than the configured `min_turn_seconds` is scored: shorter
+    segment lengths are skipped and listed under `lengths_below_min_turn`, and so are
+    shorter whole clips.
   - It reports false accepts at the tentative and bind thresholds for each top-level folder:
     `say/` from `generate`, or voices kept outside Git.
   - The folder names appear in the output verbatim, so never name one after a person or a

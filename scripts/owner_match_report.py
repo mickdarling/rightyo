@@ -147,7 +147,7 @@ def turn_report(
     def summary(group: list[Turn]) -> dict:
         missed = sum(not (turn.state == "bound" and turn.identity == owner) for turn in group)
         scored = [turn.score for turn in group if turn.identity == owner]
-        return _scores(scored, bind, tentative) | {
+        return _scores(scored, bind, tentative, rounded=True) | {
             "turns": len(group),
             "missed": missed,
             "miss_rate": _rate(missed, len(group)),
@@ -169,7 +169,7 @@ def turn_report(
         "by_route": by(lambda turn, _: turn.route),
         "by_position_in_label": by(lambda _, position: _bucket(position, POSITIONS, "turn")),
         "unconfirmed_labels": len({(turn.session, turn.label) for turn in other}),
-        "unconfirmed_turns": _scores([turn.score for turn in other], bind, tentative),
+        "unconfirmed_turns": _scores([turn.score for turn in other], bind, tentative, rounded=True),
     }
 
 
@@ -190,23 +190,33 @@ def negative_report(
     durations: tuple[float, ...] = DURATIONS,
     bind: float = BIND,
     tentative: float = TENTATIVE,
+    min_seconds: float = 1.0,
 ) -> dict:
-    """False accepts per group and segment length, each segment scored as a live turn."""
+    """False accepts per group and segment length, each segment scored as a live turn.
+
+    As live, nothing shorter than `min_seconds` of speech (the configured `min_turn_seconds`)
+    is scored: shorter segment lengths are skipped and listed, and so are shorter whole clips.
+    """
+    scored_lengths = tuple(seconds for seconds in durations if seconds >= min_seconds)
     scores: dict[str, dict[str, list[float]]] = {}
     clip_counts: dict[str, int] = {}
     for group, samples in clips:
         clip_counts[group] = clip_counts.get(group, 0) + 1
         trimmed = speech(samples)[: int(MAX_VERIFY_SECONDS * SAMPLE_RATE)]
         per = scores.setdefault(group, {})
-        for seconds in durations:
+        for seconds in scored_lengths:
             for segment in segments(trimmed, seconds):
                 vector, _ = voiceprint(embed, segment)
                 per.setdefault(f"{seconds:g}s", []).append(cosine(vector, owner_print))
-        if len(trimmed) >= SAMPLE_RATE:
+        if len(trimmed) >= min_seconds * SAMPLE_RATE:
             vector, _ = voiceprint(embed, trimmed)
             per.setdefault("whole", []).append(cosine(vector, owner_print))
     return {
         "thresholds": {"bind": bind, "tentative": tentative},
+        "min_turn_seconds": min_seconds,
+        "lengths_below_min_turn": [
+            f"{seconds:g}s" for seconds in durations if seconds < min_seconds
+        ],
         "groups": {
             group: {"clips": clip_counts[group]}
             | {length: _scores(values, bind, tentative) for length, values in per.items()}
@@ -215,15 +225,28 @@ def negative_report(
     }
 
 
-def _scores(values: list[float], bind: float, tentative: float) -> dict:
+def _scores(values: list[float], bind: float, tentative: float, *, rounded: bool = False) -> dict:
+    """Counts, threshold rates and quantiles.
+
+    `rounded` scores come from notes logged to three decimals: a logged score equal to a
+    threshold may truly be just under it, so it is counted apart as ambiguous, and only scores
+    logged above the threshold count as at or above it.
+    """
     if not values:
         return {"count": 0}
     ordered = sorted(values)
     cuts = statistics.quantiles(ordered, n=10, method="inclusive") if len(ordered) > 1 else []
+    rates = {}
+    for name, threshold in (("bind", bind), ("tentative", tentative)):
+        if rounded:
+            edge = round(threshold, 3)
+            rates[f"at_or_above_{name}"] = _rate(sum(v > edge for v in ordered), len(ordered))
+            rates[f"ambiguous_at_{name}"] = sum(v == edge for v in ordered)
+        else:
+            rates[f"at_or_above_{name}"] = _rate(sum(v >= threshold for v in ordered), len(ordered))
     return {
         "count": len(ordered),
-        "at_or_above_bind": _rate(sum(value >= bind for value in ordered), len(ordered)),
-        "at_or_above_tentative": _rate(sum(value >= tentative for value in ordered), len(ordered)),
+        **rates,
         "min": round(ordered[0], 3),
         "p10": round(cuts[0], 3) if cuts else round(ordered[0], 3),
         "median": round(statistics.median(ordered), 3),
@@ -293,6 +316,7 @@ def _negatives(args) -> dict:
             durations=durations,
             bind=settings.bind_threshold,
             tentative=settings.tentative_threshold,
+            min_seconds=settings.min_turn_seconds,
         )
     finally:
         embedder.close()
