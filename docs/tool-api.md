@@ -663,7 +663,8 @@ differences:
   identifier embeds only the parts of a turn the diarizer timeline gave its label alone
   (#148), and inferred words lie outside them, so another voice's words joined under a
   label can never bind that label to an enrolled identity. The inference is internal; no event
-  field marks it.
+  field marks it, but such a turn never carries
+  [`role_source: "voiceprint"`](#voiceprint-owner-on-transcripts).
 - **Authority is re-checked when the decision arrives.** If the label's binding no longer
   gives the turn its owner or trusted role by then (it fell below `tentative_threshold`),
   the turn is treated as `unknown` for policy: it emits no `override` and acts with no
@@ -1218,12 +1219,11 @@ A turn heard in privacy mode:
 - is never emitted: no `transcript`, `attention`, `request`, follow-up,
   acknowledgement or `conversation` event, and no event carrying its words;
 - is never decided: no hosted decision is asked for it (no Jev request), and no hosted
-  role question either. Its role is read locally (configured roles, or live
-  identification's current binding, looked up without side effects) and is never fixed
-  for the speaker;
+  role question either; no role is fixed for the speaker from it;
 - is never kept: not in the publisher's or the controller's transcript memory, so it is
   never context for a later decision or request, and not even as a digest for duplicate
-  detection;
+  detection (only its utterance id, in a bounded list of the last 64, so it never spends
+  the session's 1,000-turn budget);
 - is matched once against the phrases below, and then dropped.
 
 The only events a private turn can produce carry no words:
@@ -1236,27 +1236,43 @@ The only events a private turn can produce carry no words:
 - **`action: "exit"`**: the enrolled owner named the assistant and asked to come back:
   "<name>, I'm back" (or "I am back"), "<name>, start listening", "<name>, privacy off"
   (or "privacy mode off"). It needs a configured name or variant of up to three words,
-  directly followed by the phrase, and the owner role, resolved as the turn's published
-  role would be. A turn whose label is partly inferred never has it. Without roles, or
-  without names, there is no exit by voice. rightyo does not leave privacy mode itself:
-  the host decides and sends `{"duck": false}`.
+  directly followed by the phrase. rightyo does not leave privacy mode itself: the host
+  decides and sends `{"duck": false}`.
 - **`action: "status"`**: anyone asked "what mode am I in", "are you recording" or "are
   you listening", with or without the name. The host answers from its own state.
-- **`dismiss`**, with natural dismissal on: an exact stop phrase still stops playback (a
-  reply still playing, or a confirmation clip), so the owner keeps that safety control.
-  It is limited to `scope: ["playback"]`, withdraws nothing, ends no engagement and emits
-  no `conversation` event. Its fields are ids, times, the role and `reason:
-  "stop-phrase"`, as for any `dismiss`; it carries no text.
 
-When a turn matches both, the exit wins over the status, and either wins over a stop.
-Everything else produces nothing.
+When a turn matches both, the exit wins. Everything else produces nothing, and changes
+nothing: a stop phrase ("stop", "stop that", "stop listening", "stop recording"), named
+or not and from anyone, is a no-op, since nothing is playing or recording, and it never
+leaves privacy mode.
+
+**Leaving privacy by voice requires enrollment.** Only the enrolled owner's voice, by
+live voiceprint identification (`speaker_id` with `"live": true` and `"roles": true`),
+can exit: the turn's diarizer label must be bound to an enrolled owner identity now. An
+owner configured by session label (`speakers.owners: ["Speaker A"]`) never can, since a
+TV or another voice diarized into that slot would carry the label. Neither can a turn
+whose label is partly inferred (edge attribution, tail join, or a lone wake word joined
+to the next piece), nor one heard while the host reported its own playback (a `reply`
+from `started` to `ended`, with 300 ms either side), so the echo of a clip such as
+"Privacy off, I'm back" never counts. A named exit refused for any of these reasons is
+counted as `exit_refused` and emits nothing. Without enrollment, roles or names, the
+host must offer another way out.
 
 The phrases match loosely: anywhere in the turn, ignoring case, punctuation and filler
-("um", "uh", "ok", "okay", "so", "hey", "well", "please" and similar). A lone name
-fragment ("Jarvis,"), followed within 4 seconds by a turn that starts with an exit
-phrase, counts as one named exit, provided no other private turn comes between them.
-"Don't" or "do not" in the three words before the phrase (before the name, for the exit)
-means no match. The text exists only for the length of the match; a matcher failure
+("um", "uh", "ok", "okay", "so", "hey", "well", "please" and similar). A configured name
+variant that is itself a filler word plus a name ("Hey Jarvis") cannot be matched as a
+name, so it cannot exit; the plain name can. "Don't" or "do not" in the three words
+before the phrase (before the name, for the exit) means no match.
+
+A split exit is the enrolled owner's lone name fragment ("Jarvis,") heard while privacy
+is on, followed within 4 seconds by a turn that starts with an exit phrase. Both turns
+must pass the exit checks above, the name turn included, so a guest or a TV supplying
+the name never counts. Any other turn between them, private or not, and any change of
+the mode, ends it, and a name piece released after the off (heard across it) never
+starts one. With `turns.wake_join` on, the merger usually joins the two pieces into one
+turn first; an unlabelled "Jarvis," joined to the owner's piece makes the turn's label
+partly inferred, so that joined exit is refused (fail closed) and the owner says it
+again as one sentence. The text exists only for the length of the match; a matcher failure
 counts, matches nothing, and its exception, which might carry the words, never leaves
 the matcher.
 
@@ -1266,12 +1282,50 @@ The live speaker-identification ring (`audio_retention.speaker_ring_seconds`) re
 silence of the same length for every chunk received while privacy is on, so none of that
 audio is retained and its stream offsets stay aligned. A private turn is therefore never
 voiceprint evidence, and the exit relies on bindings made before privacy started. The
-local recognizer, diarizer and end-of-turn model still hear the audio in order to run:
-the open utterance's PCM, and the temporary WAV the whisper.cpp transcriber reads, which
-is deleted when that transcription ends. Nothing else keeps or writes audio, and there is
-no debug dump. Logs carry
+local recognizer, diarizer and end-of-turn model still hear the audio in memory, in
+order to run (the open utterance's PCM). Nothing is written to disk, even briefly: the
+whisper.cpp transcriber, for every utterance whether private or not, takes the WAV on
+stdin (`--file -`) and returns its JSON on stdout (`--output-file -`), and runs with an
+unwritable working directory, `HOME` and `TMPDIR` (`/var/empty`), so a kill
+mid-transcription leaves nothing behind and nothing is ever put in the shared temporary
+root. There is no debug dump. Logs carry
 counts only: when privacy goes off, one stderr note
-`privacy off: discarded=N exit=N status=N failed=N`.
+`privacy off: discarded=N exit=N exit_refused=N status=N failed=N`.
+
+### Starting private
+
+`listen --start-private` starts the session in privacy mode, exactly as if
+`{"duck": true}` had arrived at stream time 0, before any audio: nothing is transcribed
+into an event, kept in memory or in the speaker ring from the first frame, and the
+session's privacy span starts at 0 on the audio clock. `started` reports it:
+`"duck": {"version": 2, "private": true}` (the key is present only when the session
+starts private). Only the host's `{"duck": false}` (with `--control-fd`) leaves privacy;
+the option is never a way out, and without a control descriptor the whole session stays
+private. A session that would not advertise version 2 refuses the option and exits with
+an error rather than starting un-private: `--coaching`, and a hosted transcriber or
+diarizer.
+
+### Voiceprint owner on transcripts
+
+For the host's owner-only decisions (privacy entry is owner-only on the host,
+hailing-station #807), a `transcript` event may carry one content-free top-level field
+beside the turn (never inside it, so turn fingerprints are unchanged):
+
+```json
+"role_source": "voiceprint"
+```
+
+It is present only when the turn's `role` is `owner`, that role came from live voiceprint
+identification (the label bound to an enrolled owner voice when the role was resolved,
+with `speaker_id` `"live": true` and `"roles": true`), and no word of the turn has an
+inferred label. It is absent in every other case: an owner configured by session label in
+`speakers` (a TV or another voice diarized into that slot would carry the label), an
+inferred label (edge attribution, tail join, or a lone wake word joined to the next
+piece), a guest, an unbound or unlabelled speaker, and a session without roles. No other
+value is ever sent; absent means "not a voiceprint owner". It is never on `attention` or
+`request` events, which repeat the transcript's role and are joined to it by
+`utterance_id`, and only a live `listen` session that advertises privacy mode sends it, so
+`tool-replay`, `--coaching` and the authored fixtures are unchanged.
 
 ### Judged by when it was heard
 
@@ -1306,11 +1360,17 @@ phrase, so the [owner pause](#joined-turns) never holds them or joins them onto 
 speech:
 
 - while privacy is on, a piece holding a named exit or a status question;
-- while it is off, a piece holding an entry phrase ("stop recording", "stop listening",
-  "privacy mode", "go private"), matched loosely and with the same negation guard, so
-  the host's safety matcher (hailing-station #735 S-2) sees it in its own `transcript`
-  without waiting. Entering privacy mode is the host's decision; rightyo only releases
-  the turn.
+- while it is off, an intentional entry, so the host's safety matcher (hailing-station
+  #735 S-2) sees it in its own `transcript` without waiting. As the host's rule, entry
+  is intentional-only: the piece must be one of "stop recording", "stop the recording",
+  "stop all recording", "stop the recordings", "stop listening", "privacy mode" or "go
+  private" as the whole piece, after an optional leading name (optionally "hey" and a
+  name), with only "please", "okay", "ok", "now", "um", "uh", "so" or "thanks" at its
+  edges ("Jarvis, stop recording now please"). A mid-sentence mention ("we should stop
+  recording the meeting"), a trailing object ("stop listening to podcasts") and a
+  question ("stop recording?") are not entries and join as usual. Entering privacy mode
+  is the host's decision (owner-only, from
+  [`role_source`](#voiceprint-owner-on-transcripts)); rightyo only releases the turn.
 
 A lone wake word still joins the owner's following piece
 ([#230](https://github.com/mickdarling/rightyo/issues/230)), and the joined turn is

@@ -5,11 +5,13 @@ anyone's status question. Synthetic text only."""
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
 import json
 import logging
 import os
 import queue
+import sys
 import tempfile
 import threading
 import time
@@ -22,7 +24,8 @@ from test_conversation import MODE, SESSION, decided, turn
 
 from rightyo import tool_events
 from rightyo.contracts import Addressing, ContractError, Dismissal, SpeakerPriority
-from rightyo.live_speaker_id import PcmRing
+from rightyo.live_audio import NO_FILES_DIR, LiveAudioError, LiveConfig, _transcribe
+from rightyo.live_speaker_id import EnrolledRoles, PcmRing
 from rightyo.memory import TranscriptMemory
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
 from rightyo.providers import ConfiguredPriorityProvider
@@ -31,6 +34,8 @@ from rightyo.turn_merge import TurnMerger
 
 OURS = Addressing(names=("Jarvis",), variants=(("Jarvis", ("Travis",)),))
 OWNER = SpeakerPriority(owners=("Speaker A",))
+# With live voiceprint roles, owners are enrolled identities, not diarizer labels.
+OWNER_ID = SpeakerPriority(owners=("mick",))
 # Synthetic words that never occur in an event's keys or fixed values.
 MONOLOGUE = (
     "Marmalade zeppelin quokka, the saxophone budget is turquoise.",
@@ -73,12 +78,35 @@ class RecordingProvider(ConfiguredPriorityProvider):
         return super().assign(state)
 
 
+class Bindings:
+    """A stand-in live identifier: label -> (state, identity)."""
+
+    def __init__(self, labels):
+        self.labels = labels
+
+    def binding(self, label):
+        return self.labels.get(label)
+
+
+def enrolled():
+    """Live voiceprint roles: Speaker A is bound to the enrolled owner, Speaker B to a
+    guest's voice, anyone else is not yet identified."""
+    roles = EnrolledRoles(OWNER_ID)
+    roles.source = Bindings({"Speaker A": ("bound", "mick"), "Speaker B": ("unknown", None)})
+    return roles
+
+
+def heard(name, start, end, text, speaker="Speaker A"):
+    """A turn with a diarization-timeline label, the only kind live identification binds."""
+    return turn(name, start, end, text, speaker, provenance="diarization-timeline")
+
+
 class PrivacyEventsTests(unittest.TestCase):
-    def start(self, priority=OWNER, provider=None, **options):
+    def start(self, provider="enrolled", **options):
         self.notes = []
         self.events = SpeechEvents(report=self.notes.append)
-        if provider is None and priority is not None:
-            provider = ConfiguredPriorityProvider(priority)
+        if provider == "enrolled":
+            provider = enrolled()
         self.events.start(
             SESSION,
             now_ms=0,
@@ -101,12 +129,17 @@ class PrivacyEventsTests(unittest.TestCase):
         events = []
         for index, text in enumerate(texts):
             at = start + index * gap
-            events += self.say(turn(f"p{at}", at, at + gap - 100, text, speaker))
+            events += self.say(heard(f"p{at}", at, at + gap - 100, text, speaker))
         return events
 
     @staticmethod
     def types(events):
         return [e["type"] for e in events]
+
+    def note(self, **counts):
+        """The privacy-off note with these counts and zeros elsewhere."""
+        keys = ("discarded", "exit", "exit_refused", "status", "failed")
+        return "privacy off: " + " ".join(f"{key}={counts.get(key, 0)}" for key in keys)
 
     def test_started_advertises_version_2(self):
         (started,) = self.start()
@@ -139,15 +172,26 @@ class PrivacyEventsTests(unittest.TestCase):
         self.assertEqual(self.types(tail), ["session"])
         self.assertEqual(self.events._memory.snapshot(200_000)["turns"], [])
         self.assertEqual(self.events._pending, {})
-        # No digest of the words either: only a constant per private turn.
-        self.assertEqual(set(self.events._seen.values()), {tool_events.PRIVATE_DIGEST})
+        # No digest of the words, and none of the session's turn budget: ids only.
+        self.assertEqual(self.events._seen, {})
+        self.assertTrue(all(uid.startswith("p") for uid in self.events._private_seen))
         # Every byte the host could have read, as the JSONL stream carries it.
         everything = "".join(encode_json(e) + "\n" for e in [*stream, *events, *tail])
         self.assertEqual(leaks(everything), [])
         self.assertEqual(leaks(stderr.getvalue() + logs.getvalue()), [])
         self.assertEqual(leaks(" ".join(self.notes)), [])
         # Logs carry counts only.
-        self.assertEqual(self.notes, ["privacy off: discarded=36 exit=0 status=0 failed=0"])
+        self.assertEqual(self.notes, [self.note(discarded=36)])
+
+    def test_private_turns_never_spend_the_session_turn_budget(self):
+        # Key 3's item 4: thousands of private turns never end the stream.
+        self.start()
+        self.events.duck(True, now_ms=0)
+        for index in range(1500):
+            self.events.transcript(heard(f"q{index}", index, index, "um"), index)
+        self.events.duck(False, now_ms=2000)
+        events = self.say(heard("t1", 3000, 3900, "Jarvis, what time is it?"))
+        self.assertIn("request", self.types(events))
 
     def test_no_hosted_role_question_is_asked_for_a_private_turn(self):
         provider = RecordingProvider(OWNER)
@@ -158,7 +202,7 @@ class PrivacyEventsTests(unittest.TestCase):
         # Nor is a role fixed for the speaker from it.
         self.assertEqual(self.events._roles, {})
 
-    def test_the_named_owner_exit_emits_one_content_free_event(self):
+    def test_the_enrolled_owner_exit_emits_one_content_free_event(self):
         self.start()
         self.events.duck(True, now_ms=0)
         for index, text in enumerate(
@@ -177,25 +221,50 @@ class PrivacyEventsTests(unittest.TestCase):
                     },
                 )
 
+    def test_a_label_configured_owner_is_refused_and_counted(self):
+        # Key 3's blocker 1: a TV diarized into "Speaker A" must never end privacy.
+        for provider in (ConfiguredPriorityProvider(OWNER), EnrolledRoles(OWNER)):
+            with self.subTest(provider=type(provider).__name__):
+                self.start(provider=provider)
+                self.events.duck(True, now_ms=0)
+                self.assertEqual(self.hear("Jarvis, I'm back."), [])
+                self.events.duck(False, now_ms=5000)
+                self.assertEqual(self.notes, [self.note(discarded=1, exit_refused=1)])
+
     def test_a_guest_or_unnamed_exit_is_ignored(self):
         self.start()
         self.events.duck(True, now_ms=0)
         self.assertEqual(self.hear("Jarvis, I'm back.", speaker="Speaker B"), [])
-        self.assertEqual(self.hear("Jarvis, I'm back.", speaker=None, start=5000), [])
-        self.assertEqual(self.hear("I'm back.", start=10_000), [])
-        self.assertEqual(self.hear("Start listening.", start=15_000), [])
+        self.assertEqual(self.hear("Jarvis, I'm back.", speaker="Speaker C", start=5000), [])
+        self.assertEqual(self.hear("Jarvis, I'm back.", speaker=None, start=10_000), [])
+        self.assertEqual(self.hear("I'm back.", start=15_000), [])
+        self.assertEqual(self.hear("Start listening.", start=20_000), [])
+        self.events.duck(False, now_ms=30_000)
+        self.assertEqual(self.notes, [self.note(discarded=5, exit_refused=3)])
 
     def test_without_roles_nobody_can_exit(self):
-        self.start(priority=None)
+        self.start(provider=None)
         self.events.duck(True, now_ms=0)
         self.assertEqual(self.hear("Jarvis, I'm back."), [])
 
     def test_an_inferred_owner_label_cannot_exit(self):
         self.start()
         self.events.duck(True, now_ms=0)
-        current = turn("t1", 100, 900, "Jarvis, I'm back.")
+        current = heard("t1", 100, 900, "Jarvis, I'm back.")
         self.events.transcript(current, current.end_ms, inferred=True)
         self.assertEqual(self.events.drain(), [])
+
+    def test_an_exit_heard_during_the_hosts_own_playback_is_dropped(self):
+        # An echo of a clip such as "Privacy off, I'm back" is never the owner leaving.
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events.reply("started", 1000)
+        self.assertEqual(self.hear("Jarvis, I'm back.", start=1200), [])
+        self.events.reply("ended", 3000)
+        # Within the margin after it ended: still dropped.
+        self.assertEqual(self.say(heard("t1", 3200, 3900, "Jarvis, I'm back.")), [])
+        events = self.say(heard("t2", 3400, 4100, "Jarvis, I'm back."))
+        self.assertEqual([e["action"] for e in events], ["exit"])
 
     def test_loose_matching(self):
         self.start()
@@ -218,7 +287,7 @@ class PrivacyEventsTests(unittest.TestCase):
     def test_a_split_name_fragment_joins_the_exit(self):
         self.start()
         self.events.duck(True, now_ms=0)
-        self.assertEqual(self.hear("Jarvis,", speaker=None), [])
+        self.assertEqual(self.hear("Jarvis,"), [])
         events = self.hear("I'm back.", start=1500)
         self.assertEqual([e["action"] for e in events], ["exit"])
         # Too late after the name, or with a turn between: no exit.
@@ -227,9 +296,87 @@ class PrivacyEventsTests(unittest.TestCase):
         self.assertEqual(self.hear("Jarvis,", start=30_000), [])
         self.assertEqual(self.hear("Something else.", start=31_000), [])
         self.assertEqual(self.hear("I'm back.", start=32_000), [])
-        # A guest finishing someone's name is still a guest.
+        # A guest finishing the owner's name is still a guest.
         self.assertEqual(self.hear("Jarvis,", start=40_000), [])
         self.assertEqual(self.hear("I'm back.", speaker="Speaker B", start=41_000), [])
+
+    def test_a_name_from_anyone_but_the_enrolled_owner_never_starts_a_split_exit(self):
+        self.start()
+        self.events.duck(True, now_ms=0)
+        for index, speaker in enumerate(("Speaker B", "Speaker C", None)):
+            with self.subTest(speaker=speaker):
+                at = index * 10_000
+                self.assertEqual(self.hear("Travis.", speaker=speaker, start=at), [])
+                self.assertEqual(self.hear("I'm back.", start=at + 1000), [])
+
+    def test_key_2_repro_a_stale_name_never_exits(self):
+        # Key 2's blocker: on, a guest's name released after the off, a public turn, on
+        # again, then the owner's unnamed "start listening".
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events.duck(False, now_ms=1000)
+        self.assertEqual(self.say(heard("n1", 600, 1200, "Travis.", "Speaker B")), [])
+        self.say(heard("g1", 1500, 1800, "A synthetic aside.", "Speaker B"))
+        self.events.duck(True, now_ms=2000)
+        events = self.say(heard("o1", 2100, 2900, "start listening to this song"))
+        self.assertEqual(events, [])
+
+    def test_an_owner_name_straddling_the_off_never_starts_a_split_exit(self):
+        for release_after_next_on in (False, True):
+            with self.subTest(release_after_next_on=release_after_next_on):
+                self.start()
+                self.events.duck(True, now_ms=0)
+                self.events.duck(False, now_ms=1000)
+                # The owner's own name, heard across the off and released late, before or
+                # after privacy goes on again.
+                name = heard("n1", 600, 1200, "Jarvis,")
+                if not release_after_next_on:
+                    self.assertEqual(self.say(name), [])
+                self.events.duck(True, now_ms=1300)
+                if release_after_next_on:
+                    self.assertEqual(self.say(name), [])
+                self.assertIsNone(self.events._private_name_end)
+                self.assertEqual(self.say(heard("o1", 1400, 2000, "I'm back.")), [])
+
+    def test_a_session_started_private_keeps_nothing_until_the_host_turns_it_off(self):
+        # hailing-station #735 S-2b: `--start-private` is `{"duck": true}` at time 0.
+        self.notes = []
+        self.events = SpeechEvents(report=self.notes.append)
+        self.events.duck(True, now_ms=0)
+        self.events.start(
+            SESSION, now_ms=0, addressing=OURS, conversation=MODE, priority=enrolled(), duck=True
+        )
+        (started,) = self.events.drain()
+        self.assertEqual(started["duck"], {"version": 2, "private": True})
+        self.assertEqual(self.events._duck_spans, [[0, None]])
+        self.assertEqual(self.hear(*MONOLOGUE, start=0), [])
+        self.events.duck(False, now_ms=5000)
+        events = self.say(heard("t1", 6000, 6900, "Jarvis, what time is it?"))
+        self.assertIn("request", self.types(events))
+        (request,) = [e for e in events if e["type"] == "request"]
+        self.assertEqual(request["context"]["turns"], [])
+        # Not private at start: no `private` key.
+        self.assertEqual(self.start()[0]["duck"], {"version": 2})
+
+    def test_a_public_turn_between_ends_a_split_exit(self):
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.assertEqual(self.say(heard("n1", 100, 600, "Jarvis,")), [])
+        self.assertIsNotNone(self.events._private_name_end)
+        self.events.duck(False, now_ms=700)
+        self.say(heard("g1", 800, 900, "A synthetic aside.", "Speaker B"))
+        self.events.duck(True, now_ms=1000)
+        self.assertEqual(self.say(heard("o1", 1100, 1600, "I'm back.")), [])
+
+    def test_the_off_clears_a_split_exit(self):
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.assertEqual(self.say(heard("n1", 100, 600, "Jarvis,")), [])
+        self.assertEqual(self.events._private_name_end, 600)
+        self.events.duck(False, now_ms=700)
+        self.assertIsNone(self.events._private_name_end)
+        self.events.duck(True, now_ms=700)
+        self.assertEqual(self.say(heard("o1", 800, 1400, "I'm back.")), [])
 
     def test_near_misses_and_negations_are_rejected(self):
         self.start()
@@ -271,18 +418,36 @@ class PrivacyEventsTests(unittest.TestCase):
                     {"schema_version", "type", "session_id", "sequence", "emitted_at_ms", "action"},
                 )
 
-    def test_a_stop_phrase_only_stops_playback_and_carries_no_words(self):
+    def test_stop_never_exits_and_does_nothing_in_privacy(self):
+        # Mick: "In privacy mode, there's no recording, so stop shouldn't do anything."
         self.start(dismissal=Dismissal())
-        self.events.duck(True, now_ms=0)
-        (dismiss,) = self.hear("Stop.")
-        self.assertEqual(dismiss["type"], "dismiss")
-        self.assertEqual(dismiss["scope"], ["playback"])
-        self.assertEqual(dismiss["withdrawn_request_ids"], [])
-        self.assertNotIn("text", json.dumps(dismiss))
-        # Without natural dismissal, nothing.
-        self.start()
-        self.events.duck(True, now_ms=0)
-        self.assertEqual(self.hear("Stop."), [])
+        self.say(heard("t0", 0, 900, "Jarvis, what time is it?"))
+        self.events.duck(True, now_ms=1000)
+
+        def state():
+            events = self.events
+            return copy.deepcopy(
+                (
+                    events._dismissed,
+                    events._cooldowns,
+                    events._delivered,
+                    events._withdrawn,
+                    events._engaged,
+                    events.last_request,
+                    events._private_name_end,
+                    events._memory.snapshot(100_000),
+                )
+            )
+
+        before = state()
+        forms = ("Stop.", "Stop that.", "Stop listening.", "Stop recording.", "Stop it.")
+        for index, form in enumerate(forms):
+            for text in (form, f"Jarvis, {form[0].lower()}{form[1:]}"):
+                with self.subTest(text=text):
+                    events = self.hear(text, start=2000 + index * 10_000)
+                    self.assertEqual(events, [])
+                    self.assertEqual(state(), before)
+                    self.assertTrue(self.events.ducked)
 
     def test_a_matcher_failure_leaks_no_words(self):
         self.start()
@@ -303,15 +468,58 @@ class PrivacyEventsTests(unittest.TestCase):
         self.events.duck(False, now_ms=100_000)
         self.assertEqual(events, [])
         self.assertEqual(leaks(stderr.getvalue() + logs.getvalue() + " ".join(self.notes)), [])
-        self.assertEqual(self.notes, ["privacy off: discarded=4 exit=0 status=0 failed=4"])
+        self.assertEqual(self.notes, [self.note(discarded=4, failed=4)])
+
+    def test_role_source_marks_only_a_live_voiceprint_owner(self):
+        # The host's owner-only privacy entry (HS #807): "voiceprint" or absent, nothing else.
+        (started,) = self.start()
+        self.assertNotIn("role_source", started)
+        sources = {}
+        for name, speaker, inferred in (
+            ("owner", "Speaker A", False),
+            ("inferred", "Speaker A", True),
+            ("guest", "Speaker B", False),
+            ("unbound", "Speaker C", False),
+            ("unlabelled", None, False),
+        ):
+            at = len(sources) * 1000
+            self.events.transcript(
+                heard(name, at, at + 900, "x", speaker), at + 900, inferred=inferred
+            )
+            (event, *_rest) = self.events.drain()
+            sources[name] = (event["turn"]["role"], event.get("role_source"))
+        self.assertEqual(
+            sources,
+            {
+                "owner": ("owner", "voiceprint"),
+                "inferred": ("owner", None),
+                "guest": ("participant", None),
+                "unbound": ("unknown", None),
+                "unlabelled": ("unknown", None),
+            },
+        )
+        # A label configured as the owner, with live roles or without, is never one.
+        for provider in (EnrolledRoles(OWNER), ConfiguredPriorityProvider(OWNER)):
+            with self.subTest(provider=type(provider).__name__):
+                self.start(provider=provider)
+                self.events.transcript(heard("l", 0, 900, "x"), 900)
+                event = self.events.drain()[0]
+                self.assertEqual(event["turn"]["role"], "owner")
+                self.assertNotIn("role_source", event)
+        # Nor where privacy is not advertised (replay, coaching).
+        replay = SpeechEvents()
+        replay.start(SESSION, now_ms=0, priority=enrolled())
+        replay.drain()
+        replay.transcript(heard("r", 0, 900, "x"), 900)
+        self.assertNotIn("role_source", replay.drain()[0])
 
     def test_after_off_normal_behaviour_resumes_without_the_private_window(self):
         self.start()
-        self.say(turn("t0", 0, 900, "A synthetic opener."), "ignore")
+        self.say(heard("t0", 0, 900, "A synthetic opener."), "ignore")
         self.events.duck(True, now_ms=1000)
         self.hear(*MONOLOGUE, start=1000)
         self.events.duck(False, now_ms=6000)
-        events = self.say(turn("t9", 7000, 7900, "Jarvis, what time is it?"))
+        events = self.say(heard("t9", 7000, 7900, "Jarvis, what time is it?"))
         self.assertEqual(self.types(events), ["transcript", "attention", "request", "conversation"])
         (request,) = [e for e in events if e["type"] == "request"]
         self.assertEqual([t["text"] for t in request["context"]["turns"]], ["A synthetic opener."])
@@ -412,12 +620,7 @@ class PrivacyPhraseTests(unittest.TestCase):
             "Jarvis,": {"name"},
             "Travis.": {"name"},
             "What mode am I in?": {"status"},
-            "Um, stop recording.": {"entry"},
-            "Ok so go private": {"entry"},
-            "Don't stop recording.": set(),
-            "We should not, um, do not stop listening": set(),
-            "Jarvis, privacy mode.": {"entry"},
-            "Jarvis, privacy mode off.": {"exit", "entry"},
+            "Jarvis, privacy mode off.": {"exit"},
             "": set(),
         }
         for text, kinds in cases.items():
@@ -426,11 +629,57 @@ class PrivacyPhraseTests(unittest.TestCase):
         # Without names nothing is named.
         self.assertEqual(privacy_phrase("Jarvis, I'm back.", None), frozenset())
 
+    def test_entry_is_intentional_only(self):
+        # The host's S-2 rule: a standalone turn, after an optional name or address, with
+        # small fillers at the edges only. Never mid-sentence, with an object, or a question.
+        standalone = (
+            "Stop recording.",
+            "Stop listening",
+            "Privacy mode.",
+            "Go private!",
+            "Stop the recording.",
+            "Stop recording now.",
+            "Stop all recording.",
+            "Stop the recordings.",
+            "Um, stop recording please.",
+            "Ok so go private, thanks",
+            "Jarvis, privacy mode.",
+            "Hey Jarvis, stop listening.",
+            "Okay Travis, stop recording now please.",
+            "Please, Jarvis, go private.",
+        )
+        embedded = (
+            "We should stop recording the meeting.",
+            "Stop listening to podcasts.",
+            "Stop listening on 443.",
+            "I said stop recording.",
+            "Don't stop recording.",
+            "Stop recording?",
+            "Can you stop recording?",
+            "Privacy mode off.",
+            "I'm not in privacy mode.",
+            "What's privacy mode?",
+            "Jarvis, what is privacy mode",
+            "Go private and stop recording.",
+            "Stop all the recording.",
+            "Stop the walrus recording.",
+            "Jarvis, um, can you go private",
+        )
+        for text in standalone:
+            with self.subTest(text=text):
+                self.assertIn("entry", privacy_phrase(text, OURS))
+        for text in embedded:
+            with self.subTest(text=text):
+                self.assertNotIn("entry", privacy_phrase(text, OURS))
+        # Without names, only the unnamed forms.
+        self.assertIn("entry", privacy_phrase("Stop recording.", None))
+        self.assertNotIn("entry", privacy_phrase("Jarvis, stop recording.", None))
+
 
 class DuckControllerTests(unittest.TestCase):
     """The controller asks no decision for, keeps no memory or audio of, a private turn."""
 
-    def controller(self, **extra):
+    def controller(self, constructor=None, **extra):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         asset = Path(directory.name) / "asset"
@@ -446,8 +695,8 @@ class DuckControllerTests(unittest.TestCase):
             )
         }
         path = Path(directory.name) / "config.json"
-        path.write_text(json.dumps({**base, **extra}))
-        controller = PrototypeController(PrototypeConfig.load(path))
+        path.write_text(json.dumps({**base, "demo_audio": str(asset), **extra}))
+        controller = PrototypeController(PrototypeConfig.load(path), **(constructor or {}))
         self.addCleanup(controller.close)
         return controller
 
@@ -490,8 +739,8 @@ class DuckControllerTests(unittest.TestCase):
         blob = "".join(encode_json(e) for e in drained)
         self.assertEqual(leaks(blob + stderr.getvalue() + " ".join(notes)), [])
 
-    def test_hosted_speech_is_recognized_so_privacy_is_not_advertised(self):
-        self.assertFalse(self.controller()._hosted_speech())
+    def test_privacy_is_advertised_only_with_local_speech(self):
+        # The guard itself, through `start`, not a mock (key 2's nit 3).
         hosted = {
             "transcriber": {
                 "kind": "hosted-openai-compatible",
@@ -499,19 +748,37 @@ class DuckControllerTests(unittest.TestCase):
                 "model": "whisper-1",
             }
         }
-        self.assertTrue(self.controller(**hosted)._hosted_speech())
-        diarizer = {"diarizer": {"kind": "hosted-deepgram", "model": "nova-3"}}
-        self.assertTrue(self.controller(**diarizer)._hosted_speech())
+        for extra, advertised in (({}, True), (hosted, False)):
+            with self.subTest(hosted=bool(extra)):
+                events = SpeechEvents()
+
+                def no_audio(*_args, **_options):
+                    raise PrototypeError("no audio in this test")
+
+                controller = self.controller(
+                    constructor={
+                        "event_publisher": events,
+                        "processor_factory": no_audio,
+                        "allow_hosted_speech": True,
+                    },
+                    **extra,
+                )
+                controller.start({"mode": "demo", "session_id": "advertise"})
+                started = events.drain()[0]
+                self.assertEqual(started["phase"], "started")
+                self.assertEqual("duck" in started, advertised)
+                if advertised:
+                    self.assertEqual(started["duck"], {"version": 2})
 
     def test_the_named_owner_exit_reaches_the_host_through_the_controller(self):
         controller = self.controller()
         events = SpeechEvents()
-        events.start(SESSION, now_ms=0, addressing=OURS, priority=ConfiguredPriorityProvider(OWNER))
+        events.start(SESSION, now_ms=0, addressing=OURS, priority=enrolled())
         events.drain()
         controller._events = events
         controller.duck(True)
         work, memory = queue.Queue(), TranscriptMemory()
-        current = turn("t1", 100, 900, "Um, Jarvis, I'm back.")
+        current = heard("t1", 100, 900, "Um, Jarvis, I'm back.")
         PrototypeController._accept(controller, controller._generation, work, memory, current)
         self.assertEqual([e.get("action") for e in events.drain()], ["exit"])
         self.assertEqual(work.qsize(), 0)
@@ -624,6 +891,106 @@ class DuckControllerTests(unittest.TestCase):
         ):
             self.assertFalse(predicate(MONOLOGUE[0]))
         self.assertEqual(leaks(stderr.getvalue()), [])
+
+
+FAKE_WHISPER = """#!{python}
+import json, os, sys, time
+audio = sys.stdin.buffer.read()
+if os.path.exists(os.path.join(os.path.dirname(sys.argv[0]), "hang")):
+    time.sleep(30)
+json.dump(
+    {{
+        "transcription": [],
+        "argv": sys.argv[1:],
+        "cwd": os.getcwd(),
+        "home": os.environ.get("HOME"),
+        "tmpdir": os.environ.get("TMPDIR"),
+        "riff": audio[:4].decode("latin-1"),
+        "bytes": len(audio),
+    }},
+    sys.stdout,
+)
+"""
+
+
+class TranscriptionWritesNothingTests(unittest.TestCase):
+    """Key 3's blocker 2: the local recognizer never puts words or audio on disk, even
+    briefly or after a kill: the WAV goes in on stdin and the JSON comes back on stdout."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.whisper = self.root / "whisper-cli"
+        self.whisper.write_text(FAKE_WHISPER.format(python=sys.executable))
+        self.whisper.chmod(0o700)
+        (self.root / "model").touch()
+        # A watched temporary root: nothing may appear in it.
+        self.shared = self.root / "shared-tmp"
+        self.shared.mkdir()
+
+    def config(self, **extra):
+        return LiveConfig(
+            session_id="no-files",
+            whisper_executable=self.whisper,
+            whisper_model=self.root / "model",
+            diarization_library=self.root / "model",
+            diarization_model=self.root / "model",
+            **extra,
+        )
+
+    def guarded(self):
+        """No temporary file or directory may be made, and the temp root is `shared`."""
+
+        def refuse(*_args, **_options):
+            raise AssertionError("a temporary file was requested")
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.dict(os.environ, {"TMPDIR": str(self.shared)}))
+        stack.enter_context(mock.patch.object(tempfile, "tempdir", str(self.shared)))
+        for name in ("mkstemp", "mkdtemp", "NamedTemporaryFile", "TemporaryDirectory"):
+            stack.enter_context(mock.patch.object(tempfile, name, refuse))
+        return stack
+
+    def test_audio_in_on_stdin_and_json_out_on_stdout(self):
+        pcm = b"\x01\x02" * 1600
+        with self.guarded():
+            document = _transcribe(self.config(), pcm)
+        self.assertEqual(document["transcription"], [])
+        argv = document["argv"]
+        self.assertEqual(argv[argv.index("--file") + 1], "-")
+        self.assertEqual(argv[argv.index("--output-file") + 1], "-")
+        self.assertEqual(document["riff"], "RIFF")
+        self.assertGreater(document["bytes"], len(pcm))
+        self.assertEqual(
+            {document["cwd"], document["home"], document["tmpdir"]},
+            {os.path.realpath(NO_FILES_DIR)} | {NO_FILES_DIR},
+        )
+        self.assertEqual(list(self.shared.iterdir()), [])
+        self.assertEqual(
+            sorted(p.name for p in self.root.iterdir()),
+            sorted(["whisper-cli", "model", "shared-tmp"]),
+        )
+
+    def test_a_kill_mid_transcription_leaves_nothing_behind(self):
+        (self.root / "hang").touch()
+        processes = []
+        killer = threading.Timer(0.5, lambda: processes and processes[0].kill())
+        killer.start()
+        self.addCleanup(killer.cancel)
+        with (
+            self.guarded(),
+            self.assertRaises(LiveAudioError),
+        ):
+            _transcribe(self.config(), b"\x01\x02" * 1600, processes.append)
+        # It really ran, and was killed mid-transcription.
+        self.assertEqual(len(processes), 1)
+        self.assertLess(processes[0].returncode, 0)
+        self.assertEqual(list(self.shared.iterdir()), [])
+        self.assertEqual(
+            sorted(p.name for p in self.root.iterdir()),
+            sorted(["whisper-cli", "model", "shared-tmp", "hang"]),
+        )
 
 
 def fragment(text, start, end, speaker="Speaker A"):

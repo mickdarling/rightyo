@@ -412,6 +412,14 @@ def main(argv: list[str] | None = None) -> int:
     listen.add_argument("--use-jev", action="store_true")
     listen.add_argument("--allow-hosted", action="store_true")
     listen.add_argument(
+        "--start-private",
+        action="store_true",
+        help=(
+            "start in privacy mode (internally duck, hailing-station #735): nothing heard is"
+            ' kept or emitted from the first frame until the host sends {"duck": false}'
+        ),
+    )
+    listen.add_argument(
         "--coaching",
         action="store_true",
         help="opt-in owner-private coaching; stdin PCM plus trusted coaching controls",

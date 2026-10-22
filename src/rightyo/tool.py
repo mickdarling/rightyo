@@ -281,6 +281,13 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
         config = replace(config, dismissal=dismissal_from_args(args))
     # Stdout carries the events; acknowledgement-gating notes (#132) go to stderr.
     coaching = getattr(args, "coaching", False)
+    # Starting private (hailing-station #735 S-2b) is honoured only where privacy mode v2 is
+    # advertised; anywhere else it is refused rather than starting un-private.
+    start_private = getattr(args, "start_private", False) is True
+    if start_private and coaching:
+        raise PrototypeError("--start-private is refused with --coaching")
+    if start_private and config.hosted_speech:
+        raise PrototypeError("--start-private is refused with a hosted speech backend")
     # A coaching listener's control descriptor carries only coaching records (it refuses a
     # `{"duck": ...}` line), so it never advertises duck mode (hailing-station #735).
     events = SpeechEvents(
@@ -288,6 +295,10 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
         retain_transcripts=not coaching,
         duck_control=not coaching,
     )
+    if start_private:
+        # Exactly as if `{"duck": true}` arrived at stream time 0, before any audio: the
+        # session's privacy span starts at 0 and `started` reports `"private": true`.
+        events.duck(True, now_ms=0)
     consent = {"allow_hosted_speech": True} if config.hosted_speech else {}
     # Content-free session notes (end-of-turn scores, capture, shadow speaker
     # identification) go to stderr in every mode.

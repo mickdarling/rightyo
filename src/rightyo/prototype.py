@@ -967,7 +967,7 @@ class PrototypeController:
                         {"duck": True}
                         if getattr(self._events, "duck_control", False) is True
                         and callable(getattr(self._events, "duck", None))
-                        and not self._hosted_speech()
+                        and not self.config.hosted_speech
                         else {}
                     ),
                 )
@@ -1031,9 +1031,9 @@ class PrototypeController:
 
         Privacy mode (internally duck, hailing-station #735 S-1): while it is on, a piece
         holding a named exit or a status question, so the owner pause never delays the way
-        back in; while it is off, a piece holding an entry phrase ("stop recording", "stop
-        listening", "privacy mode", "go private"), so the host's safety matcher sees it at
-        once. Matched loosely, as `privacy_phrase` does; nothing is kept.
+        back in; while it is off, a piece that is an intentional entry ("stop recording",
+        "privacy mode", "go private" and the like as the whole piece), so the host's safety
+        matcher sees it at once. Matched as `privacy_phrase` does; nothing is kept.
         """
         stop = (self.config.speakers or SpeakerPriority()).is_stop_phrase
         addressing = self.config.addressing
@@ -1465,13 +1465,6 @@ class PrototypeController:
                 if generation == self._generation:
                     self._budget_reached = True
         return not boundary
-
-    def _hosted_speech(self) -> bool:
-        """Whether the configured transcriber or diarizer sends audio to a hosted service."""
-        return any(
-            spec["kind"].startswith("hosted-")
-            for spec in (self.config.transcriber, self.config.diarizer)
-        )
 
     def _private_audio(self) -> bool:
         """Whether privacy mode is on now, as the publisher holds it."""

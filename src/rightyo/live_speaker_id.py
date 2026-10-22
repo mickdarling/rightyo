@@ -599,6 +599,23 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         """
         return self._lookup(turn)[0]
 
+    def resolved_by_voiceprint(self, utterance_id: str) -> bool:
+        """Whether the latest `role_for`, for this utterance, came from a live
+        identification binding rather than a label configured in `speakers`."""
+        resolved = self._resolved
+        return resolved is not None and resolved[0] == utterance_id
+
+    def enrolled_owner(self, turn) -> bool:
+        """Whether `turn` is the owner's by live voiceprint identification now (hailing-station
+        #735 S-1): its label is bound to an enrolled owner identity. A label configured as the
+        owner by session label is not, so a TV diarized into that slot never qualifies.
+        Looked up without side effects; never blocks or raises."""
+        try:
+            role, binding = self._lookup(turn)
+        except Exception:  # noqa: BLE001 - identification never fails the session
+            return False
+        return role == "owner" and binding is not None and binding[0] == "bound"
+
     def _lookup(self, turn) -> tuple[str, tuple | None]:
         """A turn's role and the binding it came from (None when no binding was used)."""
         label = turn.speaker_id

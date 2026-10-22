@@ -16,7 +16,6 @@ import wave
 from argparse import Namespace
 from dataclasses import replace
 from pathlib import Path
-from unittest import mock
 
 from rightyo.addressedness import observe_gap, request_shaped
 from rightyo.contracts import MAX_TEXT_CHARS, Addressing, SpeakerPriority
@@ -1612,6 +1611,8 @@ class DecisionPathTests(unittest.TestCase):
         diarizer=None,
         shadow=None,
         captured=None,
+        start_private=False,
+        coaching=False,
         **extra,
     ):
         if pcm is not None:
@@ -1652,6 +1653,8 @@ class DecisionPathTests(unittest.TestCase):
             use_jev=True,
             allow_hosted=True,
             names=None,
+            start_private=start_private,
+            coaching=coaching,
         )
         output = io.StringIO()
         with contextlib.redirect_stderr(io.StringIO()):
@@ -1685,11 +1688,26 @@ class DecisionPathTests(unittest.TestCase):
         events, _ = self.run_listen()
         self.assertEqual(events[0]["duck"], {"version": 2})
 
-    def test_a_hosted_speech_backend_never_advertises_privacy_mode(self):
-        # Hosted speech would still be sent the audio heard while private (#735 S-1).
-        with mock.patch.object(PrototypeController, "_hosted_speech", return_value=True):
-            events, _ = self.run_listen()
-        self.assertNotIn("duck", events[0])
+    def test_a_session_can_start_private(self):
+        # hailing-station #735 S-2b: as if {"duck": true} arrived at time 0, before audio.
+        events, provider = self.run_listen(start_private=True)
+        self.assertEqual(events[0]["duck"], {"version": 2, "private": True})
+        # Nothing from the first frame: no transcript, decision or other content event.
+        self.assertEqual({e["type"] for e in events}, {"session"})
+        self.assertEqual(provider.requests, 0)
+
+    def test_starting_private_is_refused_where_privacy_is_not_advertised(self):
+        hosted = {
+            "transcriber": {
+                "kind": "hosted-openai-compatible",
+                "endpoint": "https://transcribe.example.test/v1/audio/transcriptions",
+                "model": "whisper-1",
+            }
+        }
+        with self.assertRaisesRegex(PrototypeError, "start-private is refused with a hosted"):
+            self.run_listen(start_private=True, **hosted)
+        with self.assertRaisesRegex(PrototypeError, "start-private is refused with --coaching"):
+            self.run_listen(start_private=True, coaching=True)
 
     def test_without_merging_the_same_speech_takes_two_decisions(self):
         events, provider = self.run_listen(turns={"merge_gap_ms": 0})

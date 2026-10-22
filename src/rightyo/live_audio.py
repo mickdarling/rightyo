@@ -15,13 +15,13 @@ import base64
 import contextlib
 import ctypes
 import inspect
+import io
 import json
 import math
 import os
 import selectors
 import subprocess
 import sys
-import tempfile
 import time
 import wave
 from collections import deque
@@ -821,60 +821,69 @@ def _terminate(process: subprocess.Popen) -> None:
         pass
 
 
+# Where the local recognizer runs (hailing-station #735 S-1): its working directory, HOME
+# and TMPDIR. The audio goes in on stdin and the JSON comes back on stdout, so nothing is
+# ever written to disk, even briefly or after a kill; an unwritable directory makes any
+# stray write by the binary fail rather than land in the shared temporary root.
+NO_FILES_DIR = "/var/empty" if os.path.isdir("/var/empty") else os.path.abspath(os.sep)
+
+
+def _wav_bytes(pcm: bytes) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(SAMPLE_RATE)
+        target.writeframes(pcm)
+    return buffer.getvalue()
+
+
 def _transcribe(
     config: LiveConfig,
     pcm: bytes,
     register: Callable[[subprocess.Popen], None] | None = None,
 ) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="rightyo-live-asr-") as directory:
-        audio = Path(directory) / "utterance.wav"
-        with wave.open(str(audio), "wb") as target:
-            target.setnchannels(1)
-            target.setsampwidth(2)
-            target.setframerate(SAMPLE_RATE)
-            target.writeframes(pcm)
-        output = Path(directory) / "transcript"
+    """One whisper.cpp run over `pcm`, in memory only: WAV on stdin, JSON on stdout."""
+    try:
+        process = subprocess.Popen(
+            [
+                str(Path(config.whisper_executable).resolve()),
+                "--model",
+                str(Path(config.whisper_model).resolve()),
+                "--file",
+                "-",
+                "--output-json-full",
+                "--output-file",
+                "-",
+                "--no-prints",
+                "--max-context",
+                "0",
+                "--suppress-nst",
+            ],
+            cwd=NO_FILES_DIR,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={"PATH": os.defpath, "HOME": NO_FILES_DIR, "TMPDIR": NO_FILES_DIR},
+        )
         try:
-            process = subprocess.Popen(
-                [
-                    str(Path(config.whisper_executable).resolve()),
-                    "--model",
-                    str(Path(config.whisper_model).resolve()),
-                    "--file",
-                    str(audio),
-                    "--output-json-full",
-                    "--output-file",
-                    str(output),
-                    "--no-prints",
-                    "--max-context",
-                    "0",
-                    "--suppress-nst",
-                ],
-                cwd=directory,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env={"PATH": os.defpath, "HOME": directory, "TMPDIR": directory},
-            )
-            try:
-                if register is not None:
-                    register(process)
-                if process.wait(timeout=config.timeout_seconds) != 0:
-                    raise LiveAudioError("Local recognizer failed")
-            finally:
-                _terminate(process)
-            with output.with_suffix(".json").open("rb") as source:
-                raw = source.read(MAX_RESPONSE_BYTES + 1)
-            if len(raw) > MAX_RESPONSE_BYTES:
-                raise LiveAudioError("Local recognizer exceeded output limit")
-            document = json.loads(raw)
-            if not isinstance(document, dict):
-                raise ValueError
-            return document
-        except subprocess.TimeoutExpired:
-            raise LiveAudioError("Local recognizer timed out") from None
-        except (OSError, subprocess.CalledProcessError, ValueError, RecursionError):
-            raise LiveAudioError("Local recognizer failed") from None
+            if register is not None:
+                register(process)
+            raw, _ = process.communicate(_wav_bytes(pcm), timeout=config.timeout_seconds)
+            if process.returncode != 0:
+                raise LiveAudioError("Local recognizer failed")
+        finally:
+            _terminate(process)
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise LiveAudioError("Local recognizer exceeded output limit")
+        document = json.loads(raw)
+        if not isinstance(document, dict):
+            raise ValueError
+        return document
+    except subprocess.TimeoutExpired:
+        raise LiveAudioError("Local recognizer timed out") from None
+    except (OSError, subprocess.CalledProcessError, ValueError, RecursionError):
+        raise LiveAudioError("Local recognizer failed") from None
 
 
 def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]] | None:
@@ -974,7 +983,7 @@ def _counted_units(
 
 
 class WhisperCppTranscriber:
-    """The default `Transcriber`: the pinned whisper.cpp CLI on a temporary WAV file."""
+    """The default `Transcriber`: the pinned whisper.cpp CLI, audio and JSON over pipes."""
 
     recognizer_id = "whisper.cpp-live-window"
 
