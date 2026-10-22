@@ -142,6 +142,22 @@ class PrivacyEventsTests(unittest.TestCase):
         self.events.end("stopped", 3000)
         self.assertEqual(list(self.events._private_seen), [])
 
+    def test_a_private_turn_released_after_privacy_ends_leaves_no_id(self):
+        # Round 7 (keys' nit): heard in privacy, released after its end, still private.
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events.duck(False, now_ms=1000)
+        self.assertEqual(self.say(heard("p1", 100, 900, "synthetic words")), [])
+        self.assertEqual(list(self.events._private_seen), [])
+
+    def test_the_session_end_drops_a_split_exit_in_progress(self):
+        # Round 7 (key 2's nit): no per-turn time from privacy outlives the session.
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events._private_name_end = 900
+        self.events.end("stopped", 1000)
+        self.assertIsNone(self.events._private_name_end)
+
     def say(self, current, label="attend", **options):
         self.events.transcript(current, current.end_ms)
         if current.utterance_id in self.events._pending:
@@ -818,6 +834,35 @@ class DuckControllerTests(unittest.TestCase):
         hear("t2", 3500)
         self.assertEqual(scored, ["t1", "t2"])
         self.assertEqual(controller._turn_spans, {})
+
+    def test_scoring_follows_the_accept_when_privacy_starts_between_them(self):
+        # Round 7 (key 1's nit): one decision for both; a turn the publisher dropped as
+        # private is never scored, even if privacy went on just before its accept.
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        scored = []
+        shadow = SimpleNamespace(turn=lambda current, **_: scored.append(current.utterance_id))
+        work, memory = queue.Queue(), TranscriptMemory()
+        accept = PrototypeController._accept
+
+        def privacy_first(*args):
+            controller._received_ms = 1000
+            controller.duck(True)
+            return accept(controller, *args)
+
+        controller._accept = privacy_first
+        controller._turn(controller._generation, work, memory, shadow, turn("t1", 0, 900, "x"))
+        self.assertEqual(scored, [])
+        self.assertEqual(events.drain(), [])
+        # And a turn the stop cut off is neither accepted nor scored.
+        del controller._accept
+        generation = controller._generation
+        controller.stop()
+        controller._turn(generation, work, memory, shadow, turn("t2", 2000, 2900, "x"))
+        self.assertEqual(scored, [])
 
     def test_stop_drops_per_turn_notes_an_accept_never_took(self):
         # Jarvis on #242 round 5: a stop between the observation and the accept.

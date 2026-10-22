@@ -1009,10 +1009,13 @@ class PrototypeController:
             )
             self._audio_thread.start()
 
-    def _accept(self, generation: int, work: queue.Queue, memory: TranscriptMemory, turn: Turn):
+    def _accept(
+        self, generation: int, work: queue.Queue, memory: TranscriptMemory, turn: Turn
+    ) -> bool | None:
+        """Accept a final turn; whether it was heard in privacy, or None once stopped."""
         with self._lock:
             if generation != self._generation or self._stop.is_set():
-                return
+                return None
             # Privacy mode (internally duck, hailing-station #735 S-1), judged by when the
             # turn was heard (see `SpeechEvents.heard_ducked`): no hosted decision is ever
             # asked for it and it is kept out of the memory every later decision's context
@@ -1030,7 +1033,7 @@ class PrototypeController:
                 # Passed only when set, so publishers without live roles see no change.
                 self._publish("transcript", turn, **({"inferred": True} if inferred else {}))
             if self._decision_status == "off" or self._decision_cancel.is_set() or ducked:
-                return
+                return ducked
             try:
                 work.put_nowait(turn)
             except queue.Full:
@@ -1039,8 +1042,9 @@ class PrototypeController:
                     self._decision_status = "unavailable"
                 self._discard_pending()
                 self._tool_attention_error("attention-backlog")
-                return
+                return ducked
             self._pending += 1
+            return ducked
 
     def _heard_private(self, turn: Turn) -> bool:
         """Whether the publisher heard this turn in privacy mode (hailing-station #735)."""
@@ -1233,12 +1237,12 @@ class PrototypeController:
             # voiceprint evidence (#137), in shadow mode or with roles.
             inferred = turn.utterance_id in self._inferred_turns
             spans = self._turn_spans.pop(turn.utterance_id, None)
-            # A private turn is never scored (#735 S-1): no label evidence, binding or
-            # count is derived from speech heard in privacy. The exit's voiceprint check
-            # reads only bindings made from public speech.
-            private = self._heard_private(turn)
-        self._accept(generation, work, memory, turn)
-        if shadow is not None and not private:
+        # A private turn is never scored (#735 S-1): no label evidence, binding or count is
+        # derived from speech heard in privacy, judged by the same decision `_accept` made
+        # (so a mode change between the two cannot split them). The exit's voiceprint
+        # check reads only bindings made from public speech.
+        private = self._accept(generation, work, memory, turn)
+        if shadow is not None and private is False:
             # After the turn is accepted and published; it never raises or blocks.
             shadow.turn(turn, inferred=inferred, spans=spans)
 

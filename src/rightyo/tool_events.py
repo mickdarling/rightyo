@@ -832,7 +832,9 @@ class SpeechEvents:
                 # the session's turn budget.
                 uid = turn.utterance_id
                 if uid not in self._seen and uid not in self._private_seen:
-                    self._private_seen.append(uid)
+                    if self._duck:
+                        # Kept only while privacy is on; cleared at its end (#735 S-1).
+                        self._private_seen.append(uid)
                     self._private(turn, inferred)
                 return
             # Any turn heard outside privacy ends a split exit.
@@ -2351,6 +2353,7 @@ class SpeechEvents:
             self._delivered.clear()
             self._withdrawn.clear()
             self._private_seen.clear()
+            self._private_name_end = None
             self._active = False
             self._terminal = True
             self._emit(
