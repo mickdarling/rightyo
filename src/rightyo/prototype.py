@@ -89,6 +89,7 @@ from rightyo.turn_merge import (
     DEFAULT_TURN_MERGE_GAP_MS,
     complete_hold,
     merge_gap,
+    owner_pause,
     tail_join,
 )
 
@@ -315,6 +316,10 @@ class PrototypeConfig:
     # The `turns` section's `wake_join` (#230): a lone unattributed wake word joins the
     # owner's following sentence. On by default; acts only with names and owners.
     turn_wake_join: bool = True
+    # The `turns` section's `owner_pause_ms` (hailing-station #735 R-1): the owner's own
+    # turns wait this long for a continuation, as the complete hold and the merge gap; see
+    # `LiveConfig.turn_owner_pause_ms`. 0, the default, is off; acts only with owners.
+    turn_owner_pause_ms: int = 0
     # The `decision` section's optional `scene` (#96): the setting text given to the
     # decision model. Absent means the single-user pilot default; null turns it off.
     decision_scene: str | None = DEFAULT_SCENE
@@ -471,6 +476,7 @@ class PrototypeConfig:
                 "collapse_restarts",
                 "bridge_backchannels",
                 "wake_join",
+                "owner_pause_ms",
             }:
                 raise ValueError
             hold_unfinished = turns.get("hold_unfinished", True)
@@ -484,6 +490,7 @@ class PrototypeConfig:
             } != {bool}:
                 raise ValueError
             hold_complete = complete_hold(turns.get("complete_hold_ms", 0))
+            pause = owner_pause(turns.get("owner_pause_ms", 0))
             tail = tail_join(turns.get("tail_join_ms", 0))
             coverage = turns.get("word_label_coverage", DEFAULT_WORD_LABEL_COVERAGE)
             if type(coverage) not in (int, float) or not 0 <= coverage <= 1:
@@ -524,6 +531,7 @@ class PrototypeConfig:
                 turn_collapse_restarts=restarts,
                 turn_bridge_backchannels=bridge,
                 turn_wake_join=wake_join,
+                turn_owner_pause_ms=pause,
                 decision_scene=scene,
                 reply_wait_ms=wait,
                 edge_attribution_ms=edges,
@@ -1018,18 +1026,28 @@ class PrototypeController:
         owner, so the name never raises anyone's role.
         """
         addressing = self.config.addressing
-        speakers = self.config.speakers
-        if (
-            not self.config.turn_wake_join
-            or addressing is None
-            or speakers is None
-            or not speakers.owners
-        ):
+        if not self.config.turn_wake_join or addressing is None:
             return None, None
-        enrolled = self._enrolled_roles
+        owner = self._turn_owner()
+        if owner is None:
+            return None, None
 
         def wake_word(text: str) -> bool:
             return addressing.name_for(text) is not None
+
+        return wake_word, owner
+
+    def _turn_owner(self) -> Callable[[dict[str, Any]], bool] | None:
+        """The turn merger's owner predicate (#230, #735), or None without owners.
+
+        A fragment is the owner's when its label resolves to the owner role now, by the
+        same rules the turn's published role uses: configured session labels, or live
+        identification bindings looked up without side effects.
+        """
+        speakers = self.config.speakers
+        if speakers is None or not speakers.owners:
+            return None
+        enrolled = self._enrolled_roles
 
         def owner(fragment: dict[str, Any]) -> bool:
             if enrolled is None:
@@ -1044,7 +1062,7 @@ class PrototypeController:
             )
             return enrolled.role_of(probe) == "owner"
 
-        return wake_word, owner
+        return owner
 
     def _turn_unfinished(self):
         """The predicate for turns held despite end-of-turn's "complete" (#199), or None.
@@ -1165,6 +1183,9 @@ class PrototypeController:
             shadow = self._shadow_speaker_id()
             settings = self.config.end_of_turn
             wake_word, owner = self._wake_join()
+            if owner is None and self.config.turn_owner_pause_ms:
+                # The owner-only pause (#735) uses the same owner predicate.
+                owner = self._turn_owner()
             processor = self.processor_factory(
                 LiveConfig(
                     session_id=session,
@@ -1219,6 +1240,8 @@ class PrototypeController:
                     # A lone wake word joins the owner's following sentence (#230).
                     turn_wake_word=wake_word,
                     turn_owner=owner,
+                    # The owner's own turns wait longer for a continuation (#735).
+                    turn_owner_pause_ms=self.config.turn_owner_pause_ms,
                     end_of_turn_threshold=settings.threshold if settings else 0.5,
                     end_of_turn_silence_ms=settings.silence_ms if settings else 200,
                     timeline_window_ms=self.config.timeline_window_ms,

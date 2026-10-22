@@ -32,7 +32,7 @@ from typing import Any, Callable
 from .addressedness import reply_wait
 from .contracts import PROVENANCE, Turn, identifier, utterance_scoped_speaker
 from .providers import Diarizer, Transcriber
-from .turn_merge import TurnMerger, complete_hold, merge_gap, tail_join
+from .turn_merge import TurnMerger, complete_hold, merge_gap, owner_pause, tail_join
 
 SAMPLE_RATE = 16000
 FRAME_BYTES = 640  # 20 ms of mono signed little-endian PCM16
@@ -203,6 +203,10 @@ class LiveConfig:
     # `overlap`) and says whether its label is the owner's now. None, the default, is off.
     turn_wake_word: Callable[[str], bool] | None = None
     turn_owner: Callable[[dict[str, Any]], bool] | None = None
+    # The owner-only pause (hailing-station #735; see `TurnMerger`): with `turn_owner`
+    # set, a turn whose label is the owner's is held at least this long, as the complete
+    # hold and as the merge gap for the same speaker's continuation. 0, the default, is off.
+    turn_owner_pause_ms: int = 0
     end_of_turn_threshold: float = 0.5
     end_of_turn_silence_ms: int = 200
     # The trailing window of the diarizer timeline returned for attribution (#226), and
@@ -229,6 +233,10 @@ class LiveConfig:
             complete_hold(self.turn_complete_hold_ms)
         except ValueError:
             raise LiveAudioError("Invalid complete hold") from None
+        try:
+            owner_pause(self.turn_owner_pause_ms)
+        except ValueError:
+            raise LiveAudioError("Invalid owner pause") from None
         if type(self.turn_collapse_restarts) is not bool or (
             type(self.turn_bridge_backchannels) is not bool
         ):
@@ -1084,6 +1092,7 @@ class LiveProcessor:
             bridge_backchannels=config.turn_bridge_backchannels,
             wake_word=config.turn_wake_word,
             owner=config.turn_owner,
+            owner_pause_ms=config.turn_owner_pause_ms,
         )
 
     @property
