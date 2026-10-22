@@ -123,6 +123,11 @@ class LiveConfig:
     # Optional content-free stderr diagnostics (counts only): skipped segments and
     # suppressed utterances.
     report: Callable[[str], None] | None = None
+    # Whether audio received between two stream times was heard in privacy mode
+    # (hailing-station #735 S-1). Per-utterance diagnostics (end-of-turn scores and
+    # timing, skipped or suppressed recognizer output) are withheld for it, so logs keep
+    # nothing about private speech. None means never private; a failure counts as private.
+    private: Callable[[int, int], bool] | None = None
     # Total audio accepted per session, in stream milliseconds. None means no ceiling:
     # memory stays bounded by the utterance window and downstream retention limits.
     session_budget_ms: int | None = None
@@ -1343,7 +1348,8 @@ class LiveProcessor:
         # Content-free: a probability and stream timing only, never audio or text.
         self._diagnostic(
             f"end_of_turn p={probability:.3f} silence_ms={silence}"
-            f" outcome={'complete' if complete else 'wait'}"
+            f" outcome={'complete' if complete else 'wait'}",
+            span=(self._utterance_start, self._received_ms),
         )
         return complete
 
@@ -1371,14 +1377,27 @@ class LiveProcessor:
         ):
             return
         self._diagnostic(
-            f"end_of_turn finalized silence_ms={self._received_ms - self._last_voice_ms}"
+            f"end_of_turn finalized silence_ms={self._received_ms - self._last_voice_ms}",
+            span=(self._utterance_start, self._received_ms),
         )
         self._finalize(timeline, complete=True)
 
-    def _diagnostic(self, message: str) -> None:
-        if self.config.report is not None:
-            with contextlib.suppress(Exception):
-                self.config.report(message)
+    def _diagnostic(self, message: str, *, span: tuple[int, int] | None = None) -> None:
+        """Report `message`; one about the utterance heard over `span` is withheld if that
+        audio was heard in privacy mode (`LiveConfig.private`)."""
+        if self.config.report is None or (span is not None and self._heard_private(*span)):
+            return
+        with contextlib.suppress(Exception):
+            self.config.report(message)
+
+    def _heard_private(self, start_ms: int, end_ms: int) -> bool:
+        private = self.config.private
+        if private is None:
+            return False
+        try:
+            return private(start_ms, end_ms) is not False
+        except Exception:  # noqa: BLE001 - fail closed: withhold the diagnostic
+            return True
 
     def _finalize(self, timeline: list[dict[str, Any]], complete: bool = False) -> None:
         self._complete = False
@@ -1403,7 +1422,11 @@ class LiveProcessor:
             self._skipped_utterances += 1
         skipped = self.skipped_segments - before[0]
         suppressed = self.skipped_utterances > before[1]
-        if (skipped or suppressed) and self.config.report is not None:
+        if (
+            (skipped or suppressed)
+            and self.config.report is not None
+            and not self._heard_private(offset, offset + len(pcm) // BYTES_PER_MS)
+        ):
             # Content-free: counts only, never recognizer text or timestamps. A failing
             # diagnostic channel never ends the session.
             segments = f"{skipped} recognizer segment(s) with unusable timestamps"

@@ -1046,6 +1046,14 @@ class PrototypeController:
             self._pending += 1
             return ducked
 
+    def _heard_private_span(self, start_ms: int, end_ms: int) -> bool:
+        """Whether audio over this stream span was heard in privacy mode (#735 S-1), by the
+        same rule as a turn (`SpeechEvents.heard_ducked`); for the processor's diagnostics."""
+        heard_ducked = getattr(self._events, "heard_ducked", None)
+        if not callable(heard_ducked):
+            return False
+        return heard_ducked(SimpleNamespace(start_ms=start_ms, end_ms=end_ms)) is True
+
     def _heard_private(self, turn: Turn) -> bool:
         """Whether the publisher heard this turn in privacy mode (hailing-station #735)."""
         heard_ducked = getattr(self._events, "heard_ducked", None)
@@ -1272,6 +1280,7 @@ class PrototypeController:
                     ),
                     cancelled=stop.is_set,
                     report=self.report,
+                    private=self._heard_private_span,
                     session_budget_ms=self._budget_ms,
                     transcriber=transcriber_factory(
                         self.config.transcriber, allow_hosted=self.allow_hosted_speech

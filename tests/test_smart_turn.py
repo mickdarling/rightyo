@@ -165,6 +165,33 @@ class LiveEndOfTurnTests(unittest.TestCase):
             ],
         )
 
+    def test_nothing_is_reported_about_an_utterance_heard_in_privacy(self):
+        # Codex P1 on #242: scores and pause timing of private speech never reach the logs;
+        # only the logs change, so the model is still asked and turns still end the same.
+        def run(verdict):
+            messages, model = [], ScriptedModel(0.25, 0.9)
+            _, turns = self.run_processor(
+                SPLIT_QUESTION, model, report=messages.append, private=verdict
+            )
+            return messages, len(model.calls), [turn.text for turn in turns]
+
+        spans = []
+
+        def private(start_ms, end_ms):
+            spans.append((start_ms, end_ms))
+            return True
+
+        def failing(_start_ms, _end_ms):
+            raise RuntimeError("privacy state unavailable")
+
+        public = run(lambda _start_ms, _end_ms: False)
+        self.assertEqual(len(public[0]), 3)
+        for verdict in (private, failing):
+            with self.subTest(verdict=verdict.__name__):
+                self.assertEqual(run(verdict), ([], public[1], public[2]))
+        self.assertTrue(spans)
+        self.assertTrue(all(start <= end for start, end in spans))
+
     def test_a_complete_turn_waits_for_a_lagging_diarizer_timeline(self):
         messages = []
         model = ScriptedModel(0.9)

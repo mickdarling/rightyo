@@ -902,6 +902,42 @@ class DuckControllerTests(unittest.TestCase):
         self.assertEqual(work.qsize(), 1)
         self.assertEqual(scored, ["t1"])
 
+    def test_the_processor_is_told_which_audio_was_heard_in_privacy(self):
+        # Codex P1 on #242: the processor withholds per-utterance diagnostics by this rule.
+        controller = self.controller()
+        self.assertFalse(controller._heard_private_span(0, 1000))  # No publisher.
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        controller._received_ms = 1000
+        controller.duck(True)
+        controller._received_ms = 3000
+        controller.duck(False)
+        self.assertFalse(controller._heard_private_span(0, 900))
+        self.assertTrue(controller._heard_private_span(500, 1500))  # Straddles the on.
+        self.assertTrue(controller._heard_private_span(1500, 2500))
+        self.assertTrue(controller._heard_private_span(2500, 3500))  # Straddles the off.
+        self.assertFalse(controller._heard_private_span(3000, 4000))
+
+    def test_the_live_processor_is_given_the_privacy_rule(self):
+        configs = []
+
+        def capture(config, *_args, **_options):
+            configs.append(config)
+            raise PrototypeError("no audio in this test")
+
+        events = SpeechEvents()
+        controller = self.controller(
+            constructor={"event_publisher": events, "processor_factory": capture}
+        )
+        controller.start({"mode": "demo", "session_id": "wiring"})
+        deadline = time.monotonic() + 5
+        while not configs and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(configs), 1)
+        self.assertEqual(configs[0].private, controller._heard_private_span)
+
     def test_stop_drops_per_turn_notes_an_accept_never_took(self):
         # Jarvis on #242 round 5: a stop between the observation and the accept.
         controller = self.controller()

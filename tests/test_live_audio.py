@@ -755,6 +755,30 @@ class ConservativeAlignmentTests(unittest.TestCase):
                 "(1 recognizer segment(s) with unusable timestamps); the session continues"
             ],
         )
+        # Heard in privacy (hailing-station #735 S-1): counted, never reported.
+        turns, reports = [], []
+        with (
+            patch("rightyo.live_audio._Diarizer", FakeDiarizer),
+            patch("rightyo.live_audio._transcribe", side_effect=[bad, good]),
+        ):
+            processor = LiveProcessor(
+                LiveConfig(
+                    **{
+                        **config.__dict__,
+                        "report": reports.append,
+                        "private": lambda _start_ms, _end_ms: True,
+                    }
+                ),
+                turns.append,
+            )
+            for _ in range(2):
+                for _ in range(10):
+                    processor.push_pcm16(VOICE)
+                for _ in range(72):
+                    processor.push_pcm16(SILENCE)
+            processor.finish()
+        self.assertEqual(processor.skipped_utterances, 1)
+        self.assertEqual(reports, [])
 
     def test_reporter_must_be_callable(self):
         with self.assertRaisesRegex(LiveAudioError, "reporter"):
