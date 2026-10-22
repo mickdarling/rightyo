@@ -128,6 +128,20 @@ class PrivacyEventsTests(unittest.TestCase):
         )
         return self.events.drain()
 
+    def test_private_ids_are_dropped_when_privacy_ends_and_when_the_session_ends(self):
+        # Jarvis on #242 round 5: the de-duplication ids live only while privacy is on.
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events.transcript(heard("p1", 100, 900, "synthetic words"), 900)
+        self.assertEqual(list(self.events._private_seen), ["p1"])
+        self.events.duck(False, now_ms=1000)
+        self.assertEqual(list(self.events._private_seen), [])
+        self.events.duck(True, now_ms=2000)
+        self.events.transcript(heard("p2", 2100, 2900, "synthetic words"), 2900)
+        self.assertEqual(list(self.events._private_seen), ["p2"])
+        self.events.end("stopped", 3000)
+        self.assertEqual(list(self.events._private_seen), [])
+
     def say(self, current, label="attend", **options):
         self.events.transcript(current, current.end_ms)
         if current.utterance_id in self.events._pending:
@@ -776,6 +790,46 @@ class DuckControllerTests(unittest.TestCase):
         controller.duck(False)
         accept("t4", 9500, "D")
         self.assertEqual(list(controller._turn_gaps), ["t1", "t4"])
+
+    def test_a_private_turn_is_never_scored_by_the_speaker_identifier(self):
+        # Jarvis on #242 round 5: no label evidence, binding or count from private speech.
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        scored = []
+        shadow = SimpleNamespace(turn=lambda current, **_: scored.append(current.utterance_id))
+        work, memory = queue.Queue(), TranscriptMemory()
+        generation = controller._generation
+
+        def hear(name, start):
+            controller._observe_spans(generation, name, ((start, start + 900),))
+            current = turn(name, start, start + 900, "synthetic")
+            controller._turn(generation, work, memory, shadow, current)
+
+        hear("t1", 0)
+        controller._received_ms = 1000
+        controller.duck(True)
+        hear("p1", 1000)
+        hear("p2", 2000)
+        controller._received_ms = 3000
+        controller.duck(False)
+        hear("t2", 3500)
+        self.assertEqual(scored, ["t1", "t2"])
+        self.assertEqual(controller._turn_spans, {})
+
+    def test_stop_drops_per_turn_notes_an_accept_never_took(self):
+        # Jarvis on #242 round 5: a stop between the observation and the accept.
+        controller = self.controller()
+        generation = controller._generation
+        controller._observe_gap(generation, "p1", {"silence_ms": 700})
+        controller._observe_inferred(generation, "p1")
+        controller._observe_spans(generation, "p1", ((0, 900),))
+        controller.stop()
+        self.assertEqual(controller._turn_gaps, {})
+        self.assertEqual(controller._inferred_turns, set())
+        self.assertEqual(controller._turn_spans, {})
 
     def test_privacy_is_advertised_only_with_local_speech(self):
         # The guard itself, through `start`, not a mock (key 2's nit 3).

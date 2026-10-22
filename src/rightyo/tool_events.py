@@ -1195,6 +1195,8 @@ class SpeechEvents:
                 # The off edge is exclusive (see `heard_ducked`); [t, t] covers nothing.
                 self._duck_spans[-1][1] = max(at, self._duck_spans[-1][0])
             if not on and self._duck:
+                # Ids of turns heard in privacy are kept only while it is on (#735 S-1).
+                self._private_seen.clear()
                 counts, self._private_counts = (
                     self._private_counts,
                     dict.fromkeys(self._private_counts, 0),
@@ -2348,6 +2350,7 @@ class SpeechEvents:
             self._open.clear()
             self._delivered.clear()
             self._withdrawn.clear()
+            self._private_seen.clear()
             self._active = False
             self._terminal = True
             self._emit(

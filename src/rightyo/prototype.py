@@ -1018,8 +1018,7 @@ class PrototypeController:
             # asked for it and it is kept out of the memory every later decision's context
             # is read from. It is still passed to the publisher, which only matches it for
             # the local exit and status phrases and emits no transcript (`_private`).
-            heard_ducked = getattr(self._events, "heard_ducked", None)
-            ducked = callable(heard_ducked) and heard_ducked(turn) is True
+            ducked = self._heard_private(turn)
             if ducked:
                 # Observed just before this accept (#96); no decision will ever take it.
                 self._turn_gaps.pop(turn.utterance_id, None)
@@ -1042,6 +1041,11 @@ class PrototypeController:
                 self._tool_attention_error("attention-backlog")
                 return
             self._pending += 1
+
+    def _heard_private(self, turn: Turn) -> bool:
+        """Whether the publisher heard this turn in privacy mode (hailing-station #735)."""
+        heard_ducked = getattr(self._events, "heard_ducked", None)
+        return callable(heard_ducked) and heard_ducked(turn) is True
 
     def _turn_break(self):
         """The predicate for turns that are never joined or held (#89, #98).
@@ -1229,8 +1233,12 @@ class PrototypeController:
             # voiceprint evidence (#137), in shadow mode or with roles.
             inferred = turn.utterance_id in self._inferred_turns
             spans = self._turn_spans.pop(turn.utterance_id, None)
+            # A private turn is never scored (#735 S-1): no label evidence, binding or
+            # count is derived from speech heard in privacy. The exit's voiceprint check
+            # reads only bindings made from public speech.
+            private = self._heard_private(turn)
         self._accept(generation, work, memory, turn)
-        if shadow is not None:
+        if shadow is not None and not private:
             # After the turn is accepted and published; it never raises or blocks.
             shadow.turn(turn, inferred=inferred, spans=spans)
 
@@ -1660,6 +1668,10 @@ class PrototypeController:
             self._error = None
             self._memory.clear()
             self._decisions.clear()
+            # Per-turn notes observed before an accept that the stop cut off (#735 S-1).
+            self._turn_gaps.clear()
+            self._inferred_turns.clear()
+            self._turn_spans.clear()
             self._pending = self._received_ms = 0
             self._received_bytes = 0
             self._budget_ms = None
