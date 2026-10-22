@@ -4,9 +4,10 @@ Two explicit steps; neither changes a threshold, an enrolment or the live pipeli
 
     turns       read the shadow `speaker_id` notes RightyO writes on stderr (one per scored
                 turn, already content-free) and report the owner's turn scores by speech
-                length, input route and position in the session. A session label that ever
-                bound to the owner counts as the owner's own voice for all of its turns, so
-                its turns that were not `bound` at the time are misses. Labels that never
+                length, input route and position among the label's scored turns. A session
+                label that ever bound to the owner counts as the owner's own voice for all of
+                its turns, so any of its turns not bound to the owner at the time is a miss.
+                Only scores against the owner's print enter the quantiles. Labels that never
                 bound are reported apart: they mix guests, media and owner turns that never
                 got there.
     negatives   score 16 kHz mono WAV clips of other voices (built-in `say` voices from
