@@ -1355,7 +1355,9 @@ mode on ends any [conversation](#conversation-mode) silently, with nothing kept 
 reply to revive. Nothing can then time out, end or revive while private, and nothing
 deferred is emitted at the exit: the next public request starts a fresh conversation. A
 host treats `{"duck": true}` as the end of any conversation. An `owner_voice` status is
-not polled while private either; the first poll after the exit reports any change.
+not polled while private either; the first poll after the exit reports any change. That
+poll can still reveal, at most once, a change that fell due while private, and so that
+private speech may have happened, though not when.
 
 The mode is held across sessions, like media mode, and emits nothing when it
 changes; a session that starts with it on counts from its start. The host keeps privacy

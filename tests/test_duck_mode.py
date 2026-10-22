@@ -612,6 +612,53 @@ class PrivacyEventsTests(unittest.TestCase):
         self.assertEqual({e["type"] for e in inside}, {"privacy", "attention"})
         self.assertEqual([e for e in inside if e["type"] == "attention"][0]["utterance_id"], "r2")
 
+    def conversation_events(self, since=0):
+        return [
+            e
+            for e in self.events.drain()
+            if e["type"] == "conversation" and e["emitted_at_ms"] >= since
+        ]
+
+    def test_a_request_decided_while_private_opens_no_conversation(self):
+        # Key 1's M2: a direct request heard before the on, decided after it, reaches
+        # `_engage`, which must not engage while private.
+        self.start()
+        current = heard("r1", 0, 900, "Jarvis, what time is it?")
+        self.events.transcript(current, current.end_ms)
+        self.events.drain()
+        self.events.duck(True, now_ms=1000)
+        self.events.decision(decided(current, "attend"), 1100)
+        events = self.events.drain()
+        self.assertIn("request", self.types(events))
+        self.assertNotIn("conversation", self.types(events))
+        # Nothing at the exit, nor after it, until a fresh public request.
+        self.events.reply("started", 2000)
+        self.events.reply("ended", 3000)
+        self.events.duck(False, now_ms=20000)
+        self.events.reply("started", 21000)
+        self.events.reply("ended", 22000)
+        self.events.expire(40000)
+        self.assertEqual(self.conversation_events(), [])
+
+    def test_a_conversation_lapsed_before_the_on_is_never_revived(self):
+        # Key 1's M4: a lapsed (dormant) engagement must not be revived by a reply while
+        # private, which would make its later timeout time the private window.
+        self.start()
+        self.say(heard("r1", 0, 900, "Jarvis, what time is it?"))
+        other = heard("o1", 30000, 30400, "A synthetic aside.", speaker="Speaker B")
+        self.events.transcript(other, other.end_ms)
+        self.events.decision(decided(other, "ignore"), 30500)
+        lapsed = self.conversation_events()
+        self.assertEqual([(e["reason"], e["at_ms"]) for e in lapsed], [("timeout", 10900)])
+        self.events.duck(True, now_ms=31000)
+        self.events.reply("started", 32000)
+        self.events.reply("ended", 33000)
+        self.events.duck(False, now_ms=60000)
+        self.events.reply("started", 80000)
+        self.events.reply("ended", 81000)
+        self.events.expire(100000)
+        self.assertEqual(self.conversation_events(), [])
+
     def test_outside_privacy_the_timeout_still_fires(self):
         self.start()
         stream = self.conversation_script(self.events, private=False)

@@ -1182,8 +1182,8 @@ class SpeechEvents:
         turn heard in privacy (`heard_ducked`) keeps nothing (see `_private`): no
         `transcript`, attention, request, follow-up, acknowledgement or conversation event,
         no memory or context, and no hosted decision or role question. Only a local match
-        of the exit and status phrases may emit a content-free `privacy` event, and an exact
-        stop phrase a playback-only `dismiss`. A turn accepted before it was turned on and
+        of the exit and status phrases may emit a content-free `privacy` event; a stop
+        phrase is a no-op. A turn accepted before it was turned on and
         heard before it is still decided, but engages no conversation while it is on.
 
         No `conversation` event is emitted while it is on (rightyo#244): a timer-driven
@@ -1191,7 +1191,9 @@ class SpeechEvents:
         Turning it on ends any engagement silently, with nothing kept to revive, so nothing
         can lapse, end or revive while private, and nothing deferred is emitted at the exit:
         the next public request starts a fresh conversation. Nor is an owner-voice status
-        polled while it is on. Emits nothing; turning it off reports counts only.
+        polled while it is on: the first poll after the exit may still show, at most once,
+        that private speech happened, though not when. Emits nothing; turning it off
+        reports counts only.
         """
         if type(on) is not bool:
             raise ContractError("invalid duck mode")
@@ -1205,6 +1207,8 @@ class SpeechEvents:
                 # fall due while private, and none is owed at the exit.
                 self._engaged = None
                 self._dormant = None
+                # Defensive: with nothing engaged or dormant these no longer matter, and a
+                # fresh request resets them anyway.
                 self._asked_at = None
                 self._replied_at = None
                 self._duck_spans.append([at, None])
