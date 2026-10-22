@@ -487,9 +487,9 @@ a turn:
   last piece.
 
 A guest, a participant, an unknown speaker, an unlabelled piece and an overlapping piece
-keep the defaults, and with `owner_pause_ms` 0 nothing changes. A stop phrase or a
-dismissal-shaped piece is still never held: it releases the held owner turn and follows
-at once. Another speaker's turn still releases the held owner turn (a backchannel with
+keep the defaults, and with `owner_pause_ms` 0 nothing changes. A stop phrase, a
+dismissal-shaped piece or a named [duck-mode entry or exit](#duck-mode) is still never held: it
+releases the held owner turn and follows at once. Another speaker's turn still releases the held owner turn (a backchannel with
 `bridge_backchannels` still bridges it), tail join keeps its own window, a piece that
 looks cut off is held the owner pause rather than the merge gap, and a lone wake word
 joined to the owner's sentence then waits the owner pause like any owner turn. The owner
@@ -1186,6 +1186,87 @@ The exact stop phrases alone found 2 of the 20, with one false dismissal ("Stop.
 to another person). Without the question (the #96 request), 9 of the 20 dismissals were
 attended and would have been delivered as requests. These are authored
 lines, not recordings; the PR records the tables.
+
+## Duck mode
+
+Duck mode ([hailing-station #735](https://github.com/mickdarling/hailing-station/issues/735))
+is for the owner thinking out loud: the host keeps the owner's turns and asks the
+assistant only when the owner cues it. A live `listen` session's `started` event
+advertises it as a separate top-level object beside the capability set,
+`"duck": {"version": 1}`; a host enters duck mode only for a child that advertised it.
+`tool-replay` takes no control and does not advertise it, so the authored fixtures are
+unchanged. Neither does `listen --coaching`: its control descriptor carries only coaching
+records and refuses any other line. With `listen --mode stdin --control-fd N` the
+host turns it on and off with the JSON lines `{"duck": true}` and `{"duck": false}`,
+beside the reply lines above and media mode's `{"media": true|false}`
+([hailing-station #551](https://github.com/mickdarling/hailing-station/issues/551)). A
+non-boolean value or any other key is a malformed line: skipped with a content-free
+stderr note, like any other.
+
+Speech **heard** in duck mode is judged by when it was heard, not when it is released.
+Each change is stamped, when its control line arrives, with the received-audio clock that
+turns are timed in (never the wall clock, which runs ahead of it for good after lost
+audio), and a turn counts as heard in duck
+mode when it is accepted while the mode is on, or when its `[start_ms, end_ms]` overlaps a
+span the mode was on. The on edge is inclusive and the off edge exclusive: the off is
+stamped at or after the end of all audio received by then, so speech heard in duck mode
+starts before it, and speech starting at it was heard after. A span turned on and off
+with no audio between (a new session that starts in duck mode and is turned off before
+any audio) covers nothing. A turn the merger held across the off edge (the merge gap or the
+[owner pause](#joined-turns)), a continuation joined to a piece said in duck mode, a
+bridged backchannel and a tail join all count, and so does speech said before the mode
+went on that is joined with speech said during it. A session's spans are kept for the
+whole session, at most 64; beyond that the oldest two are merged into one, which can only
+widen them.
+
+A turn heard in duck mode:
+
+- is still emitted as a `transcript` with its role, the owner's and anyone else's, so
+  the host can keep the owner's;
+- is never decided: no hosted decision is asked for it (no Jev request), and no
+  `attention`, `request`, follow-up, acknowledgement or `conversation` event comes of it;
+- is never context: it is kept out of the transcript memory that later decisions (the
+  hosted decision's context) and later requests' `context` are read from, so neither a
+  guest's turn nor the owner's thinking reaches the assistant after the mode ends. The
+  host's own owner-only buffer is the only place it is kept.
+
+The exact stop phrases still dismiss at once (natural dismissal's fast path), so the
+owner can still stop a reply that is playing; that dismissal also ends an open engagement,
+as always. A model-judged dismissal needs a decision, so in duck mode only the exact stop
+phrases dismiss. An engagement already open is otherwise left to lapse as usual. A turn
+heard and accepted before the mode went on is still decided and may still form a request.
+
+The mode is held across sessions, like media mode, and emits nothing when it changes; a
+session that starts with it on counts from its start. The host keeps duck and media mode
+exclusive; if both were on, nothing would be decided. Turning it off restores decisions
+for speech heard after the off. Speech between the owner's spoken exit and the host's
+`{"duck": false}` was heard in duck mode, so it stays undecided: the off point is when
+that line arrives, so speech that starts in the second or two between the spoken exit and
+it is treated as heard in duck mode (failing closed), and the owner repeats a request said
+in that moment.
+
+The host matches its spoken entry and exit only as a whole named owner turn. With
+`addressing` names configured, the turn merger therefore releases them on their own and
+at once, as it does a stop phrase, so the owner pause never joins the exit onto the
+owner's thinking. A named exit is released this way only while duck mode is on, and a
+named entry only while it is off, so outside duck mode an exit-shaped turn joins as
+before. The phrases are the host's (`VoiceDuck`, hailing-station #783): a configured name
+or variant, then an entry ("duck mode", "duck mode on", "let me think out loud", "I'm
+going to think out loud", "think out loud with me") or an exit ("duck mode off", "end
+duck mode", "done thinking", "I'm done thinking", "done thinking out loud"), with an
+optional leading "hey", "ok" or "okay" and an optional "please". The unnamed phrase is
+never released alone, so a lone wake word ("Jarvis," then "done thinking.") still joins
+it ([#230](https://github.com/mickdarling/rightyo/issues/230)) and the joined turn is
+released at once.
+
+While duck mode is on, the host's short cues are released the same way, with or without a
+name: "what do you think", "play that back", "mute", "are you still listening" and
+"discard that". A cue is therefore emitted as its own `transcript` at once rather than
+after the owner pause. Outside duck mode they join as usual. The host's cue tables land
+in hailing-station #735 H-3 and H-4; these lists must be kept in step with them. A longer
+cue ("what was I saying about…") is not matched here and is merged like any other speech,
+and a phrase the recognizer did not finalize separately from other speech is still one
+turn.
 
 ## Request forming
 

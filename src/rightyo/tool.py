@@ -178,7 +178,8 @@ def _read_control(fd: int, controller) -> None:
 
     Bounded lines of `{"reply": "started"}` or `{"reply": "ended"}` (an ended reply may add
     `"asked": true` when it ended with a question, #199), and the host's media mode
-    `{"media": true}` or `{"media": false}` (hailing-station #551); anything else is
+    `{"media": true}` or `{"media": false}` (hailing-station #551), and its duck mode
+    `{"duck": true}` or `{"duck": false}` (hailing-station #735); anything else is
     reported on stderr (content-free) and skipped. The reader never ends the session.
     """
     try:
@@ -211,10 +212,13 @@ def _apply_control(line: bytes, controller) -> None:
             {"reply"},
             {"reply", "asked"},
             {"media"},
+            {"duck"},
         ):
             raise ValueError
         if "media" in message:
             controller.media(message["media"])
+        elif "duck" in message:
+            controller.duck(message["duck"])
         elif "asked" in message:
             if message["reply"] != "ended" or type(message["asked"]) is not bool:
                 raise ValueError
@@ -277,7 +281,13 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
         config = replace(config, dismissal=dismissal_from_args(args))
     # Stdout carries the events; acknowledgement-gating notes (#132) go to stderr.
     coaching = getattr(args, "coaching", False)
-    events = SpeechEvents(report=None if coaching else _stderr, retain_transcripts=not coaching)
+    # A coaching listener's control descriptor carries only coaching records (it refuses a
+    # `{"duck": ...}` line), so it never advertises duck mode (hailing-station #735).
+    events = SpeechEvents(
+        report=None if coaching else _stderr,
+        retain_transcripts=not coaching,
+        duck_control=not coaching,
+    )
     consent = {"allow_hosted_speech": True} if config.hosted_speech else {}
     # Content-free session notes (end-of-turn scores, capture, shadow speaker
     # identification) go to stderr in every mode.

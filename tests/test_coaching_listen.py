@@ -348,7 +348,11 @@ class CoachingListenTests(unittest.TestCase):
             any(event.get("type") in {"session", "transcript"} for event in child.events)
         )
         child.qualify()
-        child.next(lambda event: event.get("type") == "session" and event.get("phase") == "started")
+        started = child.next(
+            lambda event: event.get("type") == "session" and event.get("phase") == "started"
+        )
+        # Its control descriptor refuses `{"duck": ...}`, so duck mode is not advertised.
+        self.assertNotIn("duck", started)
         final = self.final(child)
         self.assertEqual(final["turn"]["recognizer_id"], "synthetic-authored-v1")
         self.assertEqual(final["turn"]["provenance"], "synthetic")
