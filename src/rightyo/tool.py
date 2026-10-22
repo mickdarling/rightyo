@@ -178,7 +178,8 @@ def _read_control(fd: int, controller) -> None:
 
     Bounded lines of `{"reply": "started"}` or `{"reply": "ended"}` (an ended reply may add
     `"asked": true` when it ended with a question, #199), and the host's media mode
-    `{"media": true}` or `{"media": false}` (hailing-station #551); anything else is
+    `{"media": true}` or `{"media": false}` (hailing-station #551), and its duck mode
+    `{"duck": true}` or `{"duck": false}` (hailing-station #735); anything else is
     reported on stderr (content-free) and skipped. The reader never ends the session.
     """
     try:
@@ -211,10 +212,13 @@ def _apply_control(line: bytes, controller) -> None:
             {"reply"},
             {"reply", "asked"},
             {"media"},
+            {"duck"},
         ):
             raise ValueError
         if "media" in message:
             controller.media(message["media"])
+        elif "duck" in message:
+            controller.duck(message["duck"])
         elif "asked" in message:
             if message["reply"] != "ended" or type(message["asked"]) is not bool:
                 raise ValueError

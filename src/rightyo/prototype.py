@@ -593,6 +593,73 @@ def _takes_keyword(factory: Any, name: str) -> bool:
     )
 
 
+# Hailing Station's whole-turn duck-mode phrases (hailing-station #735, `VoiceDuck` in
+# #783), entry and exit. The host matches them only as a whole owner turn, so the turn
+# merger releases them alone, like a stop phrase: an exit joined onto the owner's thinking
+# aloud would leave duck mode on until its auto-end. Keep in step with the host's sets.
+DUCK_PHRASES = frozenset(
+    {
+        "duck mode",
+        "duck mode on",
+        "let me think out loud",
+        "i'm going to think out loud",
+        "think out loud with me",
+        "duck mode off",
+        "end duck mode",
+        "done thinking",
+        "i'm done thinking",
+        "done thinking out loud",
+    }
+)
+DUCK_GREETINGS = frozenset({"hey", "ok", "okay"})
+# The host's short cues while ducking (hailing-station #735), named or not: matched only
+# while duck mode is on, so outside it "what do you think" can still take a continuation.
+DUCK_CUES = frozenset({"what do you think", "play that back", "mute", *DUCK_PHRASES})
+
+
+def _duck_words(text: str, addressing: Addressing | None) -> tuple[str, bool]:
+    """`text` trimmed as the host trims a duck phrase, and whether it named the assistant.
+
+    Words of letters and apostrophes, lowercased; a trailing "please", one leading
+    greeting, a configured name or variant of up to three words, then a "please" dropped.
+    """
+    cleaned = "".join(c if c.isalpha() or c == "'" else " " for c in text.replace("\u2019", "'"))
+    words = cleaned.lower().split()
+    while words and words[-1] == "please":
+        words.pop()
+    if words and words[0] in DUCK_GREETINGS:
+        words = words[1:]
+    width = None
+    if addressing is not None:
+        width = next(
+            (
+                size
+                for size in range(1, 4)
+                if size < len(words) and addressing.name_for(" ".join(words[:size])) is not None
+            ),
+            None,
+        )
+    if width is not None:
+        words = words[width:]
+    if words and words[0] == "please":
+        words = words[1:]
+    return " ".join(words), width is not None
+
+
+def duck_phrase_shaped(text: str, addressing: Addressing | None) -> bool:
+    """Whether `text` is a whole named duck-mode entry or exit ("Jarvis, done thinking").
+
+    The name is required, as the host requires it; without names, nothing is one.
+    """
+    phrase, named = _duck_words(text, addressing)
+    return named and phrase in DUCK_PHRASES
+
+
+def duck_cue_shaped(text: str, addressing: Addressing | None) -> bool:
+    """Whether `text` is a whole duck-mode cue ("what do you think?"), named or not."""
+    return _duck_words(text, addressing)[0] in DUCK_CUES
+
+
 def _no_report(_message: str) -> None:
     """The diagnostic sink when a session has no channel (the lab)."""
 
@@ -957,6 +1024,9 @@ class PrototypeController:
                     acknowledgement=self.config.acknowledgement,
                     other_agents=self.config.other_agents,
                     **({} if self.owner_voice is None else {"owner_voice": self.owner_voice}),
+                    # Duck mode (hailing-station #735): the live controller takes the
+                    # control, so a publisher that holds it advertises it.
+                    **({"duck": True} if callable(getattr(self._events, "duck", None)) else {}),
                 )
                 self._event_terminal = False
                 if self.owner_voice is not None and not voiceprint and self.report is not None:
@@ -990,10 +1060,13 @@ class PrototypeController:
                 memory.append(turn)
             inferred = turn.utterance_id in self._inferred_turns
             self._inferred_turns.discard(turn.utterance_id)
+            # Duck mode (hailing-station #735) as the publisher holds it now: the turn is
+            # still published, but no hosted decision is ever asked for it.
+            ducked = getattr(self._events, "ducked", False) is True
             if self._events is not None:
                 # Passed only when set, so publishers without live roles see no change.
                 self._publish("transcript", turn, **({"inferred": True} if inferred else {}))
-            if self._decision_status == "off" or self._decision_cancel.is_set():
+            if self._decision_status == "off" or self._decision_cancel.is_set() or ducked:
                 return
             try:
                 work.put_nowait(turn)
@@ -1007,11 +1080,26 @@ class PrototypeController:
             self._pending += 1
 
     def _turn_break(self):
-        """The predicate for turns that are never joined or held (#89, #98)."""
+        """The predicate for turns that are never joined or held (#89, #98).
+
+        With names configured, a whole named duck-mode entry or exit too (hailing-station
+        #735), in or out of duck mode, and while the publisher is in duck mode a whole
+        duck cue ("what do you think?"), so the host can match them on the live transcript.
+        """
         stop = (self.config.speakers or SpeakerPriority()).is_stop_phrase
-        if self.config.dismissal is None:
-            return stop
-        return lambda text: stop(text) or dismissal_shaped(text)
+        addressing = self.config.addressing
+        dismissal = self.config.dismissal is not None
+
+        def ducking() -> bool:
+            # Read as the merger releases the piece; the publisher holds the mode.
+            return getattr(self._events, "ducked", False) is True
+
+        return lambda text: (
+            stop(text)
+            or (dismissal and dismissal_shaped(text))
+            or duck_phrase_shaped(text, addressing)
+            or (ducking() and duck_cue_shaped(text, addressing))
+        )
 
     def _wake_join(
         self,
@@ -1661,6 +1749,19 @@ class PrototypeController:
         with self._lock:
             if self._events is not None:
                 self._events.media(on)
+
+    def duck(self, on: bool) -> None:
+        """Forward the host's duck mode (hailing-station #735) to the event publisher.
+
+        Held by the publisher across sessions, like media mode; ignored without one (the
+        web lab). While on, accepted turns are published but never queued for a hosted
+        decision (see `_accept`). A malformed value raises before anything is forwarded.
+        """
+        if type(on) is not bool:
+            raise PrototypeError("invalid duck mode")
+        with self._lock:
+            if self._events is not None:
+                self._events.duck(on)
 
     def _publish(self, method, value, **fields):
         """Run under the controller lock; a broken consumer cancels observation."""

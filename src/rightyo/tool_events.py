@@ -29,6 +29,8 @@ from rightyo.memory import TranscriptMemory
 from rightyo.providers import ConfiguredPriorityProvider, ProviderError
 
 MAX_EVENT_BYTES = 1200000
+# The duck-mode control version advertised on `started` (hailing-station #735).
+DUCK_VERSION = 1
 # How long a reply reported as playing can keep a conversation engaged when its end is
 # never reported (#124).
 MAX_REPLY_HOLD_MS = 180000
@@ -242,6 +244,10 @@ class SpeechEvents:
         # Turns accepted while media mode was on (utterance id -> turn end, pruned by
         # retention): the mode each pending turn is decided under (see `_media_for`).
         self._media_turns = {}
+        # Duck mode (hailing-station #735), set by the host while the owner thinks out loud:
+        # transcripts as usual, but a turn accepted while it is on is never decided (see
+        # `duck`). Like media mode it outlasts sessions.
+        self._duck = False
         # Owner-voice status (rightyo#164), off by default: the settings, and the last state
         # emitted this session (None, "unrecognized" or "recognized"; each at most once).
         self._owner_voice = None
@@ -360,6 +366,7 @@ class SpeechEvents:
         acknowledgement=None,
         other_agents=None,
         owner_voice=None,
+        duck=False,
     ):
         with self._lock:
             identifier(session_id, "session_id")
@@ -379,6 +386,8 @@ class SpeechEvents:
                 raise ContractError("invalid attention capability")
             if not self._retain_transcripts and attention_enabled:
                 raise ContractError("attention requires transcript retention")
+            if type(duck) is not bool:
+                raise ContractError("invalid duck capability")
             if other_agents is not None and not isinstance(other_agents, Addressing):
                 raise ContractError("invalid other agents")
             if addressing is not None and not isinstance(addressing, Addressing):
@@ -495,6 +504,10 @@ class SpeechEvents:
                     if acknowledgement is None
                     else {"acknowledgement": acknowledgement.to_dict()}
                 ),
+                # And for duck mode (hailing-station #735), when the producer takes the
+                # `{"duck": true|false}` control (live `listen`, not replay): a host enters
+                # duck mode only for a child that advertised this object.
+                **({"duck": {"version": DUCK_VERSION}} if duck else {}),
             )
 
     def expire(self, now_ms):
@@ -637,7 +650,7 @@ class SpeechEvents:
             self._seen[turn.utterance_id] = digest
             if turn.end_ms <= self._now - self.retention_ms:
                 return
-            if expect_decision and self._attention_enabled:
+            if expect_decision and self._attention_enabled and not self._duck:
                 size = len(encode_json(context))
                 if len(self._pending) >= 32 or self._pending_bytes + size > MAX_PENDING_BYTES:
                     self._clear_content()
@@ -931,6 +944,28 @@ class SpeechEvents:
             raise ContractError("invalid media mode")
         with self._lock:
             self._media = on
+
+    def duck(self, on):
+        """The host's duck mode (hailing-station #735), on or off; it outlasts sessions.
+
+        While on, every turn is still emitted as a `transcript` with its role, but none is
+        held for a decision: no attention, request, follow-up, acknowledgement or
+        conversation event comes of it, and the controller asks no hosted decision for it.
+        The stop-phrase fast path is unchanged. Only the mode when a turn is accepted
+        counts: a turn accepted before it was turned on is still decided, and a turn
+        accepted while it was on is never decided, even after it is turned off. Emits
+        nothing.
+        """
+        if type(on) is not bool:
+            raise ContractError("invalid duck mode")
+        with self._lock:
+            self._duck = on
+
+    @property
+    def ducked(self):
+        """Whether duck mode is on now (see `duck`)."""
+        with self._lock:
+            return self._duck
 
     def _media_for(self, turn):
         """Whether media mode applies to `turn`: whether it was on when the turn was accepted.
