@@ -1228,15 +1228,17 @@ class SpeechEvents:
             kinds = frozenset()
             self._private_counts["failed"] += 1
         split, self._private_name_end = self._private_name_end, None
+        # Heard entirely since the mode last went on, and it is still on: a turn heard in an
+        # earlier private period and released late can never end this one (#735 S-1).
+        current = (
+            self._duck
+            and bool(self._duck_spans)
+            and turn.start_ms >= self._duck_spans[-1][0]
+        )
         if "name" in kinds:
-            # Only the enrolled owner's own name fragment, heard entirely since the mode
-            # last went on (a piece heard across an earlier off, released late, never
-            # starts one), can begin a split exit.
-            if (
-                self._duck
-                and turn.start_ms >= self._duck_spans[-1][0]
-                and self._may_exit(turn, inferred)
-            ):
+            # Only the enrolled owner's own name fragment, in the current period, can
+            # begin a split exit.
+            if current and self._may_exit(turn, inferred):
                 self._private_name_end = turn.end_ms
             return
         named = "exit" in kinds or (
@@ -1245,7 +1247,7 @@ class SpeechEvents:
             and 0 <= turn.start_ms - split <= PRIVACY_SPLIT_NAME_MS
         )
         if named:
-            if self._may_exit(turn, inferred):
+            if current and self._may_exit(turn, inferred):
                 self._private_counts["exit"] += 1
                 self._emit("privacy", action="exit")
                 return

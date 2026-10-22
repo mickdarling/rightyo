@@ -349,6 +349,19 @@ class PrivacyEventsTests(unittest.TestCase):
                 self.assertEqual(self.hear("Travis.", speaker=speaker, start=at), [])
                 self.assertEqual(self.hear("I'm back.", start=at + 1000), [])
 
+    def test_an_exit_heard_in_an_earlier_period_never_ends_this_one(self):
+        # Round 8 (key 2's round-7 nit): off, quickly on again, then the owner's exit from
+        # the earlier period is released late. It must not end the new period; and an
+        # exit released after the off, while public, emits nothing.
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events.duck(False, now_ms=1000)
+        self.assertEqual(self.say(heard("x0", 100, 900, "Jarvis, I'm back.")), [])
+        self.events.duck(True, now_ms=1200)
+        self.assertEqual(self.say(heard("x1", 200, 1000, "Jarvis, I'm back.")), [])
+        events = self.say(heard("x2", 1300, 2000, "Jarvis, I'm back."))
+        self.assertEqual([e.get("action") for e in events], ["exit"])
+
     def test_key_2_repro_a_stale_name_never_exits(self):
         # Key 2's blocker: on, a guest's name released after the off, a public turn, on
         # again, then the owner's unnamed "start listening".
@@ -863,6 +876,21 @@ class DuckControllerTests(unittest.TestCase):
         controller.stop()
         controller._turn(generation, work, memory, shadow, turn("t2", 2000, 2900, "x"))
         self.assertEqual(scored, [])
+
+    def test_a_public_turn_queued_for_a_decision_is_still_scored(self):
+        # Round 8 (key 1's round-7 nit): `_accept` returns False on the queued path too.
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        controller._decision_status = "ready"
+        scored = []
+        shadow = SimpleNamespace(turn=lambda current, **_: scored.append(current.utterance_id))
+        work, memory = queue.Queue(), TranscriptMemory()
+        controller._turn(controller._generation, work, memory, shadow, turn("t1", 0, 900, "x"))
+        self.assertEqual(work.qsize(), 1)
+        self.assertEqual(scored, ["t1"])
 
     def test_stop_drops_per_turn_notes_an_accept_never_took(self):
         # Jarvis on #242 round 5: a stop between the observation and the accept.
