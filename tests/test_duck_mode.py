@@ -11,6 +11,7 @@ import os
 import queue
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -231,8 +232,6 @@ class DuckControllerTests(unittest.TestCase):
         events.drain()
         controller._events = events
         controller._decision_status = "ready"
-        now = [0]
-        controller._now_ms = lambda: now[0]
         work, memory = queue.Queue(), TranscriptMemory()
 
         def accept(name, start, text):
@@ -241,12 +240,12 @@ class DuckControllerTests(unittest.TestCase):
 
         accept("t1", 0, "A")
         self.assertEqual(work.qsize(), 1)
-        now[0] = 1000
+        controller._received_ms = 1000
         controller.duck(True)
         self.assertEqual(events._duck_spans, [[1000, None]])
         accept("t2", 1000, "B")
         self.assertEqual(work.qsize(), 1)
-        now[0] = 3000
+        controller._received_ms = 3000
         controller.duck(False)
         # Heard at 2,000 ms, while ducking; released only after the off edge.
         accept("t3", 2000, "C")
@@ -261,9 +260,39 @@ class DuckControllerTests(unittest.TestCase):
     def types(events):
         return [e["type"] for e in events]
 
+    def test_spans_use_the_audio_clock_when_the_wall_clock_runs_ahead(self):
+        # Key 1's round-3 case: two minutes of audio lost earlier, so the wall clock (and
+        # `_now_ms`) runs D = 120 s ahead of the received audio turns are timed in.
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0)
+        events.drain()
+        controller._events = events
+        controller._decision_status = "ready"
+        controller._mode = "microphone"
+        base = time.monotonic()
+        work, memory = queue.Queue(), TranscriptMemory()
+
+        def accept(name, start, end):
+            current = turn(name, start, end, "synthetic")
+            PrototypeController._accept(controller, controller._generation, work, memory, current)
+
+        controller._audio_started, controller._received_ms = base - 180, 60_000
+        self.assertGreater(controller._now_ms(), controller._received_ms)
+        controller.duck(True)
+        controller._audio_started, controller._received_ms = base - 240, 120_000
+        controller.duck(False)
+        self.assertEqual(events._duck_spans, [[60_000, 120_000]])
+        # Heard while ducking, held by the owner pause, released after the off: undecided.
+        accept("h1", 110_000, 118_000)
+        self.assertEqual(work.qsize(), 0)
+        # Said after the off in audio time, though within D of its wall-clock time: decided.
+        accept("t1", 121_000, 122_000)
+        self.assertEqual(work.qsize(), 1)
+
     def test_the_controller_forwards_or_ignores_without_a_publisher(self):
         events = SpeechEvents()
-        controller = SimpleNamespace(_lock=threading.RLock(), _events=events, _now_ms=lambda: 7)
+        controller = SimpleNamespace(_lock=threading.RLock(), _events=events, _received_ms=7)
         PrototypeController.duck(controller, True)
         self.assertIs(events._duck, True)
         self.assertEqual(events._duck_spans, [[7, None]])

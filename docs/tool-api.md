@@ -1203,7 +1203,9 @@ non-boolean value or any other key is a malformed line: skipped with a content-f
 stderr note, like any other.
 
 Speech **heard** in duck mode is judged by when it was heard, not when it is released.
-Each change is stamped with the session's stream clock, and a turn counts as heard in duck
+Each change is stamped, when its control line arrives, with the received-audio clock that
+turns are timed in (never the wall clock, which runs ahead of it for good after lost
+audio), and a turn counts as heard in duck
 mode when it is accepted while the mode is on, or when its `[start_ms, end_ms]` overlaps a
 span the mode was on. A turn the merger held across the off edge (the merge gap or the
 [owner pause](#joined-turns)), a continuation joined to a piece said in duck mode, a
@@ -1233,8 +1235,10 @@ The mode is held across sessions, like media mode, and emits nothing when it cha
 session that starts with it on counts from its start. The host keeps duck and media mode
 exclusive; if both were on, nothing would be decided. Turning it off restores decisions
 for speech heard after the off. Speech between the owner's spoken exit and the host's
-`{"duck": false}` was heard in duck mode, so it stays undecided: the owner repeats a
-request said in that moment.
+`{"duck": false}` was heard in duck mode, so it stays undecided: the off point is when
+that line arrives, so speech that starts in the second or two between the spoken exit and
+it is treated as heard in duck mode (failing closed), and the owner repeats a request said
+in that moment.
 
 The host matches its spoken entry and exit only as a whole named owner turn. With
 `addressing` names configured, the turn merger therefore releases them on their own and

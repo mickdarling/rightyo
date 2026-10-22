@@ -1772,15 +1772,18 @@ class PrototypeController:
         """Forward the host's duck mode (hailing-station #735) to the event publisher.
 
         Held by the publisher across sessions, like media mode; ignored without one (the
-        web lab). Stamped with this session's stream clock, so a turn heard while it was on
-        is never decided, even when it is released after it was turned off (see `_accept`).
-        A malformed value raises before anything is forwarded.
+        web lab). Stamped with the received-audio clock turns are timed in (never the wall
+        clock, which runs ahead of it for good after lost audio), so a turn heard while it
+        was on is never decided, even when it is released after it was turned off (see
+        `_accept`), and speech after it is. A malformed value raises before anything is
+        forwarded.
         """
         if type(on) is not bool:
             raise PrototypeError("invalid duck mode")
         with self._lock:
             if self._events is not None:
-                self._events.duck(on, now_ms=self._now_ms())
+                # At least the end of every piece received so far, held ones included.
+                self._events.duck(on, now_ms=self._received_ms)
 
     def _publish(self, method, value, **fields):
         """Run under the controller lock; a broken consumer cancels observation."""
