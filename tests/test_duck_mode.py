@@ -749,6 +749,34 @@ class DuckControllerTests(unittest.TestCase):
         blob = "".join(encode_json(e) for e in drained)
         self.assertEqual(leaks(blob + stderr.getvalue() + " ".join(notes)), [])
 
+    def test_a_private_turn_leaves_no_post_turn_gap_behind(self):
+        # Codex P2 on #242: the gap is observed just before the accept, and only a queued
+        # decision pops it, so a private turn's id and silence must be dropped here.
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        controller._decision_status = "ready"
+        work, memory = queue.Queue(), TranscriptMemory()
+        generation = controller._generation
+
+        def accept(name, start, text):
+            controller._observe_gap(generation, name, {"silence_ms": 700, "next": "other"})
+            current = turn(name, start, start + 900, text)
+            PrototypeController._accept(controller, generation, work, memory, current)
+
+        accept("t1", 0, "A")
+        controller._received_ms = 1000
+        controller.duck(True)
+        for index, text in enumerate(MONOLOGUE):
+            accept(f"p{index}", 1000 + index * 1000, text)
+        self.assertEqual(list(controller._turn_gaps), ["t1"])
+        controller._received_ms = 9000
+        controller.duck(False)
+        accept("t4", 9500, "D")
+        self.assertEqual(list(controller._turn_gaps), ["t1", "t4"])
+
     def test_privacy_is_advertised_only_with_local_speech(self):
         # The guard itself, through `start`, not a mock (key 2's nit 3).
         hosted = {

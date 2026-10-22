@@ -1020,6 +1020,9 @@ class PrototypeController:
             # the local exit and status phrases and emits no transcript (`_private`).
             heard_ducked = getattr(self._events, "heard_ducked", None)
             ducked = callable(heard_ducked) and heard_ducked(turn) is True
+            if ducked:
+                # Observed just before this accept (#96); no decision will ever take it.
+                self._turn_gaps.pop(turn.utterance_id, None)
             if self.retain_transcripts and not ducked:
                 memory.append(turn)
             inferred = turn.utterance_id in self._inferred_turns
