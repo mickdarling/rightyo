@@ -80,7 +80,7 @@ def parse_notes(lines: Iterable[str]) -> tuple[list[Turn], dict[str, int]]:
     summary counts, which say how many turns were never scored and why."""
     turns: list[Turn] = []
     session = 0
-    counts = dict.fromkeys(SUMMARY_COUNTS, 0)
+    counts = dict.fromkeys(SUMMARY_COUNTS, 0) | {"started": 0}
     for line in lines:
         at = line.find("speaker_id ")
         if at < 0:
@@ -93,6 +93,7 @@ def parse_notes(lines: Iterable[str]) -> tuple[list[Turn], dict[str, int]]:
             continue
         if words[0] == "start":
             session += 1
+            counts["started"] += 1
             continue
         fields = dict(word.split("=", 1) for word in words if "=" in word)
         if words[0] == "summary":
@@ -162,14 +163,17 @@ def turn_report(
 
     return {
         "thresholds": {"bind": bind, "tentative": tentative},
-        "sessions": len({turn.session for turn in turns}),
+        "sessions_with_scored_turns": len({turn.session for turn in turns}),
         "owner_labels": len(confirmed),
         "owner_turns": summary([turn for turn, _ in own]),
         "by_speech_length": by(lambda turn, _: _bucket(turn.speech_ms, LENGTHS_MS, "ms")),
         "by_route": by(lambda turn, _: turn.route),
         "by_position_in_label": by(lambda _, position: _bucket(position, POSITIONS, "turn")),
         "unconfirmed_labels": len({(turn.session, turn.label) for turn in other}),
-        "unconfirmed_turns": _scores([turn.score for turn in other], bind, tentative, rounded=True),
+        "unconfirmed_turns": _scores(
+            [turn.score for turn in other if turn.identity == owner], bind, tentative, rounded=True
+        )
+        | {"scored_against_another_print": sum(turn.identity != owner for turn in other)},
     }
 
 

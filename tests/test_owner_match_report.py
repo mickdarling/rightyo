@@ -72,6 +72,7 @@ class NoteParsingTests(unittest.TestCase):
         ]
         turns, counts = harness.parse_notes(lines)
         self.assertEqual((counts["short"], counts["offered"], counts["scored"]), (3, 4, 2))
+        self.assertEqual(counts["started"], 2)
         self.assertEqual(counts["unsegmented"], 0)
         self.assertEqual([turn.session for turn in turns], [1, 1, 2])
         self.assertEqual(turns[0].label, "Speaker A")
@@ -99,7 +100,7 @@ class TurnReportTests(unittest.TestCase):
 
     def test_a_label_that_bound_counts_all_its_turns_as_the_owner(self):
         report = self.report()
-        self.assertEqual(report["sessions"], 2)
+        self.assertEqual(report["sessions_with_scored_turns"], 2)
         self.assertEqual(report["owner_labels"], 1)
         self.assertEqual(report["owner_turns"]["count"], 4)
         self.assertEqual(report["owner_turns"]["missed"], 2)
@@ -134,6 +135,9 @@ class TurnReportTests(unittest.TestCase):
         ]
         report = harness.turn_report(harness.parse_notes(lines)[0])
         owner = report["owner_turns"]
+        # Speaker B never bound to the owner: its 0.80 is against the guest print, not the owner's.
+        self.assertEqual(report["unconfirmed_turns"]["count"], 0)
+        self.assertEqual(report["unconfirmed_turns"]["scored_against_another_print"], 1)
         self.assertEqual(report["owner_labels"], 1)
         self.assertEqual((owner["turns"], owner["missed"], owner["count"]), (3, 2, 1))
         self.assertEqual(owner["scored_against_another_print"], 2)
@@ -172,6 +176,17 @@ class TurnReportTests(unittest.TestCase):
         ]
         routes = harness.turn_report(harness.parse_notes(lines)[0])["by_route"]
         self.assertEqual(sorted(routes), ["other", "usb_audio"])
+
+    def test_a_session_with_no_scored_turn_still_counts_as_started(self):
+        lines = [
+            "rightyo: speaker_id start enrolled=1\n",
+            note("Speaker A", 4000, 0.70, "bound"),
+            "rightyo: speaker_id start enrolled=1\n",
+            "rightyo: speaker_id summary offered=3 scored=0 short=3\n",
+        ]
+        turns, counts = harness.parse_notes(lines)
+        self.assertEqual(counts["started"], 2)
+        self.assertEqual(harness.turn_report(turns)["sessions_with_scored_turns"], 1)
 
 
 class NegativeReportTests(unittest.TestCase):

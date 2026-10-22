@@ -253,8 +253,10 @@ voices other than the owner. It changes nothing in the pipeline.
   - The report breaks scores and misses down by speech length, input route and position.
     Position counts only scored turns. Routes are limited to RightyO's allowlisted tokens, and
     `unrecorded` mixes every session from before routes were logged.
-  - Labels that never bound are reported apart, as are the session summaries' unscored turns
-    (`short` under `min_turn_seconds`, plus `overlap`, `unsegmented` and `dropped`).
+  - Labels that never bound are reported apart, again with only scores against the owner's
+    print in their quantiles. So are the session summaries' unscored turns (`short` under
+    `min_turn_seconds`, plus `overlap`, `unsegmented` and `dropped`), and the number of
+    sessions started, which counts sessions that produced no scored turn.
 - `negatives --config <prototype.json> --data <folder>` scores clips as a live turn is.
   - Each clip's speech is trimmed and capped at 30 s first. It is then cut into 1, 2, 3, 6 and
     12 s segments, at most 8 per clip, plus the whole trimmed clip.
