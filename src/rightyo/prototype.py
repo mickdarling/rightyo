@@ -1755,10 +1755,14 @@ class PrototypeController:
         clock, which runs ahead of it for good after lost audio), so a turn heard while it
         was on is never decided, even when it is released after it was turned off (see
         `_accept`), and speech after it is. A malformed value raises before anything is
-        forwarded.
+        forwarded. Turning it on is refused with a hosted speech backend, which would
+        still be sent the audio heard while private (S-1; `started` never advertises it
+        there, and `--start-private` is refused): fail closed, never apparently private.
         """
         if type(on) is not bool:
             raise PrototypeError("invalid duck mode")
+        if on and self.config.hosted_speech:
+            raise PrototypeError("duck mode is refused with a hosted speech backend")
         with self._lock:
             if self._events is not None:
                 # At least the end of every piece received so far, held ones included.

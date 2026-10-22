@@ -935,6 +935,27 @@ class DuckControllerTests(unittest.TestCase):
                 if advertised:
                     self.assertEqual(started["duck"], {"version": 2})
 
+    def test_privacy_is_refused_with_hosted_speech(self):
+        # Codex P1 on #242: a stale or misconfigured host must not put a hosted-speech
+        # process into apparent privacy while its audio still goes to the backend.
+        hosted = {
+            "transcriber": {
+                "kind": "hosted-openai-compatible",
+                "endpoint": "https://transcribe.example.test/v1/audio/transcriptions",
+                "model": "whisper-1",
+            }
+        }
+        controller = self.controller(**hosted)
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        with self.assertRaises(PrototypeError):
+            controller.duck(True)
+        self.assertFalse(events.ducked)
+        controller.duck(False)
+        self.assertFalse(events.ducked)
+
     def test_the_named_owner_exit_reaches_the_host_through_the_controller(self):
         controller = self.controller()
         events = SpeechEvents()
@@ -1005,11 +1026,16 @@ class DuckControllerTests(unittest.TestCase):
 
     def test_the_controller_forwards_or_ignores_without_a_publisher(self):
         events = SpeechEvents()
-        controller = SimpleNamespace(_lock=threading.RLock(), _events=events, _received_ms=7)
+        local = SimpleNamespace(hosted_speech=False)
+        controller = SimpleNamespace(
+            _lock=threading.RLock(), _events=events, _received_ms=7, config=local
+        )
         PrototypeController.duck(controller, True)
         self.assertIs(events._duck, True)
         self.assertEqual(events._duck_spans, [[7, None]])
-        PrototypeController.duck(SimpleNamespace(_lock=threading.RLock(), _events=None), True)
+        PrototypeController.duck(
+            SimpleNamespace(_lock=threading.RLock(), _events=None, config=local), True
+        )
         with self.assertRaises(PrototypeError):
             PrototypeController.duck(controller, "yes")
 
