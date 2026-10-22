@@ -1,5 +1,6 @@
 """Duck mode (hailing-station #735 R-2): while the owner thinks out loud, every turn is
-still transcribed with its role, but nothing is decided or requested. Synthetic text only."""
+still transcribed with its role, but nothing heard then is decided, requested or used as
+context. Synthetic text only."""
 
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ from rightyo.prototype import (
     duck_phrase_shaped,
 )
 from rightyo.providers import ConfiguredPriorityProvider
-from rightyo.tool_events import SpeechEvents
+from rightyo.tool_events import MAX_DUCK_SPANS, SpeechEvents
 from rightyo.turn_merge import TurnMerger
 
 OURS = Addressing(names=("Jarvis",), variants=(("Jarvis", ("Travis",)),))
@@ -54,6 +55,9 @@ class DuckModeTests(unittest.TestCase):
         self.events.decision(decided(current, label, **options), current.end_ms + 100)
         return self.events.drain()
 
+    def types(self, events):
+        return [e["type"] for e in events]
+
     def test_started_advertises_the_duck_capability(self):
         (started,) = self.start()
         self.assertEqual(started["duck"], {"version": 1})
@@ -68,60 +72,92 @@ class DuckModeTests(unittest.TestCase):
 
     def test_an_owner_request_is_transcribed_but_never_decided(self):
         self.start()
-        self.events.duck(True)
-        events = self.say(turn("t1", 0, 900, "Jarvis, what time is it?"))
-        self.assertEqual([e["type"] for e in events], ["transcript"])
+        self.events.duck(True, now_ms=0)
+        events = self.say(turn("t1", 100, 900, "Jarvis, what time is it?"))
+        self.assertEqual(self.types(events), ["transcript"])
         self.assertEqual(events[0]["turn"]["role"], "owner")
         self.assertEqual(self.events._pending, {})
 
     def test_no_follow_up_and_no_conversation_window(self):
         self.start()
         self.say(turn("t1", 0, 900, "Jarvis, what time is it?"))
-        self.events.duck(True)
+        self.events.duck(True, now_ms=1000)
         events = self.say(turn("t2", 2000, 2900, "And tomorrow?"), "uncertain", attend=0.9)
-        self.assertEqual([e["type"] for e in events], ["transcript"])
+        self.assertEqual(self.types(events), ["transcript"])
 
     def test_a_guest_turn_is_transcribed_with_its_role(self):
         self.start()
-        self.events.duck(True)
-        events = self.say(turn("t1", 0, 900, "Jarvis, open the door.", "Speaker B"))
-        self.assertEqual([e["type"] for e in events], ["transcript"])
+        self.events.duck(True, now_ms=0)
+        events = self.say(turn("t1", 100, 900, "Jarvis, open the door.", "Speaker B"))
+        self.assertEqual(self.types(events), ["transcript"])
         self.assertEqual(events[0]["turn"]["role"], "participant")
 
-    def test_a_turn_accepted_before_it_was_turned_on_is_still_decided(self):
+    def test_a_turn_heard_and_accepted_before_it_was_turned_on_is_still_decided(self):
         self.start()
         current = turn("t1", 0, 900, "Jarvis, what time is it?")
         self.events.transcript(current, current.end_ms)
-        self.events.duck(True)
-        self.events.decision(decided(current, "attend"), current.end_ms + 100)
-        events = [e["type"] for e in self.events.drain()]
-        self.assertIn("request", events)
+        self.events.duck(True, now_ms=1000)
+        self.events.decision(decided(current, "attend"), 1100)
+        self.assertIn("request", self.types(self.events.drain()))
 
     def test_a_turn_heard_in_duck_mode_stays_undecided_after_it_is_turned_off(self):
         self.start()
-        self.events.duck(True)
-        current = turn("t1", 0, 900, "Jarvis, what time is it?")
+        self.events.duck(True, now_ms=0)
+        current = turn("t1", 100, 900, "Jarvis, what time is it?")
         self.events.transcript(current, current.end_ms)
-        self.events.duck(False)
-        self.events.decision(decided(current, "attend"), current.end_ms + 100)
-        self.assertEqual([e["type"] for e in self.events.drain()], ["transcript"])
+        self.events.duck(False, now_ms=1000)
+        self.events.decision(decided(current, "attend"), 1100)
+        self.assertEqual(self.types(self.events.drain()), ["transcript"])
 
-    def test_turning_it_off_restores_decisions(self):
+    def test_speech_held_past_the_off_edge_is_never_decided(self):
+        # Key 2's minimal case: heard while ducking, held by the merger (the owner pause),
+        # and released only after the host turned duck mode off.
         self.start()
-        self.events.duck(True)
-        self.events.duck(False)
-        events = self.say(turn("t1", 0, 900, "Jarvis, what time is it?"))
-        self.assertEqual(
-            [e["type"] for e in events], ["transcript", "attention", "request", "conversation"]
-        )
+        self.events.duck(True, now_ms=0)
+        self.events.duck(False, now_ms=3000)
+        events = self.say(turn("t1", 1000, 1900, "and the budget too"))
+        self.assertEqual(self.types(events), ["transcript"])
+
+    def test_a_turn_joined_across_the_off_edge_is_never_decided(self):
+        # A ducked piece held, the mode turned off, then a continuation joined into it.
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events.duck(False, now_ms=3000)
+        joined = turn("t1", 2000, 5000, "Jarvis, so that is the plan and the budget too")
+        self.assertEqual(self.types(self.say(joined)), ["transcript"])
+
+    def test_pre_duck_speech_joined_with_ducked_speech_stays_undecided(self):
+        self.start()
+        self.events.duck(True, now_ms=2000)
+        self.events.duck(False, now_ms=2500)
+        joined = turn("t1", 0, 2100, "Jarvis, what time is it and the budget")
+        self.assertEqual(self.types(self.say(joined)), ["transcript"])
+
+    def test_turning_it_off_restores_decisions_for_speech_heard_after(self):
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events.duck(False, now_ms=500)
+        events = self.say(turn("t1", 1000, 1900, "Jarvis, what time is it?"))
+        self.assertEqual(self.types(events), ["transcript", "attention", "request", "conversation"])
+
+    def test_ducked_turns_are_never_context(self):
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.say(turn("t1", 100, 900, "A guest's synthetic aside.", "Speaker B"))
+        self.say(turn("t2", 1000, 1900, "The owner's synthetic thought."))
+        self.events.duck(False, now_ms=2000)
+        events = self.say(turn("t3", 3000, 3900, "Jarvis, what time is it?"))
+        (request,) = [e for e in events if e["type"] == "request"]
+        self.assertEqual(request["context"]["turns"], [])
+        self.assertEqual(self.events._memory.snapshot(4000)["turns"], [request["turn"]])
 
     def test_a_stop_phrase_still_dismisses_at_once(self):
         self.start(dismissal=Dismissal())
-        self.events.duck(True)
-        current = turn("t1", 0, 900, "Stop.")
+        self.events.duck(True, now_ms=0)
+        current = turn("t1", 100, 900, "Stop.")
         self.events.transcript(current, current.end_ms)
         events = [e for e in self.events.drain() if e["type"] in DECIDED | {"transcript"}]
-        self.assertEqual([e["type"] for e in events], ["transcript", "dismiss"])
+        self.assertEqual(self.types(events), ["transcript", "dismiss"])
 
     def test_a_session_start_keeps_it(self):
         # The host may report duck mode before a (re)started session begins.
@@ -129,30 +165,43 @@ class DuckModeTests(unittest.TestCase):
         self.events.duck(True)
         self.events.start(SESSION, now_ms=0, addressing=OURS, conversation=MODE)
         self.events.drain()
-        events = self.say(turn("t1", 0, 900, "Jarvis, what time is it?"))
-        self.assertEqual([e["type"] for e in events], ["transcript"])
+        self.events.duck(False, now_ms=500)
+        self.assertEqual(self.types(self.say(turn("t1", 0, 900, "Jarvis, hi."))), ["transcript"])
+        events = self.say(turn("t2", 1000, 1900, "Jarvis, what time is it?"))
+        self.assertIn("request", self.types(events))
 
     def test_it_is_independent_of_media_mode(self):
         # The host keeps the two exclusive; if both were on, duck mode decides nothing.
         self.start()
         self.events.media(True)
-        self.events.duck(True)
+        self.events.duck(True, now_ms=0)
         self.assertEqual(
-            [e["type"] for e in self.say(turn("t1", 0, 900, "Jarvis, what's on?"))],
-            ["transcript"],
+            self.types(self.say(turn("t1", 100, 900, "Jarvis, what's on?"))), ["transcript"]
         )
-        self.events.duck(False)
+        self.events.duck(False, now_ms=1000)
         events = self.say(turn("t2", 2000, 2900, "What time is it?"))
         self.assertEqual(events[1]["decision"].get("media"), True)
 
-    def test_a_non_boolean_is_refused(self):
+    def test_spans_are_bounded_and_merging_only_widens_them(self):
+        self.start()
+        for index in range(MAX_DUCK_SPANS + 6):
+            self.events.duck(True, now_ms=index * 1000)
+            self.events.duck(False, now_ms=index * 1000 + 100)
+        self.assertEqual(len(self.events._duck_spans), MAX_DUCK_SPANS)
+        # Between the first two spans: now covered, so held undecided (fail closed).
+        self.assertTrue(self.events.heard_ducked(turn("t1", 500, 600, "x")))
+        self.assertFalse(self.events.heard_ducked(turn("t2", 999_000, 999_100, "x")))
+
+    def test_a_non_boolean_or_bad_time_is_refused(self):
         for bad in ("on", 1, None):
             with self.subTest(bad=bad), self.assertRaises(ContractError):
                 SpeechEvents().duck(bad)
+        with self.assertRaises(ContractError):
+            SpeechEvents().duck(True, now_ms=-1)
 
 
 class DuckControllerTests(unittest.TestCase):
-    """The controller asks no hosted decision for a turn accepted in duck mode."""
+    """The controller asks no hosted decision for, and keeps no memory of, a ducked turn."""
 
     def controller(self, **extra):
         directory = tempfile.TemporaryDirectory()
@@ -175,80 +224,110 @@ class DuckControllerTests(unittest.TestCase):
         self.addCleanup(controller.close)
         return controller
 
-    def test_a_ducked_turn_is_published_but_never_queued(self):
+    def test_a_ducked_turn_is_published_but_never_queued_or_remembered(self):
         controller = self.controller()
         events = SpeechEvents()
         events.start(SESSION, now_ms=0)
         events.drain()
         controller._events = events
         controller._decision_status = "ready"
-        work = queue.Queue()
+        now = [0]
+        controller._now_ms = lambda: now[0]
+        work, memory = queue.Queue(), TranscriptMemory()
 
         def accept(name, start, text):
             current = turn(name, start, start + 900, text)
-            generation = controller._generation
-            PrototypeController._accept(controller, generation, work, TranscriptMemory(), current)
+            PrototypeController._accept(controller, controller._generation, work, memory, current)
 
         accept("t1", 0, "A")
         self.assertEqual(work.qsize(), 1)
+        now[0] = 1000
         controller.duck(True)
-        self.assertIs(events.ducked, True)
+        self.assertEqual(events._duck_spans, [[1000, None]])
         accept("t2", 1000, "B")
         self.assertEqual(work.qsize(), 1)
-        self.assertEqual(controller._pending, 1)
-        self.assertEqual([e["type"] for e in events.drain()], ["transcript", "transcript"])
+        now[0] = 3000
         controller.duck(False)
+        # Heard at 2,000 ms, while ducking; released only after the off edge.
         accept("t3", 2000, "C")
+        self.assertEqual(work.qsize(), 1)
+        accept("t4", 3500, "D")
         self.assertEqual(work.qsize(), 2)
+        self.assertEqual(controller._pending, 2)
+        self.assertEqual(self.types(events.drain()), ["transcript"] * 4)
+        self.assertEqual([t["text"] for t in memory.snapshot(5000)["turns"]], ["A", "D"])
+
+    @staticmethod
+    def types(events):
+        return [e["type"] for e in events]
 
     def test_the_controller_forwards_or_ignores_without_a_publisher(self):
         events = SpeechEvents()
-        controller = SimpleNamespace(_lock=threading.RLock(), _events=events)
+        controller = SimpleNamespace(_lock=threading.RLock(), _events=events, _now_ms=lambda: 7)
         PrototypeController.duck(controller, True)
         self.assertIs(events._duck, True)
+        self.assertEqual(events._duck_spans, [[7, None]])
         PrototypeController.duck(SimpleNamespace(_lock=threading.RLock(), _events=None), True)
         with self.assertRaises(PrototypeError):
             PrototypeController.duck(controller, "yes")
 
-    def test_the_turn_break_releases_named_duck_phrases_only_with_names(self):
-        named = self.controller(addressing={"names": ["Jarvis"]})._turn_break()
-        self.assertTrue(named("Jarvis, done thinking."))
-        self.assertTrue(named("Stop."))
-        self.assertFalse(named("Jarvis, what time is it?"))
-        self.assertFalse(named("Jarvis, go away"))  # dismissal shapes need dismissal on
-        unnamed = self.controller()._turn_break()
-        self.assertFalse(unnamed("Jarvis, done thinking."))
-
-    def test_the_turn_break_releases_duck_cues_only_while_ducking(self):
-        controller = self.controller(addressing={"names": ["Jarvis"]})
+    def breaks(self, ducking, **extra):
+        controller = self.controller(**extra)
         controller._events = SpeechEvents()
-        breaks = controller._turn_break()
-        cues = ("What do you think?", "Jarvis, play that back.", "Mute.", "Done thinking.")
+        controller._events.duck(ducking)
+        return controller._turn_break()
+
+    def test_the_exit_breaks_only_while_ducking_and_the_entry_only_while_not(self):
+        named = {"addressing": {"names": ["Jarvis"]}}
+        ducking, normal = self.breaks(True, **named), self.breaks(False, **named)
+        self.assertTrue(ducking("Jarvis, done thinking."))
+        self.assertFalse(normal("Jarvis, done thinking."))
+        self.assertTrue(normal("Jarvis, let me think out loud."))
+        self.assertFalse(ducking("Jarvis, let me think out loud."))
+        for predicate in (ducking, normal):
+            self.assertTrue(predicate("Stop."))
+            self.assertFalse(predicate("Jarvis, what time is it?"))
+            self.assertFalse(predicate("Jarvis, go away"))  # dismissal shapes need dismissal
+        self.assertFalse(self.breaks(True)("Jarvis, done thinking."))
+
+    def test_cues_break_only_while_ducking_named_or_not(self):
+        cues = (
+            "What do you think?",
+            "Jarvis, play that back.",
+            "Mute.",
+            "Are you still listening?",
+            "Discard that.",
+        )
+        ducking = self.breaks(True, addressing={"names": ["Jarvis"]})
+        normal = self.breaks(False, addressing={"names": ["Jarvis"]})
         for text in cues:
             with self.subTest(text=text):
-                self.assertFalse(breaks(text))
-        controller.duck(True)
-        for text in cues:
-            with self.subTest(text=text):
-                self.assertTrue(breaks(text))
-        self.assertFalse(breaks("What do you think about the plan?"))
-        unnamed = self.controller()
-        unnamed._events = controller._events
-        self.assertTrue(unnamed._turn_break()("What do you think?"))
+                self.assertTrue(ducking(text))
+                self.assertFalse(normal(text))
+        self.assertFalse(ducking("What do you think about the plan?"))
+        # The unnamed exit is not a cue, so a lone wake word can still join it (#230).
+        self.assertFalse(ducking("done thinking."))
+        self.assertTrue(self.breaks(True)("What do you think?"))
 
 
 class DuckPhraseTests(unittest.TestCase):
-    def test_named_entry_and_exit_phrases_match_as_the_host_trims_them(self):
+    def test_named_exit_phrases_match_as_the_host_trims_them(self):
         for text in (
             "Jarvis, done thinking.",
             "Jarvis done thinking please",
             "Hey Jarvis, please end duck mode.",
-            "Okay Travis, I’m done thinking.",
-            "Jarvis, let me think out loud.",
-            "JARVIS, DUCK MODE!",
+            "Okay Travis, I'm done thinking.",
+            "JARVIS, DUCK MODE OFF!",
         ):
             with self.subTest(text=text):
-                self.assertTrue(duck_phrase_shaped(text, OURS))
+                self.assertTrue(duck_phrase_shaped(text, OURS, True))
+                self.assertFalse(duck_phrase_shaped(text, OURS, False))
+
+    def test_named_entry_phrases_match_only_while_not_ducking(self):
+        for text in ("Jarvis, let me think out loud.", "Hey Jarvis, duck mode."):
+            with self.subTest(text=text):
+                self.assertTrue(duck_phrase_shaped(text, OURS, False))
+                self.assertFalse(duck_phrase_shaped(text, OURS, True))
 
     def test_anything_else_is_not_one(self):
         for text in (
@@ -260,105 +339,110 @@ class DuckPhraseTests(unittest.TestCase):
             "",
         ):
             with self.subTest(text=text):
-                self.assertFalse(duck_phrase_shaped(text, OURS))
-        self.assertFalse(duck_phrase_shaped("Jarvis, done thinking.", None))
+                self.assertFalse(duck_phrase_shaped(text, OURS, True))
+        self.assertFalse(duck_phrase_shaped("Jarvis, done thinking.", None, True))
 
     def test_cues_match_named_or_not(self):
         for text in ("What do you think?", "Hey Jarvis, play that back please.", "Mute"):
             with self.subTest(text=text):
                 self.assertTrue(duck_cue_shaped(text, OURS))
-        self.assertTrue(duck_cue_shaped("what do you think", None))
+        self.assertTrue(duck_cue_shaped("are you still listening", None))
         self.assertFalse(duck_cue_shaped("What do you think of it?", OURS))
+        self.assertFalse(duck_cue_shaped("Done thinking.", OURS))
+
+
+def fragment(text, start, end, speaker="Speaker A"):
+    return {
+        "text": text,
+        "start_ms": start,
+        "end_ms": end,
+        "speaker": speaker,
+        "overlap": False,
+        "speaker_provenance": "diarization-timeline",
+    }
 
 
 class DuckPhraseMergeTests(unittest.TestCase):
-    """A named duck phrase is released alone, at once, even with the owner pause (R-1)."""
+    """While ducking, the exit and the cues are released alone and at once, even with the
+    owner pause (R-1), and a lone wake word still joins the exit (#230)."""
 
-    def fragment(self, text, start, end, speaker="Speaker A"):
-        return {
-            "text": text,
-            "start_ms": start,
-            "end_ms": end,
-            "speaker": speaker,
-            "overlap": False,
-            "speaker_provenance": "diarization-timeline",
-        }
-
-    def merger(self, emitted, **options):
+    def merger(self, emitted, breaks=None, **options):
         stop = SpeakerPriority().is_stop_phrase
+        if breaks is None:
+
+            def breaks(text):
+                return (
+                    stop(text)
+                    or duck_phrase_shaped(text, OURS, True)
+                    or duck_cue_shaped(text, OURS)
+                )
+
         return TurnMerger(
             2000,
             24000,
             emitted.append,
-            lambda text: stop(text) or duck_phrase_shaped(text, OURS),
+            breaks,
             owner=lambda item: item["speaker"] == "Speaker A",
             owner_pause_ms=6000,
             **options,
         )
 
+    @staticmethod
+    def texts(emitted):
+        return [e["text"] for e in emitted]
+
     def test_the_exit_is_never_joined_onto_held_owner_speech(self):
         emitted = []
         merger = self.merger(emitted)
-        merger.offer(self.fragment("So that is the plan for the week", 0, 2000), complete=True)
-        merger.offer(self.fragment("Jarvis, done thinking.", 3000, 4000))
+        merger.offer(fragment("So that is the plan for the week", 0, 2000), complete=True)
+        merger.offer(fragment("Jarvis, done thinking.", 3000, 4000))
         self.assertEqual(
-            [e["text"] for e in emitted],
-            ["So that is the plan for the week", "Jarvis, done thinking."],
+            self.texts(emitted), ["So that is the plan for the week", "Jarvis, done thinking."]
         )
 
     def test_nothing_joins_the_exit_after_it(self):
         emitted = []
         merger = self.merger(emitted)
-        merger.offer(self.fragment("Jarvis, done thinking.", 0, 1000))
-        self.assertEqual([e["text"] for e in emitted], ["Jarvis, done thinking."])
-        merger.offer(self.fragment("and one more thing", 1500, 2500))
+        merger.offer(fragment("Jarvis, done thinking.", 0, 1000))
+        self.assertEqual(self.texts(emitted), ["Jarvis, done thinking."])
+        merger.offer(fragment("and one more thing", 1500, 2500))
         merger.flush()
-        self.assertEqual(
-            [e["text"] for e in emitted], ["Jarvis, done thinking.", "and one more thing"]
-        )
+        self.assertEqual(self.texts(emitted), ["Jarvis, done thinking.", "and one more thing"])
 
     def test_a_split_exit_is_emitted_as_soon_as_it_is_whole(self):
         emitted = []
         merger = self.merger(emitted)
-        merger.offer(self.fragment("Jarvis, done", 0, 800))
+        merger.offer(fragment("Jarvis, done", 0, 800))
         self.assertEqual(emitted, [])
-        merger.offer(self.fragment("thinking.", 1200, 1800))
-        self.assertEqual([e["text"] for e in emitted], ["Jarvis, done thinking."])
+        merger.offer(fragment("thinking.", 1200, 1800))
+        self.assertEqual(self.texts(emitted), ["Jarvis, done thinking."])
+
+    def test_a_comma_pause_exit_still_joins_the_lone_wake_word(self):
+        # Key 1's B2: "Jarvis," unattributed, then the owner's "done thinking." (#230).
+        emitted = []
+        merger = self.merger(emitted, wake_word=lambda text: OURS.name_for(text) is not None)
+        merger.offer(fragment("Jarvis,", 0, 500, speaker=None), complete=True)
+        merger.offer(fragment("done thinking.", 900, 1600))
+        self.assertEqual(self.texts(emitted), ["Jarvis, done thinking."])
 
     def test_a_cue_while_ducking_is_released_alone_and_at_once(self):
         emitted = []
-        merger = TurnMerger(
-            2000,
-            24000,
-            emitted.append,
-            lambda text: duck_cue_shaped(text, OURS),
-            owner=lambda item: item["speaker"] == "Speaker A",
-            owner_pause_ms=6000,
-        )
-        merger.offer(self.fragment("I keep coming back to the second option", 0, 2000))
-        merger.offer(self.fragment("What do you think?", 3000, 3800), complete=True)
+        merger = self.merger(emitted)
+        merger.offer(fragment("I keep coming back to the second option", 0, 2000))
+        merger.offer(fragment("What do you think?", 3000, 3800), complete=True)
         self.assertEqual(
-            [e["text"] for e in emitted],
-            ["I keep coming back to the second option", "What do you think?"],
+            self.texts(emitted), ["I keep coming back to the second option", "What do you think?"]
         )
 
     def test_without_the_break_the_owner_pause_would_hide_it(self):
         # The failure this guards against (hailing-station #783 review).
         emitted = []
-        merger = TurnMerger(
-            2000,
-            24000,
-            emitted.append,
-            SpeakerPriority().is_stop_phrase,
-            owner=lambda item: item["speaker"] == "Speaker A",
-            owner_pause_ms=6000,
-        )
-        merger.offer(self.fragment("So that is the plan for the week", 0, 2000), complete=True)
-        merger.offer(self.fragment("Jarvis, done thinking.", 3000, 4000))
+        merger = self.merger(emitted, breaks=SpeakerPriority().is_stop_phrase)
+        merger.offer(fragment("So that is the plan for the week", 0, 2000), complete=True)
+        merger.offer(fragment("Jarvis, done thinking.", 3000, 4000))
         merger.flush()
         self.assertEqual(
-            [e["text"] for e in emitted],
-            ["So that is the plan for the week Jarvis, done thinking."],
+            self.texts(emitted), ["So that is the plan for the week Jarvis, done thinking."]
         )
 
 

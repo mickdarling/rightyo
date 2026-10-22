@@ -1678,6 +1678,11 @@ class DecisionPathTests(unittest.TestCase):
             events[0]["addressing"], {"names": ["Haili"], "variants": {"Haili": ["Hailey"]}}
         )
 
+    def test_a_live_session_advertises_the_duck_control(self):
+        # Hailing Station enters duck mode only for a child that advertised it (#735 R-2).
+        events, _ = self.run_listen()
+        self.assertEqual(events[0]["duck"], {"version": 1})
+
     def test_without_merging_the_same_speech_takes_two_decisions(self):
         events, provider = self.run_listen(turns={"merge_gap_ms": 0})
         self.assertEqual(provider.requests, 2)
