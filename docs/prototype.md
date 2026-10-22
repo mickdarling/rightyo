@@ -45,7 +45,8 @@ off); see [joined turns](tool-api.md#joined-turns), which also covers `complete_
 `collapse_restarts` and `bridge_backchannels` for one thought split into several
 requests (#216), `wake_join` (default true) for a lone wake word split from the owner's
 sentence (#230), `owner_pause_ms` (default 0, off; 0 to 10,000) for a longer pause
-on the owner's turns only (hailing-station#735), and `word_label_coverage` (default 0, off; 0.5 suggested) for one-word
+on the owner's turns only, which joins them even with `merge_gap_ms` 0
+(hailing-station#735), and `word_label_coverage` (default 0, off; 0.5 suggested) for one-word
 turns left without a speaker (#220). The same object's `reply_wait_ms`
 (default 1,200 ms, 0 to 3,000, 0 off) sets how long a question or request is held to
 observe the [post-turn gap](tool-api.md#scene-and-post-turn-gap). The same object's

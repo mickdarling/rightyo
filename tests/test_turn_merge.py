@@ -729,6 +729,134 @@ class OwnerPauseTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 pause_merger([], pause=invalid)
 
+    def test_a_guest_turn_still_held_never_takes_the_owner_window(self):
+        # No tick past the merge gap: the guest's turn is still held (as when an utterance
+        # opened inside the gap) when the same label's piece starts after the gap.
+        for speaker in (GUEST, "Speaker C"):
+            for complete in (False, True):
+                with self.subTest(speaker=speaker, complete=complete):
+                    steps = [
+                        ("offer", fragment("guest one", 0, 1000, speaker=speaker), False),
+                        ("offer", fragment("guest two", 3500, 4000, speaker=speaker), complete),
+                        ("flush",),
+                    ]
+                    emitted, baseline = self.run_both(steps, reply_wait_ms=1200)
+                    self.assertEqual(dumps(emitted), dumps(baseline))
+                    self.assertEqual([i["text"] for i in emitted], ["guest one", "guest two"])
+        # Another speaker's piece releases a held owner turn with one owner check.
+        asked, emitted = [], []
+
+        def counting(item):
+            asked.append(item["speaker"])
+            return item["speaker"] == OWNER
+
+        merger = pause_merger(emitted, owner=counting)
+        merger.offer(fragment("owner one", 0, 1000))
+        merger.offer(fragment("guest one", 3500, 4000, speaker=GUEST))
+        self.assertEqual([i["text"] for i in emitted], ["owner one"])
+        self.assertEqual(asked, [OWNER, GUEST])
+        # Control: the owner's piece at the same time joins.
+        self.merger.offer(fragment("owner one", 0, 1000))
+        self.merger.offer(fragment("owner two", 3500, 4000))
+        self.merger.flush()
+        self.assertEqual(self.texts(), ["owner one owner two"])
+
+    def test_a_label_that_stops_resolving_to_the_owner_keeps_the_defaults(self):
+        # A live identification rebind while the turn is held (#137): from the next
+        # piece on, the label is not the owner's.
+        for complete in (False, True):
+            with self.subTest(complete=complete):
+                owner_now, asked, emitted = [True], [], []
+
+                def owner(item):
+                    asked.append(item["text"])
+                    return owner_now[0] and item["speaker"] == OWNER
+
+                merger = pause_merger(emitted, owner=owner, reply_wait_ms=1200)
+                merger.offer(fragment("first part", 0, 1000), complete=complete)
+                owner_now[0] = False
+                # Past the 2,000 ms merge gap, inside the pause: not joined.
+                merger.offer(fragment("second part", 4000, 5000))
+                self.assertEqual([i["text"] for i in emitted], ["first part"])
+                # The released piece itself is held only the usual merge gap.
+                merger.due(5000 + 2000 - 1, None)
+                self.assertEqual(len(emitted), 1)
+                merger.due(5000 + 2000, None)
+                self.assertEqual([i["text"] for i in emitted], ["first part", "second part"])
+                # Asked once per offer: the same label's answer is reused within one.
+                self.assertEqual(asked, ["first part", "first part"])
+
+    def test_a_rebind_during_a_join_drops_back_to_the_merge_gap(self):
+        owner_now, emitted = [True], []
+        merger = pause_merger(emitted, owner=lambda item: owner_now[0] and item["speaker"] == OWNER)
+        merger.offer(fragment("first part", 0, 1000))
+        owner_now[0] = False
+        # Within the merge gap, so it joins; the joined turn then waits only the gap.
+        merger.offer(fragment("second part", 1500, 2000))
+        merger.due(2000 + 2000 - 1, None)
+        self.assertEqual(emitted, [])
+        merger.due(2000 + 2000, None)
+        self.assertEqual([i["text"] for i in emitted], ["first part second part"])
+        # A piece after the gap would no longer have joined.
+        self.assertFalse(merger.holding)
+
+    def test_a_rebound_joined_turn_reports_the_gap_it_would_have_without_the_pause(self):
+        # Not request-shaped, then a request-shaped join after a rebind: the joined turn
+        # is observed over the reply wait (3,000 ms), as with the pause off.
+        def run(pause):
+            owner_now, emitted = [True], []
+            merger = pause_merger(
+                emitted,
+                pause=pause,
+                owner=lambda item: owner_now[0] and item["speaker"] == OWNER,
+                reply_wait_ms=3000,
+            )
+            merger.offer(fragment("so anyway", 0, 1000))
+            owner_now[0] = False
+            merger.offer(fragment("what time is it?", 2500, 3000))
+            for now in range(3000, 12001, 100):
+                merger.due(now, None)
+            return emitted
+
+        baseline = run(0)
+        self.assertEqual(dumps(run(PAUSE)), dumps(baseline))
+        self.assertEqual(baseline[0]["post_turn_gap"]["window_ms"], 3000)
+
+    def test_a_smaller_pause_never_shortens_the_complete_hold(self):
+        emitted = []
+        merger = pause_merger(emitted, pause=500, complete_hold_ms=3000)
+        merger.offer(fragment("Jarvis, add milk.", 0, 1000), complete=True)
+        merger.due(3999, None)
+        self.assertEqual(emitted, [])
+        merger.due(4000, None)
+        self.assertEqual([i["text"] for i in emitted], ["Jarvis, add milk."])
+
+    def test_a_complete_owner_turn_with_an_utterance_local_label_is_not_held(self):
+        item = fragment("Jarvis, add milk.", 0, 1000)
+        item["speaker_provenance"] = "diarization-utterance"
+        self.merger.offer(item, complete=True)
+        self.assertEqual(self.texts(), ["Jarvis, add milk."])
+        self.assertFalse(self.merger.holding)
+
+    def test_without_reply_wait_owner_turns_carry_no_gap_evidence(self):
+        for complete in (False, True):
+            with self.subTest(complete=complete):
+                emitted = []
+                drive(
+                    pause_merger(emitted),
+                    [
+                        ("offer", fragment("what time is it?", 0, 1000), complete),
+                        *ticks(1000, 8000),
+                        ("offer", fragment("what time", 9000, 9500), False),
+                        *ticks(9500, 12000),
+                        ("offer", fragment("is it?", 12500, 13000), False),
+                        *ticks(13000, 20000),
+                    ],
+                )
+                self.assertEqual(len(emitted), 2)
+                for item in emitted:
+                    self.assertNotIn("post_turn_gap", item)
+
     def test_a_shorter_pause_never_shortens_the_merge_gap(self):
         emitted = []
         merger = pause_merger(emitted, pause=500)
@@ -799,6 +927,51 @@ class OwnerPauseInteractionTests(unittest.TestCase):
             turn["post_turn_gap"],
             observe_gap(turn, None, 2000),
         )
+
+    def test_a_bridged_backchannel_is_the_following_speech_in_the_frozen_gap(self):
+        # The owner's turn, then a guest's "yeah" 100 ms later, bridged (#216).
+        def run(pause, ticks_to):
+            emitted = []
+            merger = pause_merger(
+                emitted, pause=pause, reply_wait_ms=1200, bridge_backchannels=True
+            )
+            merger.offer(fragment("turn off the lights", 0, 1000))
+            merger.offer(fragment("yeah", 1100, 1300, speaker=GUEST), complete=True)
+            for now in range(1300, ticks_to + 1, 100):
+                merger.due(now, None)
+            merger.flush()
+            return emitted
+
+        baseline = run(0, 6000)
+        for ticks_to in (3100, 6000):
+            with self.subTest(ticks_to=ticks_to):
+                emitted = run(4000, ticks_to)
+                self.assertEqual(dumps(emitted), dumps(baseline))
+                self.assertEqual(
+                    emitted[0]["post_turn_gap"],
+                    {
+                        "observed": True,
+                        "window_ms": 2000,
+                        "silence_ms": 100,
+                        "following": "different_speaker",
+                    },
+                )
+
+    def test_a_joined_owner_turn_judged_complete_has_no_gap_evidence(self):
+        emitted = []
+        merger = pause_merger(emitted, reply_wait_ms=1200)
+        drive(
+            merger,
+            [
+                ("offer", fragment("Jarvis, what time", 0, 1000), False),
+                *ticks(1000, 3900),
+                ("offer", fragment("is it?", 4000, 4500), True),
+                *ticks(4500, 12000),
+            ],
+        )
+        (turn,) = emitted
+        self.assertEqual(turn["text"], "Jarvis, what time is it?")
+        self.assertNotIn("post_turn_gap", turn)
 
     def test_tail_join_keeps_its_own_window(self):
         def run(start):
