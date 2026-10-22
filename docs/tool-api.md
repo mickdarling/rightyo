@@ -459,6 +459,53 @@ does not look cut off, so one thought becomes two or three requests
   Any other speech by someone else releases the held turn, so turns never join across a
   change of speaker.
 
+The owner can also be given a longer pause than everyone else
+([hailing-station#735](https://github.com/mickdarling/hailing-station/issues/735), R-1).
+`"turns": {"owner_pause_ms": 4000}` (default 0, off; 0 to 10,000) applies only to a turn
+whose speaker label has the `owner` role when it starts being held, resolved as for the
+lone wake word above (configured session labels, or a live identification binding to an
+owner identity, looked up without side effects). The role is checked again before a
+piece that could join the held turn or be bridged across it (the same label, an
+unlabelled tail, a backchannel), and once when the hold the turn would have had without
+the pause runs out. If the label no longer resolves to the owner (live identification
+rebound it), the turn behaves from then on as with `owner_pause_ms` 0: it is released at
+once if that hold would already have released it, and otherwise keeps that hold. It needs configured owners and does nothing without them. Unlike
+the lone wake word join, it also joins the owner's pieces when `merge_gap_ms` is 0. Such
+a turn:
+
+- when an end-of-turn model calls it complete, is held for the larger of
+  `owner_pause_ms` and `complete_hold_ms`, as `complete_hold_ms` would hold it: only a
+  `diarization-timeline` turn, only the same labelled speaker's continuation joins, and
+  its post-turn gap stays unobserved;
+- otherwise is held, and joined by the same labelled speaker's continuation, for the
+  larger of `owner_pause_ms` and its usual hold, so a shorter value never shortens the
+  merge gap. Its post-turn gap is what it would have been without the longer hold:
+  observed over the usual window (the largest of the merge gap, `tail_join_ms` and, for a
+  request-shaped turn, `reply_wait_ms`) and frozen once that has passed, so later speech
+  never counts as following it; a bridged backchannel after it counts as the following
+  speech, as it would on release. A joined turn waits the owner pause again after its
+  last piece.
+
+A guest, a participant, an unknown speaker, an unlabelled piece and an overlapping piece
+keep the defaults, and with `owner_pause_ms` 0 nothing changes. A stop phrase or a
+dismissal-shaped piece is still never held: it releases the held owner turn and follows
+at once. Another speaker's turn still releases the held owner turn (a backchannel with
+`bridge_backchannels` still bridges it), tail join keeps its own window, a piece that
+looks cut off is held the owner pause rather than the merge gap, and a lone wake word
+joined to the owner's sentence then waits the owner pause like any owner turn. The owner
+pause joins only the owner's own labelled pieces, so a joined turn is not marked
+inferred.
+
+The cost is latency, mostly on the owner's turns. An owner turn judged complete is
+emitted and decided about `owner_pause_ms` minus the silence already waited at
+finalization later than without the pause; any other owner turn about `owner_pause_ms`
+minus its usual hold later. Each joined piece restarts the pause, so in the worst case a
+turn is released about `max_span_ms` (24 s by default) plus the pause after it started,
+plus any utterance still open at the deadline. If anyone starts speaking within the
+pause it waits until that utterance is finalized, as for any hold. With
+`bridge_backchannels`, another speaker's backchannel during the pause is emitted after
+the owner's turn, so it can be delayed by up to the pause too.
+
 A joined turn spans at most twice `max_utterance_ms` (24 s by default) and 4,000
 characters; a piece that would exceed either starts a new turn. A role is still fixed
 the first time a speaker is emitted, on the joined turn.
