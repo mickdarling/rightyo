@@ -1286,9 +1286,16 @@ local recognizer, diarizer and end-of-turn model still hear the audio in memory,
 order to run (the open utterance's PCM). Nothing is written to disk, even briefly: the
 whisper.cpp transcriber, for every utterance whether private or not, takes the WAV on
 stdin (`--file -`) and returns its JSON on stdout (`--output-file -`), and runs with a working
-directory, `HOME` and `TMPDIR` verified unwritable by this process (`/var/empty` on
-macOS, `/proc` on Linux; never a fallback: without one, `listen` refuses to start and the
-recognizer refuses to run), so a kill mid-transcription leaves nothing behind and nothing
+directory, `HOME` and `TMPDIR` in which this process cannot create a file: the first of
+`/var/empty` and `/proc` that is a real directory (checked with `lstat`, so a symlink is
+never used or probed) and in which an exclusive, no-follow create of an unpredictably
+named empty file is refused (EACCES, EPERM, EROFS or ENOENT). A create that succeeds
+means writable: the probe file is removed at once and the directory is not used. The
+check is by behaviour, not permission bits, so root works where the refusal is real
+(procfs on Linux), and is refused where root can write (`/var/empty` on macOS). The
+choice is probed once per process and re-probed only if that directory stops being a real
+directory. There is no fallback: without one, `listen` refuses to start and the recognizer
+refuses to run, so a kill mid-transcription leaves nothing behind and nothing
 is ever put in the shared temporary root. Its stdout is read in chunks and the recognizer
 is stopped as soon as it passes 2 MiB ("Local recognizer failed"); its stderr goes to the
 null device. There is no debug dump. Logs carry

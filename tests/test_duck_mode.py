@@ -1161,35 +1161,119 @@ class RecognizerSandboxTests(unittest.TestCase):
         self.root = Path(directory.name)
 
     def candidates(self, *paths):
+        """These candidates, with an empty per-process cache, both restored afterwards."""
         from rightyo import live_audio
 
-        return mock.patch.object(live_audio, "NO_FILES_CANDIDATES", tuple(map(str, paths)))
+        stack = contextlib.ExitStack()
+        stack.enter_context(
+            mock.patch.object(live_audio, "NO_FILES_CANDIDATES", tuple(map(str, paths)))
+        )
+        stack.enter_context(mock.patch.object(live_audio, "_recognizer_dir_cache", None))
+        return stack
 
-    def test_a_writable_or_missing_or_linked_candidate_is_refused(self):
+    def probes(self):
+        """A spy on the creation probe: the directories it was asked about."""
+        from rightyo import live_audio
+
+        asked, real = [], live_audio._refuses_creation
+
+        def spy(directory):
+            asked.append(directory)
+            return real(directory)
+
+        return asked, mock.patch.object(live_audio, "_refuses_creation", spy)
+
+    def locked(self, name="locked"):
+        """A directory this (non-root) process cannot create anything in."""
+        if os.geteuid() == 0:
+            self.skipTest("root can write any ordinary directory")
+        locked = self.root / name
+        locked.mkdir()
+        locked.chmod(0o555)
+        self.addCleanup(lambda: locked.exists() and locked.chmod(0o755))
+        return locked
+
+    def test_a_writable_or_missing_candidate_is_refused_and_leaves_no_residue(self):
         writable = self.root / "writable"
         writable.mkdir()
-        link = self.root / "link"
-        link.symlink_to(writable)
-        for path in (writable, self.root / "missing", link):
+        for path in (writable, self.root / "missing"):
             with self.subTest(path=path.name), self.candidates(path):
                 with self.assertRaises(RecognizerSandboxError):
                     recognizer_dir()
+        self.assertEqual(list(writable.iterdir()), [])
+
+    def test_a_symlink_is_rejected_without_being_probed(self):
+        # Also #244: a symlinked candidate, even to an unwritable directory, never counts.
+        link = self.root / "link"
+        link.symlink_to(self.locked())
+        asked, spy = self.probes()
+        with spy, self.candidates(link), self.assertRaises(RecognizerSandboxError):
+            recognizer_dir()
+        self.assertEqual(asked, [])
 
     def test_an_unwritable_directory_is_accepted_and_preferred_in_order(self):
-        if os.geteuid() == 0:
-            self.skipTest("root can write any directory")
-        locked = self.root / "locked"
-        locked.mkdir()
-        locked.chmod(0o555)
-        self.addCleanup(locked.chmod, 0o755)
+        locked = self.locked()
         with self.candidates(self.root / "missing", self.root, locked):
             self.assertEqual(recognizer_dir(), str(locked))
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["locked"])
+
+    def test_the_probe_decides_not_the_permission_bits(self):
+        # Codex P1 on be56490: root's `os.access` says "writable" for procfs, which refuses
+        # new files. With `os.access` always true, the probe still accepts an unwritable
+        # directory and still rejects a writable one.
+        from rightyo import live_audio
+
+        locked = self.locked()
+        writable = self.root / "writable"
+        writable.mkdir()
+        with mock.patch.object(live_audio.os, "access", return_value=True):
+            with self.candidates(writable, locked):
+                self.assertEqual(recognizer_dir(), str(locked))
+        self.assertEqual(list(writable.iterdir()), [])
+
+    def test_the_choice_is_cached_and_reprobed_only_when_it_vanishes(self):
+        first, second = self.locked("first"), self.locked("second")
+        asked, spy = self.probes()
+        with spy, self.candidates(first, second):
+            self.assertEqual(recognizer_dir(), str(first))
+            self.assertEqual(recognizer_dir(), str(first))
+            self.assertEqual(asked, [str(first)])
+            # The cached directory disappears: probed again, and the next one is chosen.
+            first.chmod(0o755)
+            first.rmdir()
+            self.assertEqual(recognizer_dir(), str(second))
+            self.assertEqual(asked, [str(first), str(second)])
+
+    def test_a_refusal_counts_only_for_the_unwritable_errors(self):
+        import errno
+
+        from rightyo import live_audio
+
+        for number, accepted in (
+            (errno.EACCES, True),
+            (errno.EPERM, True),
+            (errno.EROFS, True),
+            (errno.ENOENT, True),
+            (errno.ENOSPC, False),
+            (errno.EIO, False),
+        ):
+            with (
+                self.subTest(errno=errno.errorcode[number]),
+                self.candidates(self.root),
+                mock.patch.object(live_audio.os, "open", side_effect=OSError(number, "x")),
+            ):
+                if accepted:
+                    self.assertEqual(recognizer_dir(), str(self.root))
+                else:
+                    with self.assertRaises(RecognizerSandboxError):
+                        recognizer_dir()
 
     @unittest.skipUnless(os.path.isdir("/var/empty"), "macOS /var/empty")
     def test_var_empty_is_accepted_on_macos(self):
         if os.geteuid() == 0:
-            self.skipTest("root can write /var/empty")
+            self.skipTest("root can write /var/empty on macOS, so the probe refuses it")
         self.assertEqual(recognizer_dir(), "/var/empty")
+        self.assertEqual(os.listdir("/var/empty"), [])
 
     def test_without_one_transcription_is_refused_before_any_audio(self):
         model = self.root / "model"

@@ -14,12 +14,15 @@ import array
 import base64
 import contextlib
 import ctypes
+import errno
 import inspect
 import io
 import json
 import math
 import os
+import secrets
 import selectors
+import stat
 import subprocess
 import sys
 import threading
@@ -837,18 +840,59 @@ class RecognizerSandboxError(LiveAudioError):
     """No directory this process cannot write is available for the local recognizer."""
 
 
-def recognizer_dir() -> str:
-    """The first real, unwritable candidate directory (`NO_FILES_CANDIDATES`).
+# What a refused exclusive create in an unwritable directory fails with.
+UNWRITABLE_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOENT})
+# The directory chosen by the first successful probe in this process (see `recognizer_dir`).
+_recognizer_dir_cache: str | None = None
 
-    Verified each time: a directory that is missing, a symlink, or writable by this process
-    (as for root) is refused, and with none left this raises `RecognizerSandboxError`.
+
+def _real_directory(path: str) -> bool:
+    """Whether `path` itself is a directory, by `lstat`: a symlink never is."""
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _refuses_creation(directory: str) -> bool:
+    """Whether creating a file in `directory` really fails, by trying it.
+
+    `os.access` is not enough: root's override reports procfs (which refuses new files)
+    as writable. So this exclusively creates an unpredictably named file, never following
+    a link, and writes nothing. A refusal with EACCES, EPERM, EROFS or ENOENT means
+    unwritable. Any success means writable: the file is closed and unlinked at once. Any
+    other error counts as writable (fail closed).
     """
+    probe = os.path.join(directory, secrets.token_hex(16))
+    try:
+        descriptor = os.open(
+            probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600
+        )
+    except OSError as error:
+        return error.errno in UNWRITABLE_ERRNOS
+    os.close(descriptor)
+    with contextlib.suppress(OSError):
+        os.unlink(probe)
+    return False
+
+
+def recognizer_dir() -> str:
+    """The first candidate (`NO_FILES_CANDIDATES`) that is a real directory (by `lstat`,
+    so never a symlink, which is never probed) in which this process cannot create a file
+    (`_refuses_creation`).
+
+    Probed once per process and cached; probed again only if the cached directory stops
+    being a real directory. Decided by behaviour rather than permission bits, so it is right
+    for root too. With no candidate left this raises `RecognizerSandboxError`.
+    """
+    global _recognizer_dir_cache
+    cached = _recognizer_dir_cache
+    if cached is not None and _real_directory(cached):
+        return cached
+    _recognizer_dir_cache = None
     for candidate in NO_FILES_CANDIDATES:
-        if (
-            os.path.isdir(candidate)
-            and not os.path.islink(candidate)
-            and not os.access(candidate, os.W_OK)
-        ):
+        if _real_directory(candidate) and _refuses_creation(candidate):
+            _recognizer_dir_cache = candidate
             return candidate
     raise RecognizerSandboxError(
         "The local recognizer needs a directory this process cannot write, such as /var/empty"
