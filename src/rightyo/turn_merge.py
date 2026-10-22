@@ -260,6 +260,11 @@ class TurnMerger:
         # The owner-only pause of the held fragment (#735): `owner_pause_ms` when it was
         # the owner's when it started being held, else 0.
         self._held_pause = 0
+        # With the owner pause: the hold the held turn would have had without it (0: it
+        # would have been emitted at once), and whether that hold would have released it
+        # by now, so a label that stops being the owner's behaves exactly as at 0.
+        self._base_hold = 0
+        self._base_passed = False
         # Whether the held fragment is held longer than it would have been without the
         # wake word hold or the owner pause, and the post-turn gap window it would then
         # have had (None: it would have been emitted with its gap unobserved).
@@ -408,6 +413,8 @@ class TurnMerger:
             # the owner's (#735). A live identification rebind ends its pause, and it
             # keeps the defaults from here. Any other piece releases it anyway.
             self._held_pause = self._owner_pause_for(self._held, asked)
+            if not self._held_pause:
+                self._end_owner_pause()
         if self._held_wake:
             # Only the owner's own sentence continues a lone wake word (#230); the owner
             # predicate is asked once per offered fragment.
@@ -451,6 +458,7 @@ class TurnMerger:
             if self._held_pause:
                 # The owner's joined turn waits the owner pause again (#735), with its gap
                 # observed over the window it would have had without it.
+                self._base_hold, self._base_passed = self._hold_ms, False
                 self._extend(self._hold_ms, self._held_pause)
             # Detected speech up to now belonged to the continuation just joined.
             self._heard_ms = None
@@ -462,6 +470,7 @@ class TurnMerger:
                 # Judged complete again: wait the short hold for a further piece.
                 self._hold_ms, self._held_complete = hold_complete, True
                 self._extended, self._base_window = False, None
+                self._base_hold, self._base_passed = self.complete_hold_ms, False
                 return
             if complete or self._breaks(held["text"]):
                 # The recognizer split the stop phrase itself ("never" + "mind"): emit
@@ -482,6 +491,7 @@ class TurnMerger:
         )
         wake = self._wake_only(fragment)
         extended, base_window = False, None
+        base_hold = self.complete_hold_ms if held_complete else 0
         if held_complete:
             hold = max(self.complete_hold_ms, pause)
         elif wake:
@@ -496,14 +506,15 @@ class TurnMerger:
             if pause and not complete:
                 # The owner's turn waits the owner pause for its continuation (#735), with
                 # its gap observed over the window it would have had without it.
-                base = hold
+                base_hold = hold
                 hold = max(hold, pause)
-                extended, base_window = self._extension(base, hold)
+                extended, base_window = self._extension(base_hold, hold)
         if hold:
             self._held, self._hold_ms, self._heard_ms = dict(fragment), hold, None
             self._held_complete = held_complete
             self._held_wake = wake
             self._held_pause = pause
+            self._base_hold, self._base_passed = base_hold, False
             self._extended, self._base_window = extended, base_window
         else:
             self.emit(dict(fragment))
@@ -514,6 +525,15 @@ class TurnMerger:
         if hold <= base:
             return False, None
         return True, (base or None) if self.reply_wait_ms else None
+
+    def _end_owner_pause(self) -> None:
+        """The held turn's label is no longer the owner's (#735): it behaves as without the
+        pause. If the hold it would have had would already have released it (or it would
+        have been emitted at once, as a turn judged complete with no `complete_hold_ms`),
+        it is released now, before the piece being offered. Otherwise that piece either
+        joins it, which sets its hold afresh, or releases it."""
+        if self._base_passed or not self._base_hold:
+            self._release(None, quiet=True)
 
     def _extend(self, base: int, pause: int) -> None:
         """Hold the held turn for the owner pause, or `base` if that is longer (#735)."""
@@ -583,6 +603,11 @@ class TurnMerger:
                 if after and (following is None or after[0]["start_ms"] < following["start_ms"]):
                     following = after[0]
                 held["post_turn_gap"] = observe_gap(held, following, window)
+        if self._held_pause and not self._base_passed:
+            # Whether the hold without the owner pause would have released it by now.
+            ended = held["end_ms"] + self._base_hold
+            if now_ms >= ended and (open_since_ms is None or open_since_ms > ended):
+                self._base_passed = True
         deadline = held["end_ms"] + self._hold_ms
         if now_ms >= deadline and (open_since_ms is None or open_since_ms > deadline):
             # No fragment arrived through the whole window: quiet, unless speech was
@@ -599,6 +624,7 @@ class TurnMerger:
         heard, self._heard_ms = self._heard_ms, None
         held_complete, self._held_complete = self._held_complete, False
         self._held_wake, self._held_pause = False, 0
+        self._base_hold, self._base_passed = 0, False
         extended, self._extended = self._extended, False
         base_window, self._base_window = self._base_window, None
         bridged, self._bridged = self._bridged, []
@@ -652,6 +678,7 @@ class TurnMerger:
         self._held_complete = False
         self._held_wake = False
         self._held_pause = 0
+        self._base_hold, self._base_passed = 0, False
         self._extended = False
         self._base_window = None
         self._bridged = []

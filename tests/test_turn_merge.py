@@ -822,6 +822,46 @@ class OwnerPauseTests(unittest.TestCase):
         self.assertEqual(dumps(run(PAUSE)), dumps(baseline))
         self.assertEqual(baseline[0]["post_turn_gap"]["window_ms"], 3000)
 
+    def test_after_a_rebind_the_held_turn_behaves_exactly_as_at_zero(self):
+        # Codex P2 on #233: a turn held only because the owner pause holds a turn judged
+        # complete must not join the next piece on the merge gap once the label is no
+        # longer the owner's; at 0 it was emitted at once (or after `complete_hold_ms`).
+        def run(pause, complete_hold, second_at, ticked, complete):
+            owner_now, emitted = [True], []
+            merger = pause_merger(
+                emitted,
+                pause=pause,
+                owner=lambda item: owner_now[0] and item["speaker"] == OWNER,
+                complete_hold_ms=complete_hold,
+                reply_wait_ms=1200,
+            )
+            merger.offer(fragment("what time is it?", 0, 1000), complete=complete)
+            if ticked:
+                for now in range(1000, second_at, 100):
+                    merger.due(now, None)
+            owner_now[0] = False
+            merger.offer(fragment("and in Tokyo?", second_at, second_at + 500))
+            for now in range(second_at + 500, second_at + 9000, 100):
+                merger.due(now, None)
+            merger.flush()
+            return emitted
+
+        for complete_hold in (0, 1000):
+            for second_at in (1500, 2500):
+                for ticked in (False, True):
+                    for complete in (True, False):
+                        case = dict(
+                            complete_hold=complete_hold,
+                            second_at=second_at,
+                            ticked=ticked,
+                            complete=complete,
+                        )
+                        with self.subTest(**case):
+                            self.assertEqual(dumps(run(PAUSE, **case)), dumps(run(0, **case)))
+        # The reported case: two requests stay two.
+        texts = [i["text"] for i in run(PAUSE, 0, 1500, True, True)]
+        self.assertEqual(texts, ["what time is it?", "and in Tokyo?"])
+
     def test_a_smaller_pause_never_shortens_the_complete_hold(self):
         emitted = []
         merger = pause_merger(emitted, pause=500, complete_hold_ms=3000)
