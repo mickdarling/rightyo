@@ -232,3 +232,42 @@ rm -rf /private/tmp/vp
 Defaults: 24 clips per duration, seed 137, four threads. The same seed reproduces the same
 clips and noise from the same rendered audio. macOS voice updates can change the renders;
 the manifest records their hashes.
+
+## Owner match measurement (#243)
+
+`scripts/owner_match_report.py` measures the enrolled owner's live matching before any threshold or
+enrolment change. It reads only the content-free shadow `speaker_id` notes and scores only
+voices other than the owner. It changes nothing in the pipeline.
+
+- `turns --log <stderr log>` reads the per-turn notes, which hold label, speech length, turn
+  score, state, identifier and route.
+  - A session label that ever bound to the owner counts as the owner for all of its turns. Any
+    of its turns not bound to the owner at the time is a miss.
+  - Each note's score is against that note's closest identifier. Only scores against the
+    owner's print enter the quantiles; the rest are counted. With one enrolled print, every
+    score is against the owner's.
+  - The report breaks scores and misses down by speech length, input route and position.
+    Position counts only scored turns. Routes are limited to RightyO's allowlisted tokens, and
+    `unrecorded` mixes every session from before routes were logged.
+  - Labels that never bound are reported apart, as are the session summaries' unscored turns
+    (`short` under `min_turn_seconds`, plus `overlap`, `unsegmented` and `dropped`).
+- `negatives --config <prototype.json> --data <folder>` scores clips as a live turn is.
+  - Each clip's speech is trimmed and capped at 30 s first. It is then cut into 1, 2, 3, 6 and
+    12 s segments, at most 8 per clip, plus the whole trimmed clip.
+  - Each piece's mean of window embeddings is compared by cosine with the owner's voiceprint
+    made with the same model.
+  - The 1 s segments assume the default `min_turn_seconds` of 1.0.
+  - It reports false accepts at the tentative and bind thresholds for each top-level folder:
+    `say/` from `generate`, or voices kept outside Git.
+  - The folder names appear in the output verbatim, so never name one after a person or a
+    cloned voice.
+
+Both write aggregate JSON only: counts, rates and score quantiles, with no audio, embeddings,
+text, labels, file names or paths. Caveats:
+- A diarization label that merged two people counts both as the owner.
+- Synthetic and cloned voices are easier to reject than a guest in the room, the TV or a
+  recording of the owner, so `negatives` bounds false accepts from below.
+- A replayed recording of the owner cannot be measured this way at all.
+- Zero false accepts on these voices is not evidence for lowering a threshold or relaxing an
+  owner-only gate (privacy entry and exit, owner commands). That needs real guests, media and
+  replay.
