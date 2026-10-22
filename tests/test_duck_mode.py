@@ -25,7 +25,16 @@ from test_conversation import MODE, SESSION, decided, turn
 
 from rightyo import tool_events
 from rightyo.contracts import Addressing, ContractError, Dismissal, SpeakerPriority
-from rightyo.live_audio import NO_FILES_DIR, LiveAudioError, LiveConfig, _transcribe
+from rightyo.live_audio import (
+    MAX_RESPONSE_BYTES,
+    READ_CHUNK_BYTES,
+    LiveAudioError,
+    LiveConfig,
+    RecognizerSandboxError,
+    WhisperCppTranscriber,
+    _transcribe,
+    recognizer_dir,
+)
 from rightyo.live_speaker_id import EnrolledRoles, PcmRing
 from rightyo.memory import TranscriptMemory
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
@@ -1117,7 +1126,7 @@ class TranscriptionWritesNothingTests(unittest.TestCase):
         self.assertGreater(document["bytes"], len(pcm))
         self.assertEqual(
             {document["cwd"], document["home"], document["tmpdir"]},
-            {os.path.realpath(NO_FILES_DIR)} | {NO_FILES_DIR},
+            {os.path.realpath(recognizer_dir())} | {recognizer_dir()},
         )
         self.assertEqual(list(self.shared.iterdir()), [])
         self.assertEqual(
@@ -1169,6 +1178,11 @@ if mode == "oversize":
     sys.stdout.write(json.dumps({{"pad": "x" * (2 * 1024 * 1024 + 10)}}))
 if mode == "nondict":
     sys.stdout.write("[]")
+if mode == "flood":
+    chunk = "x" * 65536
+    while True:
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
 """
 
 
@@ -1235,6 +1249,136 @@ class TranscriptionFailureParityTests(unittest.TestCase):
         document, seen = self.run_mode("noise")
         self.assertEqual(document["transcription"][0]["text"], " walrus kumquat")
         self.assertNotIn("walrus", seen)
+
+
+class BoundedRecognizerTests(TranscriptionFailureParityTests):
+    """Codex P1 on #242: stdout is read in chunks and the recognizer is stopped at the cap,
+    and a large WAV on stdin never deadlocks against stdout."""
+
+    def test_a_flooding_recognizer_is_stopped_at_the_cap(self):
+        from rightyo import live_audio
+
+        read, total = os.read, [0]
+
+        def counted(descriptor, size):
+            chunk = read(descriptor, size)
+            total[0] += len(chunk)
+            return chunk
+
+        processes = []
+        (self.root / "mode").write_text("flood")
+        config = LiveConfig(
+            session_id="flood",
+            whisper_executable=self.whisper,
+            whisper_model=self.model,
+            diarization_library=self.model,
+            diarization_model=self.model,
+            timeout_seconds=60,
+        )
+        started = time.monotonic()
+        with (
+            mock.patch.object(live_audio.os, "read", counted),
+            self.assertRaises(LiveAudioError) as caught,
+        ):
+            _transcribe(config, b"\x01\x02" * 1600, processes.append)
+        self.assertEqual(str(caught.exception), "Local recognizer failed")
+        # Never more than one chunk past the cap was read, and the process was stopped.
+        self.assertGreater(total[0], MAX_RESPONSE_BYTES)
+        self.assertLessEqual(total[0], MAX_RESPONSE_BYTES + READ_CHUNK_BYTES)
+        self.assertIsNotNone(processes[0].poll())
+        self.assertLess(time.monotonic() - started, 30)
+
+    def test_a_large_wav_on_stdin_does_not_deadlock(self):
+        self.whisper.write_text(FAKE_WHISPER.format(python=sys.executable))
+        config = LiveConfig(
+            session_id="large",
+            whisper_executable=self.whisper,
+            whisper_model=self.model,
+            diarization_library=self.model,
+            diarization_model=self.model,
+            timeout_seconds=30,
+        )
+        pcm = b"\x01\x02" * (5 * 1024 * 1024)
+        document = _transcribe(config, pcm)
+        self.assertEqual(document["bytes"], len(pcm) + 44)
+
+
+class RecognizerSandboxTests(unittest.TestCase):
+    """Codex P2 on #242: the recognizer runs only in a directory verified unwritable by this
+    process; there is no fallback, so without one transcription is refused."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+
+    def candidates(self, *paths):
+        from rightyo import live_audio
+
+        return mock.patch.object(live_audio, "NO_FILES_CANDIDATES", tuple(map(str, paths)))
+
+    def test_a_writable_or_missing_or_linked_candidate_is_refused(self):
+        writable = self.root / "writable"
+        writable.mkdir()
+        link = self.root / "link"
+        link.symlink_to(writable)
+        for path in (writable, self.root / "missing", link):
+            with self.subTest(path=path.name), self.candidates(path):
+                with self.assertRaises(RecognizerSandboxError):
+                    recognizer_dir()
+
+    def test_an_unwritable_directory_is_accepted_and_preferred_in_order(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can write any directory")
+        locked = self.root / "locked"
+        locked.mkdir()
+        locked.chmod(0o555)
+        self.addCleanup(locked.chmod, 0o755)
+        with self.candidates(self.root / "missing", self.root, locked):
+            self.assertEqual(recognizer_dir(), str(locked))
+
+    @unittest.skipUnless(os.path.isdir("/var/empty"), "macOS /var/empty")
+    def test_var_empty_is_accepted_on_macos(self):
+        if os.geteuid() == 0:
+            self.skipTest("root can write /var/empty")
+        self.assertEqual(recognizer_dir(), "/var/empty")
+
+    def test_without_one_transcription_is_refused_before_any_audio(self):
+        model = self.root / "model"
+        model.touch()
+        config = LiveConfig(
+            session_id="sandbox",
+            whisper_executable=model,
+            whisper_model=model,
+            diarization_library=model,
+            diarization_model=model,
+        )
+        with self.candidates(self.root):
+            with self.assertRaises(RecognizerSandboxError):
+                WhisperCppTranscriber(config)
+            with self.assertRaises(RecognizerSandboxError):
+                _transcribe(config, b"\x01\x02" * 1600)
+            # And the controller refuses to start a session that would transcribe.
+            path = self.root / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        key: str(model)
+                        for key in (
+                            "whisper_executable",
+                            "whisper_model",
+                            "diarization_library",
+                            "diarization_model",
+                            "microphone_helper",
+                            "demo_audio",
+                        )
+                    }
+                )
+            )
+            controller = PrototypeController(PrototypeConfig.load(path))
+            self.addCleanup(controller.close)
+            with self.assertRaisesRegex(PrototypeError, "cannot write, such as /var/empty"):
+                controller.start({"mode": "demo"})
 
 
 def fragment(text, start, end, speaker="Speaker A"):

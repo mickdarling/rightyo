@@ -1285,10 +1285,13 @@ voiceprint evidence, and the exit relies on bindings made before privacy started
 local recognizer, diarizer and end-of-turn model still hear the audio in memory, in
 order to run (the open utterance's PCM). Nothing is written to disk, even briefly: the
 whisper.cpp transcriber, for every utterance whether private or not, takes the WAV on
-stdin (`--file -`) and returns its JSON on stdout (`--output-file -`), and runs with an
-unwritable working directory, `HOME` and `TMPDIR` (`/var/empty`), so a kill
-mid-transcription leaves nothing behind and nothing is ever put in the shared temporary
-root. There is no debug dump. Logs carry
+stdin (`--file -`) and returns its JSON on stdout (`--output-file -`), and runs with a working
+directory, `HOME` and `TMPDIR` verified unwritable by this process (`/var/empty` on
+macOS, `/proc` on Linux; never a fallback: without one, `listen` refuses to start and the
+recognizer refuses to run), so a kill mid-transcription leaves nothing behind and nothing
+is ever put in the shared temporary root. Its stdout is read in chunks and the recognizer
+is stopped as soon as it passes 2 MiB ("Local recognizer failed"); its stderr goes to the
+null device. There is no debug dump. Logs carry
 counts only: when privacy goes off, one stderr note
 `privacy off: discarded=N exit=N exit_refused=N status=N failed=N`.
 

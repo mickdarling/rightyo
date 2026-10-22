@@ -22,6 +22,7 @@ import os
 import selectors
 import subprocess
 import sys
+import threading
 import time
 import wave
 from collections import deque
@@ -823,9 +824,35 @@ def _terminate(process: subprocess.Popen) -> None:
 
 # Where the local recognizer runs (hailing-station #735 S-1): its working directory, HOME
 # and TMPDIR. The audio goes in on stdin and the JSON comes back on stdout, so nothing is
-# ever written to disk, even briefly or after a kill; an unwritable directory makes any
-# stray write by the binary fail rather than land in the shared temporary root.
-NO_FILES_DIR = "/var/empty" if os.path.isdir("/var/empty") else os.path.abspath(os.sep)
+# ever written to disk, even briefly or after a kill; the directory must be one this
+# process cannot write, so a stray write by the binary fails rather than lands anywhere.
+# There is no fallback: without one, transcription is refused (fail closed). macOS has
+# /var/empty; on Linux, /proc is a real directory in which no file can be created.
+NO_FILES_CANDIDATES = ("/var/empty", "/proc")
+# How much of the recognizer's stdout is read at a time.
+READ_CHUNK_BYTES = 65536
+
+
+class RecognizerSandboxError(LiveAudioError):
+    """No directory this process cannot write is available for the local recognizer."""
+
+
+def recognizer_dir() -> str:
+    """The first real, unwritable candidate directory (`NO_FILES_CANDIDATES`).
+
+    Verified each time: a directory that is missing, a symlink, or writable by this process
+    (as for root) is refused, and with none left this raises `RecognizerSandboxError`.
+    """
+    for candidate in NO_FILES_CANDIDATES:
+        if (
+            os.path.isdir(candidate)
+            and not os.path.islink(candidate)
+            and not os.access(candidate, os.W_OK)
+        ):
+            return candidate
+    raise RecognizerSandboxError(
+        "The local recognizer needs a directory this process cannot write, such as /var/empty"
+    )
 
 
 def _wav_bytes(pcm: bytes) -> bytes:
@@ -838,12 +865,53 @@ def _wav_bytes(pcm: bytes) -> bytes:
     return buffer.getvalue()
 
 
+def _feed(stream, data: bytes) -> None:
+    """Write `data` to the recognizer's stdin and close it; a closed pipe ends quietly."""
+    try:
+        stream.write(data)
+    except (OSError, ValueError):
+        pass
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            stream.close()
+
+
+def _bounded_stdout(process: subprocess.Popen, deadline: float) -> bytes:
+    """The recognizer's whole stdout, read in chunks; never more than `MAX_RESPONSE_BYTES`.
+
+    Raises `LiveAudioError` as soon as the output passes the cap, before any more is read,
+    and `subprocess.TimeoutExpired` at the deadline.
+    """
+    chunks, total = [], 0
+    descriptor = process.stdout.fileno()
+    with selectors.DefaultSelector() as selector:
+        selector.register(descriptor, selectors.EVENT_READ)
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or not selector.select(left):
+                raise subprocess.TimeoutExpired(process.args, 0)
+            chunk = os.read(descriptor, READ_CHUNK_BYTES)
+            if not chunk:
+                return b"".join(chunks)
+            total += len(chunk)
+            if total > MAX_RESPONSE_BYTES:
+                raise LiveAudioError("Local recognizer failed")
+            chunks.append(chunk)
+
+
 def _transcribe(
     config: LiveConfig,
     pcm: bytes,
     register: Callable[[subprocess.Popen], None] | None = None,
 ) -> dict[str, Any]:
-    """One whisper.cpp run over `pcm`, in memory only: WAV on stdin, JSON on stdout."""
+    """One whisper.cpp run over `pcm`, in memory only: WAV on stdin, JSON on stdout.
+
+    The WAV is fed from a thread while stdout is read in bounded chunks, so neither pipe
+    can deadlock the other and a runaway recognizer is stopped at `MAX_RESPONSE_BYTES`.
+    stderr goes to the null device, so it is never buffered and never blocks.
+    """
+    sandbox = recognizer_dir()
+    deadline = time.monotonic() + config.timeout_seconds
     try:
         process = subprocess.Popen(
             [
@@ -860,27 +928,33 @@ def _transcribe(
                 "0",
                 "--suppress-nst",
             ],
-            cwd=NO_FILES_DIR,
+            cwd=sandbox,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            env={"PATH": os.defpath, "HOME": NO_FILES_DIR, "TMPDIR": NO_FILES_DIR},
+            env={"PATH": os.defpath, "HOME": sandbox, "TMPDIR": sandbox},
+        )
+        feeder = threading.Thread(
+            target=_feed,
+            args=(process.stdin, _wav_bytes(pcm)),
+            name="rightyo-asr-feed",
+            daemon=True,
         )
         try:
             if register is not None:
                 register(process)
-            raw, _ = process.communicate(_wav_bytes(pcm), timeout=config.timeout_seconds)
-            if process.returncode != 0:
+            feeder.start()
+            raw = _bounded_stdout(process, deadline)
+            if process.wait(timeout=max(0.0, deadline - time.monotonic())) != 0:
                 raise LiveAudioError("Local recognizer failed")
         finally:
             _terminate(process)
-            # After a timeout or a failure the pipes may still be open; close them here.
+            # Every path closes both pipes; the feeder ends once its pipe is closed.
             for stream in (process.stdin, process.stdout):
-                if stream is not None:
-                    with contextlib.suppress(OSError):
-                        stream.close()
-        if len(raw) > MAX_RESPONSE_BYTES:
-            raise LiveAudioError("Local recognizer exceeded output limit")
+                with contextlib.suppress(OSError, ValueError):
+                    stream.close()
+            if feeder.ident is not None:
+                feeder.join(timeout=2)
         document = json.loads(raw)
         if not isinstance(document, dict):
             raise ValueError
@@ -995,6 +1069,8 @@ class WhisperCppTranscriber:
     def __init__(self, config: LiveConfig):
         if config.whisper_executable is None or config.whisper_model is None:
             raise LiveAudioError("Explicit existing runtimes and models are required")
+        # Refused before any audio when no unwritable directory is available (fail closed).
+        recognizer_dir()
         self.config = config
         # Unusable segments, and the utterances they suppressed, this session (see
         # `_counted_units`); read by `LiveProcessor`.
