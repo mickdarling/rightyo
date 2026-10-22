@@ -692,6 +692,20 @@ class PrivacyPhraseTests(unittest.TestCase):
         self.assertEqual(privacy_phrase("RD, I'm back.", droid), frozenset())
         self.assertNotIn("entry", privacy_phrase("Stop recording 2", OURS))
 
+    def test_a_name_that_is_a_filler_word_is_still_a_name(self):
+        # Codex P2 on #242: a configured name such as "Okay" must not be dropped as filler.
+        for name in ("Okay", "Hey", "So"):
+            with self.subTest(name=name):
+                named = Addressing(names=(name,))
+                self.assertEqual(privacy_phrase(f"{name}, I'm back.", named), frozenset({"exit"}))
+                self.assertEqual(privacy_phrase(f"{name}.", named), frozenset({"name"}))
+                self.assertEqual(
+                    privacy_phrase(f"Um, {name}, I'm back.", named), frozenset({"exit"})
+                )
+        # Other filler is still dropped, and other names still treat it as filler.
+        self.assertEqual(privacy_phrase("Okay, um, Jarvis, I'm back.", OURS), frozenset({"exit"}))
+        self.assertEqual(privacy_phrase("Okay, I'm back.", OURS), frozenset({"rest"}))
+
     def test_entry_is_intentional_only(self):
         # The host's S-2 rule: a standalone turn, after an optional name or address, with
         # small fillers at the edges only. Never mid-sentence, with an object, or a question.

@@ -183,6 +183,20 @@ def _privacy_words(text, filler=PRIVACY_FILLER):
     return [word for word in cleaned.lower().split() if word not in filler]
 
 
+def _filler_for(addressing):
+    """The filler dropped before matching, less any word of a configured name or variant: a
+    name such as "Okay" or "Hey" is still a name, so its owner keeps the way back in."""
+    if addressing is None:
+        return PRIVACY_FILLER
+    named = {
+        word
+        for name in addressing.names
+        for spelling in (name, *addressing.spellings(name))
+        for word in _privacy_words(spelling, ())
+    }
+    return PRIVACY_FILLER - named
+
+
 def _negated(words, at):
     """Whether "don't" or "do not" comes in the three words before `at`."""
     before = words[max(0, at - 3) : at]
@@ -214,7 +228,7 @@ def privacy_phrase(text, addressing):
     no match. The entry counts only as the whole turn (`_standalone_entry`) and never as a
     question. Nothing is kept: the words exist only inside this call.
     """
-    words = _privacy_words(text)
+    words = _privacy_words(text, _filler_for(addressing))
     kinds = set()
     if addressing is not None:
         if words and addressing.name_for(" ".join(words)) is not None:
