@@ -606,6 +606,8 @@ DUCK_ENTRY = frozenset(
         "let me think out loud",
         "i'm going to think out loud",
         "think out loud with me",
+        "rubber duck mode",
+        "rubber duck mode on",
     }
 )
 DUCK_EXIT = frozenset(
@@ -615,6 +617,7 @@ DUCK_EXIT = frozenset(
         "done thinking",
         "i'm done thinking",
         "done thinking out loud",
+        "rubber duck mode off",
     }
 )
 DUCK_GREETINGS = frozenset({"hey", "ok", "okay"})

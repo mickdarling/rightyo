@@ -385,6 +385,25 @@ class DuckPhraseTests(unittest.TestCase):
                 self.assertTrue(duck_phrase_shaped(text, OURS, False))
                 self.assertFalse(duck_phrase_shaped(text, OURS, True))
 
+    def test_rubber_duck_phrases_match_as_the_host_trims_them(self):
+        for text in ("Jarvis, rubber duck mode.", "Hey Jarvis, please rubber duck mode on"):
+            with self.subTest(text=text):
+                self.assertTrue(duck_phrase_shaped(text, OURS, False))
+                self.assertFalse(duck_phrase_shaped(text, OURS, True))
+        for text in ("Jarvis, rubber duck mode off.", "Okay Jarvis, rubber duck mode off, please"):
+            with self.subTest(text=text):
+                self.assertTrue(duck_phrase_shaped(text, OURS, True))
+                self.assertFalse(duck_phrase_shaped(text, OURS, False))
+        for text in (
+            "Rubber duck mode.",
+            "Rubber duck mode off.",
+            "Jarvis, rubber duck mode off now.",
+            "Jarvis, a rubber duck mode.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(duck_phrase_shaped(text, OURS, False))
+                self.assertFalse(duck_phrase_shaped(text, OURS, True))
+
     def test_anything_else_is_not_one(self):
         for text in (
             "Done thinking.",
@@ -480,6 +499,34 @@ class DuckPhraseMergeTests(unittest.TestCase):
         merger.offer(fragment("Jarvis,", 0, 500, speaker=None), complete=True)
         merger.offer(fragment("done thinking.", 900, 1600))
         self.assertEqual(self.texts(emitted), ["Jarvis, done thinking."])
+
+    def test_the_rubber_duck_entry_is_released_alone_when_not_ducking(self):
+        for entry in ("Jarvis, rubber duck mode.", "Jarvis, rubber duck mode on."):
+            with self.subTest(entry=entry):
+                emitted = []
+                merger = self.merger(
+                    emitted, breaks=lambda text: duck_phrase_shaped(text, OURS, False)
+                )
+                merger.offer(fragment("So that is the plan for the week", 0, 2000), complete=True)
+                merger.offer(fragment(entry, 3000, 4000))
+                self.assertEqual(self.texts(emitted), ["So that is the plan for the week", entry])
+
+    def test_the_rubber_duck_exit_is_released_alone_while_ducking(self):
+        emitted = []
+        merger = self.merger(emitted)
+        merger.offer(fragment("So that is the plan for the week", 0, 2000), complete=True)
+        merger.offer(fragment("Jarvis, rubber duck mode off.", 3000, 4000))
+        self.assertEqual(
+            self.texts(emitted),
+            ["So that is the plan for the week", "Jarvis, rubber duck mode off."],
+        )
+
+    def test_a_comma_pause_rubber_duck_exit_joins_the_lone_wake_word(self):
+        emitted = []
+        merger = self.merger(emitted, wake_word=lambda text: OURS.name_for(text) is not None)
+        merger.offer(fragment("Jarvis,", 0, 500, speaker=None), complete=True)
+        merger.offer(fragment("rubber duck mode off.", 900, 1600))
+        self.assertEqual(self.texts(emitted), ["Jarvis, rubber duck mode off."])
 
     def test_a_cue_while_ducking_is_released_alone_and_at_once(self):
         emitted = []
