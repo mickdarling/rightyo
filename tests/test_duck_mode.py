@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -991,6 +992,97 @@ class TranscriptionWritesNothingTests(unittest.TestCase):
             sorted(p.name for p in self.root.iterdir()),
             sorted(["whisper-cli", "model", "shared-tmp", "hang"]),
         )
+
+
+FAILING_WHISPER = """#!{python}
+import json, os, signal, sys, time
+mode = open(os.path.join(os.path.dirname(sys.argv[0]), "mode")).read().strip()
+sys.stdin.buffer.read()
+doc = json.dumps({{"transcription": [{{"text": " walrus kumquat", "offsets": {{}}}}]}})
+if mode == "crash":
+    sys.stderr.write("fatal: walrus kumquat\\n")
+    sys.exit(3)
+if mode == "killed":
+    sys.stdout.write(doc[:20])
+    sys.stdout.flush()
+    os.kill(os.getpid(), signal.SIGKILL)
+if mode == "truncated":
+    sys.stdout.write(doc[:20])
+if mode == "timeout":
+    time.sleep(30)
+if mode == "noise":
+    sys.stderr.write("noise walrus kumquat\\n" * 5000)
+    sys.stdout.write(doc)
+if mode == "oversize":
+    sys.stdout.write(json.dumps({{"pad": "x" * (2 * 1024 * 1024 + 10)}}))
+if mode == "nondict":
+    sys.stdout.write("[]")
+"""
+
+
+class TranscriptionFailureParityTests(unittest.TestCase):
+    """The stdin/stdout recognizer fails exactly as the old file mode did (#242 round 2):
+    the same `LiveAudioError` message per case, with no words in it, its traceback, stderr
+    or the logs, and stderr noise ignored."""
+
+    CASES = {
+        "crash": "Local recognizer failed",
+        "killed": "Local recognizer failed",
+        "empty": "Local recognizer failed",
+        "truncated": "Local recognizer failed",
+        "timeout": "Local recognizer timed out",
+        "oversize": "Local recognizer failed",
+        "nondict": "Local recognizer failed",
+    }
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.whisper = self.root / "whisper-cli"
+        self.whisper.write_text(FAILING_WHISPER.format(python=sys.executable))
+        self.whisper.chmod(0o700)
+        self.model = self.root / "model"
+        self.model.touch()
+
+    def run_mode(self, mode):
+        (self.root / "mode").write_text(mode)
+        config = LiveConfig(
+            session_id="parity",
+            whisper_executable=self.whisper,
+            whisper_model=self.model,
+            diarization_library=self.model,
+            diarization_model=self.model,
+            timeout_seconds=1 if mode == "timeout" else 30,
+        )
+        stderr, logs = io.StringIO(), io.StringIO()
+        handler = logging.StreamHandler(logs)
+        logging.getLogger().addHandler(handler)
+        self.addCleanup(logging.getLogger().removeHandler, handler)
+        with contextlib.redirect_stderr(stderr):
+            try:
+                return _transcribe(
+                    config, b"\\x01\\x02" * 1600
+                ), stderr.getvalue() + logs.getvalue()
+            except LiveAudioError as error:
+                trace = "".join(traceback.format_exception(error))
+                return error, trace + stderr.getvalue() + logs.getvalue()
+
+    def test_each_failure_raises_the_old_error_and_leaks_nothing(self):
+        for mode, message in self.CASES.items():
+            with self.subTest(mode=mode):
+                error, seen = self.run_mode(mode)
+                self.assertIsInstance(error, LiveAudioError)
+                self.assertEqual(str(error), message)
+                self.assertIsNone(error.__cause__)
+                self.assertTrue(error.__suppress_context__)
+                self.assertNotIn("walrus", seen)
+                self.assertNotIn("kumquat", seen)
+
+    def test_stderr_noise_is_ignored(self):
+        document, seen = self.run_mode("noise")
+        self.assertEqual(document["transcription"][0]["text"], " walrus kumquat")
+        self.assertNotIn("walrus", seen)
 
 
 def fragment(text, start, end, speaker="Speaker A"):

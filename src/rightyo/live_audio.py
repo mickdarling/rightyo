@@ -874,6 +874,11 @@ def _transcribe(
                 raise LiveAudioError("Local recognizer failed")
         finally:
             _terminate(process)
+            # After a timeout or a failure the pipes may still be open; close them here.
+            for stream in (process.stdin, process.stdout):
+                if stream is not None:
+                    with contextlib.suppress(OSError):
+                        stream.close()
         if len(raw) > MAX_RESPONSE_BYTES:
             raise LiveAudioError("Local recognizer exceeded output limit")
         document = json.loads(raw)
