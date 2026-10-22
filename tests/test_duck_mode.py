@@ -682,6 +682,16 @@ class PrivacyPhraseTests(unittest.TestCase):
         # Without names nothing is named.
         self.assertEqual(privacy_phrase("Jarvis, I'm back.", None), frozenset())
 
+    def test_a_name_with_digits_keeps_them(self):
+        # Codex P2 on #242: an `Addressing` name may hold digits, so the tokenizer keeps
+        # them; and a number around a phrase is a word, never silently dropped.
+        droid = Addressing(names=("R2D2",))
+        self.assertEqual(privacy_phrase("R2D2, I'm back.", droid), frozenset({"exit"}))
+        self.assertEqual(privacy_phrase("R2-D2.", droid), frozenset({"name"}))
+        # The digits are part of the name: without them it is not the name.
+        self.assertEqual(privacy_phrase("RD, I'm back.", droid), frozenset())
+        self.assertNotIn("entry", privacy_phrase("Stop recording 2", OURS))
+
     def test_entry_is_intentional_only(self):
         # The host's S-2 rule: a standalone turn, after an optional name or address, with
         # small fillers at the edges only. Never mid-sentence, with an object, or a question.

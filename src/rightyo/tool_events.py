@@ -174,8 +174,12 @@ def speaker_name(value):
 
 
 def _privacy_words(text, filler=PRIVACY_FILLER):
-    """`text` as lowercase words of letters and apostrophes, with `filler` dropped."""
-    cleaned = "".join(c if c.isalpha() or c == "'" else " " for c in text.replace("\u2019", "'"))
+    """`text` as lowercase words of letters, digits and apostrophes, with `filler` dropped.
+
+    Digits are kept: a configured name may hold them ("R2D2"), and a number in a turn is
+    a word of its own, never silently removed from around a phrase.
+    """
+    cleaned = "".join(c if c.isalnum() or c == "'" else " " for c in text.replace("\u2019", "'"))
     return [word for word in cleaned.lower().split() if word not in filler]
 
 
