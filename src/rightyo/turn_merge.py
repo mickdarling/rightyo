@@ -83,9 +83,10 @@ continuation, for at least that long instead of the merge gap. Every other speak
 the defaults, and the owner predicate is not asked while it is 0. A stop phrase or a
 dismissal is still never held; `max_span_ms` and the text cap still bound a joined turn;
 tail join keeps its own window. The owner check is made when the fragment starts being
-held and again before each piece that could join it (at most once per offer), so a
-label that stops resolving to the owner (a live identification rebind) drops back to the
-defaults. Its post-turn gap is what it would have been without the longer hold: observed
+held, again before each piece that could join it or be bridged across it (at most once
+per offer), and once when the hold it would have had without the pause runs out, so a
+label that stops resolving to the owner (a live identification rebind) behaves as at 0
+from then on. Its post-turn gap is what it would have been without the longer hold: observed
 over the window it would have had (a bridged backchannel counting as the speech that
 followed, as on release) and frozen once that has passed, or unobserved when judged
 complete. The pause also joins the owner's pieces with merging off (`gap_ms` 0).
@@ -402,19 +403,21 @@ class TurnMerger:
             self._release(fragment)
             self.emit(dict(fragment))
             return
-        if self._bridges(fragment):
-            self._bridged.append(dict(fragment))
-            return
         asked: dict[tuple, int] = {}
         if self._held_pause and (
-            fragment["speaker"] is None or self._same_label(fragment, self._held)
+            fragment["speaker"] is None
+            or self._same_label(fragment, self._held)
+            or self._bridges(fragment)
         ):
-            # Before a piece that could join it: whether the held turn's label is still
-            # the owner's (#735). A live identification rebind ends its pause, and it
-            # keeps the defaults from here. Any other piece releases it anyway.
+            # Before a piece that could join it or be bridged across it: whether the held
+            # turn's label is still the owner's (#735). A live identification rebind ends
+            # its pause, and it keeps the defaults from here. Any other piece releases it.
             self._held_pause = self._owner_pause_for(self._held, asked)
             if not self._held_pause:
                 self._end_owner_pause()
+        if self._bridges(fragment):
+            self._bridged.append(dict(fragment))
+            return
         if self._held_wake:
             # Only the owner's own sentence continues a lone wake word (#230); the owner
             # predicate is asked once per offered fragment.
@@ -530,10 +533,12 @@ class TurnMerger:
         """The held turn's label is no longer the owner's (#735): it behaves as without the
         pause. If the hold it would have had would already have released it (or it would
         have been emitted at once, as a turn judged complete with no `complete_hold_ms`),
-        it is released now, before the piece being offered. Otherwise that piece either
-        joins it, which sets its hold afresh, or releases it."""
+        it is released now, before the piece being offered. Otherwise it is held as long
+        as it would have been, which also bounds which backchannels it bridges."""
         if self._base_passed or not self._base_hold:
             self._release(None, quiet=True)
+        else:
+            self._hold_ms = self._base_hold
 
     def _extend(self, base: int, pause: int) -> None:
         """Hold the held turn for the owner pause, or `base` if that is longer (#735)."""
@@ -608,6 +613,12 @@ class TurnMerger:
             ended = held["end_ms"] + self._base_hold
             if now_ms >= ended and (open_since_ms is None or open_since_ms > ended):
                 self._base_passed = True
+                # Once, here: if its label is no longer the owner's, release it now, as
+                # that hold would have (its gap evidence is frozen above).
+                self._held_pause = self._owner_pause_for(held, {})
+                if not self._held_pause:
+                    self._release(None, quiet=True)
+                    return
         deadline = held["end_ms"] + self._hold_ms
         if now_ms >= deadline and (open_since_ms is None or open_since_ms > deadline):
             # No fragment arrived through the whole window: quiet, unless speech was

@@ -862,6 +862,128 @@ class OwnerPauseTests(unittest.TestCase):
         texts = [i["text"] for i in run(PAUSE, 0, 1500, True, True)]
         self.assertEqual(texts, ["what time is it?", "and in Tokyo?"])
 
+    def test_after_a_rebind_a_backchannel_is_bridged_exactly_as_at_zero(self):
+        # Codex P2 on #233: a backchannel offered after a rebind must not be bridged by
+        # the stale owner hold, nor keep the turn held to the owner deadline.
+        def run(pause, backchannel_at, speaker, ticked, complete, open_since):
+            # What was emitted by each step, so the release times are compared too.
+            owner_now, emitted, timeline = [True], [], []
+            merger = pause_merger(
+                emitted,
+                pause=pause,
+                owner=lambda item: owner_now[0] and item["speaker"] == OWNER,
+                complete_hold_ms=1000,
+                reply_wait_ms=1200,
+                bridge_backchannels=True,
+            )
+            merger.offer(fragment("turn off the lights", 0, 1000), complete=complete)
+            if ticked:
+                for now in range(1000, backchannel_at, 100):
+                    merger.due(now, open_since)
+            owner_now[0] = False
+            merger.offer(fragment("mm", backchannel_at, backchannel_at + 200, speaker=speaker))
+            timeline.append(len(emitted))
+            for now in range(backchannel_at + 200, backchannel_at + 9000, 100):
+                merger.due(now, None)
+                timeline.append(len(emitted))
+            merger.flush()
+            return emitted, timeline
+
+        for backchannel_at in (1500, 2500, 3500):
+            for speaker in (None, GUEST):
+                for ticked in (False, True):
+                    for complete in (False, True):
+                        for open_since in (None, 1800):
+                            case = dict(
+                                backchannel_at=backchannel_at,
+                                speaker=speaker,
+                                ticked=ticked,
+                                complete=complete,
+                                open_since=open_since,
+                            )
+                            with self.subTest(**case):
+                                self.assertEqual(dumps(run(PAUSE, **case)), dumps(run(0, **case)))
+
+    def test_after_a_rebind_with_no_further_piece_the_turn_is_released_as_at_zero(self):
+        for complete in (False, True):
+            for reply_wait in (0, 1200):
+                with self.subTest(complete=complete, reply_wait=reply_wait):
+                    results = []
+                    for pause in (0, PAUSE):
+                        owner_now, emitted, timeline = [True], [], []
+                        merger = pause_merger(
+                            emitted,
+                            pause=pause,
+                            owner=lambda item: owner_now[0] and item["speaker"] == OWNER,
+                            complete_hold_ms=1000,
+                            reply_wait_ms=reply_wait,
+                        )
+                        merger.offer(fragment("what time is it?", 0, 1000), complete=complete)
+                        owner_now[0] = False
+                        for now in range(1000, 9000, 100):
+                            merger.due(now, None)
+                            timeline.append(len(emitted))
+                        results.append(dumps([emitted, timeline]))
+                    self.assertEqual(results[1], results[0])
+        # Still the owner's when that hold runs out: held for the pause, asked once more.
+        asked, emitted = [], []
+
+        def counting(item):
+            asked.append(item["text"])
+            return item["speaker"] == OWNER
+
+        merger = pause_merger(emitted, owner=counting)
+        merger.offer(fragment("what time", 0, 1000))
+        for now in range(1000, 7000, 100):
+            merger.due(now, None)
+        self.assertEqual(emitted, [])
+        merger.due(7000, None)
+        self.assertEqual([i["text"] for i in emitted], ["what time"])
+        self.assertEqual(asked, ["what time", "what time"])
+
+    def test_a_rejoined_owner_turn_restarts_its_pause_zero_hold(self):
+        # The first piece's pause-0 hold has passed; after the owner's join, a rebind must
+        # use the joined turn's own hold, so the next piece within the merge gap joins.
+        owner_now, emitted = [True], []
+        merger = pause_merger(emitted, owner=lambda item: owner_now[0] and item["speaker"] == OWNER)
+        merger.offer(fragment("first", 0, 1000))
+        for now in range(1000, 4000, 20):
+            merger.due(now, None)
+        merger.offer(fragment("second", 4000, 5000))
+        owner_now[0] = False
+        merger.offer(fragment("third", 5500, 6000))
+        merger.flush()
+        self.assertEqual([i["text"] for i in emitted], ["first second third"])
+
+    def test_after_a_rebind_an_unlabelled_tail_joins_as_at_zero(self):
+        # RO #235 item 1: the re-check also runs before an unlabelled tail, so the joined
+        # turn keeps the pause-0 hold rather than the stale owner pause.
+        results = []
+        for pause in (0, PAUSE):
+            owner_now, emitted, timeline, asked = [True], [], [], []
+
+            def owner(item):
+                asked.append(item["text"])
+                return owner_now[0] and item["speaker"] == OWNER
+
+            merger = pause_merger(
+                emitted, pause=pause, owner=owner, tail_join_ms=1000, reply_wait_ms=1200
+            )
+            merger.offer(fragment("turn off the", 0, 1000))
+            owner_now[0] = False
+            merger.offer(fragment("lights", 1500, 1800, speaker=None))
+            # The owner is asked again before the tail joins, not only later.
+            self.assertEqual(len(asked), 2 if pause else 0)
+            for now in range(1800, 9000, 100):
+                merger.due(now, None)
+                timeline.append(len(emitted))
+            results.append([emitted, timeline])
+        self.assertEqual(dumps(results[1]), dumps(results[0]))
+        emitted, timeline = results[1]
+        self.assertEqual([i["text"] for i in emitted], ["turn off the lights"])
+        # Released at the merge gap after the tail (3,800 ms), not the owner pause.
+        self.assertEqual(timeline.index(1), (3800 - 1800) // 100)
+
     def test_a_smaller_pause_never_shortens_the_complete_hold(self):
         emitted = []
         merger = pause_merger(emitted, pause=500, complete_hold_ms=3000)

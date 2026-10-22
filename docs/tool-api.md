@@ -464,10 +464,12 @@ The owner can also be given a longer pause than everyone else
 `"turns": {"owner_pause_ms": 4000}` (default 0, off; 0 to 10,000) applies only to a turn
 whose speaker label has the `owner` role when it starts being held, resolved as for the
 lone wake word above (configured session labels, or a live identification binding to an
-owner identity, looked up without side effects). The role is checked again before each
-piece of the same label (or an unlabelled tail) is offered to the held turn; if the label
-no longer resolves to the owner (live identification rebound it), the turn keeps the
-defaults from then on. It needs configured owners and does nothing without them. Unlike
+owner identity, looked up without side effects). The role is checked again before a
+piece that could join the held turn or be bridged across it (the same label, an
+unlabelled tail, a backchannel), and once when the hold the turn would have had without
+the pause runs out. If the label no longer resolves to the owner (live identification
+rebound it), the turn behaves from then on as with `owner_pause_ms` 0: it is released at
+once if that hold would already have released it, and otherwise keeps that hold. It needs configured owners and does nothing without them. Unlike
 the lone wake word join, it also joins the owner's pieces when `merge_gap_ms` is 0. Such
 a turn:
 
