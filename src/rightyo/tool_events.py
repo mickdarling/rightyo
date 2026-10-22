@@ -1230,11 +1230,7 @@ class SpeechEvents:
         split, self._private_name_end = self._private_name_end, None
         # Heard entirely since the mode last went on, and it is still on: a turn heard in an
         # earlier private period and released late can never end this one (#735 S-1).
-        current = (
-            self._duck
-            and bool(self._duck_spans)
-            and turn.start_ms >= self._duck_spans[-1][0]
-        )
+        current = self._duck and bool(self._duck_spans) and turn.start_ms >= self._duck_spans[-1][0]
         if "name" in kinds:
             # Only the enrolled owner's own name fragment, in the current period, can
             # begin a split exit.
