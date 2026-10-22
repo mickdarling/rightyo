@@ -281,7 +281,13 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
         config = replace(config, dismissal=dismissal_from_args(args))
     # Stdout carries the events; acknowledgement-gating notes (#132) go to stderr.
     coaching = getattr(args, "coaching", False)
-    events = SpeechEvents(report=None if coaching else _stderr, retain_transcripts=not coaching)
+    # A coaching listener's control descriptor carries only coaching records (it refuses a
+    # `{"duck": ...}` line), so it never advertises duck mode (hailing-station #735).
+    events = SpeechEvents(
+        report=None if coaching else _stderr,
+        retain_transcripts=not coaching,
+        duck_control=not coaching,
+    )
     consent = {"allow_hosted_speech": True} if config.hosted_speech else {}
     # Content-free session notes (end-of-turn scores, capture, shadow speaker
     # identification) go to stderr in every mode.

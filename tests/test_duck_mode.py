@@ -171,6 +171,33 @@ class DuckModeTests(unittest.TestCase):
         events = self.say(turn("t2", 1000, 1900, "Jarvis, what time is it?"))
         self.assertIn("request", self.types(events))
 
+    def test_turned_off_before_any_audio_of_a_new_session_covers_nothing(self):
+        # Codex P2 on #237: kept on into a new session, then off before audio: [0, 0].
+        self.events = SpeechEvents()
+        self.events.duck(True)
+        self.events.start(SESSION, now_ms=0, addressing=OURS, conversation=MODE)
+        self.events.drain()
+        self.events.duck(False, now_ms=0)
+        self.assertEqual(self.events._duck_spans, [[0, 0]])
+        events = self.say(turn("t1", 0, 900, "Jarvis, what time is it?"))
+        self.assertIn("request", self.types(events))
+
+    def test_the_on_edge_is_inclusive_and_the_off_edge_exclusive(self):
+        self.start()
+        self.events.duck(True, now_ms=1000)
+        self.events.duck(False, now_ms=2000)
+        heard = self.events.heard_ducked
+        # Ending as it went on: counted (fail closed).
+        self.assertTrue(heard(turn("a", 500, 1000, "x")))
+        self.assertFalse(heard(turn("b", 500, 999, "x")))
+        # The off is stamped at or after the end of all audio received by then, so a piece
+        # heard in duck mode ends at or before it and starts before it.
+        self.assertTrue(heard(turn("c", 1999, 2000, "x")))
+        self.assertTrue(heard(turn("d", 1500, 2600, "x")))  # joined across the off
+        # Starting at the off: heard after it.
+        self.assertFalse(heard(turn("e", 2000, 2600, "x")))
+        self.assertFalse(heard(turn("f", 2000, 2000, "x")))
+
     def test_it_is_independent_of_media_mode(self):
         # The host keeps the two exclusive; if both were on, duck mode decides nothing.
         self.start()

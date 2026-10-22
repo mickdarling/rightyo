@@ -1195,7 +1195,8 @@ assistant only when the owner cues it. A live `listen` session's `started` event
 advertises it as a separate top-level object beside the capability set,
 `"duck": {"version": 1}`; a host enters duck mode only for a child that advertised it.
 `tool-replay` takes no control and does not advertise it, so the authored fixtures are
-unchanged. With `listen --mode stdin --control-fd N` the
+unchanged. Neither does `listen --coaching`: its control descriptor carries only coaching
+records and refuses any other line. With `listen --mode stdin --control-fd N` the
 host turns it on and off with the JSON lines `{"duck": true}` and `{"duck": false}`,
 beside the reply lines above and media mode's `{"media": true|false}`
 ([hailing-station #551](https://github.com/mickdarling/hailing-station/issues/551)). A
@@ -1207,7 +1208,11 @@ Each change is stamped, when its control line arrives, with the received-audio c
 turns are timed in (never the wall clock, which runs ahead of it for good after lost
 audio), and a turn counts as heard in duck
 mode when it is accepted while the mode is on, or when its `[start_ms, end_ms]` overlaps a
-span the mode was on. A turn the merger held across the off edge (the merge gap or the
+span the mode was on. The on edge is inclusive and the off edge exclusive: the off is
+stamped at or after the end of all audio received by then, so speech heard in duck mode
+starts before it, and speech starting at it was heard after. A span turned on and off
+with no audio between (a new session that starts in duck mode and is turned off before
+any audio) covers nothing. A turn the merger held across the off edge (the merge gap or the
 [owner pause](#joined-turns)), a continuation joined to a piece said in duck mode, a
 bridged backchannel and a tail join all count, and so does speech said before the mode
 went on that is joined with speech said during it. A session's spans are kept for the

@@ -1036,8 +1036,14 @@ class PrototypeController:
                     other_agents=self.config.other_agents,
                     **({} if self.owner_voice is None else {"owner_voice": self.owner_voice}),
                     # Duck mode (hailing-station #735): the live controller takes the
-                    # control, so a publisher that holds it advertises it.
-                    **({"duck": True} if callable(getattr(self._events, "duck", None)) else {}),
+                    # control, so a publisher that holds it advertises it, unless its host
+                    # control channel does not carry the line (a coaching listener).
+                    **(
+                        {"duck": True}
+                        if getattr(self._events, "duck_control", False) is True
+                        and callable(getattr(self._events, "duck", None))
+                        else {}
+                    ),
                 )
                 self._event_terminal = False
                 if self.owner_voice is not None and not voiceprint and self.report is not None:

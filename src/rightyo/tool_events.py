@@ -166,10 +166,22 @@ class SpeechEvents:
     """
 
     def __init__(
-        self, *, retention_ms=300000, max_pending=128, report=None, retain_transcripts=True
+        self,
+        *,
+        retention_ms=300000,
+        max_pending=128,
+        report=None,
+        retain_transcripts=True,
+        duck_control=True,
     ):
         if type(retain_transcripts) is not bool:
             raise ContractError("invalid transcript retention setting")
+        if type(duck_control) is not bool:
+            raise ContractError("invalid duck control setting")
+        # Whether this publisher's host control channel takes `{"duck": ...}` lines
+        # (hailing-station #735): false for a coaching listener, whose control descriptor
+        # carries only coaching records, so a live controller never advertises duck mode.
+        self.duck_control = duck_control
         self._retain_transcripts = retain_transcripts
         # At least five: one open request plus the owner's transcript, attention and
         # request, with a terminal slot, so the static and dynamic override bounds agree.
@@ -980,6 +992,7 @@ class SpeechEvents:
                     first, second = self._duck_spans[0], self._duck_spans.pop(1)
                     first[1] = second[1]
             elif not on and self._duck and self._duck_spans and self._duck_spans[-1][1] is None:
+                # The off edge is exclusive (see `heard_ducked`); [t, t] covers nothing.
                 self._duck_spans[-1][1] = max(at, self._duck_spans[-1][0])
             self._duck = on
 
@@ -988,12 +1001,18 @@ class SpeechEvents:
         on counts, whenever it was said), or the turn's span overlaps a span it was on.
 
         A turn joined from pieces said before and after a change counts as heard in duck
-        mode, so the mode's end never releases speech heard during it, held or joined.
+        mode, so the mode's end never releases speech heard during it, held or joined. The
+        on edge is inclusive (a turn ending as it went on counts) and the off edge is
+        exclusive: the off is stamped at or after the end of all audio received by then,
+        so a piece heard in duck mode ends at or before it and, unless it is empty, starts
+        before it; speech starting at the off was heard after it. A span [t, t] (on and
+        off with no audio between) covers nothing.
         """
         with self._lock:
             return self._duck or any(
-                turn.end_ms >= on_ms and (off_ms is None or turn.start_ms <= off_ms)
+                turn.end_ms >= on_ms and (off_ms is None or turn.start_ms < off_ms)
                 for on_ms, off_ms in self._duck_spans
+                if off_ms is None or off_ms > on_ms
             )
 
     @property
