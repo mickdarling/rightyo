@@ -367,19 +367,37 @@ A lone wake word is the other exception
 ([#230](https://github.com/mickdarling/rightyo/issues/230)). The live window can finalize
 the name on its own at a comma pause ("Jarvis," then "are you there?"). The name alone is
 too short to identify the speaker, so it has no label, while the rest is labelled as the
-owner; neither half was then an addressed owner request. With `addressing` names and
+owner; neither half was then an addressed owner request. With `addressing` names,
 configured owners (by session label or by
-[live identification](#roles-from-live-speaker-identification)) and joining on, a piece
+[live identification](#roles-from-live-speaker-identification)), joining on and
+`"turns": {"wake_join": true}` (the default; false turns only this join off), a piece
 whose whole text is a configured name or variant, with no speaker label and no overlap,
-is held for at most `merge_gap_ms`, even when an end-of-turn model called it complete. A
-labelled, non-overlapping piece with the same provenance that starts within the gap and
-whose label has the `owner` role at that moment joins it: the joined turn keeps the
-owner's label, starts with the name, and is decided once. Its label is partly inferred,
-so it is reported like tail join and never exercises owner authority (no override or
-owner stop phrase). The name never raises anyone's role: a guest's, a participant's or an
-unknown speaker's piece is never joined to it, and the name is then emitted unchanged, as
-before, only up to the gap later. A stop phrase is never held or joined, and any other
-piece without a label behaves as before.
+is held even when an end-of-turn model called it complete. It is held until
+`merge_gap_ms` has passed after it, and, as for any held turn, while an utterance that
+opened within that window is still being collected. A labelled, non-overlapping piece
+with the same provenance that starts within the gap and whose label has the `owner` role
+at that moment joins it: the joined turn keeps the owner's label, starts with the name,
+and is decided once.
+
+- Its label is partly inferred, so it is reported like tail join and never exercises
+  owner authority (no override, owner stop phrase or withdrawal). This is the one
+  inferred-label mechanism allowed with configured session-label roles, which still
+  refuse edge attribution and tail join: only the name's speaker is inferred, and only
+  from the owner's own labelled continuation.
+- In media mode (hailing-station #551) attending a turn takes owner authority, so a
+  joined turn is not attended there: the owner repeats the request, or says it without the pause. A
+  television can say the name too, so this fails closed.
+- The owner check is made when the pieces join; the published role is resolved when the
+  joined turn is emitted, up to a merge gap later. If live identification rebinds the
+  label in between, the turn carries the new role (still without authority).
+- The name never raises anyone's role: a guest's, a participant's or an unknown speaker's
+  piece is never joined to it, and neither is a name with a speaker label. The name is
+  then emitted unchanged, only later. Its post-turn gap is what it would have been
+  without the hold: unobserved when it was judged complete or is not request-shaped,
+  otherwise observed over `reply_wait_ms`, so speech after that window never counts as
+  following it.
+- A stop phrase is never held or joined, and any other piece without a label behaves as
+  before.
 
 An end-of-turn model's "complete" does not skip the hold for a piece that looks cut off
 mid-request ([#199](https://github.com/mickdarling/rightyo/issues/199)). Such a piece

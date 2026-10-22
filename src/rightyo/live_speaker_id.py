@@ -586,26 +586,40 @@ class EnrolledRoles(ConfiguredPriorityProvider):
 
     def role_for(self, turn) -> str:
         self._resolved = None
+        role, binding = self._lookup(turn)
+        if binding is not None:
+            self._resolved = (turn.utterance_id, turn.speaker_id, binding)
+        return role
+
+    def role_of(self, turn) -> str:
+        """The role `role_for` would give `turn` now, without recording the binding.
+
+        For a look-ahead from another thread, such as the turn merger's owner check
+        (#230): it leaves the binding `name_for` reads untouched. Never blocks or raises.
+        """
+        return self._lookup(turn)[0]
+
+    def _lookup(self, turn) -> tuple[str, tuple | None]:
+        """A turn's role and the binding it came from (None when no binding was used)."""
         label = turn.speaker_id
         if label is None:
-            return "unknown"
+            return "unknown", None
         configured = self.priority.configured_role(label)
         if configured is not None:
-            return configured
+            return configured, None
         source = self.source
         if source is None or turn.overlap or turn.speaker_provenance != "diarization-timeline":
-            return "unknown"
+            return "unknown", None
         try:
             binding = source.binding(label)
         except Exception:  # noqa: BLE001 - identification never fails the session
             binding = None
         if binding is None:
-            return "unknown"
-        self._resolved = (turn.utterance_id, label, binding)
+            return "unknown", None
         state, identity = binding
         if state == "bound" and identity is not None:
-            return self.priority.configured_role(identity) or "participant"
-        return "participant" if state == "unknown" else "unknown"
+            return self.priority.configured_role(identity) or "participant", binding
+        return ("participant" if state == "unknown" else "unknown"), binding
 
     def owner_voice(self, threshold_s: float) -> str | None:
         """This session's owner-voice status (rightyo#164), or None; never blocks or raises.
