@@ -52,6 +52,27 @@ Three opt-in refinements address one thought split into several requests (#216):
   another speaker releases the held turn as before, so turns never join across a speaker
   change.
 
+One more opt-in inference joins a lone wake word to the owner's sentence (#230). The
+live window can finalize the name on its own at a comma pause ("Jarvis," + "are you
+there?"); the name alone is too short for speaker identification, so it arrives
+unattributed and the rest arrives as the owner's. With both `wake_word` (the text is only
+a configured name, plus punctuation or whitespace) and `owner` (the fragment's label
+resolves to the owner role now) set, such an unattributed, non-overlapping fragment is
+held until `gap_ms` has passed after it, even when the end-of-turn model called it
+complete (longer only while an utterance that opened within that window is still being
+collected, as for any held turn, or when a request-shaped name's reply wait is longer). A
+continuation that starts within `gap_ms` of it, is labelled, does not overlap, has the
+same speaker provenance and is attributed to the owner by `owner` joins it: the joined
+turn takes the continuation's label and keeps the name, and is marked `inferred`, so it
+is dispatched as one addressed owner request but never exercises owner authority (#137).
+The wake word never raises a speaker's role: only the continuation's own owner
+attribution counts, so a guest's or an unknown speaker's continuation is never joined,
+and nothing else is joined into the held name. Without a joining continuation the name
+is released unchanged, only later: its post-turn gap is what it would have been without
+the hold (unobserved when it was judged complete or is not request-shaped; otherwise
+observed over the reply wait and frozen once that window has passed, so speech after it
+never counts as following the name). A stop phrase is never held or joined.
+
 This is a fixed-gap first step towards the wait/yield end-of-turn decision of #84, not
 an adaptive model.
 
@@ -164,6 +185,8 @@ class TurnMerger:
         complete_hold_ms: int = 0,
         collapse_restarts: bool = False,
         bridge_backchannels: bool = False,
+        wake_word: Callable[[str], bool] | None = None,
+        owner: Callable[[dict[str, Any]], bool] | None = None,
     ):
         self.gap_ms = merge_gap(gap_ms)
         self.tail_join_ms = tail_join(tail_join_ms)
@@ -182,6 +205,12 @@ class TurnMerger:
         if unfinished is not None and not callable(unfinished):
             raise ValueError("invalid unfinished-turn predicate")
         self.unfinished = unfinished
+        if wake_word is not None and not callable(wake_word):
+            raise ValueError("invalid wake word predicate")
+        if owner is not None and not callable(owner):
+            raise ValueError("invalid owner predicate")
+        self.wake_word = wake_word
+        self.owner = owner
         if type(max_span_ms) is not int or max_span_ms < 1:
             raise ValueError("invalid turn merge span")
         self.max_span_ms = max_span_ms
@@ -195,6 +224,11 @@ class TurnMerger:
         self._held_complete = False
         # Backchannels bridged while the turn is held, emitted right after it (#216).
         self._bridged: list[dict[str, Any]] = []
+        # Whether the held fragment is a lone unattributed wake word held for the
+        # owner's continuation (#230), and the post-turn gap window it would have had
+        # without that hold (None: it would have been emitted with its gap unobserved).
+        self._held_wake = False
+        self._wake_window: int | None = None
 
     @property
     def holding(self) -> bool:
@@ -205,9 +239,54 @@ class TurnMerger:
 
     def _hold_for(self, fragment: dict[str, Any]) -> int:
         hold = max(self.gap_ms, self.tail_join_ms) if self._joinable(fragment) else 0
-        if self.reply_wait_ms and self.shaped(fragment["text"]):
+        if self._observed(fragment):
             hold = max(hold, self.reply_wait_ms)
         return hold
+
+    def _observed(self, fragment: dict[str, Any]) -> bool:
+        """Whether a fragment is held to observe its post-turn gap (#96)."""
+        return bool(self.reply_wait_ms) and self.shaped(fragment["text"])
+
+    def _wake_only(self, fragment: dict[str, Any]) -> bool:
+        """Whether a fragment is a lone wake word, unattributed, to hold for the owner (#230).
+
+        Its text is only a configured name (the predicate's judgement); it has no speaker
+        label and does not overlap. Off unless merging, `wake_word` and `owner` are all on.
+        """
+        return (
+            self.gap_ms > 0
+            and self.wake_word is not None
+            and self.owner is not None
+            and fragment["speaker"] is None
+            and not fragment["overlap"]
+            and self._predicate(self.wake_word, fragment["text"])
+        )
+
+    @staticmethod
+    def _predicate(predicate: Callable[[Any], bool], value: Any) -> bool:
+        """Only a literal True counts; any other value, or an exception, is False."""
+        try:
+            return predicate(value) is True
+        except Exception:  # noqa: BLE001 - an inference that fails never joins
+            return False
+
+    def _owner_continues(self, fragment: dict[str, Any]) -> bool:
+        """Whether the owner's own labelled fragment continues the held wake word (#230).
+
+        Only the continuation's attribution counts: a guest's or an unknown speaker's
+        fragment, an unattributed or overlapping one, or one with another provenance is
+        never joined. The bounds of the gap path apply, with the merge gap only.
+        """
+        held = self._held
+        return (
+            held is not None
+            and self._joinable(fragment)
+            and fragment["speaker_provenance"] == held["speaker_provenance"]
+            and fragment["start_ms"] - held["end_ms"] <= self.gap_ms
+            and max(held["end_ms"], fragment["end_ms"]) - held["start_ms"] <= self.max_span_ms
+            and len(held["text"]) + 1 + len(fragment["text"]) <= MAX_TEXT_CHARS
+            and self._predicate(self.owner, dict(fragment))
+        )
 
     def _continues(self, fragment: dict[str, Any]) -> bool:
         held = self._held
@@ -260,7 +339,23 @@ class TurnMerger:
         if self._bridges(fragment):
             self._bridged.append(dict(fragment))
             return
-        if self._continues(fragment):
+        if self._held_wake:
+            # Only the owner's own sentence continues a lone wake word (#230); the owner
+            # predicate is asked once per offered fragment.
+            if self._owner_continues(fragment):
+                # It keeps its own label and provenance and takes the name, starting
+                # where the name started; the name's own gap observation is dropped.
+                wake = self._held
+                self._held, self._held_wake, self._wake_window = None, False, None
+                self._heard_ms = None
+                joined = dict(fragment)
+                joined["text"] = wake["text"] + " " + fragment["text"]
+                joined["start_ms"] = wake["start_ms"]
+                # The name's speaker is inferred from the continuation: no owner authority.
+                joined["inferred"] = True
+                self.offer(joined, complete=complete)
+                return
+        elif self._continues(fragment):
             held = self._held
             joined = self._join_text(held["text"], fragment["text"], self._held_complete)
             complete = complete and not self._looks_unfinished(joined)
@@ -302,13 +397,22 @@ class TurnMerger:
             # Utterance-local labels never match the next utterance's: no join is possible.
             and fragment["speaker_provenance"] == "diarization-timeline"
         )
+        wake = self._wake_only(fragment)
         if held_complete:
             hold = self.complete_hold_ms
+        elif wake:
+            # A lone wake word waits the merge gap for the owner's sentence, even when
+            # judged complete. Its gap is observed over the window it would have had
+            # without this hold, if any, so its evidence is unchanged (#96).
+            window = 0 if complete else self._hold_for(fragment)
+            hold = max(self.gap_ms, window)
         else:
             hold = 0 if complete else self._hold_for(fragment)
         if hold:
             self._held, self._hold_ms, self._heard_ms = dict(fragment), hold, None
             self._held_complete = held_complete
+            self._held_wake = wake
+            self._wake_window = (window or None) if wake else None
         else:
             self.emit(dict(fragment))
 
@@ -361,6 +465,15 @@ class TurnMerger:
         held = self._held
         if held is None:
             return
+        window = self._wake_window
+        if self._held_wake and window is not None and "post_turn_gap" not in held:
+            # Without the wake hold the name would have been released here (#230): freeze
+            # its observation as it would have been, while it waits on for the owner.
+            ended = held["end_ms"] + window
+            if now_ms >= ended and (open_since_ms is None or open_since_ms > ended):
+                held["post_turn_gap"] = observe_gap(
+                    held, self._heard_following(held, self._heard_ms), window
+                )
         deadline = held["end_ms"] + self._hold_ms
         if now_ms >= deadline and (open_since_ms is None or open_since_ms > deadline):
             # No fragment arrived through the whole window: quiet, unless speech was
@@ -376,18 +489,14 @@ class TurnMerger:
         held, self._held = self._held, None
         heard, self._heard_ms = self._heard_ms, None
         held_complete, self._held_complete = self._held_complete, False
+        held_wake, self._held_wake = self._held_wake, False
+        wake_window, self._wake_window = self._wake_window, None
         bridged, self._bridged = self._bridged, []
         if held is None:
             return
         if following is None and quiet and heard is not None:
             # Detected speech without a fragment: something followed, speaker unknown.
-            following = {
-                "speaker": None,
-                "overlap": False,
-                "speaker_provenance": held["speaker_provenance"],
-                "start_ms": heard,
-                "end_ms": heard,
-            }
+            following = self._heard_following(held, heard)
         elif following is not None and heard is not None and heard < following["start_ms"]:
             # The following speech began at its detected onset, before its first retained
             # token: measure the gap from there, and classify the speaker from the fragment.
@@ -396,15 +505,40 @@ class TurnMerger:
         if after and (following is None or after[0]["start_ms"] < following["start_ms"]):
             # A backchannel after the turn's last word was the speech that followed it.
             following = after[0]
-        if self.reply_wait_ms and not held_complete and (following is not None or quiet):
+        if held_wake:
+            # A wake word held only for the owner's sentence (#230) carries the gap it
+            # would have had without that hold: frozen in `due`, or observed over its own
+            # window (speech after it counts as quiet), or unobserved.
+            if (
+                wake_window is not None
+                and "post_turn_gap" not in held
+                and (following is not None or quiet)
+            ):
+                held["post_turn_gap"] = observe_gap(held, following, wake_window)
+        elif self.reply_wait_ms and not held_complete and (following is not None or quiet):
             # A turn judged complete keeps an unobserved gap, as without the hold.
             held["post_turn_gap"] = observe_gap(held, following, self._hold_ms)
         self.emit(held)
         for backchannel in bridged:
             self.emit(backchannel)
 
+    @staticmethod
+    def _heard_following(held: dict[str, Any], heard: int | None) -> dict[str, Any] | None:
+        """Detected speech with no fragment, as the following speech: speaker unknown."""
+        if heard is None:
+            return None
+        return {
+            "speaker": None,
+            "overlap": False,
+            "speaker_provenance": held["speaker_provenance"],
+            "start_ms": heard,
+            "end_ms": heard,
+        }
+
     def discard(self) -> None:
         self._held = None
         self._heard_ms = None
         self._held_complete = False
+        self._held_wake = False
+        self._wake_window = None
         self._bridged = []

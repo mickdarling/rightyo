@@ -17,8 +17,10 @@ from argparse import Namespace
 from dataclasses import replace
 from pathlib import Path
 
-from rightyo.contracts import SpeakerPriority
+from rightyo.addressedness import request_shaped
+from rightyo.contracts import MAX_TEXT_CHARS, Addressing, SpeakerPriority
 from rightyo.live_audio import FRAME_BYTES, LiveAudioError, LiveConfig, LiveProcessor
+from rightyo.live_speaker_id import EnrolledRoles
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
 from rightyo.providers import MockProvider
 from rightyo.tool import listen
@@ -183,6 +185,358 @@ class TurnMergerTests(unittest.TestCase):
                 TurnMerger(invalid, 24000, self.emitted.append)
 
 
+# A lone wake word split from the owner's sentence (#230). Synthetic text only.
+JARVIS = Addressing(("Jarvis",), (("Jarvis", ("Jarvus",)),))
+OWNER = "Speaker A"
+GUEST = "Speaker B"
+
+
+def wake_merger(emitted, gap=2000, **options):
+    return TurnMerger(
+        gap,
+        24000,
+        emitted.append,
+        SpeakerPriority().is_stop_phrase,
+        wake_word=lambda text: JARVIS.name_for(text) is not None,
+        owner=lambda item: item["speaker"] == OWNER,
+        **options,
+    )
+
+
+class WakeWordJoinTests(unittest.TestCase):
+    """A lone unattributed wake word joins the owner's continuation, and nothing else."""
+
+    def setUp(self):
+        self.emitted = []
+        self.merger = wake_merger(self.emitted)
+
+    def pairs(self):
+        return [(item["text"], item["speaker"]) for item in self.emitted]
+
+    def test_owner_continuation_joins_at_0_300_and_1000_ms(self):
+        for gap in (0, 300, 1000):
+            for complete in (False, True):
+                with self.subTest(gap=gap, complete=complete):
+                    self.emitted.clear()
+                    # The end-of-turn model may call the name alone complete.
+                    self.merger.offer(fragment("Jarvis,", 0, 1000, speaker=None), complete=complete)
+                    self.assertEqual(self.emitted, [])
+                    self.merger.offer(fragment("are you there?", 1000 + gap, 2200 + gap))
+                    self.merger.flush()
+                    self.assertEqual(self.pairs(), [("Jarvis, are you there?", OWNER)])
+                    (turn,) = self.emitted
+                    self.assertEqual((turn["start_ms"], turn["end_ms"]), (0, 2200 + gap))
+                    self.assertEqual(turn["speaker_provenance"], "diarization-timeline")
+                    self.assertIs(turn["inferred"], True)
+                    self.assertFalse(turn["overlap"])
+
+    def test_a_variant_spelling_counts_and_a_complete_continuation_is_emitted_at_once(self):
+        self.merger.offer(fragment("jarvus.", 0, 900, speaker=None))
+        self.merger.offer(fragment("are you there?", 900, 1800), complete=True)
+        self.assertEqual(self.pairs(), [("jarvus. are you there?", OWNER)])
+        self.assertFalse(self.merger.holding)
+
+    def test_the_joined_turn_still_joins_the_owners_next_piece(self):
+        self.merger.offer(fragment("Jarvis,", 0, 1000, speaker=None))
+        self.merger.offer(fragment("are you", 1000, 1500))
+        self.merger.offer(fragment("there?", 2500, 2900))
+        self.merger.flush()
+        self.assertEqual(self.pairs(), [("Jarvis, are you there?", OWNER)])
+        self.assertIs(self.emitted[0]["inferred"], True)
+
+    def test_a_guest_continuation_is_never_joined(self):
+        self.merger.offer(fragment("Jarvis,", 0, 1000, speaker=None))
+        self.merger.offer(fragment("are you there?", 1000, 2200, speaker=GUEST))
+        self.merger.flush()
+        self.assertEqual(self.pairs(), [("Jarvis,", None), ("are you there?", GUEST)])
+        self.assertTrue(all("inferred" not in item for item in self.emitted))
+
+    def test_an_unknown_continuation_is_never_joined(self):
+        for speaker, overlap in (("Speaker C", False), (None, False), (OWNER, True)):
+            with self.subTest(speaker=speaker, overlap=overlap):
+                self.emitted.clear()
+                self.merger.offer(fragment("Jarvis,", 0, 1000, speaker=None))
+                self.merger.offer(
+                    fragment("are you there?", 1000, 2200, speaker=speaker, overlap=overlap)
+                )
+                self.merger.flush()
+                self.assertEqual(self.pairs(), [("Jarvis,", None), ("are you there?", speaker)])
+                self.assertTrue(all("inferred" not in item for item in self.emitted))
+
+    def test_another_provenance_or_a_failing_owner_predicate_never_joins(self):
+        other = fragment("are you there?", 1000, 2200)
+        other["speaker_provenance"] = "unknown"
+        self.merger.offer(fragment("Jarvis,", 0, 1000, speaker=None))
+        self.merger.offer(other)
+        self.merger.flush()
+        self.assertEqual(self.pairs(), [("Jarvis,", None), ("are you there?", OWNER)])
+
+        def broken(_item):
+            raise RuntimeError("identification failed")
+
+        emitted = []
+        merger = TurnMerger(2000, 24000, emitted.append, wake_word=bool, owner=broken)
+        merger.offer(fragment("Jarvis,", 0, 1000, speaker=None))
+        merger.offer(fragment("are you there?", 1000, 2200))
+        merger.flush()
+        self.assertEqual([item["text"] for item in emitted], ["Jarvis,", "are you there?"])
+
+    def test_without_a_continuation_in_the_gap_the_wake_word_is_emitted_as_today(self):
+        baseline = []
+        TurnMerger(2000, 24000, baseline.append).offer(fragment("Jarvis,", 0, 1000, speaker=None))
+        # A continuation just past the merge gap does not join.
+        self.merger.offer(fragment("Jarvis,", 0, 1000, speaker=None))
+        self.merger.offer(fragment("are you there?", 3001, 4000))
+        self.merger.flush()
+        self.assertEqual(self.emitted[0], baseline[0])
+        self.assertEqual(self.pairs(), [("Jarvis,", None), ("are you there?", OWNER)])
+        # Silence: released, unchanged, once the merge gap has passed and no later.
+        self.emitted.clear()
+        self.merger.offer(fragment("Jarvis,", 0, 1000, speaker=None), complete=True)
+        self.merger.due(2999, None)
+        self.assertEqual(self.emitted, [])
+        self.merger.due(3000, None)
+        self.assertEqual(self.emitted, baseline)
+        # With post-turn gaps observed (#96), a name that would not have been held for
+        # its gap is still released without one.
+        emitted = []
+        merger = wake_merger(emitted, reply_wait_ms=1200, shaped=lambda text: False)
+        merger.offer(fragment("Jarvis,", 0, 1000, speaker=None))
+        merger.due(3000, None)
+        self.assertEqual(emitted, baseline)
+
+    def test_the_hold_is_bounded_by_the_merge_gap(self):
+        merger = wake_merger(self.emitted, gap=800)
+        merger.offer(fragment("Jarvis,", 0, 1000, speaker=None), complete=True)
+        merger.due(1800, None)
+        self.assertEqual(self.pairs(), [("Jarvis,", None)])
+        # Merging off: no hold, no join.
+        self.emitted.clear()
+        merger = wake_merger(self.emitted, gap=0)
+        merger.offer(fragment("Jarvis,", 0, 1000, speaker=None))
+        self.assertEqual(self.pairs(), [("Jarvis,", None)])
+        self.assertFalse(merger.holding)
+
+    def test_a_stop_phrase_is_never_held_or_joined(self):
+        self.merger.offer(fragment("Jarvis,", 0, 1000, speaker=None))
+        self.merger.offer(fragment("stop", 1000, 1300))
+        self.assertEqual(self.pairs(), [("Jarvis,", None), ("stop", OWNER)])
+        self.assertFalse(self.merger.holding)
+        self.assertTrue(all("inferred" not in item for item in self.emitted))
+        # An unattributed stop phrase is not held for the owner either.
+        self.emitted.clear()
+        self.merger.offer(fragment("never mind", 0, 400, speaker=None))
+        self.assertEqual(self.pairs(), [("never mind", None)])
+        self.assertFalse(self.merger.holding)
+
+    def test_other_unattributed_fragments_behave_as_today(self):
+        for text, overlap in (
+            ("are you there?", False),
+            ("hey Jarvis", False),
+            ("Jarvis, what time is it", False),
+            ("Jarvis,", True),
+        ):
+            with self.subTest(text=text, overlap=overlap):
+                baseline = []
+                TurnMerger(2000, 24000, baseline.append).offer(
+                    fragment(text, 0, 1000, speaker=None, overlap=overlap)
+                )
+                self.emitted.clear()
+                self.merger.offer(fragment(text, 0, 1000, speaker=None, overlap=overlap))
+                # Emitted at once, unchanged, and never joined to the owner's next turn.
+                self.assertEqual(self.emitted, baseline)
+                self.assertFalse(self.merger.holding)
+                self.merger.offer(fragment("are you there?", 1000, 2200))
+                self.merger.flush()
+                self.assertEqual(self.emitted[1]["text"], "are you there?")
+
+    def test_predicates_are_validated(self):
+        for options in ({"wake_word": "Jarvis"}, {"owner": OWNER}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                TurnMerger(2000, 24000, self.emitted.append, **options)
+        backends = {
+            "provenance": "causal-replay",
+            "transcriber": ScriptedTranscriber(TEXTS),
+            "diarizer": ScriptedDiarizer(),
+        }
+        # A valid configuration first, so the errors below come from the new checks.
+        LiveConfig("wake-test", **backends, turn_wake_word=bool, turn_owner=bool)
+        for options, message in (
+            ({"turn_wake_word": "Jarvis"}, "Invalid wake word predicate"),
+            ({"turn_owner": OWNER}, "Invalid owner predicate"),
+        ):
+            with self.subTest(options=options), self.assertRaisesRegex(LiveAudioError, message):
+                LiveConfig("wake-test", **backends, **options)
+
+    def test_only_a_literal_true_from_a_predicate_counts(self):
+        for wake_word, owner in ((lambda text: 1, lambda item: True), (bool, lambda item: "yes")):
+            with self.subTest(wake_word=wake_word, owner=owner):
+                emitted = []
+                merger = TurnMerger(2000, 24000, emitted.append, wake_word=wake_word, owner=owner)
+                merger.offer(fragment("Jarvis,", 0, 1000, speaker=None))
+                merger.offer(fragment("are you there?", 1000, 2200))
+                merger.flush()
+                self.assertEqual([item["text"] for item in emitted], ["Jarvis,", "are you there?"])
+
+    def test_the_mergers_own_guards_reject_overlap_and_unattributed_continuations(self):
+        # Even with an owner predicate that accepts everything.
+        for speaker, overlap in ((OWNER, True), (None, False)):
+            with self.subTest(speaker=speaker, overlap=overlap):
+                emitted = []
+                merger = TurnMerger(
+                    2000, 24000, emitted.append, wake_word=bool, owner=lambda item: True
+                )
+                merger.offer(fragment("Jarvis,", 0, 1000, speaker=None))
+                merger.offer(
+                    fragment("are you there?", 1000, 2200, speaker=speaker, overlap=overlap)
+                )
+                merger.flush()
+                self.assertEqual([item["text"] for item in emitted], ["Jarvis,", "are you there?"])
+                self.assertTrue(all("inferred" not in item for item in emitted))
+
+    def test_span_and_text_limits_apply_to_the_wake_join(self):
+        merger = TurnMerger(
+            2000, 2000, self.emitted.append, wake_word=bool, owner=lambda item: True
+        )
+        merger.offer(fragment("Jarvis,", 0, 1000, speaker=None))
+        merger.offer(fragment("are you there?", 1500, 2001))
+        merger.flush()
+        self.assertEqual(self.pairs(), [("Jarvis,", None), ("are you there?", OWNER)])
+        # Exactly at the span limit still joins.
+        self.emitted.clear()
+        merger.offer(fragment("Jarvis,", 0, 1000, speaker=None))
+        merger.offer(fragment("are you there?", 1500, 2000))
+        merger.flush()
+        self.assertEqual(self.pairs(), [("Jarvis, are you there?", OWNER)])
+        # The joined text may not exceed the turn text limit.
+        fits = "a" * (MAX_TEXT_CHARS - len("Jarvis,") - 1)
+        for text, joined in ((fits, True), (fits + "a", False)):
+            with self.subTest(length=len(text)):
+                self.emitted.clear()
+                self.merger.offer(fragment("Jarvis,", 0, 1000, speaker=None))
+                self.merger.offer(fragment(text, 1000, 2200))
+                self.merger.flush()
+                self.assertEqual(len(self.emitted), 1 if joined else 2)
+
+    def test_a_labelled_name_is_never_held_as_a_wake_word(self):
+        # A guest's labelled name keeps its own speaker: it joins the guest's own
+        # continuation as before, never the owner's sentence.
+        self.merger.offer(fragment("Jarvis,", 0, 1000, speaker=GUEST))
+        self.merger.offer(fragment("are you there?", 1000, 2200))
+        self.merger.flush()
+        self.assertEqual(self.pairs(), [("Jarvis,", GUEST), ("are you there?", OWNER)])
+        for speaker in (GUEST, OWNER):
+            with self.subTest(speaker=speaker):
+                self.emitted.clear()
+                self.merger.offer(fragment("Jarvis,", 0, 1000, speaker=speaker))
+                self.merger.offer(fragment("are you there?", 1000, 2200, speaker=speaker))
+                self.merger.flush()
+                self.assertEqual(self.pairs(), [("Jarvis, are you there?", speaker)])
+                # The ordinary same-speaker join: nothing inferred.
+                self.assertNotIn("inferred", self.emitted[0])
+
+
+def drive(merger, steps):
+    """Run a scripted stream against a merger: ("due", now, open_since), ("offer",
+    fragment, complete), ("heard", ms) or ("flush",)."""
+    for step in steps:
+        if step[0] == "due":
+            merger.due(step[1], step[2])
+        elif step[0] == "offer":
+            merger.offer(dict(step[1]), complete=step[2])
+        elif step[0] == "heard":
+            merger.heard(step[1])
+        else:
+            merger.flush()
+
+
+def ticks(start, stop, open_since=None):
+    return [("due", now, open_since) for now in range(start, stop + 1, 100)]
+
+
+class WakeWordEvidenceTests(unittest.TestCase):
+    """A request-shaped lone name that joins nothing reaches downstream exactly as on main.
+
+    The baseline is a merger without the wake options; both use the real `request_shaped`
+    and the prototype defaults (merge gap 2,000 ms, reply wait 1,200 ms).
+    """
+
+    def compare(self, steps):
+        baseline, emitted = [], []
+        stop = SpeakerPriority().is_stop_phrase
+        drive(TurnMerger(2000, 24000, baseline.append, stop, reply_wait_ms=1200), steps)
+        drive(wake_merger(emitted, reply_wait_ms=1200), steps)
+        self.assertEqual(json.dumps(emitted, sort_keys=True), json.dumps(baseline, sort_keys=True))
+        return emitted
+
+    def test_the_name_is_request_shaped(self):
+        self.assertTrue(request_shaped("Jarvis?"))
+
+    def scenarios(self, complete):
+        name = ("offer", fragment("Jarvis?", 0, 1000, speaker=None), complete)
+        guest_late = fragment("hello there", 2500, 3000, speaker=GUEST)
+        guest_soon = fragment("hello there", 1500, 2000, speaker=GUEST)
+        return {
+            "quiet": [name, *ticks(1000, 5000), ("flush",)],
+            "another speaker after the reply window": [
+                name,
+                *ticks(1000, 2400),
+                *ticks(2500, 4400, open_since=2500),
+                ("offer", guest_late, False),
+                *ticks(4500, 7000),
+                ("flush",),
+            ],
+            "another speaker inside the reply window": [
+                name,
+                *ticks(1000, 1400),
+                *ticks(1500, 3400, open_since=1500),
+                ("offer", guest_soon, False),
+                *ticks(3500, 6000),
+                ("flush",),
+            ],
+            "speech heard without text, then quiet": [
+                name,
+                ("heard", 1100),
+                *ticks(1000, 5000),
+                ("flush",),
+            ],
+            "speech heard after the reply window": [
+                name,
+                *ticks(1000, 2300),
+                ("heard", 2400),
+                *ticks(2400, 5000),
+                ("flush",),
+            ],
+        }
+
+    def test_not_judged_complete(self):
+        for label, steps in self.scenarios(False).items():
+            with self.subTest(label):
+                emitted = self.compare(steps)
+                self.assertEqual(emitted[0]["post_turn_gap"]["window_ms"], 1200)
+
+    def test_judged_complete(self):
+        for label, steps in self.scenarios(True).items():
+            with self.subTest(label):
+                emitted = self.compare(steps)
+                self.assertNotIn("post_turn_gap", emitted[0])
+
+    def test_the_owner_still_joins_and_the_name_alone_is_never_emitted(self):
+        emitted = []
+        merger = wake_merger(emitted, reply_wait_ms=1200)
+        drive(
+            merger,
+            [
+                ("offer", fragment("Jarvis?", 0, 1000, speaker=None), False),
+                *ticks(1000, 2900),
+                ("offer", fragment("are you there?", 3000, 3500), False),
+                ("flush",),
+            ],
+        )
+        self.assertEqual([item["text"] for item in emitted], ["Jarvis? are you there?"])
+        self.assertIs(emitted[0]["inferred"], True)
+
+
 class ScriptedTranscriber:
     """One scripted text per utterance, timed to the utterance's voiced frames."""
 
@@ -231,6 +585,44 @@ class ScriptedDiarizer:
     finish = segments
 
     def close(self):
+        pass
+
+
+class LateLabelDiarizer(ScriptedDiarizer):
+    """No speaker before `labelled_from_ms`, then `speaker` throughout (#230)."""
+
+    def __init__(self, labelled_from_ms, speaker):
+        super().__init__()
+        self.labelled_from_ms, self.speaker = labelled_from_ms, speaker
+
+    def segments(self):
+        end = self.pushed_ms + 1000
+        return [{"start_ms": self.labelled_from_ms, "end_ms": end, "speaker": self.speaker}]
+
+    finish = segments
+
+
+class BoundShadow:
+    """A stand-in live identifier with fixed bindings: label -> (state, identity)."""
+
+    def __init__(self, labels):
+        self.labels = labels
+        self.inferred = []
+
+    def start(self):
+        pass
+
+    def audio(self, pcm):
+        pass
+
+    def turn(self, current, *, inferred=False, spans=None):
+        if inferred:
+            self.inferred.append(current.utterance_id)
+
+    def binding(self, label):
+        return self.labels.get(label)
+
+    def close(self, drain=False):
         pass
 
 
@@ -428,7 +820,9 @@ class DecisionPathTests(unittest.TestCase):
         self.base["addressing"] = {"names": ["Haili"], "variants": {"Haili": ["Hailey"]}}
         self.config = self.root / "config.json"
 
-    def run_listen(self, texts=TEXTS, pcm=None, switch_ms=None, **extra):
+    def run_listen(
+        self, texts=TEXTS, pcm=None, switch_ms=None, diarizer=None, shadow=None, **extra
+    ):
         if pcm is not None:
             with wave.open(str(self.demo), "wb") as file:
                 file.setnchannels(1)
@@ -441,7 +835,7 @@ class DecisionPathTests(unittest.TestCase):
         def processor(config, callback):
             backends = {
                 "transcriber": ScriptedTranscriber(texts),
-                "diarizer": ScriptedDiarizer(switch_ms),
+                "diarizer": diarizer or ScriptedDiarizer(switch_ms),
             }
             return LiveProcessor(replace(config, **backends), callback)
 
@@ -451,6 +845,11 @@ class DecisionPathTests(unittest.TestCase):
                 event_publisher=event_publisher,
                 processor_factory=processor,
                 provider_factory=lambda **options: CountingProvider(built, **options),
+                **(
+                    {}
+                    if shadow is None
+                    else {"speaker_id_factory": lambda settings, *, report: shadow}
+                ),
             )
 
         args = Namespace(
@@ -531,6 +930,115 @@ class DecisionPathTests(unittest.TestCase):
         events, _ = self.run_listen(texts=("Wait.", "never mind me"), pcm=pcm)
         texts = [e["turn"]["text"] for e in self.of(events, "transcript")]
         self.assertEqual(texts, ["Wait. never mind me"])
+
+    def run_wake_word(self, owner, **extra):
+        # "Haili," (0-200 ms) with no speaker label, a 1,500 ms pause, then "are you
+        # there?" (1,700-1,900 ms) labelled Speaker A by the timeline from 1,000 ms on.
+        return self.run_listen(
+            texts=("Haili,", "are you there?"),
+            diarizer=LateLabelDiarizer(1000, 1),
+            speakers={"owner": [owner], "trusted": [], "owner_only": False},
+            **extra,
+        )
+
+    def run_identified(self, binding):
+        """The same speech with live identification roles (#137): Speaker A's binding is
+        `binding`, and the configured owner is the enrolled identity `owner`."""
+        shadow = BoundShadow({} if binding is None else {"Speaker A": binding})
+        identification = {
+            "python": self.base["whisper_executable"],
+            "model": self.base["whisper_model"],
+            "live": True,
+            "roles": True,
+        }
+        events, provider = self.run_wake_word(
+            owner="owner", shadow=shadow, speaker_id=identification
+        )
+        return [e["turn"] for e in self.of(events, "transcript")], events, shadow
+
+    def test_live_identification_joins_only_an_owner_binding(self):
+        transcripts, events, shadow = self.run_identified(("bound", "owner"))
+        self.assertEqual(
+            [(t["text"], t["speaker_id"], t["role"]) for t in transcripts],
+            [("Haili, are you there?", "Speaker A", "owner")],
+        )
+        (request,) = self.of(events, "request")
+        self.assertEqual(request["turn"]["text"], "Haili, are you there?")
+        # The joined turn reaches identification as inferred (#137).
+        self.assertEqual(shadow.inferred, [transcripts[0]["utterance_id"]])
+        for binding, role in (
+            (("bound", "guest"), "participant"),
+            (("unknown", None), "participant"),
+            (("tentative", "owner"), "unknown"),
+            (None, "unknown"),
+        ):
+            with self.subTest(binding=binding):
+                transcripts, events, _ = self.run_identified(binding)
+                self.assertEqual(
+                    [(t["text"], t["speaker_id"], t["role"]) for t in transcripts],
+                    [("Haili,", None, "unknown"), ("are you there?", "Speaker A", role)],
+                )
+                requests = self.of(events, "request")
+                self.assertFalse([r for r in requests if r["turn"].get("role") == "owner"])
+
+    def test_the_owner_check_leaves_the_name_binding_alone(self):
+        roles = EnrolledRoles(SpeakerPriority(owners=("owner",)))
+        roles.source = BoundShadow({"Speaker A": ("bound", "owner")})
+        controller = PrototypeController(
+            PrototypeConfig.load(self._write(speakers={"owner": ["owner"]}))
+        )
+        self.addCleanup(controller.close)
+        controller._enrolled_roles = roles
+        wake_word, owner = controller._wake_join()
+        roles._resolved = sentinel = ("live-1", "Speaker B", ("bound", "guest"))
+        self.assertTrue(owner(fragment("are you there?", 0, 100)))
+        self.assertIs(roles._resolved, sentinel)
+        self.assertFalse(owner(fragment("are you there?", 0, 100, overlap=True)))
+        other = fragment("are you there?", 0, 100)
+        other["speaker_provenance"] = "diarization-utterance"
+        self.assertFalse(owner(other))
+        self.assertTrue(wake_word("Hailey."))
+        self.assertFalse(wake_word("hey Haili"))
+
+    def _write(self, **extra):
+        self.config.write_text(json.dumps({**self.base, **extra}))
+        return self.config
+
+    def test_wake_join_can_be_turned_off_alone(self):
+        events, _ = self.run_wake_word(owner="Speaker A", turns={"wake_join": False})
+        texts = [e["turn"]["text"] for e in self.of(events, "transcript")]
+        self.assertEqual(texts, ["Haili,", "are you there?"])
+        self.assertTrue(PrototypeConfig.load(self._write()).turn_wake_join)
+        self.assertFalse(
+            PrototypeConfig.load(self._write(turns={"wake_join": False})).turn_wake_join
+        )
+        for invalid in ("false", 0, None):
+            with self.subTest(invalid=invalid), self.assertRaises(PrototypeError):
+                PrototypeConfig.load(self._write(turns={"wake_join": invalid}))
+
+    def test_a_lone_wake_word_and_the_owners_sentence_are_one_owner_request(self):
+        events, provider = self.run_wake_word(owner="Speaker A")
+        transcripts = [e["turn"] for e in self.of(events, "transcript")]
+        self.assertEqual(
+            [(t["text"], t["speaker_id"], t.get("role")) for t in transcripts],
+            [("Haili, are you there?", "Speaker A", "owner")],
+        )
+        self.assertEqual(provider.requests, 1)
+        (request,) = self.of(events, "request")
+        self.assertEqual(request["turn"]["utterance_id"], transcripts[0]["utterance_id"])
+        self.assertEqual(request["turn"]["text"], "Haili, are you there?")
+
+    def test_a_non_owner_continuation_forms_no_owner_request(self):
+        # Speaker A is a participant here: the name is never joined to their sentence.
+        events, _ = self.run_wake_word(owner="Speaker B")
+        transcripts = [e["turn"] for e in self.of(events, "transcript")]
+        self.assertEqual(
+            [(t["text"], t["speaker_id"], t.get("role")) for t in transcripts],
+            [("Haili,", None, "unknown"), ("are you there?", "Speaker A", "participant")],
+        )
+        requests = self.of(events, "request")
+        self.assertFalse([r for r in requests if r["turn"].get("role") == "owner"])
+        self.assertFalse([r for r in requests if r["turn"]["text"] == "are you there?"])
 
     def test_config_section_is_validated(self):
         self.config.write_text(json.dumps(self.base))

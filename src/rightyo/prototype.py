@@ -16,7 +16,8 @@ import wave
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Callable
 
 from rightyo.addressedness import (
     DEFAULT_REPLY_WAIT_MS,
@@ -311,6 +312,9 @@ class PrototypeConfig:
     turn_complete_hold_ms: int = 0
     turn_collapse_restarts: bool = False
     turn_bridge_backchannels: bool = False
+    # The `turns` section's `wake_join` (#230): a lone unattributed wake word joins the
+    # owner's following sentence. On by default; acts only with names and owners.
+    turn_wake_join: bool = True
     # The `decision` section's optional `scene` (#96): the setting text given to the
     # decision model. Absent means the single-user pilot default; null turns it off.
     decision_scene: str | None = DEFAULT_SCENE
@@ -466,12 +470,18 @@ class PrototypeConfig:
                 "complete_hold_ms",
                 "collapse_restarts",
                 "bridge_backchannels",
+                "wake_join",
             }:
                 raise ValueError
             hold_unfinished = turns.get("hold_unfinished", True)
             restarts = turns.get("collapse_restarts", False)
             bridge = turns.get("bridge_backchannels", False)
-            if type(hold_unfinished) is not bool or {type(restarts), type(bridge)} != {bool}:
+            wake_join = turns.get("wake_join", True)
+            if type(hold_unfinished) is not bool or {
+                type(restarts),
+                type(bridge),
+                type(wake_join),
+            } != {bool}:
                 raise ValueError
             hold_complete = complete_hold(turns.get("complete_hold_ms", 0))
             tail = tail_join(turns.get("tail_join_ms", 0))
@@ -513,6 +523,7 @@ class PrototypeConfig:
                 turn_complete_hold_ms=hold_complete,
                 turn_collapse_restarts=restarts,
                 turn_bridge_backchannels=bridge,
+                turn_wake_join=wake_join,
                 decision_scene=scene,
                 reply_wait_ms=wait,
                 edge_attribution_ms=edges,
@@ -994,6 +1005,47 @@ class PrototypeController:
             return stop
         return lambda text: stop(text) or dismissal_shaped(text)
 
+    def _wake_join(
+        self,
+    ) -> tuple[Callable[[str], bool] | None, Callable[[dict[str, Any]], bool] | None]:
+        """The wake-word and owner predicates of the lone wake word join (#230), or Nones.
+
+        Only with configured names and owners, and `turns.wake_join` on: the wake word is
+        a turn whose text is only a configured name or variant; the owner is a fragment
+        whose label resolves to the owner role now, by the same rules the turn's published
+        role uses (configured session labels, or live identification bindings, looked up
+        without side effects). A guest, a participant and an unknown speaker are never the
+        owner, so the name never raises anyone's role.
+        """
+        addressing = self.config.addressing
+        speakers = self.config.speakers
+        if (
+            not self.config.turn_wake_join
+            or addressing is None
+            or speakers is None
+            or not speakers.owners
+        ):
+            return None, None
+        enrolled = self._enrolled_roles
+
+        def wake_word(text: str) -> bool:
+            return addressing.name_for(text) is not None
+
+        def owner(fragment: dict[str, Any]) -> bool:
+            if enrolled is None:
+                return speakers.configured_role(fragment["speaker"]) == "owner"
+            # The identification role, as `SpeechEvents` would resolve it at emission,
+            # looked up without touching the binding its `name_for` reads.
+            probe = SimpleNamespace(
+                utterance_id=None,
+                speaker_id=fragment["speaker"],
+                overlap=fragment["overlap"],
+                speaker_provenance=fragment["speaker_provenance"],
+            )
+            return enrolled.role_of(probe) == "owner"
+
+        return wake_word, owner
+
     def _turn_unfinished(self):
         """The predicate for turns held despite end-of-turn's "complete" (#199), or None.
 
@@ -1112,6 +1164,7 @@ class PrototypeController:
             end_of_turn = self._end_of_turn_model(stop)
             shadow = self._shadow_speaker_id()
             settings = self.config.end_of_turn
+            wake_word, owner = self._wake_join()
             processor = self.processor_factory(
                 LiveConfig(
                     session_id=session,
@@ -1163,6 +1216,9 @@ class PrototypeController:
                     turn_complete_hold_ms=self.config.turn_complete_hold_ms,
                     turn_collapse_restarts=self.config.turn_collapse_restarts,
                     turn_bridge_backchannels=self.config.turn_bridge_backchannels,
+                    # A lone wake word joins the owner's following sentence (#230).
+                    turn_wake_word=wake_word,
+                    turn_owner=owner,
                     end_of_turn_threshold=settings.threshold if settings else 0.5,
                     end_of_turn_silence_ms=settings.silence_ms if settings else 200,
                     timeline_window_ms=self.config.timeline_window_ms,
