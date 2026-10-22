@@ -363,6 +363,24 @@ the range 0 to 5,000, and 0 turns joining off. A joined turn:
   label, and it is refused together with configured speaker roles, except
   [roles from live speaker identification](#roles-from-live-speaker-identification).
 
+A lone wake word is the other exception
+([#230](https://github.com/mickdarling/rightyo/issues/230)). The live window can finalize
+the name on its own at a comma pause ("Jarvis," then "are you there?"). The name alone is
+too short to identify the speaker, so it has no label, while the rest is labelled as the
+owner; neither half was then an addressed owner request. With `addressing` names and
+configured owners (by session label or by
+[live identification](#roles-from-live-speaker-identification)) and joining on, a piece
+whose whole text is a configured name or variant, with no speaker label and no overlap,
+is held for at most `merge_gap_ms`, even when an end-of-turn model called it complete. A
+labelled, non-overlapping piece with the same provenance that starts within the gap and
+whose label has the `owner` role at that moment joins it: the joined turn keeps the
+owner's label, starts with the name, and is decided once. Its label is partly inferred,
+so it is reported like tail join and never exercises owner authority (no override or
+owner stop phrase). The name never raises anyone's role: a guest's, a participant's or an
+unknown speaker's piece is never joined to it, and the name is then emitted unchanged, as
+before, only up to the gap later. A stop phrase is never held or joined, and any other
+piece without a label behaves as before.
+
 An end-of-turn model's "complete" does not skip the hold for a piece that looks cut off
 mid-request ([#199](https://github.com/mickdarling/rightyo/issues/199)). Such a piece
 ends on an article, connective, filler, modal, possessive or one of the prepositions to,

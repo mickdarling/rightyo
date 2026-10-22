@@ -195,6 +195,14 @@ class LiveConfig:
     turn_complete_hold_ms: int = 0
     turn_collapse_restarts: bool = False
     turn_bridge_backchannels: bool = False
+    # A lone wake word split from the owner's sentence (#230; see `TurnMerger`). With both
+    # set and merging on, an unattributed turn whose text is only a configured name is held
+    # for at most the merge gap, and joined by the owner's labelled continuation, which
+    # keeps its label; the joined turn is reported through `on_inferred`. `turn_wake_word`
+    # takes a turn's text; `turn_owner` a fragment (`speaker`, `speaker_provenance`,
+    # `overlap`) and says whether its label is the owner's now. None, the default, is off.
+    turn_wake_word: Callable[[str], bool] | None = None
+    turn_owner: Callable[[dict[str, Any]], bool] | None = None
     end_of_turn_threshold: float = 0.5
     end_of_turn_silence_ms: int = 200
     # The trailing window of the diarizer timeline returned for attribution (#226), and
@@ -235,6 +243,10 @@ class LiveConfig:
             raise LiveAudioError("Invalid turn break predicate")
         if self.turn_unfinished is not None and not callable(self.turn_unfinished):
             raise LiveAudioError("Invalid unfinished-turn predicate")
+        if self.turn_wake_word is not None and not callable(self.turn_wake_word):
+            raise LiveAudioError("Invalid wake word predicate")
+        if self.turn_owner is not None and not callable(self.turn_owner):
+            raise LiveAudioError("Invalid owner predicate")
         if (
             type(self.word_label_coverage) not in (int, float)
             or not math.isfinite(self.word_label_coverage)
@@ -1070,6 +1082,8 @@ class LiveProcessor:
             complete_hold_ms=config.turn_complete_hold_ms,
             collapse_restarts=config.turn_collapse_restarts,
             bridge_backchannels=config.turn_bridge_backchannels,
+            wake_word=config.turn_wake_word,
+            owner=config.turn_owner,
         )
 
     @property

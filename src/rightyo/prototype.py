@@ -16,7 +16,8 @@ import wave
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Callable
 
 from rightyo.addressedness import (
     DEFAULT_REPLY_WAIT_MS,
@@ -994,6 +995,41 @@ class PrototypeController:
             return stop
         return lambda text: stop(text) or dismissal_shaped(text)
 
+    def _wake_join(
+        self,
+    ) -> tuple[Callable[[str], bool] | None, Callable[[dict[str, Any]], bool] | None]:
+        """The wake-word and owner predicates of the lone wake word join (#230), or Nones.
+
+        Only with configured names and owners: the wake word is a turn whose text is only a
+        configured name or variant; the owner is a fragment whose label resolves to the
+        owner role now, by the same rules the turn's published role uses (configured
+        session labels, or live identification bindings). A guest, a participant and an
+        unknown speaker are never the owner, so the name never raises anyone's role.
+        """
+        addressing = self.config.addressing
+        speakers = self.config.speakers
+        if addressing is None or speakers is None or not speakers.owners:
+            return None, None
+        enrolled = self._enrolled_roles
+
+        def wake_word(text: str) -> bool:
+            return addressing.name_for(text) is not None
+
+        def owner(fragment: dict[str, Any]) -> bool:
+            if enrolled is None:
+                return speakers.configured_role(fragment["speaker"]) == "owner"
+            # The identification role, as `SpeechEvents` would resolve it at emission; no
+            # utterance id, so it can never stand for a turn's resolved name binding.
+            probe = SimpleNamespace(
+                utterance_id=None,
+                speaker_id=fragment["speaker"],
+                overlap=fragment["overlap"],
+                speaker_provenance=fragment["speaker_provenance"],
+            )
+            return enrolled.role_for(probe) == "owner"
+
+        return wake_word, owner
+
     def _turn_unfinished(self):
         """The predicate for turns held despite end-of-turn's "complete" (#199), or None.
 
@@ -1112,6 +1148,7 @@ class PrototypeController:
             end_of_turn = self._end_of_turn_model(stop)
             shadow = self._shadow_speaker_id()
             settings = self.config.end_of_turn
+            wake_word, owner = self._wake_join()
             processor = self.processor_factory(
                 LiveConfig(
                     session_id=session,
@@ -1163,6 +1200,9 @@ class PrototypeController:
                     turn_complete_hold_ms=self.config.turn_complete_hold_ms,
                     turn_collapse_restarts=self.config.turn_collapse_restarts,
                     turn_bridge_backchannels=self.config.turn_bridge_backchannels,
+                    # A lone wake word joins the owner's following sentence (#230).
+                    turn_wake_word=wake_word,
+                    turn_owner=owner,
                     end_of_turn_threshold=settings.threshold if settings else 0.5,
                     end_of_turn_silence_ms=settings.silence_ms if settings else 200,
                     timeline_window_ms=self.config.timeline_window_ms,
