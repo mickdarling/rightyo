@@ -163,7 +163,7 @@ class DuckModeTests(unittest.TestCase):
     def test_a_session_start_keeps_it(self):
         # The host may report duck mode before a (re)started session begins.
         self.events = SpeechEvents()
-        self.events.duck(True)
+        self.events.duck(True, now_ms=0)
         self.events.start(SESSION, now_ms=0, addressing=OURS, conversation=MODE)
         self.events.drain()
         self.events.duck(False, now_ms=500)
@@ -174,7 +174,7 @@ class DuckModeTests(unittest.TestCase):
     def test_turned_off_before_any_audio_of_a_new_session_covers_nothing(self):
         # Codex P2 on #237: kept on into a new session, then off before audio: [0, 0].
         self.events = SpeechEvents()
-        self.events.duck(True)
+        self.events.duck(True, now_ms=0)
         self.events.start(SESSION, now_ms=0, addressing=OURS, conversation=MODE)
         self.events.drain()
         self.events.duck(False, now_ms=0)
@@ -194,9 +194,26 @@ class DuckModeTests(unittest.TestCase):
         # heard in duck mode ends at or before it and starts before it.
         self.assertTrue(heard(turn("c", 1999, 2000, "x")))
         self.assertTrue(heard(turn("d", 1500, 2600, "x")))  # joined across the off
-        # Starting at the off: heard after it.
+        # Starting at the off: heard after it. An empty piece exactly at the off may have
+        # ended there, so it counts (#238, fail closed).
         self.assertFalse(heard(turn("e", 2000, 2600, "x")))
-        self.assertFalse(heard(turn("f", 2000, 2000, "x")))
+        self.assertTrue(heard(turn("f", 2000, 2000, "x")))
+        self.assertFalse(heard(turn("g", 2001, 2001, "x")))
+
+    def test_an_empty_span_covers_nothing_even_inside_a_turn(self):
+        # #238: [500, 500] (on and off with no audio between) must not duck a turn around it.
+        self.start()
+        self.events.duck(True, now_ms=500)
+        self.events.duck(False, now_ms=500)
+        self.assertEqual(self.events._duck_spans, [[500, 500]])
+        self.assertFalse(self.events.heard_ducked(turn("t1", 0, 1000, "x")))
+        self.assertFalse(self.events.heard_ducked(turn("t2", 500, 500, "x")))
+
+    def test_the_change_time_is_required(self):
+        # #238: no default to the latest event time, which could drift from the audio clock.
+        self.start()
+        with self.assertRaises(TypeError):
+            self.events.duck(True)
 
     def test_it_is_independent_of_media_mode(self):
         # The host keeps the two exclusive; if both were on, duck mode decides nothing.
@@ -223,9 +240,10 @@ class DuckModeTests(unittest.TestCase):
     def test_a_non_boolean_or_bad_time_is_refused(self):
         for bad in ("on", 1, None):
             with self.subTest(bad=bad), self.assertRaises(ContractError):
-                SpeechEvents().duck(bad)
-        with self.assertRaises(ContractError):
-            SpeechEvents().duck(True, now_ms=-1)
+                SpeechEvents().duck(bad, now_ms=0)
+        for bad in (-1, None):
+            with self.subTest(now_ms=bad), self.assertRaises(ContractError):
+                SpeechEvents().duck(True, now_ms=bad)
 
 
 class DuckControllerTests(unittest.TestCase):
@@ -330,7 +348,7 @@ class DuckControllerTests(unittest.TestCase):
     def breaks(self, ducking, **extra):
         controller = self.controller(**extra)
         controller._events = SpeechEvents()
-        controller._events.duck(ducking)
+        controller._events.duck(ducking, now_ms=0)
         return controller._turn_break()
 
     def test_the_exit_breaks_only_while_ducking_and_the_entry_only_while_not(self):
