@@ -969,10 +969,11 @@ class SpeechEvents:
         with self._lock:
             self._media = on
 
-    def duck(self, on, now_ms=None):
+    def duck(self, on, *, now_ms):
         """The host's duck mode (hailing-station #735), on or off; it outlasts sessions.
 
-        `now_ms` is the stream time it changed (the latest event time when omitted). A
+        `now_ms` is the stream time it changed, on the received-audio clock turns are timed
+        in, and is required (#238): a default to the latest event time could drift from it. A
         turn heard in duck mode (`heard_ducked`) is still emitted as a `transcript` with
         its role, but never held for a decision: no attention, request, follow-up,
         acknowledgement or conversation event comes of it, the controller asks no hosted
@@ -982,10 +983,9 @@ class SpeechEvents:
         """
         if type(on) is not bool:
             raise ContractError("invalid duck mode")
-        if now_ms is not None:
-            integer(now_ms, "now_ms")
+        integer(now_ms, "now_ms")
         with self._lock:
-            at = self._now if now_ms is None else now_ms
+            at = now_ms
             if on and not self._duck:
                 self._duck_spans.append([at, None])
                 if len(self._duck_spans) > MAX_DUCK_SPANS:
@@ -1005,12 +1005,18 @@ class SpeechEvents:
         on edge is inclusive (a turn ending as it went on counts) and the off edge is
         exclusive: the off is stamped at or after the end of all audio received by then,
         so a piece heard in duck mode ends at or before it and, unless it is empty, starts
-        before it; speech starting at the off was heard after it. A span [t, t] (on and
-        off with no audio between) covers nothing.
+        before it; speech starting at the off was heard after it. An empty piece exactly at
+        the off may have ended there, so it counts (#238, fail closed). A span [t, t] (on
+        and off with no audio between) covers nothing.
         """
         with self._lock:
             return self._duck or any(
-                turn.end_ms >= on_ms and (off_ms is None or turn.start_ms < off_ms)
+                turn.end_ms >= on_ms
+                and (
+                    off_ms is None
+                    or turn.start_ms < off_ms
+                    or turn.start_ms == turn.end_ms == off_ms
+                )
                 for on_ms, off_ms in self._duck_spans
                 if off_ms is None or off_ms > on_ms
             )
