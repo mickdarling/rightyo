@@ -49,6 +49,8 @@ from rightyo.live_audio import (
     LiveAudioError,
     LiveConfig,
     LiveProcessor,
+    RecognizerSandboxError,
+    recognizer_dir,
     timeline_window,
 )
 from rightyo.live_speaker_id import (
@@ -807,6 +809,18 @@ class PrototypeController:
             )
         if self.config.hosted_speech and not self.allow_hosted_speech:
             raise PrototypeError("Hosted speech backends require explicit hosted consent")
+        if self.processor_factory is LiveProcessor and self.config.transcriber["kind"] == (
+            "whisper.cpp"
+        ):
+            # The local recognizer runs only in a directory this process cannot write
+            # (hailing-station #735 S-1); without one, refuse before any audio.
+            try:
+                recognizer_dir()
+            except RecognizerSandboxError:
+                raise PrototypeError(
+                    "Transcription refused: the local recognizer needs a directory this "
+                    "process cannot write, such as /var/empty"
+                ) from None
         roles = self.config.speakers
         if (
             roles is not None
