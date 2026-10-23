@@ -34,6 +34,9 @@ except ImportError:  # the worker's features need numpy; RightyO itself does not
     numpy = None
 
 
+UNAVAILABLE = "end-of-turn model unavailable; using silence end-of-turn"
+
+
 class ScriptedModel:
     """Returns scripted probabilities in order (the last repeats) and records each call."""
 
@@ -191,6 +194,23 @@ class LiveEndOfTurnTests(unittest.TestCase):
                 self.assertEqual(run(verdict), ([], public[1], public[2]))
         self.assertTrue(spans)
         self.assertTrue(all(start <= end for start, end in spans))
+
+    def test_a_model_failure_on_private_speech_is_not_reported(self):
+        # Codex P2 on #242: a raising or invalid model on a private utterance writes nothing.
+        def broken(_pcm):
+            raise RuntimeError("synthetic model failure")
+
+        for model in (broken, ScriptedModel(1.5)):
+            for private, expected in ((True, []), (False, [UNAVAILABLE])):
+                with self.subTest(model=model, private=private):
+                    messages = []
+                    self.run_processor(
+                        SPLIT_QUESTION,
+                        model,
+                        report=messages.append,
+                        private=lambda _start_ms, _end_ms, private=private: private,
+                    )
+                    self.assertEqual(messages, expected)
 
     def test_a_complete_turn_waits_for_a_lagging_diarizer_timeline(self):
         messages = []

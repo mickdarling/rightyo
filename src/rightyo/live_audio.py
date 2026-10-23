@@ -1342,7 +1342,11 @@ class LiveProcessor:
                 raise LiveAudioError("Audio session was stopped") from None
             # A failing model never ends the session: the silence rules take over.
             self._end_of_turn = None
-            self._diagnostic("end-of-turn model unavailable; using silence end-of-turn")
+            # Withheld for an utterance heard in privacy too: even its failure is about that speech.
+            self._diagnostic(
+                "end-of-turn model unavailable; using silence end-of-turn",
+                span=(self._utterance_start, self._received_ms),
+            )
             return False
         complete = probability >= self.config.end_of_turn_threshold
         # Content-free: a probability and stream timing only, never audio or text.
