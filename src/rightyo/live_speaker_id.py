@@ -791,9 +791,10 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         """Whether `turn` is the owner's voice for privacy entry (hailing-station #735,
         rightyo#250): its label's own pieces hold at least `entry_min_seconds` of speech
         scoring at least `entry_threshold` against an owner's voiceprint, and the rest of
-        its span (the inferred words), gap by gap, each that holds any speech scoring at
-        least `entry_remainder_threshold` on its own however short, so a guest's words
-        joined under the owner's label are judged as themselves and never pass unjudged. Reports
+        its span (the inferred words), gap by gap, each that holds any speech holding no
+        more than `entry_gap_max_seconds` of it and scoring at least
+        `entry_remainder_threshold` on its own however short, so a guest's words joined
+        under the owner's label are judged as themselves and never pass unjudged. Reports
         one line of numbers per check, pass or refuse; blocks at most
         `ENTRY_CHECK_TIMEOUT_S`; never raises (a failure refuses)."""
         source = self.source
@@ -807,8 +808,12 @@ class EnrolledRoles(ConfiguredPriorityProvider):
                 return False
             result = check(turn.start_ms, turn.end_ms, spans, self.priority.owners)
             settings = source.settings
+            # Codex P1 on #250 (c9b3907): one gap is one embedding and cannot be split
+            # without word boundaries, so a voiced gap longer than about a word, which could
+            # hold his word and a guest's together, refuses.
             passed = (
                 result.outcome == "scored"
+                and result.longest_gap_ms <= settings.entry_gap_max_seconds * 1000
                 and type(result.labelled) is float
                 and result.labelled >= settings.entry_threshold
                 and (
@@ -827,6 +832,7 @@ class EnrolledRoles(ConfiguredPriorityProvider):
                     f" remainder_gap_ms={result.longest_gap_ms}"
                     f" remainder_score={_number(result.remainder, '.3f')}"
                     f" remainder_threshold={_number(settings.entry_remainder_threshold, '.2f')}"
+                    f" gap_max_ms={round(settings.entry_gap_max_seconds * 1000)}"
                 )
             return passed
         except Exception:  # noqa: BLE001 - a failed check refuses entry, never the turn

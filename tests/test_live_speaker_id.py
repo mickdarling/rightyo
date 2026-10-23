@@ -582,7 +582,7 @@ class EntryCheckTests(unittest.TestCase):
             line,
             r"^speaker_id entry_check outcome=refuse reason=scored score=1\.000 threshold=0\.35"
             r" remainder_ms=600 remainder_gap_ms=600 remainder_score=0\.\d{3}"
-            r" remainder_threshold=0\.35$",
+            r" remainder_threshold=0\.35 gap_max_ms=600$",
         )
         self.assertNotIn(PRIVATE_TEXT, " ".join(lines))
 
@@ -623,6 +623,22 @@ class EntryCheckTests(unittest.TestCase):
         )
         self.assertIn("outcome=pass", checks[1])
 
+    def test_a_gap_long_enough_to_hold_two_words_refuses(self):
+        # Codex P1 on #250 (c9b3907): one gap holding the owner's "stop" and a guest's
+        # "recording" is one embedding; a voiced gap over `entry_gap_max_seconds` refuses,
+        # and the bound comes from the config.
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.6, OWNER_F0) + tone(0.6, GUEST_F0))
+        roles = self.roles(shadow)
+        self.assertFalse(self.entry(roles, 0, 1800, ((0, 600),)))
+        self.assertIn("outcome=refuse reason=scored", lines[-1])
+        self.assertIn("remainder_gap_ms=1200", lines[-1])
+        self.assertIn("gap_max_ms=600", lines[-1])
+        loose, loose_lines = self.shadow(entry_gap_max_seconds=1.5, entry_remainder_threshold=0.5)
+        loose.audio(tone(0.6, OWNER_F0) + tone(1.2, OWNER_F0))
+        self.assertTrue(self.entry(self.roles(loose), 0, 1800, ((0, 600),)))
+        self.assertIn("gap_max_ms=1500", loose_lines[-1])
+
     def test_a_clipped_span_refuses(self):
         # Codex P2 on #250: never score what is left of a span the ring no longer holds.
         shadow, _lines = self.shadow(ring_ms=1000)
@@ -659,8 +675,13 @@ class EntryCheckTests(unittest.TestCase):
         base = {"python": "/synthetic/python", "model": "/synthetic/model.onnx", "live": True}
         config = SpeakerIdConfig.from_dict(base)
         self.assertEqual(
-            (config.entry_threshold, config.entry_min_seconds, config.entry_remainder_threshold),
-            (0.35, 0.5, 0.35),
+            (
+                config.entry_threshold,
+                config.entry_min_seconds,
+                config.entry_remainder_threshold,
+                config.entry_gap_max_seconds,
+            ),
+            (0.35, 0.5, 0.35, 0.6),
         )
         tuned = SpeakerIdConfig.from_dict(base | {"entry_remainder_threshold": 0.2})
         self.assertEqual(tuned.entry_remainder_threshold, 0.2)
@@ -671,6 +692,8 @@ class EntryCheckTests(unittest.TestCase):
             {"entry_min_seconds": 0.1},
             {"entry_min_seconds": 11},
             {"entry_remainder_threshold": -0.1},
+            {"entry_gap_max_seconds": 0.05},
+            {"entry_gap_max_seconds": 11},
             # No length below which a remainder goes unjudged (Codex P1 on #250).
             {"entry_word_seconds": 0.3},
         ):

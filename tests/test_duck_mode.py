@@ -109,7 +109,9 @@ class Checked(Bindings):
     def __init__(self, labels, score):
         super().__init__(labels)
         self.score = score
-        self.settings = SimpleNamespace(entry_threshold=0.35, entry_remainder_threshold=0.35)
+        self.settings = SimpleNamespace(
+            entry_threshold=0.35, entry_remainder_threshold=0.35, entry_gap_max_seconds=0.6
+        )
         self.lines = []
 
     def entry_score(self, start_ms, end_ms, spans, owners):

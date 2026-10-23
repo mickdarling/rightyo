@@ -1453,7 +1453,9 @@ that passes the entry voice check, which judges the turn's two parts **apart**
   (default 0.5) of speech scoring at least `entry_threshold` (default 0.35) against an
   owner's voiceprint;
 - the rest of the span, the inferred words, is judged gap by gap: every gap that holds any
-  speech at all must score at least `entry_remainder_threshold` (default 0.35) on its own,
+  speech at all must hold no more than `entry_gap_max_seconds` (default 0.6, about one
+  word) of it, since one gap is one embedding and could otherwise average his word with a
+  guest's, and must score at least `entry_remainder_threshold` (default 0.35) on its own,
   however short, never averaged with another gap. A short word ("go") can complete an
   entry, so voiced audio that cannot be scored refuses rather than pass unjudged.
 
@@ -1465,7 +1467,8 @@ failure. Short commands usually carry an inferred word, so a host accepts
 the owner's. An inferred owner turn that is not entry-shaped, or fails the check, carries
 nothing. Each check logs one line of numbers (`speaker_id entry_check outcome=pass|refuse
 reason=… score=… threshold=… remainder_ms=… remainder_gap_ms=… remainder_score=…
-remainder_threshold=…`, the gap figure being the longest voiced gap's speech), never
+remainder_threshold=… gap_max_ms=…`, the gap figure being the longest voiced gap's
+speech), never
 words or audio. It waits at most 2 s, and the session's other work waits with it: it runs as
 the turn is published, so only an entry-shaped inferred owner turn ever pays it. It is absent
 in every other case: an owner configured by session label in
