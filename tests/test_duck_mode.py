@@ -2395,6 +2395,8 @@ class PrivacyAckTests(unittest.TestCase):
 
     def test_an_ack_that_cannot_be_queued_leaves_the_reader_and_privacy_working(self):
         controller, events, _started = self.arrange(max_pending=5)
+        # The publisher was started here, not by `controller.start`: the stream is live.
+        controller._event_terminal = False
         work, memory = queue.Queue(), TranscriptMemory()
         for index in range(5):
             PrototypeController._accept(
@@ -2412,7 +2414,13 @@ class PrivacyAckTests(unittest.TestCase):
         self.assertEqual(events._duck_spans, [[6000, 6000]])
         self.assertTrue(events._media)
         self.assertIn("control line not acknowledged; session failed", self.errors.getvalue())
-        self.assertEqual(self.acks(events.drain()), [])
+        # Codex on #248: the session fails terminally, as any lost event fails it.
+        self.assertEqual(controller._phase, "error")
+        self.assertTrue(controller._stop.is_set())
+        drained = events.drain()
+        self.assertEqual(self.acks(drained), [])
+        ends = [e for e in drained if e["type"] == "session" and e.get("phase") == "error"]
+        self.assertEqual([e.get("reason") for e in ends], ["event-delivery-failed"])
 
 
 if __name__ == "__main__":
