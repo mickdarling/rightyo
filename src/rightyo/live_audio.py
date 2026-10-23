@@ -44,6 +44,9 @@ BYTES_PER_MS = 32  # mono PCM16 at 16 kHz
 MAX_CHUNK_BYTES = 32000  # one second of audio per push
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_SPEAKER = 702  # "Speaker A" .. "Speaker ZZ"; native streams use 1..8
+# A diarizer renewal deferred past an open utterance or held turn is forced this long after the
+# privacy end is reached (#242 round 21), so steady speech cannot keep the old one in use.
+SPEAKER_RENEWAL_LIMIT_MS = 10_000
 # The native stream returns only segments ending within this trailing window of pushed
 # audio. An utterance spans at most `max_utterance_ms` (<= 15 s, pre-roll included), so
 # every segment that can overlap one is inside it with a wide margin, and per-utterance
@@ -1248,6 +1251,10 @@ class LiveProcessor:
         # the host thread and taken on the audio thread, both under `_private_lock`.
         self._private_until: int | None = None
         self._private_lock = threading.Lock()
+        # Where the last privacy end was reached (audio thread only), bounding a deferred renewal;
+        # and, after a forced one, the renewal's offset: a turn starting before it is unlabelled.
+        self._end_reached_ms: int | None = None
+        self._unlabelled_before_ms = 0
         # Told when the fresh diarizer takes over, before its first frame: labels restart there,
         # so whatever was bound to the old ones in the meantime must be forgotten again.
         self.on_speakers_renewed: Callable[[], None] | None = None
@@ -1343,7 +1350,9 @@ class LiveProcessor:
         """Start a fresh diarizer once nothing is open (hailing-station #735 S-1): called when
         privacy ends, so no speaker channel or state a private voice made outlives it. Deferred
         to the first frame with no open utterance or held turn, so a turn under way keeps its
-        labels; its timeline continues on the stream clock.
+        labels; its timeline continues on the stream clock. The deferral is bounded (round 21):
+        `SPEAKER_RENEWAL_LIMIT_MS` (10 s of stream audio) after the end is reached, the renewal
+        is forced, and a turn then under way is published with no speaker label at all.
 
         `private_until_bytes` is the stream byte offset privacy ended at (by default, the end
         of the audio pushed so far), exact to the sample (round 19): audio before it still
@@ -1353,8 +1362,10 @@ class LiveProcessor:
         private_until_bytes += private_until_bytes % 2  # a whole sample
         with self._private_lock:
             self._private_until = max(private_until_bytes, self._private_until or 0)
-        if self._diarizer_renewable:
-            self._speaker_reset = True
+            # Under the same lock as the end (round 21): a renewal taken meanwhile never clears
+            # the request this end makes.
+            if self._diarizer_renewable:
+                self._speaker_reset = True
 
     def _private_cutoff(self, pcm: bytes, final: bool = False) -> bytes:
         """`pcm`, the next audio processed, with what of it was heard before privacy ended
@@ -1370,6 +1381,7 @@ class LiveProcessor:
             if until is None or (until >= start + len(pcm) and not final):
                 return pcm
             self._private_until = None
+        self._end_reached_ms = self._received_ms
         first = start - FRAME_BYTES * len(self._pre_roll)
         frames = list(self._pre_roll)
         self._pre_roll.clear()
@@ -1381,9 +1393,21 @@ class LiveProcessor:
         private = min(len(pcm), max(0, until - start))
         return bytes(private) + pcm[private:]
 
+    def _take_renewal(self) -> bool:
+        """Claims a requested renewal once its privacy end is reached (round 21): the request
+        and the end are read and the request cleared under one lock, so an end stamped while a
+        frame is taken is never lost."""
+        with self._private_lock:
+            if not self._speaker_reset or self._private_until is not None:
+                return False
+            self._speaker_reset = False
+            return True
+
     def _renew_diarizer(self) -> None:
-        self._speaker_reset = False
         offset = self._received_ms
+        if self._utterance or self._merger.holding:
+            # Forced mid-turn (round 21): the old diarizer's labels for it must not cross over.
+            self._unlabelled_before_ms = offset
         old, self._diarizer = (
             self._diarizer,
             _OffsetDiarizer(
@@ -1402,11 +1426,17 @@ class LiveProcessor:
         # Renewed only once the privacy end is reached (#242 round 20): the controller counts a
         # chunk before pushing it, so the end can lie ahead, and the fresh diarizer must never
         # be fed a frame heard while private.
+        # Forced once the end was reached SPEAKER_RENEWAL_LIMIT_MS ago (round 21).
         if (
             self._speaker_reset
-            and self._private_until is None
-            and not self._utterance
-            and not self._merger.holding
+            and (
+                (not self._utterance and not self._merger.holding)
+                or (
+                    self._end_reached_ms is not None
+                    and self._received_ms - self._end_reached_ms >= SPEAKER_RENEWAL_LIMIT_MS
+                )
+            )
+            and self._take_renewal()
         ):
             self._renew_diarizer()
         self._diarizer.push(frame)
@@ -1659,6 +1689,10 @@ class LiveProcessor:
         gap = group.pop("post_turn_gap", None)
         inferred = group.pop("inferred", False) is True
         spans = group.pop("labelled_spans", None)
+        if group["start_ms"] < self._unlabelled_before_ms:
+            # Under way at a forced renewal (round 21): labelled, wholly or partly, by the old
+            # diarizer, or joined to its label, so published unlabelled with no label evidence.
+            group["speaker"], inferred, spans = None, False, None
         turn = Turn(
             session_id=self.config.session_id,
             utterance_id=f"live-{self._counter}",
