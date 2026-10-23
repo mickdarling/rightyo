@@ -1096,6 +1096,8 @@ class PrivacyEventsTests(unittest.TestCase):
             # Only these differ by design: the advertisement, and a voiceprint role source,
             # which is published only beside privacy control.
             stream[0].pop("duck", None)
+            # Meeting shares this advertisement boundary (#227), but is never on here.
+            stream[0].pop("meeting", None)
             for event in stream:
                 event.pop("role_source", None)
             streams.append(stream)

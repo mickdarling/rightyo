@@ -1133,6 +1133,39 @@ class ControlInputTests(unittest.TestCase):
                 raise PrototypeError("invalid reply phase")
             self.phases.append(phase)
 
+    def test_meeting_lines_forward_on_off_and_refuse_extra_keys_or_non_booleans(self):
+        import contextlib
+        import io
+        import os
+        import threading
+        from types import SimpleNamespace
+
+        from rightyo.prototype import PrototypeController
+        from rightyo.tool import _read_control
+
+        events = SpeechEvents()
+        controller = SimpleNamespace(_lock=threading.RLock(), _events=events)
+        calls = []
+
+        def meeting(on):
+            PrototypeController.meeting(controller, on)
+            calls.append(on)
+
+        read, write = os.pipe()
+        os.write(
+            write,
+            b'{"meeting": true}\n{"meeting": false}\n'
+            b'{"meeting": false, "media": true}\n'
+            b'{"meeting": 1}\n{"meeting": "yes"}\n{"meeting": null}\n',
+        )
+        os.close(write)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            _read_control(read, SimpleNamespace(meeting=meeting))
+        self.assertEqual(calls, [True, False])
+        self.assertEqual(errors.getvalue(), "rightyo: invalid control line; skipped\n" * 4)
+        self.assertIs(events._meeting, False)
+
     def test_reports_are_forwarded_and_junk_is_skipped(self):
         import contextlib
         import io

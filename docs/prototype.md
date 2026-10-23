@@ -39,6 +39,12 @@ the runtime forms of address described in [the tool API](tool-api.md); `--name` 
 the command line replace the file's names. The object may also list recognizer spellings
 of a name, for example `"variants": {"Hailing Station": ["Haling Station"]}`; see
 [name variants](tool-api.md#transport-and-lifecycle). An optional
+`"meeting": {"ask_anywhere": true}` configures meeting mode
+(hailing-station#735 meeting mode (#227)). The boolean defaults to true: while the host's
+meeting control is on, an owner-authority turn naming the assistant anywhere promotes
+`uncertain` to `attend`, never `ignore`. False keeps only media mode's name/owner bar.
+The section accepts only `ask_anywhere`; it does not turn meeting mode on. See the
+[control contract](tool-api.md#meeting-mode). An optional
 `"turns": {"merge_gap_ms": 2000}` sets how long a finalized turn waits for a continuation
 by the same speaker before it is emitted and decided (default 2,000 ms, 0 to 5,000, 0
 off); see [joined turns](tool-api.md#joined-turns), which also covers `complete_hold_ms`,

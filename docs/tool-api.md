@@ -1195,6 +1195,27 @@ to another person). Without the question (the #96 request), 9 of the 20 dismissa
 attended and would have been delivered as requests. These are authored
 lines, not recordings; the PR records the tables.
 
+## Meeting mode
+
+For hailing-station#735 meeting mode (#227), a host sends `{"meeting": true}` or
+`{"meeting": false}` over `listen --mode stdin --control-fd N` only to a child whose
+`started` advertises `"meeting": {"version": 1}`. This optional top-level object is
+advertised under the same host-control condition as `duck`; older Swift `Decodable`
+hosts ignore unknown top-level and decision-evidence keys, as with `media` evidence.
+Only that exact key set and a boolean are accepted; malformed lines are skipped with
+the content-free `invalid control line; skipped` stderr note. Changes emit nothing,
+persist across sessions, and apply to turns accepted afterward, never pending decisions.
+
+While on, media mode's bar applies: attends need the assistant's configured name and,
+with roles, owner authority; every follow-up is refused (`meeting`). By default
+`"meeting": {"ask_anywhere": true}` in the prototype config also promotes an
+owner-authority turn naming the assistant anywhere from model `uncertain` to `attend`,
+with recipient `system` and optional evidence `"meeting": "ask_anywhere"`. It never
+promotes `ignore`, inferred owner labels, unavailable decisions or turns to another
+configured agent. False disables this promotion. Media and meeting may both be on:
+media's bar and the meeting promotion both apply. Normal/media-only behavior is unchanged.
+Transcripts, retention and context continue normally; this is separate from privacy mode.
+
 ## Privacy mode (internally `duck`, v3)
 
 Privacy mode ([hailing-station #735](https://github.com/mickdarling/hailing-station/issues/735))
