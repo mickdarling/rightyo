@@ -1866,8 +1866,18 @@ class PrototypeController:
                 if on and self._events.ducked is not True:
                     # #242 round 27: where this privacy interval starts, in stream bytes.
                     self._private_from_bytes = self._received_bytes
-                # At least the end of every piece received so far, held ones included.
-                self._events.duck(on, now_ms=self._received_ms)
+                # At least the end of every piece received so far, held ones included. Every
+                # applied on, a redundant one included, is acked (#735 S-8): audio received
+                # after the ack's `at_ms` falls inside the span.
+                try:
+                    self._events.duck(on, now_ms=self._received_ms, ack=on)
+                except ContractError:
+                    # The ack overran the event backlog after the duck was applied: the
+                    # session fails as any lost event fails it (Codex on #248), so `listen`
+                    # never sits waiting for audio the host withholds, nor ends as a clean
+                    # stop. The caller still applies later control lines (an off included).
+                    self._event_delivery_failed()
+                    raise
                 if ending:
                     # #242 round 27: an interval in which no audio was received, judged on the
                     # stream clock in bytes (one sample counts), heard no one, so it forgets no
@@ -1940,15 +1950,19 @@ class PrototypeController:
                 # What the assistant last acted on, or None once dismissed (#199).
                 runner.note_request(getattr(self._events, "last_request", None))
         except Exception:
-            self._stop.set()
-            self._decision_cancel.set()
-            self._phase = "error"
-            self._error = "Tool event delivery failed; the session is incomplete."
-            self._memory.clear()
-            self._decisions.clear()
-            self._discard_pending()
-            self._event_end("error", "event-delivery-failed")
+            self._event_delivery_failed()
             raise PrototypeError("Tool event delivery failed") from None
+
+    def _event_delivery_failed(self):
+        """Run under the controller lock: a lost event fails the session, terminally."""
+        self._stop.set()
+        self._decision_cancel.set()
+        self._phase = "error"
+        self._error = "Tool event delivery failed; the session is incomplete."
+        self._memory.clear()
+        self._decisions.clear()
+        self._discard_pending()
+        self._event_end("error", "event-delivery-failed")
 
     def _tool_attention_error(self, reason):
         """A tool cannot silently continue after losing its promised attention service."""

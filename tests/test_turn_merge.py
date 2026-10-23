@@ -1686,12 +1686,12 @@ class DecisionPathTests(unittest.TestCase):
         # Hailing Station enters privacy mode (internally duck) only for a child that
         # advertised version 2, which keeps nothing (#735 S-1).
         events, _ = self.run_listen()
-        self.assertEqual(events[0]["duck"], {"version": 2})
+        self.assertEqual(events[0]["duck"], {"version": 3})
 
     def test_a_session_can_start_private(self):
         # hailing-station #735 S-2b: as if {"duck": true} arrived at time 0, before audio.
         events, provider = self.run_listen(start_private=True)
-        self.assertEqual(events[0]["duck"], {"version": 2, "private": True})
+        self.assertEqual(events[0]["duck"], {"version": 3, "private": True})
         # Nothing from the first frame: no transcript, decision or other content event.
         self.assertEqual({e["type"] for e in events}, {"session"})
         self.assertEqual(provider.requests, 0)
