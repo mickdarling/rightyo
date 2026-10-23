@@ -545,16 +545,20 @@ class SpeechEvents:
         """ "voiceprint" when `turn` is the owner by live voiceprint identification, else
         None (hailing-station #735, #807): the published role is `owner`, it came from a
         live identification binding of the label to an enrolled owner voice when the role
-        was resolved for this turn, and no word of the turn has an inferred label. Never for
-        a label configured as the owner, an inferred label, a guest or an unlabelled
-        speaker, and only in a live session with privacy control and roles. Never raises.
+        was resolved for this turn, and no word of the turn has an inferred label.
+        "voiceprint_label" for the same binding when some words have an inferred label
+        (edge attribution or a tail join): the label is the owner's voice, but not every word
+        is proven to be (#735, Mick: entry needs his voice, and most short commands carry an
+        inferred word). Never for a label configured as the owner, a guest, an unbound or
+        unlabelled speaker, and only in a live session with privacy control and roles.
+        Never raises.
         """
-        if role != "owner" or inferred or not self._role_sources or not self._per_turn:
+        if role != "owner" or not self._role_sources or not self._per_turn:
             return None
         try:
             check = getattr(self._priority, "resolved_by_voiceprint", None)
             if callable(check) and check(turn.utterance_id) is True:
-                return "voiceprint"
+                return "voiceprint_label" if inferred else "voiceprint"
         except Exception:  # noqa: BLE001 - a source is descriptive and never fails the turn
             pass
         return None

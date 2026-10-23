@@ -1439,14 +1439,18 @@ beside the turn (never inside it, so turn fingerprints are unchanged):
 "role_source": "voiceprint"
 ```
 
-It is present only when the turn's `role` is `owner`, that role came from live voiceprint
+It is present only when the turn's `role` is `owner` and that role came from live voiceprint
 identification (the label bound to an enrolled owner voice when the role was resolved,
-with `speaker_id` `"live": true` and `"roles": true`), and no word of the turn has an
-inferred label. It is absent in every other case: an owner configured by session label in
-`speakers` (a TV or another voice diarized into that slot would carry the label), an
-inferred label (edge attribution, tail join, or a lone wake word joined to the next
-piece), a guest, an unbound or unlabelled speaker, and a session without roles. No other
-value is ever sent; absent means "not a voiceprint owner". It is never on `attention` or
+with `speaker_id` `"live": true` and `"roles": true`). Its value is `"voiceprint"` when no
+word of the turn has an inferred label, and `"voiceprint_label"` when some do (edge
+attribution, tail join, or a lone wake word joined to the next piece): the turn's label is
+the owner's voice, but not every word is proven to be. Short commands usually carry an
+inferred word, so a host may accept `"voiceprint_label"` where the owner's own voice is
+enough (hailing-station #735: privacy entry) and require `"voiceprint"` where every word
+must be his. It is absent in every other case: an owner configured by session label in
+`speakers` (a TV or another voice diarized into that slot would carry the label), a guest,
+an unbound or unlabelled speaker, and a session without roles. No other value is ever sent;
+absent means "not a voiceprint owner". It is never on `attention` or
 `request` events, which repeat the transcript's role and are joined to it by
 `utterance_id`, and only a live `listen` session that advertises privacy mode sends it, so
 `tool-replay`, `--coaching` and the authored fixtures are unchanged.

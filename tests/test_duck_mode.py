@@ -568,7 +568,8 @@ class PrivacyEventsTests(unittest.TestCase):
         self.assertEqual(self.notes, [self.note(discarded=4, failed=4)])
 
     def test_role_source_marks_only_a_live_voiceprint_owner(self):
-        # The host's owner-only privacy entry (HS #807): "voiceprint" or absent, nothing else.
+        # The host's owner-only privacy entry (HS #807): "voiceprint", "voiceprint_label" (the
+        # same live binding with an inferred word, #735) or absent, nothing else.
         (started,) = self.start()
         self.assertNotIn("role_source", started)
         sources = {}
@@ -589,7 +590,7 @@ class PrivacyEventsTests(unittest.TestCase):
             sources,
             {
                 "owner": ("owner", "voiceprint"),
-                "inferred": ("owner", None),
+                "inferred": ("owner", "voiceprint_label"),
                 "guest": ("participant", None),
                 "unbound": ("unknown", None),
                 "unlabelled": ("unknown", None),

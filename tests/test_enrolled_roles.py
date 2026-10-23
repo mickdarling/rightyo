@@ -131,12 +131,12 @@ class HaildModel:
         self.test.assertIn(started["capabilities"]["speakers"], {"anonymous", "enrolled"})
         finals, attentions, owners, decided = {}, {}, set(), set()
         for event in events[1:]:
-            # `role_source` (hailing-station #807) is only ever "voiceprint", only on an
-            # owner's transcript.
+            # `role_source` (hailing-station #807) is only ever "voiceprint" or
+            # "voiceprint_label" (#735), only on an owner's transcript.
             event = dict(event)
             source = event.pop("role_source", None)
             if source is not None:
-                self.test.assertEqual(source, "voiceprint")
+                self.test.assertIn(source, {"voiceprint", "voiceprint_label"})
                 self.test.assertEqual(event["type"], "transcript")
                 self.test.assertEqual(event["turn"]["role"], "owner")
             self.test.assertNotIn("inferred", json.dumps(event))
