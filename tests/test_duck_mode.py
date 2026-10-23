@@ -1346,7 +1346,7 @@ class DuckControllerTests(unittest.TestCase):
         events._delivered["request"] = {"speaker_id": guest.speaker_id}
         events._roles[guest.speaker_id] = "owner"
         self.assertTrue(events._engaged_with(guest))
-        events.forget_speakers()
+        events.forget_speakers(now_ms=1900)
         self.assertFalse(events._engaged_with(guest))
         self.assertEqual(
             (events._engaged, events._dormant, events._cooldowns, events._ended),
@@ -2641,6 +2641,116 @@ class PrivacyAckTests(unittest.TestCase):
         self.assertEqual(self.acks(drained), [])
         ends = [e for e in drained if e["type"] == "session" and e.get("phase") == "error"]
         self.assertEqual([e.get("reason") for e in ends], ["event-delivery-failed"])
+
+
+class RenewalEndsTheConversationAloudTests(unittest.TestCase):
+    """rightyo#244 follow-up: the forced diarizer renewal after privacy forgets the speakers
+    again, and with them a conversation a public request engaged after the exit. The host is
+    told (the third key's option b): `conversation` back to `ambient`, reason `timeout`."""
+
+    controller = DuckControllerTests.controller
+
+    def arrange(self, **options):
+        events = SpeechEvents(**options)
+        events.start(SESSION, now_ms=0, addressing=OURS, conversation=MODE, priority=enrolled())
+        events.drain()
+        controller = self.controller(constructor={"event_publisher": events})
+        controller._events = events
+        controller._event_terminal = False  # Started here, not by `controller.start`.
+        return controller, events
+
+    @staticmethod
+    def say(events, utterance_id, start, end, text, label="attend", **options):
+        current = heard(utterance_id, start, end, text)
+        events.transcript(current, end)
+        if utterance_id in events._pending:
+            events.decision(decided(current, label, **options), end + 100)
+
+    @staticmethod
+    def conversation(drained):
+        return [e for e in drained if e["type"] == "conversation"]
+
+    def private_then_public_request(self, controller, events):
+        controller._received_ms = 1000
+        controller.duck(True)
+        controller._received_bytes += 2  # One sample heard while private (#242 round 27).
+        controller._received_ms = 5000
+        controller.duck(False)  # The first forget: nothing is engaged, so it says nothing.
+        self.assertIsNone(events._engaged)
+        self.assertEqual(self.conversation(events.drain()), [])
+        self.say(events, "p1", 6000, 6900, "Jarvis, what time is it?")
+        engaged = self.conversation(events.drain())
+        self.assertEqual([(e["state"], e["reason"]) for e in engaged], [("engaged", "request")])
+        return engaged[0]
+
+    def test_the_forced_renewal_ends_the_engaged_conversation_aloud(self):
+        controller, events = self.arrange()
+        engaged = self.private_then_public_request(controller, events)
+        # Forced 10 s after the off (SPEAKER_RENEWAL_LIMIT_MS), well past every stamp so far:
+        # `_now` is advanced first, or the host refuses `at_ms` after `emitted_at_ms`.
+        controller._received_ms = 15000
+        controller._speakers_renewed()
+        ended = self.conversation(events.drain())
+        self.assertEqual(len(ended), 1)
+        self.assertEqual(
+            (ended[0]["state"], ended[0]["reason"], ended[0]["speaker_id"], ended[0]["at_ms"]),
+            ("ambient", "timeout", engaged["speaker_id"], 15000),
+        )
+        self.assertGreaterEqual(ended[0]["emitted_at_ms"], ended[0]["at_ms"])
+        self.assertNotIn("utterance_id", ended[0])
+        self.assertIsNone(events._engaged)
+        self.assertNotEqual(controller._phase, "error")
+        # A follow-up without the name is no longer one; the name starts a fresh conversation.
+        self.say(events, "p2", 16000, 16600, "And tomorrow?", "uncertain", attend=0.8)
+        self.assertEqual(self.conversation(events.drain()), [])
+        self.say(events, "p3", 17000, 17900, "Jarvis, and tomorrow?")
+        fresh = self.conversation(events.drain())
+        self.assertEqual(
+            [(e["state"], e["reason"], e["utterance_id"]) for e in fresh],
+            [("engaged", "request", "p3")],
+        )
+
+    def test_a_forget_with_nothing_engaged_says_nothing(self):
+        controller, events = self.arrange()
+        controller._received_ms = 4000
+        controller._speakers_renewed()
+        self.assertEqual(self.conversation(events.drain()), [])
+        # Nor after a lapse the host was already told of (a later turn finds it lapsed).
+        self.say(events, "p1", 6000, 6900, "Jarvis, what time is it?")
+        self.say(events, "q1", 59000, 59900, "synthetic words", "ignore")
+        self.assertEqual(
+            [e["state"] for e in self.conversation(events.drain())], ["engaged", "ambient"]
+        )
+        controller._received_ms = 61000
+        controller._speakers_renewed()
+        self.assertEqual(self.conversation(events.drain()), [])
+        self.assertNotEqual(controller._phase, "error")
+
+    def test_an_end_that_cannot_be_queued_fails_the_session_terminally(self):
+        controller, events = self.arrange()
+        self.private_then_public_request(controller, events)
+        self.say(events, "q1", 7000, 7900, "synthetic words", "ignore")
+        events.max_pending = len(events._queue)  # The backlog is full.
+        shadow = mock.Mock()
+        controller._shadow = shadow
+        controller._received_ms = 15000
+        controller._speakers_renewed()  # On the audio thread: it does not raise there.
+        # Everything was dropped before the end was said, so nothing is half applied.
+        self.assertIsNone(events._engaged)
+        self.assertTrue(events._labels_renewed)
+        shadow.forget.assert_called_once_with()
+        # As any lost event fails it (#248).
+        self.assertEqual(controller._phase, "error")
+        self.assertTrue(controller._stop.is_set())
+        self.assertEqual(
+            controller._error, "Tool event delivery failed; the session is incomplete."
+        )
+
+    def test_the_forget_requires_a_stream_time(self):
+        _controller, events = self.arrange()
+        for bad in ((), (None,), ("1",), (True,)):
+            with self.subTest(bad=bad), self.assertRaises((ContractError, TypeError)):
+                events.forget_speakers(**({"now_ms": bad[0]} if bad else {}))
 
 
 if __name__ == "__main__":

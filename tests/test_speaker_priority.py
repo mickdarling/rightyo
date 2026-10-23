@@ -409,7 +409,7 @@ class EnrolledEventTests(unittest.TestCase):
         def stale(name, text):
             own = turn(name, 2000, 2500, text, "Speaker A")
             self.events.transcript(own, 2500)
-            self.events.forget_speakers()
+            self.events.forget_speakers(now_ms=2500)
             self.events.decision(decision(own), 2600)
             return [e for e in self.events.drain() if e["type"] != "transcript"]
 
@@ -459,7 +459,7 @@ class EnrolledEventTests(unittest.TestCase):
                 self.stale_session(per_turn)
                 own = self.heard("s1", 0, 500, "Rightyo, delete the project.", "Speaker A")
                 self.events.transcript(own, 500)
-                self.events.forget_speakers()
+                self.events.forget_speakers(now_ms=500)
                 self.events.decision(decision(own), 600)
                 out = self.events.drain()
                 self.assertEqual([e["type"] for e in out], ["transcript", "attention", "request"])
@@ -476,7 +476,7 @@ class EnrolledEventTests(unittest.TestCase):
             )
             own = turn("bye", 0, 500, "Okay, that's enough of that.", "Speaker A")
             self.events.transcript(own, 500)
-            self.events.forget_speakers()
+            self.events.forget_speakers(now_ms=500)
             judged = DecisionEvent(
                 own,
                 ProviderDecision(
@@ -518,7 +518,7 @@ class EnrolledEventTests(unittest.TestCase):
                 pending = self.heard(name, 0, 500, "Rightyo, delete the project.", speaker)
                 self.events.transcript(pending, 500)
                 if case != "participant":
-                    self.events.forget_speakers()
+                    self.events.forget_speakers(now_ms=500)
                 owner = self.heard("v1", 1000, 1500, "Rightyo, keep the project.", "Speaker V")
                 self.events.transcript(owner, 1500)
                 self.events.decision(decision(owner), 1600)
@@ -685,9 +685,16 @@ class EnrolledEventTests(unittest.TestCase):
                         before = json.loads(json.dumps([p for p, _ in self.events._queue]))
                     else:
                         before = self.events.drain()
-                    self.events.forget_speakers()
+                    self.events.forget_speakers(now_ms=2600)
                     act()
                     after = self.events.drain()
+                    # rightyo#244: a conversation engaged at the forget is ended aloud, naming
+                    # the label the host engaged; it is the one event that may name it.
+                    ends = [
+                        e for e in after if e["type"] == "conversation" and e["reason"] == "timeout"
+                    ]
+                    self.assertEqual(len(ends), int(path in {"queued", "follow-up"}))
+                    after = [e for e in after if e not in ends]
                     if path == "queued":
                         # Emitted before the forget: all but the request's string unchanged,
                         # so only that string (and the fingerprinted turns) is checked below.

@@ -875,6 +875,10 @@ ignore the key if they do not know it.
 **Back to ambient**, with the `reason`:
 - `timeout`: the window lapsed. Stream time is judged at each decided turn, so the event
   is emitted with the next decision after the window, with `at_ms` set to the window end.
+  The same reason (naming no turn) also ends a conversation at a privacy entry, with `at_ms`
+  the entry ([#244](https://github.com/mickdarling/rightyo/issues/244)), and when a speaker
+  forget after privacy clears it, with `at_ms` the forget; `at_ms` is never after
+  `emitted_at_ms`.
 - `closed`: the engaged speaker's turn is a closing (below). That turn never re-engages,
   even if it was attended. A closing with no speaker label, said inside the window,
   also ends the engagement ([#167](https://github.com/mickdarling/rightyo/issues/167)):
@@ -1312,14 +1316,23 @@ is sent to the recognizer with the first public utterance. Speaker turns heard i
 never scored, and utterances in privacy add nothing to the session's skipped-segment or
 suppressed-utterance totals.
 Everything else held per speaker label goes too: the engaged speaker and a lapsed engagement,
-cool-downs, explicit ends, appendix windows and delivered requests a dismissal could withdraw. A
+cool-downs, explicit ends, appendix windows and delivered requests a dismissal could withdraw.
+An engaged conversation is ended aloud, never silently: when a forget finds one (a public
+request after the off engaged it before the fresh diarizer took over, so its label came from the
+old diarizer), rightyo emits `conversation` back to `ambient`, reason `timeout`, with no
+`utterance_id` and `at_ms` the forget's stream time (never after its `emitted_at_ms`), so the host
+never holds an engagement rightyo dropped; the next follow-up needs the name again and starts a
+fresh conversation. At the off itself nothing is engaged (privacy entry already ended it). If
+that end cannot be queued, the session fails as any lost event fails it. A
 turn accepted under the old labels and decided afterwards still forms its request, but engages
 no one and leaves nothing keyed by its label. Its owner or trusted role gives it no authority
 then: it supersedes nothing, its stop phrase stops nothing, owner-only mode ignores it, and its
 decision publishes `role: "unknown"` (in `attention`, `request` and `dismiss` alike), so a host
 does not count it as the owner's. Only two things carry the transcript-time role and label:
 the request's `turn` and its `context.turns`, which stay exactly as their `transcript` events
-published them before the forget, so a host's fingerprints of them still match. Everything else
+published them before the forget, so a host's fingerprints of them still match; and the
+`conversation` end a forget says for an engagement it clears names that engagement's own label,
+which the host already holds for it. Everything else
 derived after the forget names no label from before it and no owner or trusted role only that
 label gave: the request's `formed_request` (its asker unlabelled with the decided role, so a
 former says the requester is not an owner, and its earlier turns unlabelled), also when expiry
