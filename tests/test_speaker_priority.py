@@ -10,19 +10,24 @@ import unittest
 import wave
 from argparse import Namespace
 from collections import deque
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from rightyo.cli import main, priority_from_args
 from rightyo.contracts import (
+    Acknowledgement,
     ContractError,
+    Conversation,
     DecisionEvent,
+    Dismissal,
     ProviderDecision,
     SpeakerPriority,
     Turn,
     normalize_phrase,
     speaker_role,
 )
+from rightyo.live_speaker_id import EnrolledRoles
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
 from rightyo.providers import (
     JEV_MODEL,
@@ -31,6 +36,7 @@ from rightyo.providers import (
     MockProvider,
     ModelPriorityProvider,
     ProviderError,
+    TemplateRequestFormer,
     build_role_request,
     parse_role_response,
 )
@@ -388,6 +394,377 @@ class EnrolledEventTests(unittest.TestCase):
             self.events.transcript(current, current.end_ms)
             self.events.decision(decision(current, "uncertain", "unknown"), current.end_ms)
             self.assertEqual([e["type"] for e in self.events.drain()], ["transcript", "attention"])
+
+    def test_a_configured_owner_turn_pending_across_a_forget_has_no_owner_authority(self):
+        # #242 round 23 (Codex P1): accepted as the configured owner, decided only after the
+        # speakers were forgotten. Its label may now name someone else, so it supersedes no
+        # one, its stop phrase stops nothing, and owner-only mode does not let it through.
+        # Round 24: its decision publishes "unknown"; its turn keeps the transcript's "owner".
+        def open_request():
+            other = turn("other", 0, 1500, "Rightyo, delete the project.")
+            self.events.transcript(other, 1500)
+            self.events.decision(decision(other), 1600)
+            self.events.drain()
+
+        def stale(name, text):
+            own = turn(name, 2000, 2500, text, "Speaker A")
+            self.events.transcript(own, 2500)
+            self.events.forget_speakers()
+            self.events.decision(decision(own), 2600)
+            return [e for e in self.events.drain() if e["type"] != "transcript"]
+
+        for case, text in (("override", "Rightyo, keep the project."), ("stop", "Stop!")):
+            with self.subTest(case=case):
+                self.start()
+                open_request()
+                out = stale(case, text)
+                self.assertEqual([e["type"] for e in out], ["attention", "request"])
+                self.assertEqual(out[0]["decision"]["role"], "unknown")
+                self.assertEqual(out[1]["turn"]["role"], "owner")
+                self.assertIn("enrolled-demo:other", self.events._open)
+        with self.subTest(case="owner-only"):
+            self.start(SpeakerPriority(owners=("Speaker A",), owner_only=True))
+            out = stale("gated", "Rightyo, keep the project.")
+            self.assertEqual([e["type"] for e in out], ["attention"])
+            self.assertEqual(out[0]["decision"]["label"], "ignore")
+            self.assertEqual(out[0]["decision"]["role"], "unknown")
+
+    def stale_session(self, per_turn):
+        """A session whose Speaker A is the configured owner; with `per_turn`, live
+        identification roles where Speaker V is bound to the enrolled owner by voiceprint."""
+        rules = SpeakerPriority(owners=("Speaker A", "owner-id"))
+        if not per_turn:
+            self.start(rules)
+            return
+        provider = EnrolledRoles(rules)
+        provider.source = MagicMock(
+            binding=lambda label: ("bound", "owner-id") if label == "Speaker V" else None
+        )
+        self.start(provider=provider)
+
+    @staticmethod
+    def heard(name, start, end, text, speaker):
+        # Only diarization-timeline labels are looked up for a voiceprint binding.
+        return replace(
+            turn(name, start, end, text, speaker), speaker_provenance="diarization-timeline"
+        )
+
+    def test_a_stale_owner_turn_publishes_an_unknown_decision_role(self):
+        # #242 round 24: haild keeps a `role: "owner"` decision's utterance as the owner's, so
+        # an owner-labelled turn decided after a forget publishes "unknown" in its attention,
+        # request and dismiss decisions. Attention and request carry one decision, and the
+        # request's turn still equals the transcript turn published before the forget.
+        for per_turn in (False, True):
+            with self.subTest(per_turn=per_turn):
+                self.stale_session(per_turn)
+                own = self.heard("s1", 0, 500, "Rightyo, delete the project.", "Speaker A")
+                self.events.transcript(own, 500)
+                self.events.forget_speakers()
+                self.events.decision(decision(own), 600)
+                out = self.events.drain()
+                self.assertEqual([e["type"] for e in out], ["transcript", "attention", "request"])
+                self.assertEqual(out[0]["turn"]["role"], "owner")
+                self.assertEqual(out[1]["decision"]["role"], "unknown")
+                self.assertEqual(out[2]["decision"], out[1]["decision"])
+                self.assertEqual(out[2]["turn"], out[0]["turn"])
+        with self.subTest(case="dismiss"):
+            self.events = SpeechEvents()
+            self.events.start(
+                "enrolled-demo",
+                priority=ConfiguredPriorityProvider(OWNER),
+                dismissal=Dismissal(),
+            )
+            own = turn("bye", 0, 500, "Okay, that's enough of that.", "Speaker A")
+            self.events.transcript(own, 500)
+            self.events.forget_speakers()
+            judged = DecisionEvent(
+                own,
+                ProviderDecision(
+                    "uncertain",
+                    "system",
+                    0.9,
+                    {"attend": 0.0, "ignore": 0.0, "uncertain": 1.0},
+                    "mock-v1",
+                    "mock",
+                    0.9,
+                    dismissal="disengage",
+                    dismissal_choice="disengage",
+                    dismissal_confidence=0.95,
+                ),
+                1,
+                0.0,
+                0.0,
+            )
+            self.events.decision(judged, 600)
+            out = self.events.drain()
+            dismiss = [e for e in out if e["type"] == "dismiss"]
+            self.assertEqual(len(dismiss), 1)
+            self.assertEqual(dismiss[0]["role"], "unknown")
+            attention = [e for e in out if e["type"] == "attention"]
+            self.assertEqual(attention[0]["decision"]["role"], "unknown")
+
+    def test_a_stale_owner_turn_is_not_exempt_from_a_later_owner_override(self):
+        # #242 round 24: an owner-labelled turn pending across a forget gets no owner's
+        # supersession exemption: the voiceprinted owner's later attended turn supersedes it,
+        # as it does a non-stale participant's pending turn (the control).
+        cases = (
+            ("configured owner", "s1", "Speaker A"),
+            ("voiceprinted owner", "s1", "Speaker V"),
+            ("participant", "p1", "Speaker B"),
+        )
+        for case, name, speaker in cases:
+            with self.subTest(case=case):
+                self.stale_session(per_turn=True)
+                pending = self.heard(name, 0, 500, "Rightyo, delete the project.", speaker)
+                self.events.transcript(pending, 500)
+                if case != "participant":
+                    self.events.forget_speakers()
+                owner = self.heard("v1", 1000, 1500, "Rightyo, keep the project.", "Speaker V")
+                self.events.transcript(owner, 1500)
+                self.events.decision(decision(owner), 1600)
+                self.assertEqual(self.events._superseded, {name: "v1"})
+                self.events.drain()
+                self.events.decision(decision(pending), 1700)
+                out = self.events.drain()
+                self.assertEqual([e["type"] for e in out], ["attention", "override"])
+                self.assertNotIn("request_id", out[0])
+                self.assertEqual(out[1]["superseded_request_id"], "enrolled-demo:" + name)
+                self.assertEqual(out[1]["by_utterance_id"], "v1")
+
+    def test_nothing_derived_after_a_forget_carries_a_stale_owner_role_or_label(self):
+        # #242 round 25: a configured owner's turn pending across a forget, driven through
+        # every consumer after its decision. Only the request's `turn` and `context` turns
+        # carry the transcript-time "owner" and "Speaker A", byte for byte as the transcripts
+        # published them (haild fingerprints them); nothing else derived after the forget
+        # does: not the formed request (first render or re-render), dismiss events, a late
+        # withdrawal, conversation events, the latest request a decision is told of, a role
+        # question's past turns, or a diagnostic line.
+        def judged(current, kind):
+            return DecisionEvent(
+                current,
+                ProviderDecision(
+                    "uncertain",
+                    "system",
+                    0.9,
+                    {"attend": 0.0, "ignore": 0.0, "uncertain": 1.0},
+                    "mock-v1",
+                    "mock",
+                    0.9,
+                    dismissal=kind,
+                    dismissal_choice=kind,
+                    dismissal_confidence=0.95,
+                ),
+                1,
+                0.0,
+                0.0,
+            )
+
+        def session(per_turn, reports):
+            rules = SpeakerPriority(owners=("Speaker A", "owner-id"))
+            provider = ConfiguredPriorityProvider(rules)
+            if per_turn:
+                provider = EnrolledRoles(rules)
+                provider.source = MagicMock(
+                    binding=lambda label: ("bound", "owner-id") if label == "Speaker V" else None
+                )
+            self.provider = provider
+            self.events = SpeechEvents(report=reports.append)
+            self.events.start(
+                "enrolled-demo",
+                priority=provider,
+                former=TemplateRequestFormer(),
+                dismissal=Dismissal(),
+                conversation=Conversation(),
+                acknowledgement=Acknowledgement(),
+            )
+
+        def said(name, start, text):
+            return self.heard(name, start, start + 500, text, "Speaker A")
+
+        def context_turns():
+            # Earlier owner turns, decided before the forget: a request's context.
+            for current in (said("c0", 0, "Hello there."), said("c1", 1000, "Over here.")):
+                self.events.transcript(current, current.end_ms)
+                self.events.decision(decision(current, "ignore", "other_human"), current.end_ms)
+
+        def formed():
+            context_turns()
+            stale = said("s1", 2000, "Rightyo, delete the project.")
+            self.events.transcript(stale, 2500)
+            return lambda: self.events.decision(decision(stale), 2600)
+
+        def re_rendered():
+            act = formed()
+
+            def decide_then_prune():
+                act()
+                # Prunes c0 from the queued request's context, so its string is re-rendered.
+                self.events.expire(301200)
+
+            return decide_then_prune
+
+        def queued():
+            # #242 round 26: formed before the forget and still queued across it, so its
+            # string, first rendered with "Owner (Speaker A)", is re-rendered after it.
+            formed()()
+            return lambda: self.events.expire(301200)
+
+        def disengaged():
+            context_turns()
+            stale = said("s1", 2000, "Okay, that's enough of that.")
+            self.events.transcript(stale, 2500)
+            return lambda: self.events.decision(judged(stale, "disengage"), 2600)
+
+        def withdrawn():
+            # The owner's stop phrase withdrew their own pending request before the forget;
+            # the withdrawal's `dismiss` is emitted at that request's decision, after it.
+            stale = said("s1", 0, "Rightyo, delete the project.")
+            self.events.transcript(stale, 500)
+            stop = said("stop", 1000, "Stop!")
+            self.events.transcript(stop, 1500)
+            return lambda: self.events.decision(decision(stale), 1600)
+
+        def follow_up():
+            # The owner's request engaged them before the forget; their undecided turn after.
+            own = said("r1", 0, "Rightyo, add milk.")
+            self.events.transcript(own, 500)
+            self.events.decision(decision(own), 600)
+            stale = said("s1", 1000, "And eggs.")
+            self.events.transcript(stale, 1500)
+
+            def act():
+                self.assertIsNone(self.events.last_request[3])
+                self.events.decision(decision(stale, "uncertain", "unknown"), 1600)
+
+            return act
+
+        def role_question():
+            context_turns()
+            assign = MagicMock(wraps=self.provider.assign)
+            self.provider.assign = assign
+            guest = self.heard("g1", 2000, 2500, "Rightyo, lights.", "Speaker C")
+
+            def act():
+                self.events.transcript(guest, 2500)
+                past = assign.call_args.args[0]["past_turns"]
+                self.assertEqual([t["speaker_id"] for t in past], [None, None])
+                self.assertEqual({t["role"] for t in past}, {"unknown"})
+                self.assertNotIn("Speaker A", assign.call_args.args[0]["known_participants"])
+
+            return act
+
+        paths = {
+            "formed": formed,
+            "re-rendered": re_rendered,
+            "queued": queued,
+            "disengaged": disengaged,
+            "withdrawn": withdrawn,
+            "follow-up": follow_up,
+            "role question": role_question,
+        }
+        expected = {
+            "formed": ["attention", "request"],
+            "re-rendered": ["attention", "request"],
+            "queued": ["request"],
+            "disengaged": ["attention", "dismiss"],
+            "withdrawn": ["attention", "dismiss"],
+            "follow-up": ["attention"],
+            "role question": ["transcript"],
+        }
+        kept = {"turn", "context", "formed_request"}
+        for per_turn in (False, True):
+            for path, arrange in paths.items():
+                if per_turn and path == "role question":
+                    continue  # Live identification resolves roles per turn, asking nothing.
+                with self.subTest(per_turn=per_turn, path=path):
+                    reports = []
+                    session(per_turn, reports)
+                    act = arrange()
+                    if path == "queued":
+                        # Left queued across the forget (round 26).
+                        before = json.loads(json.dumps([p for p, _ in self.events._queue]))
+                    else:
+                        before = self.events.drain()
+                    self.events.forget_speakers()
+                    act()
+                    after = self.events.drain()
+                    if path == "queued":
+                        # Emitted before the forget: all but the request's string unchanged,
+                        # so only that string (and the fingerprinted turns) is checked below.
+                        first = [e for e in before if e["type"] == "request"]
+                        self.assertIn("Owner (Speaker A)", first[0]["formed_request"])
+                        for event in after:
+                            if event["type"] != "request":
+                                self.assertIn(event, before)
+                                continue
+                            self.assertEqual(
+                                *[
+                                    {k: v for k, v in e.items() if k not in kept}
+                                    for e in (event, *first)
+                                ]
+                            )
+                        after = [
+                            {k: v for k, v in e.items() if k in {"type", *kept}}
+                            for e in after
+                            if e["type"] == "request"
+                        ]
+                    published = {
+                        e["turn"]["utterance_id"]: e["turn"]
+                        for e in [*before, *after]
+                        if e["type"] == "transcript"
+                    }
+                    requests = [e for e in after if e["type"] == "request"]
+                    self.assertEqual([e["type"] for e in after], expected[path])
+                    if path in {"formed", "re-rendered", "queued"}:
+                        self.assertEqual(len(requests), 1)
+                        self.assertIn(
+                            "The requester is not an owner.", requests[0]["formed_request"]
+                        )
+                    for event in after:
+                        if event["type"] == "transcript":
+                            continue  # A turn heard after the forget: its own label.
+                        if event["type"] == "request":
+                            # As the transcripts published them, for haild's fingerprints.
+                            self.assertEqual(
+                                event["turn"], published[event["turn"]["utterance_id"]]
+                            )
+                            for past in event["context"]["turns"]:
+                                self.assertEqual(past, published[past["utterance_id"]])
+                            event = {k: v for k, v in event.items() if k not in {"turn", "context"}}
+                        text = json.dumps(event)
+                        self.assertNotIn("Speaker A", text)
+                        self.assertNotIn('"role": "owner"', text)
+                        self.assertNotIn("Owner (", text)
+                        self.assertNotIn("owner (", text)
+                    if path in {"re-rendered", "queued"}:
+                        self.assertEqual(
+                            [t["utterance_id"] for t in requests[0]["context"]["turns"]], ["c1"]
+                        )
+                        self.assertIn(
+                            "Earlier, an unknown speaker said", requests[0]["formed_request"]
+                        )
+                    if path == "queued":
+                        self.assertTrue(
+                            requests[0]["formed_request"].startswith("An unknown speaker asked")
+                        )
+                    for line in reports:
+                        self.assertNotIn("Speaker A", line)
+                        self.assertNotIn("role=owner", line)
+
+    def test_a_session_ended_without_its_queue_drops_its_formed_records(self):
+        # #242 round 26: a cancelled session clears its queue, so nothing is left to re-render.
+        self.events = SpeechEvents()
+        self.events.start(
+            "enrolled-demo",
+            priority=ConfiguredPriorityProvider(SpeakerPriority(owners=("Speaker A",))),
+            former=TemplateRequestFormer(),
+        )
+        current = self.heard("s1", 0, 500, "Rightyo, lights.", "Speaker A")
+        self.events.transcript(current, 500)
+        self.events.decision(decision(current), 600)
+        self.assertEqual(list(self.events._formed), ["enrolled-demo:s1"])
+        self.events.end("cancelled", 700)
+        self.assertEqual(self.events._formed, {})
 
     def test_owner_only_downgrades_non_owner_attend_to_ignore(self):
         self.start(SpeakerPriority(owners=("Speaker A",), trusted=("Speaker B",), owner_only=True))

@@ -745,7 +745,9 @@ set, `"owner_voice": {"threshold_s": 20}`, and a host that accepts this object m
   owner identifier that has a voiceprint enrolled with the session's model; at least
   `threshold_s` seconds of speech have been scored by live identification this session
   (scored speech is always a single label's own, unoverlapped timeline audio); and no
-  label has bound to an owner identifier.
+  label has bound to an owner identifier. When privacy ends, the bindings and the scored
+  seconds both restart, so only speech since then counts; an event already emitted is not
+  repeated.
 - `recognized` is emitted once, when a label later binds to an owner identifier, and only
   if `unrecognized` was emitted before. An owner who binds before the threshold produces
   neither event.
@@ -1224,7 +1226,12 @@ A turn heard in privacy mode:
   never context for a later decision or request, and not even as a digest for duplicate
   detection (only its utterance id, in a bounded list of the last 64, so it never spends
   the session's 1,000-turn budget);
-- is matched once against the phrases below, and then dropped.
+- is matched once against the phrases below, and then dropped. Only a turn heard entirely
+  since the mode last went on, while it is still on, is matched. A private turn released
+  only after privacy has ended (held or finalized late) is dropped unmatched, whether
+  privacy is still off or already on again by then: its status question is not answered
+  or counted, it can never exit a later period, and its id is not kept. A turn begun before
+  the mode went on is dropped unmatched the same way.
 
 The only events a private turn can produce carry no words:
 
@@ -1258,10 +1265,65 @@ from `started` to `ended`, with 300 ms either side), so the echo of a clip such 
 counted as `exit_refused` and emits nothing. Without enrollment, roles or names, the
 host must offer another way out.
 
+**Privacy keeps no speakers either.** When the host turns privacy off, rightyo forgets every
+speaker: the diarizer starts afresh (once no utterance is open, so a turn under way keeps its
+labels, but at most 10 s of audio after the first off reached since the last renewal, so
+privacy ended again meanwhile never postpones it further: steady speech then forces it, and
+the turn under way is published with no speaker label and adds no speaker evidence), every
+speaker-ID binding is dropped, and the per-label roles go with them; both are dropped again the
+moment the fresh diarizer takes over, since its labels restart there and a turn finished while
+it waited was bound to the old ones. Nothing a
+voice heard only in privacy did, a diarizer channel or a binding, outlives it. So right after
+privacy ends, voice features gated on the owner (the owner's role, `role_source`, and with them
+a host's voice privacy entry) wait until the owner has spoken publicly long enough to bind
+again (`speaker_id.bind_min_seconds`), and the owner-voice evidence restarts with the bindings
+(below). Audio heard before the off and still buffered when the stream reaches it (the pre-roll
+kept between utterances, or the start of an utterance open across it) is silenced, so none of it
+is sent to the recognizer with the first public utterance. Speaker turns heard in privacy are
+never scored, and utterances in privacy add nothing to the session's skipped-segment or
+suppressed-utterance totals.
+Everything else held per speaker label goes too: the engaged speaker and a lapsed engagement,
+cool-downs, explicit ends, appendix windows and delivered requests a dismissal could withdraw. A
+turn accepted under the old labels and decided afterwards still forms its request, but engages
+no one and leaves nothing keyed by its label. Its owner or trusted role gives it no authority
+then: it supersedes nothing, its stop phrase stops nothing, owner-only mode ignores it, and its
+decision publishes `role: "unknown"` (in `attention`, `request` and `dismiss` alike), so a host
+does not count it as the owner's. Only two things carry the transcript-time role and label:
+the request's `turn` and its `context.turns`, which stay exactly as their `transcript` events
+published them before the forget, so a host's fingerprints of them still match. Everything else
+derived after the forget names no label from before it and no owner or trusted role only that
+label gave: the request's `formed_request` (its asker unlabelled with the decided role, so a
+former says the requester is not an owner, and its earlier turns unlabelled), also when expiry
+re-renders it, including a request formed before the forget and still queued when expiry
+re-renders it after the forget (asker and earlier turns unlabelled, an owner or trusted role
+read as `unknown`; its `turn`, `context.turns` and `decision` stay as first queued); a `dismiss` for a pending request withdrawn before the forget; what a later
+decision model is given (its past turns, participants, a turn heard before the forget but decided
+after it, and the latest request); a role question's past turns; and diagnostic lines, which
+never carry labels. While it is pending, an owner's later
+override supersedes it like any non-owner turn. A speaker *configured* as owner or trusted by
+diarizer label (`speakers.owners`) gives no role after the speakers are forgotten, until the
+session restarts, since the fresh diarizer may give that label to anyone; only a live voiceprint
+binding gives those roles then (logged once).
+
+**An empty privacy interval forgets nothing.** A privacy interval in which no audio was received
+(judged on the stream clock in bytes, so even one sample counts as heard) heard no one, so when
+it ends no speaker is forgotten: no diarizer renewal, no binding dropped, and configured owner and
+trusted labels keep their roles. `--start-private` followed by `{"duck": false}` before any audio
+leaves an `owner_only` listener working. With off, on and off again, only an interval that
+received audio forgets.
+
+**No private turn outlives the off.** When the stream reaches the privacy end, what the turn
+merger still holds (a turn waiting out the merge gap, the owner pause or a lone wake word, and
+any bridged backchannel) was all heard before it. If any of it was heard in privacy, all of it
+is discarded, words and all; otherwise it is released at once on its own. So nothing said after
+the end can be joined to a private turn, and the first public request after privacy is decided
+on its own instead of being dropped with the private turn it was joined to.
+
 The phrases match loosely: anywhere in the turn, ignoring case, punctuation and filler
-("um", "uh", "ok", "okay", "so", "hey", "well", "please" and similar). A configured name
-variant that is itself a filler word plus a name ("Hey Jarvis") cannot be matched as a
-name, so it cannot exit; the plain name can. "Don't" or "do not" in the three words
+("um", "uh", "ok", "okay", "so", "hey", "well", "please" and similar). A filler word that
+is part of a configured name or variant ("Okay", "Hey Jarvis") is kept only where it is
+matched as part of that name; everywhere else it is still filler, so with a variant "Please
+Jarvis", "Jarvis, please, I'm back" still exits. "Don't" or "do not" in the three words
 before the phrase (before the name, for the exit) means no match.
 
 A split exit is the enrolled owner's lone name fragment ("Jarvis,") heard while privacy
@@ -1286,9 +1348,16 @@ local recognizer, diarizer and end-of-turn model still hear the audio in memory,
 order to run (the open utterance's PCM). Nothing is written to disk, even briefly: the
 whisper.cpp transcriber, for every utterance whether private or not, takes the WAV on
 stdin (`--file -`) and returns its JSON on stdout (`--output-file -`), and runs with a working
-directory, `HOME` and `TMPDIR` verified unwritable by this process (`/var/empty` on
-macOS, `/proc` on Linux; never a fallback: without one, `listen` refuses to start and the
-recognizer refuses to run), so a kill mid-transcription leaves nothing behind and nothing
+directory, `HOME` and `TMPDIR` in which this process cannot create a file: the first of
+`/var/empty` and `/proc` that is a real directory (checked with `lstat`, so a symlink is
+never used or probed) and in which an exclusive, no-follow create of an unpredictably
+named empty file is refused (EACCES, EPERM, EROFS or ENOENT). A create that succeeds
+means writable: the probe file is removed at once and the directory is not used. The
+check is by behaviour, not permission bits, so root works where the refusal is real
+(procfs on Linux), and is refused where root can write (`/var/empty` on macOS). The
+choice is probed once per process and re-probed only if that directory stops being a real
+directory. There is no fallback: without one, `listen` refuses to start and the recognizer
+refuses to run, so a kill mid-transcription leaves nothing behind and nothing
 is ever put in the shared temporary root. Its stdout is read in chunks and the recognizer
 is stopped as soon as it passes 2 MiB ("Local recognizer failed"); its stderr goes to the
 null device. There is no debug dump. Logs carry
@@ -1307,6 +1376,15 @@ the option is never a way out, and without a control descriptor the whole sessio
 private. A session that would not advertise version 2 refuses the option and exits with
 an error rather than starting un-private: `--coaching`, and a hosted transcriber or
 diarizer.
+
+**Hosted speech never runs private.** Privacy is never active while any audio consumer is
+hosted (a hosted transcriber or diarizer; the end-of-turn model and speaker identification are
+always local, and decisions never receive audio). Every way in is refused: `{"duck": true}`,
+`--start-private`, an embedding host's publisher that is already private when the controller is
+built or when any session starts (a restart, a demo or replay, or backends changed since), all
+with the same error. As a last line, the one point audio is fed to every consumer sends a
+hosted consumer nothing while privacy is on, whatever made it so: the session ends at once with
+`phase: "error"`, `reason: "privacy-hosted-speech"`.
 
 ### Voiceprint owner on transcripts
 
@@ -1343,7 +1421,8 @@ starting at it was heard after. A span turned on and off with no audio between (
 session that starts in privacy mode and is turned off before any audio) covers nothing.
 A turn the merger held across the off edge (the merge gap or the
 [owner pause](#joined-turns)), a continuation joined to a piece said in privacy mode, a
-bridged backchannel and a tail join all count, and so does speech said before the mode
+bridged backchannel and a tail join all count (and a turn held when the stream reaches the
+off is discarded there, so speech after the off is never joined to it), and so does speech said before the mode
 went on that is joined with speech said during it: none of it is ever emitted. A
 session's spans are kept for the whole session, at most 64; beyond that the oldest two
 are merged into one, which can only widen them.

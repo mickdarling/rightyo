@@ -683,6 +683,13 @@ class TurnMerger:
             "end_ms": heard,
         }
 
+    def held_spans(self) -> list[tuple[int, int]]:
+        """The stream spans of what is held: the held fragment, then its bridged backchannels
+        (#242 round 27: the privacy end judges them before anything can join them)."""
+        if self._held is None:
+            return []
+        return [(piece["start_ms"], piece["end_ms"]) for piece in (self._held, *self._bridged)]
+
     def discard(self) -> None:
         self._held = None
         self._heard_ms = None

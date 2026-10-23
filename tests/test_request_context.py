@@ -58,6 +58,33 @@ class RunnerTests(unittest.TestCase):
 
 
 class ForgettingTests(unittest.TestCase):
+    def test_no_decision_state_after_a_forget_names_a_label_from_before_it(self):
+        # #242 round 25 (hailing-station #735 S-1): once the speakers are forgotten, the
+        # runner's past turns, participants, a turn heard before the forget but decided after
+        # it, and the latest request carry no label from before it; later speech keeps its own.
+        runner = ReplayRunner(Attending(), request_context=True)
+        runner.process(turn("t1", 0, 900, "Jarvis, add milk"))
+        runner.note_request((900, "Jarvis, add milk", "t1", "Speaker A"))
+        stale = turn("t2", 1000, 1900, "and the other one")
+        runner.forget_speakers(2000)
+        for current in (stale, turn("t3", 3000, 3800, "x", "Speaker C")):
+            state = runner._state(current)
+            text = json.dumps(state)
+            self.assertNotIn("Speaker A", text)
+            self.assertEqual([t["speaker_id"] for t in state["past_turns"]], [None])
+            self.assertIsNone(state["assistant_request"]["speaker_id"])
+            if current is stale:
+                self.assertIsNone(state["current_turn"]["speaker_id"])
+                self.assertEqual(state["known_participants"], [])
+            else:
+                self.assertEqual(state["current_turn"]["speaker_id"], "Speaker C")
+                self.assertEqual(state["known_participants"], ["Speaker C"])
+        # A later forget never moves the boundary back; a restart clears it.
+        runner.forget_speakers(500)
+        self.assertIsNone(runner._state(stale)["current_turn"]["speaker_id"])
+        runner.restart("next-session")
+        self.assertEqual(runner._state(stale)["current_turn"]["speaker_id"], "Speaker A")
+
     def test_none_clear_restart_and_expired_retention_forget_it(self):
         from rightyo.memory import TranscriptMemory
 

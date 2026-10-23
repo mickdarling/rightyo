@@ -4,6 +4,7 @@ anyone's status question. Synthetic text only."""
 
 from __future__ import annotations
 
+import array
 import contextlib
 import copy
 import io
@@ -22,14 +23,17 @@ from types import SimpleNamespace
 from unittest import mock
 
 from test_conversation import MODE, SESSION, decided, turn
+from test_live_audio import FakeDiarizer, document
 
 from rightyo import tool_events
 from rightyo.contracts import Addressing, ContractError, Dismissal, SpeakerPriority
 from rightyo.live_audio import (
+    FRAME_BYTES,
     MAX_RESPONSE_BYTES,
     READ_CHUNK_BYTES,
     LiveAudioError,
     LiveConfig,
+    LiveProcessor,
     RecognizerSandboxError,
     WhisperCppTranscriber,
     _transcribe,
@@ -127,6 +131,66 @@ class PrivacyEventsTests(unittest.TestCase):
             **options,
         )
         return self.events.drain()
+
+    def test_private_ids_are_dropped_when_privacy_ends_and_when_the_session_ends(self):
+        # Jarvis on #242 round 5: the de-duplication ids live only while privacy is on.
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events.transcript(heard("p1", 100, 900, "synthetic words"), 900)
+        self.assertEqual(list(self.events._private_seen), ["p1"])
+        self.events.duck(False, now_ms=1000)
+        self.assertEqual(list(self.events._private_seen), [])
+        self.events.duck(True, now_ms=2000)
+        self.events.transcript(heard("p2", 2100, 2900, "synthetic words"), 2900)
+        self.assertEqual(list(self.events._private_seen), ["p2"])
+        self.events.end("stopped", 3000)
+        self.assertEqual(list(self.events._private_seen), [])
+
+    def test_a_private_turn_released_after_privacy_ends_leaves_no_id(self):
+        # Round 7 (keys' nit): heard in privacy, released after its end, still private.
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events.duck(False, now_ms=1000)
+        self.assertEqual(self.say(heard("p1", 100, 900, "synthetic words")), [])
+        self.assertEqual(list(self.events._private_seen), [])
+
+    def test_a_late_private_turn_is_never_matched_again_after_privacy_ends(self):
+        # #242 round 18: a status question from an ended period, released and offered again
+        # after the off, emits nothing and is not counted in the next period.
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events.duck(False, now_ms=1000)
+        late = heard("s1", 100, 900, "Are you recording?")
+        for _ in range(3):
+            self.assertEqual(self.say(late), [])
+        self.assertEqual(list(self.events._private_seen), [])
+        self.events.duck(True, now_ms=2000)
+        self.events.duck(False, now_ms=3000)
+        self.assertEqual(self.notes[-1], self.note())
+
+    def test_a_status_turn_of_an_earlier_period_released_in_the_next_is_dropped_unmatched(self):
+        # #242 round 23 (Codex P2): a status question from period 1, released only once period 2
+        # is on, emits no `status`, is not counted in period 2 and keeps no id.
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events.duck(False, now_ms=1000)
+        self.events.duck(True, now_ms=2000)
+        late = heard("s1", 100, 900, "Are you recording?")
+        self.assertEqual(self.say(late), [])
+        self.assertEqual(list(self.events._private_seen), [])
+        # A status question heard in period 2 is still answered and counted.
+        events = self.say(heard("s2", 2100, 2900, "Are you recording?"))
+        self.assertEqual([e.get("action") for e in events], ["status"])
+        self.events.duck(False, now_ms=3000)
+        self.assertEqual(self.notes[-1], self.note(discarded=1, status=1))
+
+    def test_the_session_end_drops_a_split_exit_in_progress(self):
+        # Round 7 (key 2's nit): no per-turn time from privacy outlives the session.
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events._private_name_end = 900
+        self.events.end("stopped", 1000)
+        self.assertIsNone(self.events._private_name_end)
 
     def say(self, current, label="attend", **options):
         self.events.transcript(current, current.end_ms)
@@ -318,6 +382,19 @@ class PrivacyEventsTests(unittest.TestCase):
                 at = index * 10_000
                 self.assertEqual(self.hear("Travis.", speaker=speaker, start=at), [])
                 self.assertEqual(self.hear("I'm back.", start=at + 1000), [])
+
+    def test_an_exit_heard_in_an_earlier_period_never_ends_this_one(self):
+        # Round 8 (key 2's round-7 nit): off, quickly on again, then the owner's exit from
+        # the earlier period is released late. It must not end the new period; and an
+        # exit released after the off, while public, emits nothing.
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events.duck(False, now_ms=1000)
+        self.assertEqual(self.say(heard("x0", 100, 900, "Jarvis, I'm back.")), [])
+        self.events.duck(True, now_ms=1200)
+        self.assertEqual(self.say(heard("x1", 200, 1000, "Jarvis, I'm back.")), [])
+        events = self.say(heard("x2", 1300, 2000, "Jarvis, I'm back."))
+        self.assertEqual([e.get("action") for e in events], ["exit"])
 
     def test_key_2_repro_a_stale_name_never_exits(self):
         # Key 2's blocker: on, a guest's name released after the off, a public turn, on
@@ -791,6 +868,42 @@ class PrivacyPhraseTests(unittest.TestCase):
         # Without names nothing is named.
         self.assertEqual(privacy_phrase("Jarvis, I'm back.", None), frozenset())
 
+    def test_a_name_with_digits_keeps_them(self):
+        # Codex P2 on #242: an `Addressing` name may hold digits, so the tokenizer keeps
+        # them; and a number around a phrase is a word, never silently dropped.
+        droid = Addressing(names=("R2D2",))
+        self.assertEqual(privacy_phrase("R2D2, I'm back.", droid), frozenset({"exit"}))
+        self.assertEqual(privacy_phrase("R2-D2.", droid), frozenset({"name"}))
+        # The digits are part of the name: without them it is not the name.
+        self.assertEqual(privacy_phrase("RD, I'm back.", droid), frozenset())
+        self.assertNotIn("entry", privacy_phrase("Stop recording 2", OURS))
+
+    def test_a_name_that_is_a_filler_word_is_still_a_name(self):
+        # Codex P2 on #242: a configured name such as "Okay" must not be dropped as filler.
+        for name in ("Okay", "Hey", "So"):
+            with self.subTest(name=name):
+                named = Addressing(names=(name,))
+                self.assertEqual(privacy_phrase(f"{name}, I'm back.", named), frozenset({"exit"}))
+                self.assertEqual(privacy_phrase(f"{name}.", named), frozenset({"name"}))
+                self.assertEqual(
+                    privacy_phrase(f"Um, {name}, I'm back.", named), frozenset({"exit"})
+                )
+        # Other filler is still dropped, and other names still treat it as filler.
+        self.assertEqual(privacy_phrase("Okay, um, Jarvis, I'm back.", OURS), frozenset({"exit"}))
+        self.assertEqual(privacy_phrase("Okay, I'm back.", OURS), frozenset({"rest"}))
+
+    def test_a_filler_word_in_a_variant_is_kept_only_inside_the_name(self):
+        # #242 round 18: a variant "Please Jarvis" keeps "please" where it is matched as part
+        # of the name, and leaves it filler everywhere else, so the plain exit still works.
+        polite = Addressing(names=("Jarvis",), variants=(("Jarvis", ("Please Jarvis",)),))
+        for text in ("Jarvis, please, I'm back.", "Please Jarvis, I'm back.", "Jarvis, I'm back."):
+            with self.subTest(text=text):
+                self.assertEqual(privacy_phrase(text, polite), frozenset({"exit"}))
+        self.assertEqual(privacy_phrase("Please, I'm back.", polite), frozenset({"rest"}))
+        self.assertEqual(privacy_phrase("Please Jarvis.", polite), frozenset({"name"}))
+        self.assertEqual(privacy_phrase("Jarvis, please.", polite), frozenset({"name"}))
+        self.assertEqual(privacy_phrase("Don't, Jarvis, please, I'm back.", polite), frozenset())
+
     def test_entry_is_intentional_only(self):
         # The host's S-2 rule: a standalone turn, after an optional name or address, with
         # small fillers at the edges only. Never mid-sentence, with an object, or a question.
@@ -901,6 +1014,323 @@ class DuckControllerTests(unittest.TestCase):
         blob = "".join(encode_json(e) for e in drained)
         self.assertEqual(leaks(blob + stderr.getvalue() + " ".join(notes)), [])
 
+    def test_a_private_turn_leaves_no_post_turn_gap_behind(self):
+        # Codex P2 on #242: the gap is observed just before the accept, and only a queued
+        # decision pops it, so a private turn's id and silence must be dropped here.
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        controller._decision_status = "ready"
+        work, memory = queue.Queue(), TranscriptMemory()
+        generation = controller._generation
+
+        def accept(name, start, text):
+            controller._observe_gap(generation, name, {"silence_ms": 700, "next": "other"})
+            current = turn(name, start, start + 900, text)
+            PrototypeController._accept(controller, generation, work, memory, current)
+
+        accept("t1", 0, "A")
+        controller._received_ms = 1000
+        controller.duck(True)
+        for index, text in enumerate(MONOLOGUE):
+            accept(f"p{index}", 1000 + index * 1000, text)
+        self.assertEqual(list(controller._turn_gaps), ["t1"])
+        controller._received_ms = 9000
+        controller.duck(False)
+        accept("t4", 9500, "D")
+        self.assertEqual(list(controller._turn_gaps), ["t1", "t4"])
+
+    def test_a_private_turn_is_never_scored_by_the_speaker_identifier(self):
+        # Jarvis on #242 round 5: no label evidence, binding or count from private speech.
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        scored = []
+        shadow = SimpleNamespace(turn=lambda current, **_: scored.append(current.utterance_id))
+        work, memory = queue.Queue(), TranscriptMemory()
+        generation = controller._generation
+
+        def hear(name, start):
+            controller._observe_spans(generation, name, ((start, start + 900),))
+            current = turn(name, start, start + 900, "synthetic")
+            controller._turn(generation, work, memory, shadow, current)
+
+        hear("t1", 0)
+        controller._received_ms = 1000
+        controller.duck(True)
+        hear("p1", 1000)
+        hear("p2", 2000)
+        controller._received_ms = 3000
+        controller.duck(False)
+        hear("t2", 3500)
+        self.assertEqual(scored, ["t1", "t2"])
+        self.assertEqual(controller._turn_spans, {})
+
+    def test_scoring_follows_the_accept_when_privacy_starts_between_them(self):
+        # Round 7 (key 1's nit): one decision for both; a turn the publisher dropped as
+        # private is never scored, even if privacy went on just before its accept.
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        scored = []
+        shadow = SimpleNamespace(turn=lambda current, **_: scored.append(current.utterance_id))
+        work, memory = queue.Queue(), TranscriptMemory()
+        accept = PrototypeController._accept
+
+        def privacy_first(*args):
+            controller._received_ms = 1000
+            controller.duck(True)
+            return accept(controller, *args)
+
+        controller._accept = privacy_first
+        controller._turn(controller._generation, work, memory, shadow, turn("t1", 0, 900, "x"))
+        self.assertEqual(scored, [])
+        self.assertEqual(events.drain(), [])
+        # And a turn the stop cut off is neither accepted nor scored.
+        del controller._accept
+        generation = controller._generation
+        controller.stop()
+        controller._turn(generation, work, memory, shadow, turn("t2", 2000, 2900, "x"))
+        self.assertEqual(scored, [])
+
+    def test_a_public_turn_queued_for_a_decision_is_still_scored(self):
+        # Round 8 (key 1's round-7 nit): `_accept` returns False on the queued path too.
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        controller._decision_status = "ready"
+        scored = []
+        shadow = SimpleNamespace(turn=lambda current, **_: scored.append(current.utterance_id))
+        work, memory = queue.Queue(), TranscriptMemory()
+        controller._turn(controller._generation, work, memory, shadow, turn("t1", 0, 900, "x"))
+        self.assertEqual(work.qsize(), 1)
+        self.assertEqual(scored, ["t1"])
+
+    def test_a_privacy_cycle_between_the_accept_and_the_scoring_discards_the_turn(self):
+        # #242 round 23 (Codex P1): a public turn accepted under the old labels, then a whole
+        # privacy on/off (a `forget`) before `shadow.turn` queues it. The epoch read at the
+        # accept goes with it, so the worker never binds the old label's audio.
+        from test_live_speaker_id import ENTRIES, Harness, ScriptedEmbedder, unit
+
+        from rightyo.live_speaker_id import ShadowSpeakerId
+
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        harness = Harness(ScriptedEmbedder([unit(1, 0, 0)] * 4), entries=ENTRIES)
+        shadow = harness.shadow
+        controller._shadow = shadow
+        pcm = array.array("h", [8000, -8000] * 32000).tobytes()  # four seconds
+        shadow.audio(pcm)
+        generation = controller._generation
+        controller._observe_spans(generation, "t1", ((0, 4000),))
+        current = heard("t1", 0, 4000, "synthetic")
+
+        def cycle_first(*args, **kwargs):
+            controller._received_ms, controller._received_bytes = 5000, 5000 * 32
+            controller.duck(True)
+            # Audio was received in the interval (#242 round 27: an empty one forgets nothing).
+            controller._received_ms, controller._received_bytes = 6000, 6000 * 32
+            controller.duck(False)
+            return ShadowSpeakerId.turn(shadow, *args, **kwargs)
+
+        work, memory = queue.Queue(), TranscriptMemory()
+        with mock.patch.object(shadow, "turn", side_effect=cycle_first):
+            controller._turn(generation, work, memory, shadow, current)
+        shadow.start()
+        shadow.close(drain=True)
+        self.assertEqual(shadow.scored, 0)
+        self.assertIsNone(shadow.binding("Speaker A"))
+        self.assertEqual(shadow._labels, {})
+        self.assertEqual(shadow.offered, 0)  # never queued at all
+
+    def test_the_processor_is_told_which_audio_was_heard_in_privacy(self):
+        # Codex P1 on #242: the processor withholds per-utterance diagnostics by this rule.
+        controller = self.controller()
+        self.assertFalse(controller._heard_private_span(0, 1000))  # No publisher.
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        controller._received_ms = 1000
+        controller.duck(True)
+        controller._received_ms = 3000
+        controller.duck(False)
+        self.assertFalse(controller._heard_private_span(0, 900))
+        self.assertTrue(controller._heard_private_span(500, 1500))  # Straddles the on.
+        self.assertTrue(controller._heard_private_span(1500, 2500))
+        self.assertTrue(controller._heard_private_span(2500, 3500))  # Straddles the off.
+        self.assertFalse(controller._heard_private_span(3000, 4000))
+
+    def test_the_live_processor_is_given_the_privacy_rule(self):
+        configs = []
+
+        def capture(config, *_args, **_options):
+            configs.append(config)
+            raise PrototypeError("no audio in this test")
+
+        events = SpeechEvents()
+        controller = self.controller(
+            constructor={"event_publisher": events, "processor_factory": capture}
+        )
+        controller.start({"mode": "demo", "session_id": "wiring"})
+        deadline = time.monotonic() + 5
+        while not configs and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(configs), 1)
+        self.assertEqual(configs[0].private, controller._heard_private_span)
+
+    def test_privacy_ending_forgets_every_speaker(self):
+        # Codex P1 on #242: at the off edge only, the diarizer is renewed, speaker-ID bindings
+        # are dropped and the publisher's per-label roles with them.
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        processor, shadow = mock.Mock(), mock.Mock()
+        controller._processor, controller._shadow = processor, shadow
+        events._roles["Speaker A"] = "participant"
+        controller.duck(False)  # Already off: no edge, nothing forgotten.
+        controller.duck(True)
+        self.assertEqual((processor.reset_speakers.call_count, shadow.forget.call_count), (0, 0))
+        self.assertEqual(events._roles, {"Speaker A": "participant"})
+        controller._received_ms, controller._received_bytes = 4321, 4321 * 32 + 6
+        controller.duck(False)
+        self.assertEqual((processor.reset_speakers.call_count, shadow.forget.call_count), (1, 1))
+        # Round 18: the buffered audio before the end is silenced, on the mode's own clock, in
+        # bytes so it is exact to the sample (round 19).
+        processor.reset_speakers.assert_called_once_with(4321 * 32 + 6)
+        self.assertEqual(events._roles, {})
+        controller.duck(False)
+        self.assertEqual((processor.reset_speakers.call_count, shadow.forget.call_count), (1, 1))
+
+    def test_the_fresh_diarizer_forgets_what_was_bound_while_it_waited(self):
+        # #242 round 14 keys: a turn finalized between the off edge and the deferred renewal is
+        # scored under the old labels; when the fresh diarizer takes over, that is forgotten too.
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        shadow = mock.Mock()
+        controller._shadow = shadow
+        events._roles["Speaker A"] = "owner"  # fixed for an old label after the edge
+        controller._speakers_renewed()
+        shadow.forget.assert_called_once_with()
+        self.assertEqual(events._roles, {})
+
+    def test_the_decision_runner_forgets_the_old_labels_with_the_publisher(self):
+        # #242 round 25: at the off edge and when the fresh diarizer takes over, the decision
+        # runner forgets the old labels too: its stored turns (`forget_speakers`) and its copy
+        # of the latest request, which loses its speaker label as the publisher's does.
+        for edge in ("off", "renewed"):
+            with self.subTest(edge=edge):
+                controller = self.controller()
+                events = SpeechEvents()
+                events.start(SESSION, now_ms=0, addressing=OURS)
+                events.drain()
+                controller._events = events
+                controller._processor, controller._shadow = mock.Mock(), mock.Mock()
+                runner = mock.Mock(request_context=True)
+                controller._runner = runner
+                controller._received_ms = 4321
+                events.last_request = (900, "Jarvis, add milk.", "u1", "Speaker A")
+                if edge == "off":
+                    controller.duck(True)
+                    controller._received_bytes += 2  # one sample heard (#242 round 27)
+                    controller.duck(False)
+                else:
+                    controller._speakers_renewed()
+                runner.note_request.assert_called_once_with((900, "Jarvis, add milk.", "u1", None))
+                # And forgets every label from before it, stamped on the received-audio clock.
+                runner.forget_speakers.assert_called_once_with(controller._received_ms)
+
+    def test_a_guest_on_a_recycled_label_gets_no_follow_up_attention(self):
+        # Round 16 (Jarvis): every per-label state goes when speakers are forgotten, so a guest
+        # the fresh diarizer gives the owner's old label is never the engaged speaker.
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        guest = turn("g1", 1000, 1900, "and the other thing")
+        key = events._cooldown_key(events._facts(guest))
+        self.assertIsNotNone(key)
+        events._engaged = {
+            "key": key,
+            "speaker_id": guest.speaker_id,
+            "from_ms": 0,
+            "until_ms": 60_000,
+        }
+        events._dormant = {"engaged": dict(events._engaged), "at_ms": 0}
+        events._cooldowns[key] = (0, 60_000)
+        events._ended[key] = 0
+        events._appendix_from[key] = 0
+        events._delivered["request"] = {"speaker_id": guest.speaker_id}
+        events._roles[guest.speaker_id] = "owner"
+        self.assertTrue(events._engaged_with(guest))
+        events.forget_speakers()
+        self.assertFalse(events._engaged_with(guest))
+        self.assertEqual(
+            (events._engaged, events._dormant, events._cooldowns, events._ended),
+            (None, None, {}, {}),
+        )
+        self.assertEqual((events._appendix_from, events._delivered, events._roles), ({}, {}, {}))
+
+    def test_the_controller_hands_the_processor_its_renewal_hook(self):
+        # Round 16 (key 1's should-fix): the wiring that makes the renewal forget is pinned.
+        made = []
+
+        class Processor:
+            on_speakers_renewed = None
+
+            def __init__(self, config, on_turn):
+                made.append(self)
+
+            def push_pcm16(self, pcm):
+                pass
+
+            def finish(self):
+                pass
+
+            def close(self):
+                pass
+
+        events = SpeechEvents()
+        controller = self.controller(
+            constructor={"event_publisher": events, "processor_factory": Processor}
+        )
+        controller.start({"mode": "demo", "session_id": "wiring"})
+        deadline = time.monotonic() + 5
+        while not made and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(made), 1)
+        wait = time.monotonic() + 5
+        while made[0].on_speakers_renewed is None and time.monotonic() < wait:
+            time.sleep(0.01)
+        self.assertEqual(made[0].on_speakers_renewed, controller._speakers_renewed)
+
+    def test_stop_drops_per_turn_notes_an_accept_never_took(self):
+        # Jarvis on #242 round 5: a stop between the observation and the accept.
+        controller = self.controller()
+        generation = controller._generation
+        controller._observe_gap(generation, "p1", {"silence_ms": 700})
+        controller._observe_inferred(generation, "p1")
+        controller._observe_spans(generation, "p1", ((0, 900),))
+        controller.stop()
+        self.assertEqual(controller._turn_gaps, {})
+        self.assertEqual(controller._inferred_turns, set())
+        self.assertEqual(controller._turn_spans, {})
+
     def test_privacy_is_advertised_only_with_local_speech(self):
         # The guard itself, through `start`, not a mock (key 2's nit 3).
         hosted = {
@@ -931,6 +1361,27 @@ class DuckControllerTests(unittest.TestCase):
                 self.assertEqual("duck" in started, advertised)
                 if advertised:
                     self.assertEqual(started["duck"], {"version": 2})
+
+    def test_privacy_is_refused_with_hosted_speech(self):
+        # Codex P1 on #242: a stale or misconfigured host must not put a hosted-speech
+        # process into apparent privacy while its audio still goes to the backend.
+        hosted = {
+            "transcriber": {
+                "kind": "hosted-openai-compatible",
+                "endpoint": "https://transcribe.example.test/v1/audio/transcriptions",
+                "model": "whisper-1",
+            }
+        }
+        controller = self.controller(**hosted)
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        with self.assertRaises(PrototypeError):
+            controller.duck(True)
+        self.assertFalse(events.ducked)
+        controller.duck(False)
+        self.assertFalse(events.ducked)
 
     def test_the_named_owner_exit_reaches_the_host_through_the_controller(self):
         controller = self.controller()
@@ -974,6 +1425,46 @@ class DuckControllerTests(unittest.TestCase):
         self.assertEqual(ring.span(3000, 4000)[0], voice)
         self.assertEqual(events._duck_spans, [[1000, 3000]])
 
+    def test_no_private_sample_reaches_asr_with_odd_sized_chunks(self):
+        # #242 round 19: the privacy end is stamped through the controller's own path, in bytes.
+        # A millisecond stamp rounded down left up to 15 private samples in front of the first
+        # public utterance when chunks end mid-millisecond.
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0)
+        events.drain()
+        controller._events = events
+        asset = Path(controller.config.whisper_model)
+        config = LiveConfig("causal-test", asset, asset, asset, asset, provenance="causal-replay")
+        with (
+            mock.patch("rightyo.live_audio._Diarizer", FakeDiarizer),
+            mock.patch("rightyo.live_audio._transcribe", return_value=document()) as transcribe,
+        ):
+            processor = LiveProcessor(config, lambda turn: None)
+            self.addCleanup(processor.close)
+            controller._processor = processor
+
+            def feed(pcm):
+                controller._feed(controller._generation, processor, pcm, "stdin")
+
+            for _ in range(3):
+                feed(bytes(640))
+            controller.duck(True)
+            marker = array.array("h", [77] * 167).tobytes()  # quiet, so kept in the pre-roll
+            for size in (222, 334) * 5:
+                feed(marker[:size])
+            self.assertNotEqual(controller._received_bytes % 32, 0)
+            controller.duck(False)
+            voice = array.array("h", [5000] * 320).tobytes()
+            for _ in range(20):
+                feed(voice)
+            for _ in range(75):
+                feed(bytes(640))
+            self.assertEqual(transcribe.call_count, 1)
+            sent = array.array("h", transcribe.call_args.args[1])
+            self.assertEqual(sent.count(77), 0)
+            self.assertEqual(sent.count(5000), 20 * 320)
+
     def test_spans_use_the_audio_clock_when_the_wall_clock_runs_ahead(self):
         controller = self.controller()
         events = SpeechEvents()
@@ -1002,11 +1493,20 @@ class DuckControllerTests(unittest.TestCase):
 
     def test_the_controller_forwards_or_ignores_without_a_publisher(self):
         events = SpeechEvents()
-        controller = SimpleNamespace(_lock=threading.RLock(), _events=events, _received_ms=7)
+        local = SimpleNamespace(hosted_speech=False)
+        controller = SimpleNamespace(
+            _lock=threading.RLock(),
+            _events=events,
+            _received_ms=7,
+            _received_bytes=224,
+            config=local,
+        )
         PrototypeController.duck(controller, True)
         self.assertIs(events._duck, True)
         self.assertEqual(events._duck_spans, [[7, None]])
-        PrototypeController.duck(SimpleNamespace(_lock=threading.RLock(), _events=None), True)
+        PrototypeController.duck(
+            SimpleNamespace(_lock=threading.RLock(), _events=None, config=local), True
+        )
         with self.assertRaises(PrototypeError):
             PrototypeController.duck(controller, "yes")
 
@@ -1313,35 +1813,119 @@ class RecognizerSandboxTests(unittest.TestCase):
         self.root = Path(directory.name)
 
     def candidates(self, *paths):
+        """These candidates, with an empty per-process cache, both restored afterwards."""
         from rightyo import live_audio
 
-        return mock.patch.object(live_audio, "NO_FILES_CANDIDATES", tuple(map(str, paths)))
+        stack = contextlib.ExitStack()
+        stack.enter_context(
+            mock.patch.object(live_audio, "NO_FILES_CANDIDATES", tuple(map(str, paths)))
+        )
+        stack.enter_context(mock.patch.object(live_audio, "_recognizer_dir_cache", None))
+        return stack
 
-    def test_a_writable_or_missing_or_linked_candidate_is_refused(self):
+    def probes(self):
+        """A spy on the creation probe: the directories it was asked about."""
+        from rightyo import live_audio
+
+        asked, real = [], live_audio._refuses_creation
+
+        def spy(directory):
+            asked.append(directory)
+            return real(directory)
+
+        return asked, mock.patch.object(live_audio, "_refuses_creation", spy)
+
+    def locked(self, name="locked"):
+        """A directory this (non-root) process cannot create anything in."""
+        if os.geteuid() == 0:
+            self.skipTest("root can write any ordinary directory")
+        locked = self.root / name
+        locked.mkdir()
+        locked.chmod(0o555)
+        self.addCleanup(lambda: locked.exists() and locked.chmod(0o755))
+        return locked
+
+    def test_a_writable_or_missing_candidate_is_refused_and_leaves_no_residue(self):
         writable = self.root / "writable"
         writable.mkdir()
-        link = self.root / "link"
-        link.symlink_to(writable)
-        for path in (writable, self.root / "missing", link):
+        for path in (writable, self.root / "missing"):
             with self.subTest(path=path.name), self.candidates(path):
                 with self.assertRaises(RecognizerSandboxError):
                     recognizer_dir()
+        self.assertEqual(list(writable.iterdir()), [])
+
+    def test_a_symlink_is_rejected_without_being_probed(self):
+        # Also #244: a symlinked candidate, even to an unwritable directory, never counts.
+        link = self.root / "link"
+        link.symlink_to(self.locked())
+        asked, spy = self.probes()
+        with spy, self.candidates(link), self.assertRaises(RecognizerSandboxError):
+            recognizer_dir()
+        self.assertEqual(asked, [])
 
     def test_an_unwritable_directory_is_accepted_and_preferred_in_order(self):
-        if os.geteuid() == 0:
-            self.skipTest("root can write any directory")
-        locked = self.root / "locked"
-        locked.mkdir()
-        locked.chmod(0o555)
-        self.addCleanup(locked.chmod, 0o755)
+        locked = self.locked()
         with self.candidates(self.root / "missing", self.root, locked):
             self.assertEqual(recognizer_dir(), str(locked))
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["locked"])
+
+    def test_the_probe_decides_not_the_permission_bits(self):
+        # Codex P1 on be56490: root's `os.access` says "writable" for procfs, which refuses
+        # new files. With `os.access` always true, the probe still accepts an unwritable
+        # directory and still rejects a writable one.
+        from rightyo import live_audio
+
+        locked = self.locked()
+        writable = self.root / "writable"
+        writable.mkdir()
+        with mock.patch.object(live_audio.os, "access", return_value=True):
+            with self.candidates(writable, locked):
+                self.assertEqual(recognizer_dir(), str(locked))
+        self.assertEqual(list(writable.iterdir()), [])
+
+    def test_the_choice_is_cached_and_reprobed_only_when_it_vanishes(self):
+        first, second = self.locked("first"), self.locked("second")
+        asked, spy = self.probes()
+        with spy, self.candidates(first, second):
+            self.assertEqual(recognizer_dir(), str(first))
+            self.assertEqual(recognizer_dir(), str(first))
+            self.assertEqual(asked, [str(first)])
+            # The cached directory disappears: probed again, and the next one is chosen.
+            first.chmod(0o755)
+            first.rmdir()
+            self.assertEqual(recognizer_dir(), str(second))
+            self.assertEqual(asked, [str(first), str(second)])
+
+    def test_a_refusal_counts_only_for_the_unwritable_errors(self):
+        import errno
+
+        from rightyo import live_audio
+
+        for number, accepted in (
+            (errno.EACCES, True),
+            (errno.EPERM, True),
+            (errno.EROFS, True),
+            (errno.ENOENT, True),
+            (errno.ENOSPC, False),
+            (errno.EIO, False),
+        ):
+            with (
+                self.subTest(errno=errno.errorcode[number]),
+                self.candidates(self.root),
+                mock.patch.object(live_audio.os, "open", side_effect=OSError(number, "x")),
+            ):
+                if accepted:
+                    self.assertEqual(recognizer_dir(), str(self.root))
+                else:
+                    with self.assertRaises(RecognizerSandboxError):
+                        recognizer_dir()
 
     @unittest.skipUnless(os.path.isdir("/var/empty"), "macOS /var/empty")
     def test_var_empty_is_accepted_on_macos(self):
         if os.geteuid() == 0:
-            self.skipTest("root can write /var/empty")
+            self.skipTest("root can write /var/empty on macOS, so the probe refuses it")
         self.assertEqual(recognizer_dir(), "/var/empty")
+        self.assertEqual(os.listdir("/var/empty"), [])
 
     def test_without_one_transcription_is_refused_before_any_audio(self):
         model = self.root / "model"
@@ -1470,6 +2054,321 @@ class DuckControlTests(unittest.TestCase):
             _read_control(read, recorder)
         self.assertEqual(recorder.calls, [("duck", True), ("media", True), ("duck", False)])
         self.assertEqual(errors.getvalue().count("skipped"), 5)
+
+
+HOSTED_CONSUMERS = {
+    "transcriber": {
+        "transcriber": {
+            "kind": "hosted-openai-compatible",
+            "endpoint": "https://transcribe.example.test/v1/audio/transcriptions",
+            "model": "whisper-1",
+        }
+    },
+    "diarizer": {"diarizer": {"kind": "hosted-deepgram", "model": "nova-3"}},
+}
+
+
+class Round27Tests(unittest.TestCase):
+    """#242 round 27 (Codex P1 x3 on 5c8a870), one test per class, over its members."""
+
+    controller = DuckControllerTests.controller
+
+    def publisher(self, private=False):
+        events = SpeechEvents()
+        if private:
+            events.duck(True, now_ms=0)
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        return events
+
+    def test_hosted_speech_never_runs_private_by_any_path(self):
+        # Class A: with any hosted audio consumer configured, every path to privacy is refused
+        # (or startup rejected), and the one choke point feeds a hosted consumer nothing while
+        # private, whatever path made privacy active.
+        from test_turn_merge import TEXTS, ScriptedDiarizer, ScriptedTranscriber
+
+        from rightyo.tool import listen
+
+        voice = b"\x01\x02" * 16_000
+
+        def cli(extra):
+            # `listen --start-private`.
+            directory = tempfile.TemporaryDirectory()
+            self.addCleanup(directory.cleanup)
+            asset = Path(directory.name) / "asset"
+            asset.touch()
+            path = Path(directory.name) / "config.json"
+            keys = ("whisper_executable", "whisper_model", "diarization_library")
+            keys += ("diarization_model", "microphone_helper", "demo_audio")
+            path.write_text(json.dumps({**dict.fromkeys(keys, str(asset)), **extra}))
+            args = SimpleNamespace(
+                config=path,
+                mode="demo",
+                session_id="r27-cli",
+                use_jev=False,
+                allow_hosted=True,
+                names=None,
+                start_private=True,
+                coaching=False,
+            )
+            with contextlib.redirect_stderr(io.StringIO()):
+                listen(args, output=io.StringIO())
+
+        def ducked_publisher(extra):
+            # A caller's publisher already private before the controller is built.
+            self.controller(
+                constructor={
+                    "event_publisher": self.publisher(private=True),
+                    "allow_hosted_speech": True,
+                },
+                **extra,
+            )
+
+        def duck_line(extra):
+            controller = self.controller(constructor={"allow_hosted_speech": True}, **extra)
+            controller._events = self.publisher()
+            controller.duck(True)
+
+        def no_audio(*_args, **_options):
+            raise PrototypeError("no audio in this test")
+
+        def restart(mode):
+            def path(extra):
+                # Made private outside the controller between sessions, then started again.
+                events = self.publisher()
+                controller = self.controller(
+                    constructor={
+                        "event_publisher": events,
+                        "allow_hosted_speech": True,
+                        "processor_factory": no_audio,
+                    },
+                    **extra,
+                )
+                events.duck(True, now_ms=0)
+                controller.start({"mode": mode, "session_id": f"r27-{mode}"})
+
+            return path
+
+        def swap(extra):
+            # A local session made private, then its speech backends swapped to a hosted one.
+            controller = self.controller(
+                constructor={
+                    "event_publisher": self.publisher(private=True),
+                    "allow_hosted_speech": True,
+                    "processor_factory": no_audio,
+                }
+            )
+            hosted = self.controller(constructor={"allow_hosted_speech": True}, **extra)
+            controller.config = hosted.config
+            controller.start({"mode": "demo", "session_id": "r27-swap"})
+
+        refused = {
+            "cli --start-private": cli,
+            "programmatic ducked publisher": ducked_publisher,
+            "duck(True) line": duck_line,
+            "restart (microphone)": restart("microphone"),
+            "replay (demo)": restart("demo"),
+            "backend swap": swap,
+        }
+        for consumer, extra in HOSTED_CONSUMERS.items():
+            for name, path in refused.items():
+                with self.subTest(consumer=consumer, path=name):
+                    with self.assertRaisesRegex(PrototypeError, "refused with a hosted"):
+                        path(extra)
+
+        # Privacy made active mid-session by a path that bypasses every refusal (the
+        # publisher's own `duck`), before and after a forced diarizer renewal built a NEW
+        # diarizer: the hosted transcriber and diarizer receive nothing while private, and the
+        # session ends as an error.
+        for consumer, extra in HOSTED_CONSUMERS.items():
+            for renewal in (False, True):
+                with self.subTest(consumer=consumer, path="bypass", renewal=renewal):
+                    events = self.publisher()
+                    controller = self.controller(
+                        constructor={"event_publisher": events, "allow_hosted_speech": True},
+                        **extra,
+                    )
+                    controller._event_terminal = False
+                    transcriber, made = ScriptedTranscriber(TEXTS), []
+
+                    def diarizer(_config, made=made):
+                        made.append(ScriptedDiarizer())
+                        return made[-1]
+
+                    processor = LiveProcessor(
+                        LiveConfig(
+                            "r27-bypass",
+                            provenance="causal-replay",
+                            transcriber=transcriber,
+                            diarizer=diarizer,
+                        ),
+                        lambda turn: None,
+                    )
+                    self.addCleanup(processor.close)
+                    controller._processor = processor
+                    generation = controller._generation
+                    public = bytes(len(voice))  # nothing opens, so a renewal is not deferred
+                    self.assertTrue(controller._feed(generation, processor, public, "stdin"))
+                    if renewal:
+                        processor.reset_speakers()
+                        controller._feed(generation, processor, public, "stdin")
+                        self.assertEqual(len(made), 2)
+                    heard = [d.pushed_ms for d in made]
+                    events.duck(True, now_ms=controller._received_ms)
+                    self.assertFalse(controller._feed(generation, processor, voice, "stdin"))
+                    self.assertEqual([d.pushed_ms for d in made], heard)
+                    self.assertEqual(processor.received_ms, heard[-1] + (1000 if renewal else 0))
+                    self.assertEqual(controller._phase, "error")
+                    end = events.drain()[-1]
+                    self.assertEqual(
+                        (end["phase"], end["reason"]), ("error", "privacy-hosted-speech")
+                    )
+
+    def test_an_empty_privacy_interval_forgets_no_speaker(self):
+        # Class B: every effect of privacy-off that assumes private audio was heard is skipped
+        # when the interval received no audio, judged on the stream clock in bytes; one sample
+        # is enough to forget; with off -> on -> off only the interval with audio forgets.
+        def arrange(start_private):
+            events = self.publisher(private=start_private)
+            controller = self.controller(constructor={"event_publisher": events})
+            controller._processor, controller._shadow = mock.Mock(), mock.Mock()
+            controller._runner = mock.Mock(request_context=True)
+            events._roles["Speaker A"] = "owner"
+            events._seen["u1"] = None
+            events._pending["u1"] = (None, None, 0, None)
+            events._withdrawn["u0"] = {"speaker_id": "Speaker A"}
+            events.last_request = (900, "Jarvis, add milk.", "u1", "Speaker A")
+            return controller, events
+
+        members = {
+            "publisher forget_speakers / _labels_renewed": lambda c, e: e._labels_renewed,
+            "_label_stale": lambda c, e: bool(e._label_stale),
+            "_old_labels": lambda c, e: bool(e._old_labels),
+            "per-label roles": lambda c, e: e._roles == {},
+            "last_request unlabelled": lambda c, e: e.last_request[3] is None,
+            "withdrawals unlabelled": lambda c, e: e._withdrawn["u0"]["speaker_id"] is None,
+            "runner forget_speakers": lambda c, e: c._runner.forget_speakers.called,
+            "reset_speakers / diarizer renewal": lambda c, e: c._processor.reset_speakers.called,
+            "shadow forget (epoch, bindings, owner-voice evidence)": (
+                lambda c, e: c._shadow.forget.called
+            ),
+        }
+
+        def cases():
+            # (name, heard): start private, off before any audio / after one sample.
+            for heard_bytes in (0, 2):
+                controller, events = arrange(start_private=True)
+                controller._received_bytes += heard_bytes
+                controller.duck(False)
+                yield f"start-private, {heard_bytes} bytes", controller, events, heard_bytes > 0
+            # Off -> on -> off: only the second interval had audio.
+            controller, events = arrange(start_private=False)
+            controller._received_bytes = 6400
+            controller.duck(True)
+            controller.duck(False)
+            yield "first of two, empty", controller, events, False
+            controller.duck(True)
+            controller._received_bytes += 2
+            controller.duck(False)
+            yield "second of two, one sample", controller, events, True
+
+        for case, controller, events, heard in cases():
+            for member, forgotten in members.items():
+                with self.subTest(case=case, member=member):
+                    self.assertIs(bool(forgotten(controller, events)), heard)
+
+    def test_a_publisher_that_cannot_say_counts_as_private(self):
+        # #242 round 28: a publisher that can be private but has no `heard_ducked` gives no
+        # answer, and the processor counts that as private, so a turn held at the privacy end is
+        # discarded, not released. One with no privacy at all never heard anything privately.
+        span = PrototypeController._heard_private_span
+        silent = SimpleNamespace(duck=lambda *_args, **_kwargs: None)
+        for name, events, expected in (
+            ("reports", self.publisher(), False),
+            ("reports private", self.publisher(private=True), True),
+            ("cannot say", silent, None),
+            ("no privacy", SimpleNamespace(), False),
+        ):
+            with self.subTest(publisher=name):
+                self.assertIs(span(SimpleNamespace(_events=events), 0, 20), expected)
+        heard = LiveProcessor._heard_private
+        processor = SimpleNamespace(config=SimpleNamespace(private=lambda _start, _end: None))
+        self.assertTrue(heard(processor, 0, 20))
+        # And no such publisher reaches a session: it is refused at construction, so the
+        # per-turn judgement (`_heard_private`) never meets an unknown either.
+        with self.assertRaisesRegex(PrototypeError, "report what it heard privately"):
+            self.controller(constructor={"event_publisher": silent})
+
+    def test_no_private_turn_held_at_the_off_survives_or_swallows_the_first_public_one(self):
+        # Class C: a private turn finalized and still held by the merger when privacy ends (the
+        # merge gap, the owner pause, a lone wake word held for the owner) is discarded at the
+        # cutoff, words and all. The first public request, within the hold, stands on its own.
+        from test_turn_merge import (
+            SILENCE,
+            VOICE,
+            LateLabelDiarizer,
+            ScriptedDiarizer,
+            ScriptedTranscriber,
+            audio,
+        )
+
+        members = {
+            "merge gap": ({"turn_merge_gap_ms": 2000}, ScriptedDiarizer, "Marmalade zeppelin"),
+            "owner pause": (
+                {
+                    "turn_merge_gap_ms": 500,
+                    "turn_owner": lambda fragment: fragment["speaker"] == "Speaker A",
+                    "turn_owner_pause_ms": 3000,
+                },
+                ScriptedDiarizer,
+                "Marmalade zeppelin",
+            ),
+            "wake word hold": (
+                {
+                    "turn_merge_gap_ms": 2000,
+                    "turn_wake_word": lambda text: text.strip(" ,.").lower() == "jarvis",
+                    "turn_owner": lambda fragment: fragment["speaker"] == "Speaker A",
+                },
+                lambda: LateLabelDiarizer(1000, 1),
+                "Jarvis,",
+            ),
+        }
+        public = "Jarvis, add the quokka to the list."
+        for member, (options, diarizer, private) in members.items():
+            with self.subTest(member=member):
+                events = self.publisher()
+                controller = self.controller(constructor={"event_publisher": events})
+                work, memory = queue.Queue(), TranscriptMemory()
+                processor = LiveProcessor(
+                    LiveConfig(
+                        SESSION,
+                        provenance="causal-replay",
+                        transcriber=ScriptedTranscriber((private, public)),
+                        diarizer=diarizer(),
+                        private=controller._heard_private_span,
+                        **options,
+                    ),
+                    lambda turn: controller._accept(controller._generation, work, memory, turn),
+                )
+                self.addCleanup(processor.close)
+                controller._processor = processor
+
+                def feed(pcm):
+                    for offset in range(0, len(pcm), FRAME_BYTES * 10):
+                        chunk = pcm[offset : offset + FRAME_BYTES * 10]
+                        controller._feed(controller._generation, processor, chunk, "stdin")
+
+                controller.duck(True)
+                feed(audio((VOICE, 200), (SILENCE, 1500)))  # finalized at 1,640 ms, held
+                self.assertTrue(processor._merger.holding)
+                controller.duck(False)
+                feed(audio((VOICE, 200), (SILENCE, 3000)))
+                processor.release_pending()
+                published = [e for e in events.drain() if e["type"] == "transcript"]
+                self.assertEqual([e["turn"]["text"] for e in published], [public])
+                self.assertEqual(published[0]["turn"]["start_ms"], 1700)
+                self.assertEqual(memory.snapshot(10_000)["turns"][0]["text"], public)
+                self.assertFalse(processor._merger.holding)
 
 
 if __name__ == "__main__":

@@ -14,12 +14,15 @@ import array
 import base64
 import contextlib
 import ctypes
+import errno
 import inspect
 import io
 import json
 import math
 import os
+import secrets
 import selectors
+import stat
 import subprocess
 import sys
 import threading
@@ -41,6 +44,9 @@ BYTES_PER_MS = 32  # mono PCM16 at 16 kHz
 MAX_CHUNK_BYTES = 32000  # one second of audio per push
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_SPEAKER = 702  # "Speaker A" .. "Speaker ZZ"; native streams use 1..8
+# A diarizer renewal deferred past an open utterance or held turn is forced this long after the
+# privacy end is reached (#242 round 21), so steady speech cannot keep the old one in use.
+SPEAKER_RENEWAL_LIMIT_MS = 10_000
 # The native stream returns only segments ending within this trailing window of pushed
 # audio. An utterance spans at most `max_utterance_ms` (<= 15 s, pre-roll included), so
 # every segment that can overlap one is inside it with a wide margin, and per-utterance
@@ -120,6 +126,11 @@ class LiveConfig:
     # Optional content-free stderr diagnostics (counts only): skipped segments and
     # suppressed utterances.
     report: Callable[[str], None] | None = None
+    # Whether audio received between two stream times was heard in privacy mode
+    # (hailing-station #735 S-1). Per-utterance diagnostics (end-of-turn scores and
+    # timing, skipped or suppressed recognizer output) are withheld for it, so logs keep
+    # nothing about private speech. None means never private; a failure counts as private.
+    private: Callable[[int, int], bool] | None = None
     # Total audio accepted per session, in stream milliseconds. None means no ceiling:
     # memory stays bounded by the utterance window and downstream retention limits.
     session_budget_ms: int | None = None
@@ -837,18 +848,59 @@ class RecognizerSandboxError(LiveAudioError):
     """No directory this process cannot write is available for the local recognizer."""
 
 
-def recognizer_dir() -> str:
-    """The first real, unwritable candidate directory (`NO_FILES_CANDIDATES`).
+# What a refused exclusive create in an unwritable directory fails with.
+UNWRITABLE_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOENT})
+# The directory chosen by the first successful probe in this process (see `recognizer_dir`).
+_recognizer_dir_cache: str | None = None
 
-    Verified each time: a directory that is missing, a symlink, or writable by this process
-    (as for root) is refused, and with none left this raises `RecognizerSandboxError`.
+
+def _real_directory(path: str) -> bool:
+    """Whether `path` itself is a directory, by `lstat`: a symlink never is."""
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _refuses_creation(directory: str) -> bool:
+    """Whether creating a file in `directory` really fails, by trying it.
+
+    `os.access` is not enough: root's override reports procfs (which refuses new files)
+    as writable. So this exclusively creates an unpredictably named file, never following
+    a link, and writes nothing. A refusal with EACCES, EPERM, EROFS or ENOENT means
+    unwritable. Any success means writable: the file is closed and unlinked at once. Any
+    other error counts as writable (fail closed).
     """
+    probe = os.path.join(directory, secrets.token_hex(16))
+    try:
+        descriptor = os.open(
+            probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600
+        )
+    except OSError as error:
+        return error.errno in UNWRITABLE_ERRNOS
+    os.close(descriptor)
+    with contextlib.suppress(OSError):
+        os.unlink(probe)
+    return False
+
+
+def recognizer_dir() -> str:
+    """The first candidate (`NO_FILES_CANDIDATES`) that is a real directory (by `lstat`,
+    so never a symlink, which is never probed) in which this process cannot create a file
+    (`_refuses_creation`).
+
+    Probed once per process and cached; probed again only if the cached directory stops
+    being a real directory. Decided by behaviour rather than permission bits, so it is right
+    for root too. With no candidate left this raises `RecognizerSandboxError`.
+    """
+    global _recognizer_dir_cache
+    cached = _recognizer_dir_cache
+    if cached is not None and _real_directory(cached):
+        return cached
+    _recognizer_dir_cache = None
     for candidate in NO_FILES_CANDIDATES:
-        if (
-            os.path.isdir(candidate)
-            and not os.path.islink(candidate)
-            and not os.access(candidate, os.W_OK)
-        ):
+        if _real_directory(candidate) and _refuses_creation(candidate):
+            _recognizer_dir_cache = candidate
             return candidate
     raise RecognizerSandboxError(
         "The local recognizer needs a directory this process cannot write, such as /var/empty"
@@ -1130,6 +1182,44 @@ def _select(value: Any, default: Callable[[LiveConfig], Any], config: LiveConfig
     return value if _is_backend_instance(value, method) else value(config)
 
 
+class _OffsetDiarizer:
+    """A diarizer started mid-stream (#735 S-1): its own clock starts at zero, so its timeline
+    is shifted onto the stream clock the processor's utterances use."""
+
+    def __init__(self, inner: Diarizer, offset_ms: int):
+        self._inner, self._offset = inner, offset_ms
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def _shifted(self, timeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                **segment,
+                **{
+                    key: segment[key] + self._offset
+                    for key in ("start_ms", "end_ms")
+                    if type(segment.get(key)) is int
+                },
+            }
+            if isinstance(segment, dict)
+            else segment
+            for segment in timeline
+        ]
+
+    def push(self, pcm: bytes) -> None:
+        self._inner.push(pcm)
+
+    def segments(self) -> list[dict[str, Any]]:
+        return self._shifted(self._inner.segments())
+
+    def finish(self) -> list[dict[str, Any]]:
+        return self._shifted(self._inner.finish())
+
+    def close(self) -> None:
+        self._inner.close()
+
+
 class LiveProcessor:
     """Single-owner synchronous processor; feed only explicitly consented audio.
 
@@ -1150,6 +1240,24 @@ class LiveProcessor:
         self._diarizer: Diarizer = _select(
             config.diarizer, lambda value: _Diarizer(value), config, "push"
         )
+        # A diarizer the processor made (the default, or a factory) can be made again when
+        # privacy ends (`reset_speakers`, hailing-station #735 S-1); a supplied instance cannot.
+        self._diarizer_renewable = config.diarizer is None or not _is_backend_instance(
+            config.diarizer, "push"
+        )
+        self._speaker_reset = False
+        # The stream byte offset privacy last ended at, until the frame holding it is processed;
+        # then what is still buffered from before it is silenced (`_private_cutoff`). Written on
+        # the host thread and taken on the audio thread, both under `_private_lock`.
+        self._private_until: int | None = None
+        self._private_lock = threading.Lock()
+        # Where the last privacy end was reached (audio thread only), bounding a deferred renewal;
+        # and, after a forced one, the renewal's offset: a turn starting before it is unlabelled.
+        self._end_reached_ms: int | None = None
+        self._unlabelled_before_ms = 0
+        # Told when the fresh diarizer takes over, before its first frame: labels restart there,
+        # so whatever was bound to the old ones in the meantime must be forgotten again.
+        self.on_speakers_renewed: Callable[[], None] | None = None
         # The per-response segment bound for this session's timeline window (#226).
         self._timeline_limit = timeline_segment_limit(config.timeline_window_ms)
         self._partial = bytearray()
@@ -1161,6 +1269,10 @@ class LiveProcessor:
         self._counter = 0
         self._utterances = 0
         self._skipped_utterances = 0
+        # Of those, the ones from utterances heard in privacy (hailing-station #735 S-1): kept
+        # apart so the session's reported totals never count private speech.
+        self._private_skipped_segments = 0
+        self._private_skipped_utterances = 0
         self._end_of_turn = config.end_of_turn
         # Whether the end-of-turn model was already asked during the current pause, and
         # whether it judged the turn complete while the diarizer timeline lagged behind.
@@ -1191,9 +1303,11 @@ class LiveProcessor:
 
     @property
     def skipped_segments(self) -> int:
-        """whisper.cpp segments skipped this session for unusable offsets (see `_units`)."""
+        """whisper.cpp segments skipped this session for unusable offsets (see `_units`), not
+        counting those in utterances heard in privacy."""
         inner = getattr(self._transcriber, "skipped_segments", 0)
-        return inner if type(inner) is int and inner > 0 else 0
+        inner = inner if type(inner) is int and inner > 0 else 0
+        return max(0, inner - self._private_skipped_segments)
 
     @property
     def skipped_utterances(self) -> int:
@@ -1204,7 +1318,7 @@ class LiveProcessor:
         """
         inner = getattr(self._transcriber, "suppressed_utterances", 0)
         inner = inner if type(inner) is int and inner > 0 else 0
-        return self._skipped_utterances + inner
+        return max(0, self._skipped_utterances + inner - self._private_skipped_utterances)
 
     @property
     def buffered_audio_bytes(self) -> int:
@@ -1232,7 +1346,121 @@ class LiveProcessor:
             self.close()
             raise
 
+    def reset_speakers(self, private_until_bytes: int | None = None) -> None:
+        """Start a fresh diarizer once nothing is open (hailing-station #735 S-1): called when
+        privacy ends, so no speaker channel or state a private voice made outlives it. Deferred
+        to the first frame with no open utterance or held turn, so a turn under way keeps its
+        labels; its timeline continues on the stream clock. The deferral is bounded (round 21):
+        `SPEAKER_RENEWAL_LIMIT_MS` (10 s of stream audio) after the first end reached since the
+        last renewal (round 22: a later end never restarts it), the renewal is forced, once any
+        later end is reached too, and a turn then under way is published with no speaker label.
+
+        `private_until_bytes` is the stream byte offset privacy ended at (by default, the end
+        of the audio pushed so far), exact to the sample (round 19): audio before it still
+        buffered once it is reached is silenced."""
+        if private_until_bytes is None:
+            private_until_bytes = self._received_ms * BYTES_PER_MS + len(self._partial)
+        private_until_bytes += private_until_bytes % 2  # a whole sample
+        with self._private_lock:
+            self._private_until = max(private_until_bytes, self._private_until or 0)
+            # Under the same lock as the end (round 21): a renewal taken meanwhile never clears
+            # the request this end makes.
+            if self._diarizer_renewable:
+                self._speaker_reset = True
+
+    def _private_cutoff(self, pcm: bytes, final: bool = False) -> bytes:
+        """`pcm`, the next audio processed, with what of it was heard before privacy ended
+        silenced (#735 S-1, rounds 18-19). Once the end falls within or before it (or at
+        `finish`, `final`), what is still buffered from before then is silenced too, the
+        pre-roll kept between turns and the start of an utterance open across the end, all
+        before `pcm` reaches the diarizer, the end-of-turn model or ASR, so no audio heard
+        while private is processed with public speech. Silence, not removal, keeps the stream
+        offsets. The end is taken under the lock, so a later one set meanwhile is kept."""
+        start = self._received_ms * BYTES_PER_MS
+        with self._private_lock:
+            until = self._private_until
+            if until is None or (until >= start + len(pcm) and not final):
+                return pcm
+            self._private_until = None
+        if self._end_reached_ms is None:
+            # The first end not yet renewed for (round 22): a later one never restarts the bound.
+            self._end_reached_ms = self._received_ms
+        self._settle_held_at_privacy_end()
+        first = start - FRAME_BYTES * len(self._pre_roll)
+        frames = list(self._pre_roll)
+        self._pre_roll.clear()
+        for index, frame in enumerate(frames):
+            private = min(len(frame), max(0, until - first - FRAME_BYTES * index))
+            self._pre_roll.append(bytes(private) + frame[private:])
+        private = min(len(self._utterance), max(0, until - self._utterance_start * BYTES_PER_MS))
+        self._utterance[:private] = bytes(private)
+        private = min(len(pcm), max(0, until - start))
+        return bytes(private) + pcm[private:]
+
+    def _settle_held_at_privacy_end(self) -> None:
+        """#242 round 27 (Codex P1): what the merger holds when the privacy end is reached was
+        all heard before it. If any of it, the held turn or a bridged backchannel, was heard in
+        privacy (`LiveConfig.private`; unknown counts), all of it is discarded, words and
+        all, so no speech after the end can be joined to it: a joined turn would overlap the
+        privacy span and be dropped whole, losing the first public request. Otherwise it is
+        released now, on its own, for the same reason. The end-of-turn judgement of an
+        utterance open across the end was made on private audio, so it is made again."""
+        self._end_of_turn_asked = self._complete = False
+        spans = self._merger.held_spans()
+        if not spans:
+            return
+        if self.config.private is None or any(self._heard_private(*span) for span in spans):
+            self._merger.discard()
+        else:
+            self._merger.flush()
+
+    def _take_renewal(self) -> bool:
+        """Claims a requested renewal once its privacy end is reached (round 21): the request
+        and the end are read and the request cleared under one lock, so an end stamped while a
+        frame is taken is never lost."""
+        with self._private_lock:
+            if not self._speaker_reset or self._private_until is not None:
+                return False
+            self._speaker_reset = False
+            return True
+
+    def _renew_diarizer(self) -> None:
+        offset = self._received_ms
+        self._end_reached_ms = None
+        if self._utterance or self._merger.holding:
+            # Forced mid-turn (round 21): the old diarizer's labels for it must not cross over.
+            self._unlabelled_before_ms = offset
+        old, self._diarizer = (
+            self._diarizer,
+            _OffsetDiarizer(
+                _select(self.config.diarizer, lambda value: _Diarizer(value), self.config, "push"),
+                offset,
+            ),
+        )
+        with contextlib.suppress(Exception):
+            old.close()
+        if self.on_speakers_renewed is not None:
+            self.on_speakers_renewed()
+
     def _frame(self, frame: bytes) -> None:
+        if self._private_until is not None:
+            frame = self._private_cutoff(frame)
+        # Renewed only once the privacy end is reached (#242 round 20): the controller counts a
+        # chunk before pushing it, so the end can lie ahead, and the fresh diarizer must never
+        # be fed a frame heard while private.
+        # Forced once the end was reached SPEAKER_RENEWAL_LIMIT_MS ago (round 21).
+        if (
+            self._speaker_reset
+            and (
+                (not self._utterance and not self._merger.holding)
+                or (
+                    self._end_reached_ms is not None
+                    and self._received_ms - self._end_reached_ms >= SPEAKER_RENEWAL_LIMIT_MS
+                )
+            )
+            and self._take_renewal()
+        ):
+            self._renew_diarizer()
         self._diarizer.push(frame)
         frame_start = self._received_ms
         self._received_ms += 20
@@ -1293,13 +1521,18 @@ class LiveProcessor:
                 raise LiveAudioError("Audio session was stopped") from None
             # A failing model never ends the session: the silence rules take over.
             self._end_of_turn = None
-            self._diagnostic("end-of-turn model unavailable; using silence end-of-turn")
+            # Withheld for an utterance heard in privacy too: even its failure is about that speech.
+            self._diagnostic(
+                "end-of-turn model unavailable; using silence end-of-turn",
+                span=(self._utterance_start, self._received_ms),
+            )
             return False
         complete = probability >= self.config.end_of_turn_threshold
         # Content-free: a probability and stream timing only, never audio or text.
         self._diagnostic(
             f"end_of_turn p={probability:.3f} silence_ms={silence}"
-            f" outcome={'complete' if complete else 'wait'}"
+            f" outcome={'complete' if complete else 'wait'}",
+            span=(self._utterance_start, self._received_ms),
         )
         return complete
 
@@ -1327,14 +1560,27 @@ class LiveProcessor:
         ):
             return
         self._diagnostic(
-            f"end_of_turn finalized silence_ms={self._received_ms - self._last_voice_ms}"
+            f"end_of_turn finalized silence_ms={self._received_ms - self._last_voice_ms}",
+            span=(self._utterance_start, self._received_ms),
         )
         self._finalize(timeline, complete=True)
 
-    def _diagnostic(self, message: str) -> None:
-        if self.config.report is not None:
-            with contextlib.suppress(Exception):
-                self.config.report(message)
+    def _diagnostic(self, message: str, *, span: tuple[int, int] | None = None) -> None:
+        """Report `message`; one about the utterance heard over `span` is withheld if that
+        audio was heard in privacy mode (`LiveConfig.private`)."""
+        if self.config.report is None or (span is not None and self._heard_private(*span)):
+            return
+        with contextlib.suppress(Exception):
+            self.config.report(message)
+
+    def _heard_private(self, start_ms: int, end_ms: int) -> bool:
+        private = self.config.private
+        if private is None:
+            return False
+        try:
+            return private(start_ms, end_ms) is not False
+        except Exception:  # noqa: BLE001 - fail closed: withhold the diagnostic
+            return True
 
     def _finalize(self, timeline: list[dict[str, Any]], complete: bool = False) -> None:
         self._complete = False
@@ -1359,7 +1605,14 @@ class LiveProcessor:
             self._skipped_utterances += 1
         skipped = self.skipped_segments - before[0]
         suppressed = self.skipped_utterances > before[1]
-        if (skipped or suppressed) and self.config.report is not None:
+        private = (skipped or suppressed) and self._heard_private(
+            offset, offset + len(pcm) // BYTES_PER_MS
+        )
+        if private:
+            # Taken out of the session's totals too, not only its note (Codex P2 on #242).
+            self._private_skipped_segments += skipped
+            self._private_skipped_utterances += 1 if suppressed else 0
+        if (skipped or suppressed) and self.config.report is not None and not private:
             # Content-free: counts only, never recognizer text or timestamps. A failing
             # diagnostic channel never ends the session.
             segments = f"{skipped} recognizer segment(s) with unusable timestamps"
@@ -1458,6 +1711,10 @@ class LiveProcessor:
         gap = group.pop("post_turn_gap", None)
         inferred = group.pop("inferred", False) is True
         spans = group.pop("labelled_spans", None)
+        if group["start_ms"] < self._unlabelled_before_ms:
+            # Under way at a forced renewal (round 21): labelled, wholly or partly, by the old
+            # diarizer, or joined to its label, so published unlabelled with no label evidence.
+            group["speaker"], inferred, spans = None, False, None
         turn = Turn(
             session_id=self.config.session_id,
             utterance_id=f"live-{self._counter}",
@@ -1484,10 +1741,11 @@ class LiveProcessor:
         if self.closed:
             return
         try:
-            if self._partial:
+            # Any privacy end not reached yet is applied here, to the tail and what is buffered.
+            pcm = self._private_cutoff(bytes(self._partial), final=True)
+            self._partial.clear()
+            if pcm:
                 # Process actual tail only. Synthetic zero-padding must not enter native history.
-                pcm = bytes(self._partial)
-                self._partial.clear()
                 self._diarizer.push(pcm)
                 if self._utterance:
                     self._utterance.extend(pcm)

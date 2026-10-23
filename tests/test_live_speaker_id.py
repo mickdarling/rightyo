@@ -255,6 +255,90 @@ class ShadowTests(unittest.TestCase):
         )
         self.assertTrue(embedder.closed)
 
+    def test_forget_drops_every_binding_and_the_owner_binds_again(self):
+        # Codex P1 on #242: no speaker state outlives privacy; the owner rebinds from public
+        # speech after `bind_min_seconds`.
+        embedder = ScriptedEmbedder(
+            [unit(1, 0.2, 0), unit(1, 0.1, 0), unit(1, 0.2, 0), unit(1, 0.1, 0)]
+        )
+        harness = Harness(embedder)
+        harness.shadow.start()
+        harness.speak(2.0)
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
+        harness.shadow.forget()
+        self.assertIsNone(harness.shadow.binding("Speaker A"))
+        self.assertEqual(harness.shadow._bound_ids, set())
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.scored == 3)
+        self.assertNotEqual(harness.shadow.binding("Speaker A"), ("bound", "owner"))
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
+        harness.shadow.close(drain=True)
+
+    def test_forget_restarts_the_owner_voice_evidence(self):
+        # #242 round 18: seconds scored before the forget, kept without the owner binding
+        # they produced, would soon report the recognised owner as unrecognised.
+        embedder = ScriptedEmbedder([unit(1, 0.2, 0), unit(1, 0.1, 0)])
+        harness = Harness(embedder)
+        harness.shadow.start()
+        harness.speak(2.0)
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
+        self.assertEqual(harness.shadow.owner_evidence(("owner",)), (True, True, 4.0))
+        harness.shadow.forget()
+        self.assertEqual(harness.shadow.owner_evidence(("owner",)), (True, False, 0.0))
+        harness.shadow.close(drain=True)
+
+    def test_owner_evidence_reads_seconds_and_bindings_together(self):
+        # #242 round 19: read under the epoch lock, so a `forget` landing between the two reads
+        # never pairs the old seconds with the emptied bindings.
+        embedder = ScriptedEmbedder([unit(1, 0.2, 0), unit(1, 0.1, 0)])
+        harness = Harness(embedder)
+        harness.shadow.start()
+        harness.speak(2.0)
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
+        results = []
+        with harness.shadow._epoch_lock:
+            reader = threading.Thread(
+                target=lambda: results.append(harness.shadow.owner_evidence(("owner",)))
+            )
+            reader.start()
+            reader.join(0.2)
+            self.assertTrue(reader.is_alive())
+            # What `forget` writes under the same lock.
+            harness.shadow._bound_ids = set()
+            harness.shadow.scored_seconds = 0.0
+        reader.join(5)
+        self.assertEqual(results, [(True, False, 0.0)])
+        harness.shadow.close(drain=True)
+
+    def test_a_binding_made_while_the_renewal_waited_is_gone_after_it(self):
+        # #242 round 14 keys: the off edge forgets; a public turn finalized before the diarizer
+        # renews binds the old "Speaker A"; the renewal forgets again, so a new voice given that
+        # label never inherits the owner.
+        embedder = ScriptedEmbedder([unit(1, 0.2, 0), unit(1, 0.1, 0)])
+        harness = Harness(embedder)
+        harness.shadow.start()
+        harness.shadow.forget()  # the off edge
+        harness.speak(2.0)
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
+        harness.shadow.forget()  # the fresh diarizer takes over
+        self.assertIsNone(harness.shadow.binding("Speaker A"))
+        harness.shadow.close(drain=True)
+
+    def test_a_turn_queued_before_forget_never_commits(self):
+        embedder = ScriptedEmbedder([unit(1, 0.2, 0)])
+        harness = Harness(embedder)
+        harness.speak(2.0)  # queued (epoch 0); the worker is not started yet
+        harness.shadow.forget()
+        harness.shadow.start()
+        harness.shadow.close(drain=True)
+        self.assertIsNone(harness.shadow.binding("Speaker A"))
+        self.assertEqual(harness.shadow.scored, 0)
+
     def test_short_overlapping_and_unlabelled_turns_are_not_scored(self):
         embedder = ScriptedEmbedder()
         harness = Harness(embedder)
