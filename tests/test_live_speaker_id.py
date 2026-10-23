@@ -581,7 +581,8 @@ class EntryCheckTests(unittest.TestCase):
         self.assertRegex(
             line,
             r"^speaker_id entry_check outcome=refuse reason=scored score=1\.000 threshold=0\.35"
-            r" remainder_ms=600 remainder_score=0\.\d{3} remainder_threshold=0\.35$",
+            r" remainder_ms=600 remainder_gap_ms=600 remainder_score=0\.\d{3}"
+            r" remainder_threshold=0\.35$",
         )
         self.assertNotIn(PRIVATE_TEXT, " ".join(lines))
 
@@ -598,9 +599,12 @@ class EntryCheckTests(unittest.TestCase):
         self.assertTrue(self.entry(roles, 800, 1600, ((800, 1400),)))
         self.assertTrue(self.entry(roles, 1600, 2700, ((1600, 2200),)))
         checks = [line for line in lines if "entry_check" in line]
-        self.assertRegex(checks[0], r"outcome=refuse .* remainder_ms=200 remainder_score=0\.\d{3} ")
-        self.assertIn("remainder_ms=200 remainder_score=1.000", checks[1])
-        self.assertIn("remainder_ms=500 remainder_score=1.000", checks[2])
+        self.assertRegex(
+            checks[0],
+            r"outcome=refuse .* remainder_ms=200 remainder_gap_ms=200 remainder_score=0\.\d{3} ",
+        )
+        self.assertIn("remainder_ms=200 remainder_gap_ms=200 remainder_score=1.000", checks[1])
+        self.assertIn("remainder_ms=500 remainder_gap_ms=500 remainder_score=1.000", checks[2])
 
     def test_each_inferred_gap_is_judged_alone(self):
         # Codex P1 on #250 (0f40847): the owner's inferred "please", his own labelled "stop",
@@ -613,7 +617,10 @@ class EntryCheckTests(unittest.TestCase):
         self.assertFalse(self.entry(roles, 0, 1400, ((400, 1000),)))
         self.assertTrue(self.entry(roles, 1400, 2800, ((1800, 2400),)))
         checks = [line for line in lines if "entry_check" in line]
-        self.assertRegex(checks[0], r"outcome=refuse .* remainder_ms=800 remainder_score=0\.\d{3} ")
+        self.assertRegex(
+            checks[0],
+            r"outcome=refuse .* remainder_ms=800 remainder_gap_ms=400 remainder_score=0\.\d{3} ",
+        )
         self.assertIn("outcome=pass", checks[1])
 
     def test_a_clipped_span_refuses(self):

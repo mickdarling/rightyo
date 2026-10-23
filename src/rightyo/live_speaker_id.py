@@ -76,13 +76,15 @@ class EntryScore:
     """A privacy-entry voice check's numbers (hailing-station #735): the own-label audio's
     best owner score, the remainder's (the lowest of its voiced gaps' scores, each scored on
     its own; None when no gap held speech, or a voiced gap could not be scored), the
-    remainder's speech in ms over all gaps, and the outcome: `scored`, or why not
-    (`short`, `clipped`, `timeout`, `busy`, `unavailable`)."""
+    remainder's speech in ms over all gaps, the outcome: `scored`, or why not (`short`,
+    `clipped`, `timeout`, `busy`, `unavailable`), and the longest voiced gap's speech in ms
+    (logged only, for tuning)."""
 
     labelled: float | None
     remainder: float | None
     remainder_ms: int
     outcome: str
+    longest_gap_ms: int = 0
 
 
 CLOSE_DRAIN_SECONDS = 3.0
@@ -646,8 +648,9 @@ class ShadowSpeakerId:
             # voice, so each is scored alone, never averaged with the others.
             voiced = [rest for rest in (speech(_samples(gap)) for gap in check.gaps) if len(rest)]
             rest_ms = round(sum(len(rest) for rest in voiced) * 1000 / SAMPLE_RATE)
+            longest = round(max((len(rest) for rest in voiced), default=0) * 1000 / SAMPLE_RATE)
             if len(own) / SAMPLE_RATE < self.settings.entry_min_seconds:
-                result = EntryScore(None, None, rest_ms, "short")
+                result = EntryScore(None, None, rest_ms, "short", longest)
             else:
                 labelled = best(own)
                 # Codex P1 on #250 (2b90c8c): any voiced gap is scored, however short, since a
@@ -658,7 +661,7 @@ class ShadowSpeakerId:
                     min(scores) if scores and all(score is not None for score in scores) else None
                 )
                 if labelled is not None:
-                    result = EntryScore(labelled, remainder, rest_ms, "scored")
+                    result = EntryScore(labelled, remainder, rest_ms, "scored", longest)
         except Exception:  # noqa: BLE001 - one check's failure refuses that entry only
             result = EntryScore(None, None, 0, "unavailable")
         finally:
@@ -821,6 +824,7 @@ class EnrolledRoles(ConfiguredPriorityProvider):
                     f" reason={result.outcome} score={_number(result.labelled, '.3f')}"
                     f" threshold={_number(settings.entry_threshold, '.2f')}"
                     f" remainder_ms={result.remainder_ms}"
+                    f" remainder_gap_ms={result.longest_gap_ms}"
                     f" remainder_score={_number(result.remainder, '.3f')}"
                     f" remainder_threshold={_number(settings.entry_remainder_threshold, '.2f')}"
                 )

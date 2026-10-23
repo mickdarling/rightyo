@@ -1464,7 +1464,8 @@ failure. Short commands usually carry an inferred word, so a host accepts
 `"voiceprint_label"` for privacy entry and requires `"voiceprint"` where every word must be
 the owner's. An inferred owner turn that is not entry-shaped, or fails the check, carries
 nothing. Each check logs one line of numbers (`speaker_id entry_check outcome=pass|refuse
-reason=… score=… threshold=… remainder_ms=… remainder_score=… remainder_threshold=…`), never
+reason=… score=… threshold=… remainder_ms=… remainder_gap_ms=… remainder_score=…
+remainder_threshold=…`, the gap figure being the longest voiced gap's speech), never
 words or audio. It waits at most 2 s, and the session's other work waits with it: it runs as
 the turn is published, so only an entry-shaped inferred owner turn ever pays it. It is absent
 in every other case: an owner configured by session label in
