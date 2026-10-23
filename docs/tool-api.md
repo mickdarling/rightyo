@@ -1452,10 +1452,10 @@ that passes the entry voice check, which judges the turn's two parts **apart**
 - the label's own timeline pieces must hold at least `speaker_id` `entry_min_seconds`
   (default 0.5) of speech scoring at least `entry_threshold` (default 0.35) against an
   owner's voiceprint;
-- the rest of the span, the inferred words, if it holds any speech at all, must score at
-  least `entry_remainder_threshold` (default 0.35) on its own, however short: a short word
-  ("go") can complete an entry, so voiced audio that cannot be scored refuses rather than
-  pass unjudged.
+- the rest of the span, the inferred words, is judged gap by gap: every gap that holds any
+  speech at all must score at least `entry_remainder_threshold` (default 0.35) on its own,
+  however short, never averaged with another gap. A short word ("go") can complete an
+  entry, so voiced audio that cannot be scored refuses rather than pass unjudged.
 
 So a guest's words joined under the owner's label are scored as themselves, never averaged
 into his voice, and an entry they complete is refused unless they score as the owner. A span

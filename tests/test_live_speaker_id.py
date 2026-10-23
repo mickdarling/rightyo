@@ -602,6 +602,20 @@ class EntryCheckTests(unittest.TestCase):
         self.assertIn("remainder_ms=200 remainder_score=1.000", checks[1])
         self.assertIn("remainder_ms=500 remainder_score=1.000", checks[2])
 
+    def test_each_inferred_gap_is_judged_alone(self):
+        # Codex P1 on #250 (0f40847): the owner's inferred "please", his own labelled "stop",
+        # then a guest's inferred "recording". Joined, the two gaps would average past the
+        # threshold; scored apart, the guest's gap refuses. Two gaps of his own pass.
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.4, OWNER_F0) + tone(0.6, OWNER_F0) + tone(0.4, GUEST_F0))
+        shadow.audio(tone(0.4, OWNER_F0) + tone(0.6, OWNER_F0) + tone(0.4, OWNER_F0))
+        roles = self.roles(shadow)
+        self.assertFalse(self.entry(roles, 0, 1400, ((400, 1000),)))
+        self.assertTrue(self.entry(roles, 1400, 2800, ((1800, 2400),)))
+        checks = [line for line in lines if "entry_check" in line]
+        self.assertRegex(checks[0], r"outcome=refuse .* remainder_ms=800 remainder_score=0\.\d{3} ")
+        self.assertIn("outcome=pass", checks[1])
+
     def test_a_clipped_span_refuses(self):
         # Codex P2 on #250: never score what is left of a span the ring no longer holds.
         shadow, _lines = self.shadow(ring_ms=1000)

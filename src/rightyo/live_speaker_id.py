@@ -59,13 +59,13 @@ ENTRY_CHECKS = 4
 
 
 class _EntryCheck:
-    """One privacy-entry voice check: a turn's own-label audio (`labelled`) and the rest of
-    its span (`remainder`, the inferred words), each scored by the worker against the
-    owners' voiceprints. `result` is an `EntryScore`, set once before `done`."""
+    """One privacy-entry voice check: a turn's own-label audio (`labelled`) and each gap of
+    the rest of its span (`gaps`, the inferred words), each scored on its own by the worker
+    against the owners' voiceprints. `result` is an `EntryScore`, set once before `done`."""
 
-    def __init__(self, labelled: bytes, remainder: bytes, owners: tuple[str, ...]):
+    def __init__(self, labelled: bytes, gaps: tuple[bytes, ...], owners: tuple[str, ...]):
         self.labelled = labelled
-        self.remainder = remainder
+        self.gaps = gaps
         self.owners = owners
         self.done = threading.Event()
         self.result = EntryScore(None, None, 0, "unavailable")
@@ -74,9 +74,10 @@ class _EntryCheck:
 @dataclass(frozen=True)
 class EntryScore:
     """A privacy-entry voice check's numbers (hailing-station #735): the own-label audio's
-    best owner score, the remainder's (None when it held no speech), the remainder's speech
-    in ms, and the outcome: `scored`, or why not (`short`, `clipped`, `timeout`, `busy`,
-    `unavailable`)."""
+    best owner score, the remainder's (the lowest of its voiced gaps' scores, each scored on
+    its own; None when no gap held speech, or a voiced gap could not be scored), the
+    remainder's speech in ms over all gaps, and the outcome: `scored`, or why not
+    (`short`, `clipped`, `timeout`, `busy`, `unavailable`)."""
 
     labelled: float | None
     remainder: float | None
@@ -613,7 +614,7 @@ class ShadowSpeakerId:
                     if clipped or not pcm:
                         return EntryScore(None, None, 0, "clipped")
                     parts[index].append(pcm)
-            check = _EntryCheck(b"".join(parts[0]), b"".join(parts[1]), tuple(owners))
+            check = _EntryCheck(b"".join(parts[0]), tuple(parts[1]), tuple(owners))
             try:
                 self._checks.put_nowait(check)
             except queue.Full:
@@ -641,16 +642,21 @@ class ShadowSpeakerId:
         result = EntryScore(None, None, 0, "unavailable")
         try:
             own = speech(_samples(check.labelled)) if check.labelled else array("h")
-            rest = speech(_samples(check.remainder)) if check.remainder else array("h")
-            rest_ms = round(len(rest) * 1000 / SAMPLE_RATE)
+            # Codex P1 on #250 (0f40847): each gap is its own inferred piece, possibly another
+            # voice, so each is scored alone, never averaged with the others.
+            voiced = [rest for rest in (speech(_samples(gap)) for gap in check.gaps) if len(rest)]
+            rest_ms = round(sum(len(rest) for rest in voiced) * 1000 / SAMPLE_RATE)
             if len(own) / SAMPLE_RATE < self.settings.entry_min_seconds:
                 result = EntryScore(None, None, rest_ms, "short")
             else:
                 labelled = best(own)
-                # Codex P1 on #250 (2b90c8c): any voiced remainder is scored, however short,
-                # since a short word ("go") can complete an entry; one that cannot be scored
-                # refuses (`entry_voice`), never passes unjudged.
-                remainder = best(rest) if len(rest) else None
+                # Codex P1 on #250 (2b90c8c): any voiced gap is scored, however short, since a
+                # short word ("go") can complete an entry; one that cannot be scored refuses
+                # (`entry_voice`: no score with speech), never passes unjudged.
+                scores = [best(rest) for rest in voiced]
+                remainder = (
+                    min(scores) if scores and all(score is not None for score in scores) else None
+                )
                 if labelled is not None:
                     result = EntryScore(labelled, remainder, rest_ms, "scored")
         except Exception:  # noqa: BLE001 - one check's failure refuses that entry only
@@ -782,9 +788,9 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         """Whether `turn` is the owner's voice for privacy entry (hailing-station #735,
         rightyo#250): its label's own pieces hold at least `entry_min_seconds` of speech
         scoring at least `entry_threshold` against an owner's voiceprint, and the rest of
-        its span (the inferred words), if it holds any speech, scores at least
-        `entry_remainder_threshold` on its own however short, so a guest's words joined
-        under the owner's label are judged as themselves and never pass unjudged. Reports
+        its span (the inferred words), gap by gap, each that holds any speech scoring at
+        least `entry_remainder_threshold` on its own however short, so a guest's words
+        joined under the owner's label are judged as themselves and never pass unjudged. Reports
         one line of numbers per check, pass or refuse; blocks at most
         `ENTRY_CHECK_TIMEOUT_S`; never raises (a failure refuses)."""
         source = self.source
