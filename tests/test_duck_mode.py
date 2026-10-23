@@ -723,16 +723,20 @@ class PrivacyEventsTests(unittest.TestCase):
         self.events.transcript(current, current.end_ms)
         self.events.decision(decided(current, "attend"), 950)
         self.events.drain()
-        self.events.duck(True, now_ms=1000)
+        # The entry comes well after the decision, as the controller stamps it (key 1 on #245:
+        # the host refuses an `at_ms` after `emitted_at_ms`).
+        self.events.duck(True, now_ms=5000)
         ended = [e for e in self.events.drain() if e["type"] == "conversation"]
         self.assertEqual(len(ended), 1)
         self.assertEqual(
             (ended[0]["state"], ended[0]["reason"], ended[0]["speaker_id"], ended[0]["at_ms"]),
-            ("ambient", "timeout", current.speaker_id, 1000),
+            ("ambient", "timeout", current.speaker_id, 5000),
         )
+        self.assertEqual(ended[0]["emitted_at_ms"], 5000)
+        self.assertTrue(self.events._duck)
         self.assertNotIn("utterance_id", ended[0])
         # A second entry (redundant) says nothing; nor do time, a reply, or the exit.
-        self.events.duck(True, now_ms=2000)
+        self.events.duck(True, now_ms=6000)
         self.events.expire(60000)
         self.events.reply("started", 61000)
         self.events.reply("ended", 62000)

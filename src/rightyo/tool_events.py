@@ -1312,21 +1312,16 @@ class SpeechEvents:
         integer(now_ms, "now_ms")
         with self._lock:
             at = now_ms
+            ended = None
             # A change of mode always ends a split exit.
             self._private_name_end = None
             if on and not self._duck:
                 # Privacy ends the conversation (rightyo#244), said at the entry itself, the
                 # moment the host already knows of, so the host never thinks it engaged: no
-                # timeout can fall due while private, and none is owed at the exit. The
-                # reason is `timeout` (no turn named), the end the host already accepts.
+                # timeout can fall due while private, and none is owed at the exit. Said once
+                # the mode is applied, so a failed emit cannot leave the entry half done.
                 if self._engaged is not None and self._active:
-                    self._emit(
-                        "conversation",
-                        state="ambient",
-                        reason="timeout",
-                        speaker_id=self._engaged["speaker_id"],
-                        at_ms=at,
-                    )
+                    ended = self._engaged["speaker_id"]
                 self._engaged = None
                 self._dormant = None
                 # Defensive: with nothing engaged or dormant these no longer matter, and a
@@ -1355,6 +1350,13 @@ class SpeechEvents:
                             + " ".join(f"{key}={value}" for key, value in counts.items())
                         )
             self._duck = on
+            if ended is not None:
+                # Stamped at the entry: the host refuses an `at_ms` after `emitted_at_ms`.
+                # The reason is `timeout` (no turn named), the end the host already accepts.
+                self._now = max(self._now, at)
+                self._emit(
+                    "conversation", state="ambient", reason="timeout", speaker_id=ended, at_ms=at
+                )
 
     def _private(self, turn, inferred):
         """Match a turn heard in privacy against the local phrases, then drop it.
