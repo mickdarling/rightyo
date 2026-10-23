@@ -76,6 +76,7 @@ class NamedOwnerTests(unittest.TestCase):
         texts = (
             "Jarvis, that's for you.",
             "Jarvis, it doesn't seem to be recognizing my voice. Can you hear me?",
+            "Jarvis,",
             "Jarvis.",
             "um, Jarvis, that's for you.",
             "please, okay, now, uh, so, thanks, hey Jarvis, that's for you.",
@@ -191,6 +192,23 @@ class NamedOwnerTests(unittest.TestCase):
     def test_no_configured_name_means_no_promotion(self):
         self.start(addressing=None)
         self.assert_unpromoted(self.say(heard("t3", 4000, "Jarvis, that's for you."), "uncertain"))
+
+    def test_non_ascii_text_attached_to_names_is_never_promoted(self):
+        cases = (
+            (OURS, "我告诉Jarvis这件事。"),
+            (OURS, "Jarvis这件事。"),
+            (
+                Addressing(names=("Synthetic Ledger Assistant Unit",)),
+                "我告诉Synthetic Ledger Assistant Unit, that's for you.",
+            ),
+        )
+        for addressing, text in cases:
+            with self.subTest(text=text):
+                self.start(addressing=addressing)
+                events = self.say(heard("t3", 4000, text), "uncertain")
+                self.assertEqual(events[0]["turn"]["role"], "owner")
+                self.assertEqual(events[0]["role_source"], "voiceprint")
+                self.assert_unpromoted(events)
 
     def test_configured_multiword_and_filler_names_are_supported(self):
         for name in ("Okay", "Hey", "Synthetic Ledger Assistant Unit"):
