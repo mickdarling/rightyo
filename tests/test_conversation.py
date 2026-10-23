@@ -130,7 +130,7 @@ class ConversationEventTests(unittest.TestCase):
         self.start(dismissal=Dismissal())
         owner = turn("t1", 0, 900, "Haili, what time is it?")
         self.events.transcript(owner, owner.end_ms)
-        self.events.forget_speakers()
+        self.events.forget_speakers(now_ms=900)
         self.events.decision(decided(owner, "attend"), owner.end_ms + 100)
         events = [e for e in self.events.drain() if e["type"] in {"request", "conversation"}]
         self.assertEqual(self.kinds(events), ["request"])
@@ -152,11 +152,13 @@ class ConversationEventTests(unittest.TestCase):
         self.start(priority=ConfiguredPriorityProvider(SpeakerPriority(owners=("Speaker A",))))
         before = self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
         self.assertEqual(before[1]["turn"]["role"], "owner")
-        self.events.forget_speakers()
+        self.events.forget_speakers(now_ms=1000)
+        ended = [e for e in self.events.drain() if e["type"] == "conversation"]
+        self.assertEqual([(e["state"], e["reason"]) for e in ended], [("ambient", "timeout")])
         after = self.say(turn("t2", 2000, 2900, "Haili, what time is it?"), "attend")
         self.assertEqual(after[1]["turn"]["role"], "unknown")
         self.assertEqual(sum("configured owner" in note for note in notes), 1)
-        self.events.forget_speakers()
+        self.events.forget_speakers(now_ms=3000)
         self.assertEqual(sum("configured owner" in note for note in notes), 1)  # logged once
 
     def test_an_engaged_speakers_undecided_follow_up_becomes_a_request(self):

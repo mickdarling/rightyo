@@ -1312,7 +1312,14 @@ is sent to the recognizer with the first public utterance. Speaker turns heard i
 never scored, and utterances in privacy add nothing to the session's skipped-segment or
 suppressed-utterance totals.
 Everything else held per speaker label goes too: the engaged speaker and a lapsed engagement,
-cool-downs, explicit ends, appendix windows and delivered requests a dismissal could withdraw. A
+cool-downs, explicit ends, appendix windows and delivered requests a dismissal could withdraw.
+An engaged conversation is ended aloud, never silently: when a forget finds one (a public
+request after the off engaged it before the fresh diarizer took over, so its label came from the
+old diarizer), rightyo emits `conversation` back to `ambient`, reason `timeout`, with no
+`utterance_id` and `at_ms` the forget's stream time (never after its `emitted_at_ms`), so the host
+never holds an engagement rightyo dropped; the next follow-up needs the name again and starts a
+fresh conversation. At the off itself nothing is engaged (privacy entry already ended it). If
+that end cannot be queued, the session fails as any lost event fails it. A
 turn accepted under the old labels and decided afterwards still forms its request, but engages
 no one and leaves nothing keyed by its label. Its owner or trusted role gives it no authority
 then: it supersedes nothing, its stop phrase stops nothing, owner-only mode ignores it, and its

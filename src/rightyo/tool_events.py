@@ -1462,13 +1462,24 @@ class SpeechEvents:
                 if off_ms is None or off_ms > on_ms
             )
 
-    def forget_speakers(self):
+    def forget_speakers(self, *, now_ms):
         """Drop everything held per speaker label (hailing-station #735 S-1): when privacy
         ends the diarizer starts afresh, so a label may now name someone else. The roles fixed
         per label, the engaged speaker and a lapsed engagement a reply could revive, cool-downs,
         explicit ends, appendix windows, and delivered requests a later dismissal by label could
-        withdraw: none may carry to a voice that inherits the label (round 16)."""
+        withdraw: none may carry to a voice that inherits the label (round 16).
+
+        `now_ms` is the stream time of the forget, on the received-audio clock turns are timed
+        in, and is required, like `duck`'s. A conversation engaged when the speakers are
+        forgotten (a public request after the exit, engaged before the fresh diarizer took
+        over) is ended aloud (rightyo#244): `conversation` back to `ambient`, reason `timeout`
+        (no turn named), `at_ms` = `now_ms`, said once everything is dropped, so a failed emit
+        (a full backlog raises) cannot leave the forget half done. The host is always told."""
+        integer(now_ms, "now_ms")
         with self._lock:
+            ended = (
+                self._engaged["speaker_id"] if self._engaged is not None and self._active else None
+            )
             self._roles.clear()
             self._engaged = None
             self._dormant = None
@@ -1497,6 +1508,16 @@ class SpeechEvents:
                         "until the session restarts"
                     )
             self._labels_renewed = True
+            if ended is not None:
+                # As at the privacy entry: the host refuses an `at_ms` after `emitted_at_ms`.
+                self._now = max(self._now, now_ms)
+                self._emit(
+                    "conversation",
+                    state="ambient",
+                    reason="timeout",
+                    speaker_id=ended,
+                    at_ms=now_ms,
+                )
 
     @property
     def ducked(self):

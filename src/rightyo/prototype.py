@@ -1896,13 +1896,26 @@ class PrototypeController:
         turn finalized while the renewal waited) is forgotten again before any new label is
         scored. Called on the audio thread."""
         with self._lock:
-            forget = getattr(self._events, "forget_speakers", None)
-            if callable(forget):
-                forget()
+            if self._publisher_forgets_speakers():
                 self._runner_forgets_speakers()
             if self._shadow is not None:
                 with contextlib.suppress(Exception):
                     self._shadow.forget()
+
+    def _publisher_forgets_speakers(self) -> bool:
+        """Under the lock: the publisher forgets the old labels, stamped on the received-audio
+        clock turns are timed in. Whether it has `forget_speakers`. An engaged conversation is
+        ended aloud there (rightyo#244), after everything is dropped; if that end overruns the
+        event backlog the session fails as any lost event fails it (as the ack does on #248),
+        and every other effect of the forget still applies."""
+        forget = getattr(self._events, "forget_speakers", None)
+        if not callable(forget):
+            return False
+        try:
+            forget(now_ms=self._received_ms)
+        except ContractError:
+            self._event_delivery_failed()
+        return True
 
     def _runner_forgets_speakers(self) -> None:
         """#242 round 25: the decision runner forgets the old labels with the publisher, so no
@@ -1924,9 +1937,7 @@ class PrototypeController:
         heard before the end and still buffered is silenced, stamped on the same clock as the
         mode (round 18) but in bytes, exact where the millisecond stamp rounds down (round 19),
         so none of it, not one sample, is sent to ASR with the next public utterance."""
-        forget = getattr(self._events, "forget_speakers", None)
-        if callable(forget):
-            forget()
+        if self._publisher_forgets_speakers():
             self._runner_forgets_speakers()
         if self._processor is not None and callable(
             getattr(self._processor, "reset_speakers", None)
