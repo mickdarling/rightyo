@@ -39,7 +39,15 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from rightyo.contracts import SpeakerPriority
-from rightyo.enroll import MAX_VERIFY_SECONDS, Store, cosine, normalize, speech, voiceprint
+from rightyo.enroll import (
+    MAX_VERIFY_SECONDS,
+    Store,
+    cosine,
+    frame_energies,
+    normalize,
+    speech,
+    voiceprint,
+)
 from rightyo.providers import ConfiguredPriorityProvider
 from rightyo.speaker_id import SAMPLE_RATE, SpeakerEmbedder, SpeakerIdConfig
 
@@ -645,8 +653,15 @@ class ShadowSpeakerId:
         try:
             own = speech(_samples(check.labelled)) if check.labelled else array("h")
             # Codex P1 on #250 (0f40847): each gap is its own inferred piece, possibly another
-            # voice, so each is scored alone, never averaged with the others.
-            voiced = [rest for rest in (speech(_samples(gap)) for gap in check.gaps) if len(rest)]
+            # voice, so each is scored alone, never averaged with the others. Its speech is
+            # measured from the owner's own loudest frame (#250 round 6): room noise 35 dB
+            # under his voice is not a word, while a word at speaking level still is.
+            peak = max(frame_energies(_samples(check.labelled)), default=0.0)
+            voiced = [
+                rest
+                for rest in (speech(_samples(gap), peak=peak) for gap in check.gaps)
+                if len(rest)
+            ]
             rest_ms = round(sum(len(rest) for rest in voiced) * 1000 / SAMPLE_RATE)
             longest = round(max((len(rest) for rest in voiced), default=0) * 1000 / SAMPLE_RATE)
             if len(own) / SAMPLE_RATE < self.settings.entry_min_seconds:

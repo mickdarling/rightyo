@@ -639,6 +639,23 @@ class EntryCheckTests(unittest.TestCase):
         self.assertTrue(self.entry(self.roles(loose), 0, 1800, ((0, 600),)))
         self.assertIn("gap_max_ms=1500", loose_lines[-1])
 
+    def test_room_noise_under_his_voice_is_not_a_word_but_a_guest_word_is(self):
+        # #250 round 6: a pause gap of room noise 40 dB under his speech is not voiced, so
+        # neither the gap bound nor the remainder score refuses him for it; a guest's word
+        # at speaking level in a gap is still judged, and refuses.
+        quiet = array(
+            "h",
+            (int(90 * math.sin(2 * math.pi * GUEST_F0 * n / RATE)) for n in range(int(0.9 * RATE))),
+        )
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.6, OWNER_F0) + quiet.tobytes() + tone(0.6, OWNER_F0))
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.4, GUEST_F0))
+        roles = self.roles(shadow)
+        self.assertTrue(self.entry(roles, 0, 2100, ((0, 600), (1500, 2100))))
+        self.assertIn("remainder_ms=0 remainder_gap_ms=0 remainder_score=-", lines[-1])
+        self.assertFalse(self.entry(roles, 2100, 3100, ((2100, 2700),)))
+        self.assertIn("remainder_gap_ms=400", lines[-1])
+
     def test_a_clipped_span_refuses(self):
         # Codex P2 on #250: never score what is left of a span the ring no longer holds.
         shadow, _lines = self.shadow(ring_ms=1000)
