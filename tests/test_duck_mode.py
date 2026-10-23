@@ -102,6 +102,22 @@ class Bindings:
         return self.labels.get(label)
 
 
+class Checked(Bindings):
+    """`Bindings` with a privacy-entry voice check that scores every span `score`."""
+
+    def __init__(self, labels, score):
+        super().__init__(labels)
+        self.score = score
+        self.settings = SimpleNamespace(entry_threshold=0.35)
+        self.lines = []
+
+    def entry_score(self, start_ms, end_ms, owners):
+        return self.score, "scored"
+
+    def _report(self, message):
+        self.lines.append(message)
+
+
 def enrolled():
     """Live voiceprint roles: Speaker A is bound to the enrolled owner, Speaker B to a
     guest's voice, anyone else is not yet identified."""
@@ -590,7 +606,7 @@ class PrivacyEventsTests(unittest.TestCase):
             sources,
             {
                 "owner": ("owner", "voiceprint"),
-                "inferred": ("owner", "voiceprint_label"),
+                "inferred": ("owner", None),
                 "guest": ("participant", None),
                 "unbound": ("unknown", None),
                 "unlabelled": ("unknown", None),
@@ -610,6 +626,38 @@ class PrivacyEventsTests(unittest.TestCase):
         replay.drain()
         replay.transcript(heard("r", 0, 900, "x"), 900)
         self.assertNotIn("role_source", replay.drain()[0])
+
+    def test_an_inferred_owner_entry_needs_its_whole_voice(self):
+        # #735: "voiceprint_label" only for an entry-shaped inferred owner turn whose whole
+        # span passes the entry voice check; anything else is unmarked.
+        labels = {"Speaker A": ("bound", "mick"), "Speaker B": ("unknown", None)}
+        label = "voiceprint_label"
+        cases = (  # name, source, speaker, words, role_source, checks logged
+            ("passes", Checked(labels, 0.5), "Speaker A", "Jarvis, privacy mode.", label, 1),
+            ("stop", Checked(labels, 0.5), "Speaker A", "stop listening", label, 1),
+            ("low", Checked(labels, 0.2), "Speaker A", "privacy mode", None, 1),
+            ("not entry", Checked(labels, 0.9), "Speaker A", "what time is it", None, 0),
+            ("guest", Checked(labels, 0.9), "Speaker B", "go private", None, 0),
+            ("no check", Bindings(labels), "Speaker A", "privacy mode", None, 0),
+        )
+        for name, source, speaker, text, expected, logged in cases:
+            with self.subTest(name=name):
+                roles = EnrolledRoles(OWNER_ID)
+                roles.source = source
+                self.start(provider=roles)
+                self.events.transcript(heard(name, 0, 900, text, speaker), 900, inferred=True)
+                (event, *_rest) = self.events.drain()
+                self.assertEqual(event.get("role_source"), expected)
+                checks = [line for line in getattr(source, "lines", []) if "entry_check" in line]
+                self.assertEqual(len(checks), logged)
+        # A non-inferred owner turn needs no check and stays "voiceprint".
+        source = Checked(labels, 0.0)
+        roles = EnrolledRoles(OWNER_ID)
+        roles.source = source
+        self.start(provider=roles)
+        self.events.transcript(heard("plain", 0, 900, "privacy mode"), 900)
+        self.assertEqual(self.events.drain()[0].get("role_source"), "voiceprint")
+        self.assertEqual(source.lines, [])
 
     def test_after_off_normal_behaviour_resumes_without_the_private_window(self):
         self.start()

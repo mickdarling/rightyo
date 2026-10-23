@@ -662,9 +662,10 @@ differences:
   exercises owner authority. Nor are its inferred words ever voiceprint evidence: the
   identifier embeds only the parts of a turn the diarizer timeline gave its label alone
   (#148), and inferred words lie outside them, so another voice's words joined under a
-  label can never bind that label to an enrolled identity. The inference is internal; no event
-  field marks it, but such a turn never carries
-  [`role_source: "voiceprint"`](#voiceprint-owner-on-transcripts).
+  label can never bind that label to an enrolled identity. The inference is internal: such a
+  turn never carries [`role_source: "voiceprint"`](#voiceprint-owner-on-transcripts), and
+  carries `"voiceprint_label"` only as a privacy entry whose whole span passes the owner
+  voice check.
 - **Authority is re-checked when the decision arrives.** If the label's binding no longer
   gives the turn its owner or trusted role by then (it fell below `tentative_threshold`),
   the turn is treated as `unknown` for policy: it emits no `override` and acts with no
@@ -1442,12 +1443,19 @@ beside the turn (never inside it, so turn fingerprints are unchanged):
 It is present only when the turn's `role` is `owner` and that role came from live voiceprint
 identification (the label bound to an enrolled owner voice when the role was resolved,
 with `speaker_id` `"live": true` and `"roles": true`). Its value is `"voiceprint"` when no
-word of the turn has an inferred label, and `"voiceprint_label"` when some do (edge
-attribution, tail join, or a lone wake word joined to the next piece): the turn's label is
-the owner's voice, but not every word is proven to be. Short commands usually carry an
-inferred word, so a host may accept `"voiceprint_label"` where the owner's own voice is
-enough (hailing-station #735: privacy entry) and require `"voiceprint"` where every word
-must be his. It is absent in every other case: an owner configured by session label in
+word of the turn has an inferred label. When some do (edge attribution, tail join, or a lone
+wake word joined to the next piece), it is `"voiceprint_label"` only for a turn that may be
+a privacy entry (it says "privacy" or "private", or "stop" with "recording" or "listening")
+whose **whole span**, the inferred words included, passes the entry voice check: at least
+`speaker_id` `entry_min_seconds` (default 0.5) of speech scoring at least `entry_threshold`
+(default 0.35) against an owner's voiceprint. A guest's words joined under the owner's label
+pull that score down, so they cannot enter for him (hailing-station #735, Mick: "I should be
+the only one to be able to turn it on"). Short commands usually carry an inferred word, so a
+host accepts `"voiceprint_label"` for privacy entry and requires `"voiceprint"` where every
+word must be the owner's. An inferred owner turn that is not entry-shaped, or fails the
+check, carries nothing. Each check logs one line of numbers (`speaker_id entry_check
+outcome=pass|refuse reason=… score=… threshold=…`), never words or audio, and waits at most
+2 s. It is absent in every other case: an owner configured by session label in
 `speakers` (a TV or another voice diarized into that slot would carry the label), a guest,
 an unbound or unlabelled speaker, and a session without roles. No other value is ever sent;
 absent means "not a voiceprint owner". It is never on `attention` or

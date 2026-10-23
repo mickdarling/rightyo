@@ -163,6 +163,12 @@ class SpeakerIdConfig:
     `emit_names` (default false, requires `roles`) adds the enrolled display name of a
     bound non-owner voice to its `transcript` event as `speaker_name` (hailing-station
     #434), and the session advertises `speaker_names`.
+
+    `entry_threshold` (default 0.35, 0 to 1) and `entry_min_seconds` (default 0.5, 0.2 to
+    10) decide a privacy-entry voice check (hailing-station #735): an owner turn with an
+    inferred word is marked `role_source: "voiceprint_label"` only if its whole span, the
+    inferred words included, has at least `entry_min_seconds` of speech and scores at least
+    `entry_threshold` against an owner's voiceprint. Tuned from logged scores, not code.
     """
 
     python: Path
@@ -177,6 +183,8 @@ class SpeakerIdConfig:
     roles: bool = False
     enrolled_follow_up_min_probability: float | None = None
     emit_names: bool = False
+    entry_threshold: float = 0.35
+    entry_min_seconds: float = 0.5
 
     @classmethod
     def from_dict(cls, value: Any) -> SpeakerIdConfig | None:
@@ -194,6 +202,8 @@ class SpeakerIdConfig:
             "roles",
             "enrolled_follow_up_min_probability",
             "emit_names",
+            "entry_threshold",
+            "entry_min_seconds",
         }
         if not isinstance(value, dict) or set(value) - keys:
             raise ValueError("invalid speaker_id section")
@@ -217,6 +227,8 @@ class SpeakerIdConfig:
         roles = value.get("roles", False)
         follow_up = value.get("enrolled_follow_up_min_probability")
         emit_names = value.get("emit_names", False)
+        entry_threshold = value.get("entry_threshold", 0.35)
+        entry_min = value.get("entry_min_seconds", 0.5)
         if (
             type(roles) is not bool
             or (roles and not live)
@@ -237,6 +249,8 @@ class SpeakerIdConfig:
             or not 1 <= threads <= 8
             or type(live) is not bool
             or not _bounded(bind_min, 0.5, 120.0)
+            or not _bounded(entry_threshold, 0.0, 1.0)
+            or not _bounded(entry_min, 0.2, 10.0)
         ):
             raise ValueError("invalid speaker_id section")
         return cls(
@@ -252,6 +266,8 @@ class SpeakerIdConfig:
             roles,
             None if follow_up is None else float(follow_up),
             emit_names,
+            float(entry_threshold),
+            float(entry_min),
         )
 
     def band(self, score: float) -> str:

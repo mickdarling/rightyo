@@ -533,6 +533,94 @@ class ToneEmbedder:
         self.closed = True
 
 
+class EntryCheckTests(unittest.TestCase):
+    """The privacy-entry voice check (hailing-station #735): a turn's whole span, inferred
+    words included, scored against the owner's voiceprint; any failure refuses."""
+
+    def shadow(self, **overrides):
+        lines: list[str] = []
+        shadow = ShadowSpeakerId(
+            settings(**overrides),
+            report=lines.append,
+            embedder_factory=lambda _settings: ToneEmbedder(),
+            entries=lambda _settings: [dict(entry) for entry in ENTRIES],
+        )
+        shadow.start()
+        self.addCleanup(shadow.close)
+        return shadow, lines
+
+    def roles(self, shadow):
+        roles = EnrolledRoles(SpeakerPriority.from_dict({"owner": ["owner"]}))
+        roles.source = shadow
+        return roles
+
+    def test_the_owners_whole_voice_scores_and_a_guests_does_not(self):
+        shadow, _lines = self.shadow()
+        shadow.audio(tone(1.0, OWNER_F0) + tone(1.0, GUEST_F0))
+        owner = shadow.entry_score(0, 1000, ["owner"])
+        guest = shadow.entry_score(1000, 2000, ["owner"])
+        self.assertEqual(owner[1], "scored")
+        self.assertGreater(owner[0], 0.99)
+        self.assertEqual(guest[1], "scored")
+        self.assertLess(guest[0], 0.1)
+
+    def test_a_guests_words_joined_under_the_owners_label_refuse_entry(self):
+        # 0.4 s of the owner, then 1.6 s of a guest inferred under the owner's label.
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.4, OWNER_F0) + tone(1.6, GUEST_F0) + tone(1.0, OWNER_F0))
+        roles = self.roles(shadow)
+        mixed, own = turn(0, 2000), turn(2000, 3000)
+        self.assertFalse(roles.entry_voice(mixed))
+        self.assertTrue(roles.entry_voice(own))
+        checks = [line for line in lines if "entry_check" in line]
+        prefix = "speaker_id entry_check outcome="
+        self.assertRegex(checks[0], rf"^{prefix}refuse reason=scored score=0\.\d+ threshold=0\.35$")
+        self.assertEqual(checks[1], f"{prefix}pass reason=scored score=1.000 threshold=0.35")
+        self.assertNotIn(PRIVATE_TEXT, " ".join(lines))
+
+    def test_the_threshold_and_minimum_come_from_the_config(self):
+        shadow, lines = self.shadow(entry_threshold=0.2, entry_min_seconds=1.5)
+        shadow.audio(tone(0.4, OWNER_F0) + tone(1.6, GUEST_F0) + tone(1.0, OWNER_F0))
+        roles = self.roles(shadow)
+        self.assertTrue(roles.entry_voice(turn(0, 2000)))
+        self.assertEqual(shadow.entry_score(2000, 3000, ["owner"]), (None, "short"))
+        self.assertFalse(roles.entry_voice(turn(2000, 3000)))
+        refused = "speaker_id entry_check outcome=refuse reason=short score=- threshold=0.20"
+        self.assertIn(refused, lines)
+
+    def test_too_little_speech_or_no_identifier_refuses(self):
+        shadow, _lines = self.shadow()
+        shadow.audio(tone(0.3, OWNER_F0))
+        self.assertEqual(shadow.entry_score(0, 300, ["owner"]), (None, "short"))
+        self.assertEqual(shadow.entry_score(5000, 6000, ["owner"]), (None, "unavailable"))
+        self.assertEqual(shadow.entry_score(0, 300, ["nobody"]), (None, "short"))
+        shadow.close()
+        self.assertEqual(shadow.entry_score(0, 300, ["owner"]), (None, "unavailable"))
+        roles = EnrolledRoles(SpeakerPriority.from_dict({"owner": ["owner"]}))
+        self.assertFalse(roles.entry_voice(turn(0, 300)))
+
+    def test_the_entry_keys_are_validated(self):
+        base = {"python": "/synthetic/python", "model": "/synthetic/model.onnx", "live": True}
+        config = SpeakerIdConfig.from_dict(base)
+        self.assertEqual((config.entry_threshold, config.entry_min_seconds), (0.35, 0.5))
+        tuned = SpeakerIdConfig.from_dict(base | {"entry_threshold": 0.5, "entry_min_seconds": 1})
+        self.assertEqual((tuned.entry_threshold, tuned.entry_min_seconds), (0.5, 1.0))
+        for bad in (
+            {"entry_threshold": 1.5},
+            {"entry_threshold": "0.4"},
+            {"entry_threshold": True},
+            {"entry_min_seconds": 0.1},
+            {"entry_min_seconds": 11},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                SpeakerIdConfig.from_dict(base | bad)
+
+    def test_a_check_with_no_owner_voiceprint_refuses(self):
+        shadow, _lines = self.shadow()
+        shadow.audio(tone(1.0, OWNER_F0))
+        self.assertEqual(shadow.entry_score(0, 1000, ["nobody"]), (None, "unavailable"))
+
+
 class SegmentScoringTests(unittest.TestCase):
     """Only the label's own diarization pieces of a turn are embedded (#148)."""
 
