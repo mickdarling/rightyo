@@ -1285,7 +1285,12 @@ suppressed-utterance totals.
 Everything else held per speaker label goes too: the engaged speaker and a lapsed engagement,
 cool-downs, explicit ends, appendix windows and delivered requests a dismissal could withdraw. A
 turn accepted under the old labels and decided afterwards still forms its request, but engages
-no one and leaves nothing keyed by its label. A speaker *configured* as owner or trusted by
+no one and leaves nothing keyed by its label. Its owner or trusted role gives it no authority
+then: it supersedes nothing, its stop phrase stops nothing, owner-only mode ignores it, and its
+decision publishes `role: "unknown"` (in `attention`, `request` and `dismiss` alike), so a host
+does not count it as the owner's. The request's `turn` still carries the role its `transcript`
+published before the forget, so the two still match. While it is pending, an owner's later
+override supersedes it like any non-owner turn. A speaker *configured* as owner or trusted by
 diarizer label (`speakers.owners`) gives no role after the speakers are forgotten, until the
 session restarts, since the fresh diarizer may give that label to anyone; only a live voiceprint
 binding gives those roles then (logged once).

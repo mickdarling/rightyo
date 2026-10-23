@@ -1955,11 +1955,17 @@ class SpeechEvents:
                 # speakers were forgotten, and the label may now name someone else. Like a turn
                 # accepted after it (round 17), it is `unknown` for policy: no override or
                 # supersession, owner-only gating, owner stop phrase, follow-up or authority.
-                # The published role, in the evidence and the request, is unchanged.
                 current = "unknown"
+            # #242 round 24: a stale turn's decision publishes the role policy uses, so one
+            # downgraded above, or by `_current_role` for its now-unlabelled turn, is `unknown`
+            # (the host keeps a `role: "owner"` decision's utterance as the owner's). It goes in
+            # the attention and request `decision` alike, which must fingerprint the same
+            # decision, and in its dismiss. The request's `turn` keeps the role its transcript
+            # published before the forget, so it still matches that transcript's fingerprint.
+            decided = current if stale else role
             authority = self._authority_role(key, current)
             if role is not None:
-                evidence["role"] = role
+                evidence["role"] = decided
                 if key == self._degraded_turn:
                     # The stream shows where model lookups degraded, not only the object.
                     evidence["role_status"] = self.role_status
@@ -2067,7 +2073,7 @@ class SpeechEvents:
             if kind is not None:
                 plan = self._plan(
                     turn,
-                    role,
+                    decided,
                     kind,
                     "decision",
                     event.decision.dismissal_confidence,
@@ -2232,10 +2238,13 @@ class SpeechEvents:
                     self._delivered.pop(superseded, None)
                 for other, (earlier, _context, _size, other_role) in self._pending.items():
                     if (
-                        self._authority_role(other, self._current_role(earlier, other_role))
+                        # #242 round 24: a turn pending across a forget has no owner's
+                        # exemption, as it has no owner authority at its decision (round
+                        # 23): its label may now name someone else.
+                        other in self._label_stale
+                        or self._authority_role(other, self._current_role(earlier, other_role))
                         != "owner"
-                        and earlier.end_ms <= turn.end_ms
-                    ):
+                    ) and earlier.end_ms <= turn.end_ms:
                         self._superseded.setdefault(other, key)
             if plan is not None:
                 self._dismissed[key] = plan["upgradable"]
