@@ -1260,7 +1260,9 @@ host must offer another way out.
 
 **Privacy keeps no speakers either.** When the host turns privacy off, rightyo forgets every
 speaker: the diarizer starts afresh (once no utterance is open, so a turn under way keeps its
-labels), every speaker-ID binding is dropped, and the per-label roles go with them. Nothing a
+labels), every speaker-ID binding is dropped, and the per-label roles go with them; both are
+dropped again the moment the fresh diarizer takes over, since its labels restart there and a
+turn finished while it waited was bound to the old ones. Nothing a
 voice heard only in privacy did, a diarizer channel or a binding, outlives it. So right after
 privacy ends, voice features gated on the owner (the owner's role, `role_source`, and with them
 a host's voice privacy entry) wait until the owner has spoken publicly long enough to bind

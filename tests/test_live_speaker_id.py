@@ -276,6 +276,21 @@ class ShadowTests(unittest.TestCase):
         wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
         harness.shadow.close(drain=True)
 
+    def test_a_binding_made_while_the_renewal_waited_is_gone_after_it(self):
+        # #242 round 14 keys: the off edge forgets; a public turn finalized before the diarizer
+        # renews binds the old "Speaker A"; the renewal forgets again, so a new voice given that
+        # label never inherits the owner.
+        embedder = ScriptedEmbedder([unit(1, 0.2, 0), unit(1, 0.1, 0)])
+        harness = Harness(embedder)
+        harness.shadow.start()
+        harness.shadow.forget()  # the off edge
+        harness.speak(2.0)
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
+        harness.shadow.forget()  # the fresh diarizer takes over
+        self.assertIsNone(harness.shadow.binding("Speaker A"))
+        harness.shadow.close(drain=True)
+
     def test_a_turn_queued_before_forget_never_commits(self):
         embedder = ScriptedEmbedder([unit(1, 0.2, 0)])
         harness = Harness(embedder)

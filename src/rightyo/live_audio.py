@@ -1243,6 +1243,9 @@ class LiveProcessor:
             config.diarizer, "push"
         )
         self._speaker_reset = False
+        # Told when the fresh diarizer takes over, before its first frame: labels restart there,
+        # so whatever was bound to the old ones in the meantime must be forgotten again.
+        self.on_speakers_renewed: Callable[[], None] | None = None
         # The per-response segment bound for this session's timeline window (#226).
         self._timeline_limit = timeline_segment_limit(config.timeline_window_ms)
         self._partial = bytearray()
@@ -1351,6 +1354,8 @@ class LiveProcessor:
         )
         with contextlib.suppress(Exception):
             old.close()
+        if self.on_speakers_renewed is not None:
+            self.on_speakers_renewed()
 
     def _frame(self, frame: bytes) -> None:
         if self._speaker_reset and not self._utterance and not self._merger.holding:

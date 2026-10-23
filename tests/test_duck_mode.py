@@ -973,6 +973,21 @@ class DuckControllerTests(unittest.TestCase):
         controller.duck(False)
         self.assertEqual((processor.reset_speakers.call_count, shadow.forget.call_count), (1, 1))
 
+    def test_the_fresh_diarizer_forgets_what_was_bound_while_it_waited(self):
+        # #242 round 14 keys: a turn finalized between the off edge and the deferred renewal is
+        # scored under the old labels; when the fresh diarizer takes over, that is forgotten too.
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        shadow = mock.Mock()
+        controller._shadow = shadow
+        events._roles["Speaker A"] = "owner"  # fixed for an old label after the edge
+        controller._speakers_renewed()
+        shadow.forget.assert_called_once_with()
+        self.assertEqual(events._roles, {})
+
     def test_stop_drops_per_turn_notes_an_accept_never_took(self):
         # Jarvis on #242 round 5: a stop between the observation and the accept.
         controller = self.controller()

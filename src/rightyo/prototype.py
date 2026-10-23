@@ -1336,6 +1336,8 @@ class PrototypeController:
                 if generation != self._generation or stop.is_set():
                     return
                 self._processor = self._session_processor = processor
+                if hasattr(processor, "on_speakers_renewed"):
+                    processor.on_speakers_renewed = self._speakers_renewed
             if mode == "microphone":
                 capture = self.capture_factory(self.config.microphone_helper)
                 with self._lock:
@@ -1786,6 +1788,19 @@ class PrototypeController:
                 self._events.duck(on, now_ms=self._received_ms)
                 if ending:
                     self._forget_speakers()
+
+    def _speakers_renewed(self) -> None:
+        """The fresh diarizer takes over (#735 S-1, round 15): its labels restart from the first
+        voice heard, so every binding or role made for the old labels since privacy ended (a
+        turn finalized while the renewal waited) is forgotten again before any new label is
+        scored. Called on the audio thread."""
+        with self._lock:
+            forget = getattr(self._events, "forget_speakers", None)
+            if callable(forget):
+                forget()
+            if self._shadow is not None:
+                with contextlib.suppress(Exception):
+                    self._shadow.forget()
 
     def _forget_speakers(self) -> None:
         """Privacy ended (#735 S-1, Codex P1 on #242): no speaker state from it may outlive it.

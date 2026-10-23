@@ -737,9 +737,13 @@ class ConservativeAlignmentTests(unittest.TestCase):
         self.addCleanup(processor.close)
         for _ in range(10):
             processor.push_pcm16(SILENCE)
+        renewed = []
+        processor.on_speakers_renewed = lambda: renewed.append(len(made[-1].frames))
         processor.reset_speakers()
         processor.push_pcm16(SILENCE)
         self.assertEqual(len(made), 2)
+        # Round 15: told once, before the fresh diarizer's first frame.
+        self.assertEqual(renewed, [0])
         self.assertTrue(made[0].closed)
         self.assertEqual(len(made[0].frames), 10)
         self.assertEqual(len(made[1].frames), 1)
@@ -755,11 +759,14 @@ class ConservativeAlignmentTests(unittest.TestCase):
 
         processor = LiveProcessor(self.renewable_config(diarizer), lambda _turn: None)
         self.addCleanup(processor.close)
+        renewed = []
+        processor.on_speakers_renewed = lambda: renewed.append(processor._received_ms)
         processor.push_pcm16(VOICE)
         processor.reset_speakers()
         for _ in range(5):
             processor.push_pcm16(VOICE)
         self.assertEqual(len(made), 1)  # Its labels stay with the turn under way.
+        self.assertEqual(renewed, [])  # Round 15: told only when the fresh diarizer takes over.
 
     def test_a_supplied_diarizer_instance_is_never_replaced(self):
         supplied = FakeDiarizer(None)
