@@ -8,6 +8,7 @@ import hashlib
 import json
 import unicodedata
 from collections import deque
+from dataclasses import replace
 from threading import RLock
 
 from rightyo.addressedness import answer_shaped, follow_up_cued, mentions_name
@@ -471,6 +472,13 @@ class SpeechEvents:
         # The last engagement that lapsed by timeout, kept so a later spoken reply can revive
         # it (rightyo#158): {"engaged": <the engagement>, "at_ms": <when it lapsed>}, or None.
         self._dormant = None
+        # Utterances accepted before the speakers were last forgotten (hailing-station #735 S-1)
+        # and not yet decided: their labels may now name someone else. Always within `_pending`.
+        self._label_stale = set()
+        # Set once the speakers are forgotten (round 17, Jarvis): a diarizer label configured as
+        # the owner or trusted may now name anyone, so until the session restarts only a live
+        # voiceprint binding gives those roles.
+        self._labels_renewed = False
         # Per speaker key, the start of the latest explicit end of that speaker's
         # conversation (#167): their request said before it, decided out of order after it,
         # never re-opens it. Other speakers' requests are unaffected. Bounded (`_mark_ended`).
@@ -668,6 +676,8 @@ class SpeechEvents:
             self._pending_ack = None
             self._engaged = None
             self._dormant = None
+            self._label_stale.clear()
+            self._labels_renewed = False
             self._ended.clear()
             self.role_status = "off" if priority is None else "ready"
             self._degraded_turn = None
@@ -880,6 +890,14 @@ class SpeechEvents:
                 if self._per_turn
                 else self._assign_role(turn, context["turns"])
             )
+            if (
+                role in {"owner", "trusted"}
+                and self._labels_renewed
+                and not self._voiceprinted(turn)
+            ):
+                # A configured label after the speakers were forgotten may name anyone (#735
+                # S-1, round 17): fail closed until the session restarts.
+                role = "unknown"
             if inferred and role is not None:
                 self._inferred[turn.utterance_id] = turn.end_ms
             if self._media:
@@ -1001,6 +1019,11 @@ class SpeechEvents:
             return None
         return "full" if role == "trusted" else "playback"
 
+    def _voiceprinted(self, turn):
+        """Whether `turn`'s role came from a live voiceprint binding, not a configured label."""
+        resolved = getattr(self._priority, "resolved_by_voiceprint", None)
+        return self._per_turn and callable(resolved) and resolved(turn.utterance_id) is True
+
     def _current_role(self, turn, role):
         """A turn's emitted owner or trusted role, re-checked against the binding now.
 
@@ -1055,6 +1078,8 @@ class SpeechEvents:
             if not inferred
             and key != turn.utterance_id
             and key not in self._withdrawn
+            # Its label may now name someone else (round 17): no dismissal by label reaches it.
+            and key not in self._label_stale
             and self._withdrawable(turn, self._facts(earlier), loose)
         ]
         # The stop-phrase fast path from a speaker whose label cannot be compared only
@@ -1328,6 +1353,18 @@ class SpeechEvents:
             self._ended.clear()
             self._appendix_from.clear()
             self._delivered.clear()
+            # A turn accepted under the old labels and decided later keeps nothing by its label
+            # either (round 17): its request still goes, without engagement, appendix,
+            # explicit end, cool-down or a withdrawable record.
+            self._label_stale = set(self._pending)
+            if not self._labels_renewed and self._report is not None:
+                # Counts and states only: which labels, never.
+                with contextlib.suppress(Exception):
+                    self._report(
+                        "speakers forgotten: configured owner and trusted labels give no role "
+                        "until the session restarts"
+                    )
+            self._labels_renewed = True
 
     @property
     def ducked(self):
@@ -1853,6 +1890,14 @@ class SpeechEvents:
             if turn != event.turn:
                 raise ContractError("decision does not match the committed transcript")
             self._decided.add(key)
+            heard = turn
+            stale = key in self._label_stale
+            if stale:
+                # Accepted before the speakers were forgotten (#735 S-1, round 17): its label may
+                # now name someone else, so it is treated as unlabelled for everything keyed by
+                # the label. The request itself still carries the turn as heard.
+                self._label_stale.discard(key)
+                turn = replace(turn, speaker_id=None)
             # Keep public evidence separate from recipient-based host target selection.
             evidence = {
                 name: value
@@ -2237,14 +2282,14 @@ class SpeechEvents:
                 self._emit(
                     "request",
                     request_id=request_id,
-                    turn=_with_role(turn, role),
+                    turn=_with_role(heard, role),
                     decision=evidence,
                     context=context,
                     decision_at_ms=self._now,
                     **formed,
                     **ack,
                 )
-                if self._dismissal is not None:
+                if self._dismissal is not None and not stale:
                     if len(self._delivered) >= MAX_WITHDRAWABLE:
                         # Bounded: the oldest delivered request can no longer be withdrawn.
                         del self._delivered[next(iter(self._delivered))]

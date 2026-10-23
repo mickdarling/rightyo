@@ -1268,6 +1268,13 @@ privacy ends, voice features gated on the owner (the owner's role, `role_source`
 a host's voice privacy entry) wait until the owner has spoken publicly long enough to bind
 again (`speaker_id.bind_min_seconds`). Speaker turns heard in privacy are never scored, and
 utterances in privacy add nothing to the session's skipped-segment or suppressed-utterance totals.
+Everything else held per speaker label goes too: the engaged speaker and a lapsed engagement,
+cool-downs, explicit ends, appendix windows and delivered requests a dismissal could withdraw. A
+turn accepted under the old labels and decided afterwards still forms its request, but engages
+no one and leaves nothing keyed by its label. A speaker *configured* as owner or trusted by
+diarizer label (`speakers.owners`) gives no role after the speakers are forgotten, until the
+session restarts, since the fresh diarizer may give that label to anyone; only a live voiceprint
+binding gives those roles then (logged once).
 
 The phrases match loosely: anywhere in the turn, ignoring case, punctuation and filler
 ("um", "uh", "ok", "okay", "so", "hey", "well", "please" and similar). A configured name
