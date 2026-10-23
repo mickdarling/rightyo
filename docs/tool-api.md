@@ -1458,7 +1458,22 @@ session's spans are kept for the whole session, at most 64; beyond that the olde
 are merged into one, which can only widen them.
 
 A turn heard and accepted before the mode went on is still decided and may still form a
-request. The mode is held across sessions, like media mode, and emits nothing when it
+request, but it opens no conversation while the mode is on.
+
+**No timing while private** ([#244](https://github.com/mickdarling/rightyo/issues/244)).
+No `conversation` event of any kind is emitted while privacy mode is on: a timeout's
+`emitted_at_ms` would show that private speech was being handled, and when. Turning the
+mode on ends any [conversation](#conversation-mode), said once at the entry itself: a
+`conversation` event back to `ambient`, reason `timeout` (no turn named), `at_ms` the
+entry, stamped at the moment the host already knows of, so the host is never left
+thinking a conversation is engaged. Nothing is kept for a reply to revive. Nothing can
+then time out, end or revive while private, and nothing deferred is emitted at the exit:
+the next public request starts a fresh conversation. An `owner_voice` status is
+not polled while private either; the first poll after the exit reports any change. That
+poll can still reveal, at most once, a change that fell due while private, and so that
+private speech may have happened, though not when.
+
+The mode is held across sessions, like media mode, and emits nothing when it
 changes; a session that starts with it on counts from its start. The host keeps privacy
 and media mode exclusive. After `{"duck": false}`, normal behaviour resumes for speech
 heard after the off, with nothing from the private window in memory or context. Speech

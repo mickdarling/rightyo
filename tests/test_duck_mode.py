@@ -192,6 +192,16 @@ class PrivacyEventsTests(unittest.TestCase):
         self.events.end("stopped", 1000)
         self.assertIsNone(self.events._private_name_end)
 
+    def entered(self, now_ms):
+        """Privacy on while a conversation is engaged: its end, said at the entry (#245), is
+        the only event."""
+        self.events.duck(True, now_ms=now_ms)
+        events = self.events.drain()
+        self.assertEqual(
+            [(e["type"], e["state"], e["reason"], e["at_ms"]) for e in events],
+            [("conversation", "ambient", "timeout", now_ms)],
+        )
+
     def say(self, current, label="attend", **options):
         self.events.transcript(current, current.end_ms)
         if current.utterance_id in self.events._pending:
@@ -404,7 +414,7 @@ class PrivacyEventsTests(unittest.TestCase):
         self.events.duck(False, now_ms=1000)
         self.assertEqual(self.say(heard("n1", 600, 1200, "Travis.", "Speaker B")), [])
         self.say(heard("g1", 1500, 1800, "A synthetic aside.", "Speaker B"))
-        self.events.duck(True, now_ms=2000)
+        self.entered(2000)
         events = self.say(heard("o1", 2100, 2900, "start listening to this song"))
         self.assertEqual(events, [])
 
@@ -452,7 +462,7 @@ class PrivacyEventsTests(unittest.TestCase):
         self.assertIsNotNone(self.events._private_name_end)
         self.events.duck(False, now_ms=700)
         self.say(heard("g1", 800, 900, "A synthetic aside.", "Speaker B"))
-        self.events.duck(True, now_ms=1000)
+        self.entered(1000)
         self.assertEqual(self.say(heard("o1", 1100, 1600, "I'm back.")), [])
 
     def test_the_off_clears_a_split_exit(self):
@@ -509,7 +519,7 @@ class PrivacyEventsTests(unittest.TestCase):
         # Mick: "In privacy mode, there's no recording, so stop shouldn't do anything."
         self.start(dismissal=Dismissal())
         self.say(heard("t0", 0, 900, "Jarvis, what time is it?"))
-        self.events.duck(True, now_ms=1000)
+        self.entered(1000)
 
         def state():
             events = self.events
@@ -635,6 +645,216 @@ class PrivacyEventsTests(unittest.TestCase):
         # Said after the off: published and decided.
         events = self.say(turn("t4", 9000, 9900, "Jarvis, what time is it?"))
         self.assertIn("request", self.types(events))
+
+    def conversation_script(self, events, *, private):
+        """A conversation whose engagement would time out, then a later request; with
+        `private`, privacy is on from 1000 to 40000 around everything but the requests."""
+        stream = []
+
+        def say(current, label="attend", **options):
+            events.transcript(current, current.end_ms)
+            if current.utterance_id in events._pending:
+                events.decision(decided(current, label, **options), current.end_ms + 100)
+            stream.extend(events.drain())
+
+        def reply(phase, at):
+            events.reply(phase, at)
+            stream.extend(events.drain())
+
+        say(heard("r1", 0, 900, "Jarvis, what time is it?"))
+        # A follow-up accepted before privacy is on, decided only once it is.
+        follow_up = heard("r2", 920, 990, "And tomorrow?")
+        events.transcript(follow_up, follow_up.end_ms)
+        stream.extend(events.drain())
+        if private:
+            events.duck(True, now_ms=1000)
+        events.decision(decided(follow_up, "uncertain", attend=0.8), 1100)
+        stream.extend(events.drain())
+        # The host answers a status question, then speech continues past the window.
+        reply("started", 2000)
+        reply("ended", 3000)
+        for at in (5000, 14000, 26000):
+            say(heard(f"x{at}", at, at + 900, "Jarvis, are you recording?"))
+        reply("started", 27000)
+        reply("ended", 28000)
+        events.expire(39000)
+        stream.extend(events.drain())
+        if private:
+            events.duck(False, now_ms=40000)
+        # After the exit: a reply, the timer, then the next public request.
+        reply("started", 41000)
+        reply("ended", 42000)
+        events.expire(45000)
+        stream.extend(events.drain())
+        say(heard("r3", 50000, 50900, "Jarvis, what is the weather?"))
+        return stream
+
+    def test_no_conversation_event_while_private_or_at_the_exit(self):
+        # rightyo#244: a timeout's emitted_at_ms would time the private window.
+        self.start()
+        stream = self.conversation_script(self.events, private=True)
+        conversation = [e for e in stream if e["type"] == "conversation"]
+        # The first request engages; nothing then until the next public request, which
+        # starts a fresh conversation: no timeout, deferred or otherwise, no extension.
+        self.assertEqual(
+            [(e["state"], e["reason"], e.get("utterance_id")) for e in conversation],
+            [
+                ("engaged", "request", "r1"),
+                ("ambient", "timeout", None),
+                ("engaged", "request", "r3"),
+            ],
+        )
+        # The end is said at the entry itself, once (Jarvis on #245: no silent state change).
+        ended = conversation[1]
+        self.assertEqual((ended["at_ms"], ended["emitted_at_ms"]), (1000, 1000))
+        # The pre-privacy follow-up is still decided, but opens nothing.
+        self.assertIn("attention", self.types(e for e in stream if e.get("utterance_id") == "r2"))
+        # Stamped after the on and before the exit: only the late follow-up's evidence
+        # and the content-free status answers.
+        inside = [e for e in stream if 1000 < e["emitted_at_ms"] < 40000]
+        self.assertEqual({e["type"] for e in inside}, {"privacy", "attention"})
+        self.assertEqual([e for e in inside if e["type"] == "attention"][0]["utterance_id"], "r2")
+
+    def test_privacy_entry_while_engaged_ends_the_conversation_once_at_the_entry(self):
+        # Jarvis on #245: the host must be told, at the entry it already knows of, and
+        # nothing while private nor at the exit.
+        self.start()
+        current = heard("r1", 0, 900, "Jarvis, what time is it?")
+        self.events.transcript(current, current.end_ms)
+        self.events.decision(decided(current, "attend"), 950)
+        self.events.drain()
+        # The entry comes well after the decision, as the controller stamps it (key 1 on #245:
+        # the host refuses an `at_ms` after `emitted_at_ms`).
+        self.events.duck(True, now_ms=5000)
+        ended = [e for e in self.events.drain() if e["type"] == "conversation"]
+        self.assertEqual(len(ended), 1)
+        self.assertEqual(
+            (ended[0]["state"], ended[0]["reason"], ended[0]["speaker_id"], ended[0]["at_ms"]),
+            ("ambient", "timeout", current.speaker_id, 5000),
+        )
+        self.assertEqual(ended[0]["emitted_at_ms"], 5000)
+        self.assertTrue(self.events._duck)
+        self.assertNotIn("utterance_id", ended[0])
+        # A second entry (redundant) says nothing; nor do time, a reply, or the exit.
+        self.events.duck(True, now_ms=6000)
+        self.events.expire(60000)
+        self.events.reply("started", 61000)
+        self.events.reply("ended", 62000)
+        self.events.duck(False, now_ms=63000)
+        self.events.expire(120000)
+        self.assertNotIn("conversation", self.types(self.events.drain()))
+
+    def test_an_acked_entry_while_engaged_says_the_end_then_the_ack(self):
+        # #245 with #248: one entry, both said at it, the conversation end first, then the
+        # S-8 ack; each stamped no earlier than its `at_ms`, in sequence order.
+        self.start()
+        current = heard("r1", 0, 900, "Jarvis, what time is it?")
+        self.events.transcript(current, current.end_ms)
+        self.events.decision(decided(current, "attend"), 950)
+        self.events.drain()
+        self.events.duck(True, now_ms=5000, ack=True)
+        said = self.events.drain()
+        self.assertEqual(
+            [(e["type"], e.get("state") or e.get("action"), e["at_ms"]) for e in said],
+            [("conversation", "ambient", 5000), ("privacy", "on", 5000)],
+        )
+        self.assertTrue(all(e["emitted_at_ms"] >= e["at_ms"] for e in said))
+        self.assertLess(said[0]["sequence"], said[1]["sequence"])
+
+    def test_privacy_entry_with_nothing_engaged_says_nothing(self):
+        self.start()
+        self.events.duck(True, now_ms=1000)
+        self.assertNotIn("conversation", self.types(self.events.drain()))
+
+    def conversation_events(self, since=0):
+        return [
+            e
+            for e in self.events.drain()
+            if e["type"] == "conversation" and e["emitted_at_ms"] >= since
+        ]
+
+    def test_a_request_decided_while_private_opens_no_conversation(self):
+        # Key 1's M2: a direct request heard before the on, decided after it, reaches
+        # `_engage`, which must not engage while private.
+        self.start()
+        current = heard("r1", 0, 900, "Jarvis, what time is it?")
+        self.events.transcript(current, current.end_ms)
+        self.events.drain()
+        self.events.duck(True, now_ms=1000)
+        self.events.decision(decided(current, "attend"), 1100)
+        events = self.events.drain()
+        self.assertIn("request", self.types(events))
+        self.assertNotIn("conversation", self.types(events))
+        # Nothing at the exit, nor after it, until a fresh public request.
+        self.events.reply("started", 2000)
+        self.events.reply("ended", 3000)
+        self.events.duck(False, now_ms=20000)
+        self.events.reply("started", 21000)
+        self.events.reply("ended", 22000)
+        self.events.expire(40000)
+        self.assertEqual(self.conversation_events(), [])
+
+    def test_a_conversation_lapsed_before_the_on_is_never_revived(self):
+        # Key 1's M4: a lapsed (dormant) engagement must not be revived by a reply while
+        # private, which would make its later timeout time the private window.
+        self.start()
+        self.say(heard("r1", 0, 900, "Jarvis, what time is it?"))
+        other = heard("o1", 30000, 30400, "A synthetic aside.", speaker="Speaker B")
+        self.events.transcript(other, other.end_ms)
+        self.events.decision(decided(other, "ignore"), 30500)
+        lapsed = self.conversation_events()
+        self.assertEqual([(e["reason"], e["at_ms"]) for e in lapsed], [("timeout", 10900)])
+        self.events.duck(True, now_ms=31000)
+        self.events.reply("started", 32000)
+        self.events.reply("ended", 33000)
+        self.events.duck(False, now_ms=60000)
+        self.events.reply("started", 80000)
+        self.events.reply("ended", 81000)
+        self.events.expire(100000)
+        self.assertEqual(self.conversation_events(), [])
+
+    def test_outside_privacy_the_timeout_still_fires(self):
+        self.start()
+        stream = self.conversation_script(self.events, private=False)
+        # Heard in public, the status questions are requests that extend the conversation.
+        conversation = [
+            (e["state"], e["reason"], e["emitted_at_ms"], e["at_ms"])
+            for e in stream
+            if e["type"] == "conversation"
+        ]
+        self.assertEqual(
+            conversation,
+            [
+                ("engaged", "request", 1000, 900),
+                ("ambient", "timeout", 27000, 24900),
+                ("engaged", "request", 27000, 26900),
+                # The reply revives it (#158), so the last request only extends it.
+                ("ambient", "timeout", 41000, 38000),
+            ],
+        )
+
+    def test_a_session_that_never_goes_private_is_unchanged(self):
+        # The differential: privacy advertised but never on, against no privacy control.
+        streams = []
+        for duck in (True, False):
+            events = SpeechEvents()
+            events.start(
+                SESSION,
+                now_ms=0,
+                addressing=OURS,
+                conversation=MODE,
+                priority=enrolled(),
+                duck=duck,
+            )
+            stream = events.drain() + self.conversation_script(events, private=False)
+            # Only these differ by design: the advertisement, and a voiceprint role source,
+            # which is published only beside privacy control.
+            stream[0].pop("duck", None)
+            for event in stream:
+                event.pop("role_source", None)
+            streams.append(stream)
+        self.assertEqual(streams[0], streams[1])
+        self.assertIn("timeout", [e.get("reason") for e in streams[0]])
 
     def test_a_session_start_keeps_it(self):
         self.events = SpeechEvents()

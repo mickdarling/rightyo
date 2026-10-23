@@ -885,7 +885,14 @@ class SpeechEvents:
         `recognized` only after it; a session whose owner bound before the threshold
         never emits either.
         """
-        if self._owner_voice is None or not self._active or self._owner_voice_state == "recognized":
+        if (
+            self._owner_voice is None
+            or not self._active
+            or self._duck
+            or self._owner_voice_state == "recognized"
+        ):
+            # Not while private (rightyo#244): a private turn's handling polls too, so the
+            # change would be timed by private speech. The first poll after the exit says it.
             return
         try:
             state = self._priority.owner_voice(self._owner_voice.threshold_s)
@@ -1291,9 +1298,19 @@ class SpeechEvents:
         turn heard in privacy (`heard_ducked`) keeps nothing (see `_private`): no
         `transcript`, attention, request, follow-up, acknowledgement or conversation event,
         no memory or context, and no hosted decision or role question. Only a local match
-        of the exit and status phrases may emit a content-free `privacy` event, and an exact
-        stop phrase a playback-only `dismiss`. A turn accepted before it was turned on and
-        heard before it is still decided. Turning it off reports counts only.
+        of the exit and status phrases may emit a content-free `privacy` event; a stop
+        phrase is a no-op. A turn accepted before it was turned on and
+        heard before it is still decided, but engages no conversation while it is on.
+
+        No `conversation` event is emitted while it is on (rightyo#244): a timer-driven
+        timeout's `emitted_at_ms` would say that private speech was being handled, and when.
+        Turning it on ends any engagement, said once at the entry (`conversation` back to
+        `ambient`, reason `timeout`, `at_ms` the entry), with nothing kept to revive, so nothing
+        can lapse, end or revive while private, and nothing deferred is emitted at the exit:
+        the next public request starts a fresh conversation. Nor is an owner-voice status
+        polled while it is on: the first poll after the exit may still show, at most once,
+        that private speech happened, though not when. Emits nothing else (but the on ack
+        below); turning it off reports counts only.
 
         `ack` (#735 S-8) is true only for a host's applied `{"duck": true}` control line. Each
         such on, a redundant one while already on included, then emits one content-free
@@ -1309,9 +1326,22 @@ class SpeechEvents:
         integer(now_ms, "now_ms")
         with self._lock:
             at = now_ms
+            ended = None
             # A change of mode always ends a split exit.
             self._private_name_end = None
             if on and not self._duck:
+                # Privacy ends the conversation (rightyo#244), said at the entry itself, the
+                # moment the host already knows of, so the host never thinks it engaged: no
+                # timeout can fall due while private, and none is owed at the exit. Said once
+                # the mode is applied, so a failed emit cannot leave the entry half done.
+                if self._engaged is not None and self._active:
+                    ended = self._engaged["speaker_id"]
+                self._engaged = None
+                self._dormant = None
+                # Defensive: with nothing engaged or dormant these no longer matter, and a
+                # fresh request resets them anyway.
+                self._asked_at = None
+                self._replied_at = None
                 self._duck_spans.append([at, None])
                 if len(self._duck_spans) > MAX_DUCK_SPANS:
                     first, second = self._duck_spans[0], self._duck_spans.pop(1)
@@ -1334,6 +1364,13 @@ class SpeechEvents:
                             + " ".join(f"{key}={value}" for key, value in counts.items())
                         )
             self._duck = on
+            if ended is not None:
+                # Stamped at the entry: the host refuses an `at_ms` after `emitted_at_ms`.
+                # The reason is `timeout` (no turn named), the end the host already accepts.
+                self._now = max(self._now, at)
+                self._emit(
+                    "conversation", state="ambient", reason="timeout", speaker_id=ended, at_ms=at
+                )
             if on and ack and self._active and self._duck_acks:
                 self._emit("privacy", action="on", at_ms=at)
 
@@ -1717,7 +1754,9 @@ class SpeechEvents:
         does not move the engagement to them.
         """
         key = self._cooldown_key(self._facts(turn))
-        if self._conversation is None or key is None:
+        if self._conversation is None or key is None or self._duck:
+            # A public request decided while private is still delivered, but opens no
+            # conversation, whose events would be timed by the private window (rightyo#244).
             return
         if turn.start_ms < self._ended.get(key, turn.start_ms):
             # Said before an explicit end of this speaker's conversation that was decided
