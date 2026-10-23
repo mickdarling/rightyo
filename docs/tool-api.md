@@ -1294,9 +1294,10 @@ published them before the forget, so a host's fingerprints of them still match. 
 derived after the forget names no label from before it and no owner or trusted role only that
 label gave: the request's `formed_request` (its asker unlabelled with the decided role, so a
 former says the requester is not an owner, and its earlier turns unlabelled), also when expiry
-re-renders it; a `dismiss` for a pending request withdrawn before the forget; the latest request
-a later decision is told of; a role question's past turns; and diagnostic lines, which never
-carry labels. While it is pending, an owner's later
+re-renders it; a `dismiss` for a pending request withdrawn before the forget; what a later
+decision model is given (its past turns, participants, a turn heard before the forget but decided
+after it, and the latest request); a role question's past turns; and diagnostic lines, which
+never carry labels. While it is pending, an owner's later
 override supersedes it like any non-owner turn. A speaker *configured* as owner or trusted by
 diarizer label (`speakers.owners`) gives no role after the speakers are forgotten, until the
 session restarts, since the fresh diarizer may give that label to anyone; only a live voiceprint

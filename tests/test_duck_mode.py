@@ -1076,10 +1076,10 @@ class DuckControllerTests(unittest.TestCase):
         shadow.forget.assert_called_once_with()
         self.assertEqual(events._roles, {})
 
-    def test_the_decision_runner_is_told_the_latest_request_without_its_old_label(self):
-        # #242 round 25: the latest request a later decision is told of loses its speaker
-        # label at the forget, in the runner's copy as in the publisher's, at the off edge and
-        # when the fresh diarizer takes over.
+    def test_the_decision_runner_forgets_the_old_labels_with_the_publisher(self):
+        # #242 round 25: at the off edge and when the fresh diarizer takes over, the decision
+        # runner forgets the old labels too: its stored turns (`forget_speakers`) and its copy
+        # of the latest request, which loses its speaker label as the publisher's does.
         for edge in ("off", "renewed"):
             with self.subTest(edge=edge):
                 controller = self.controller()
@@ -1090,6 +1090,7 @@ class DuckControllerTests(unittest.TestCase):
                 controller._processor, controller._shadow = mock.Mock(), mock.Mock()
                 runner = mock.Mock(request_context=True)
                 controller._runner = runner
+                controller._received_ms = 4321
                 events.last_request = (900, "Jarvis, add milk.", "u1", "Speaker A")
                 if edge == "off":
                     controller.duck(True)
@@ -1097,6 +1098,8 @@ class DuckControllerTests(unittest.TestCase):
                 else:
                     controller._speakers_renewed()
                 runner.note_request.assert_called_once_with((900, "Jarvis, add milk.", "u1", None))
+                # And forgets every label from before it, stamped on the received-audio clock.
+                runner.forget_speakers.assert_called_once_with(controller._received_ms)
 
     def test_a_guest_on_a_recycled_label_gets_no_follow_up_attention(self):
         # Round 16 (Jarvis): every per-label state goes when speakers are forgotten, so a guest
