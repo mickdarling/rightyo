@@ -192,6 +192,16 @@ class PrivacyEventsTests(unittest.TestCase):
         self.events.end("stopped", 1000)
         self.assertIsNone(self.events._private_name_end)
 
+    def entered(self, now_ms):
+        """Privacy on while a conversation is engaged: its end, said at the entry (#245), is
+        the only event."""
+        self.events.duck(True, now_ms=now_ms)
+        events = self.events.drain()
+        self.assertEqual(
+            [(e["type"], e["state"], e["reason"], e["at_ms"]) for e in events],
+            [("conversation", "ambient", "timeout", now_ms)],
+        )
+
     def say(self, current, label="attend", **options):
         self.events.transcript(current, current.end_ms)
         if current.utterance_id in self.events._pending:
@@ -404,7 +414,7 @@ class PrivacyEventsTests(unittest.TestCase):
         self.events.duck(False, now_ms=1000)
         self.assertEqual(self.say(heard("n1", 600, 1200, "Travis.", "Speaker B")), [])
         self.say(heard("g1", 1500, 1800, "A synthetic aside.", "Speaker B"))
-        self.events.duck(True, now_ms=2000)
+        self.entered(2000)
         events = self.say(heard("o1", 2100, 2900, "start listening to this song"))
         self.assertEqual(events, [])
 
@@ -452,7 +462,7 @@ class PrivacyEventsTests(unittest.TestCase):
         self.assertIsNotNone(self.events._private_name_end)
         self.events.duck(False, now_ms=700)
         self.say(heard("g1", 800, 900, "A synthetic aside.", "Speaker B"))
-        self.events.duck(True, now_ms=1000)
+        self.entered(1000)
         self.assertEqual(self.say(heard("o1", 1100, 1600, "I'm back.")), [])
 
     def test_the_off_clears_a_split_exit(self):
@@ -509,7 +519,7 @@ class PrivacyEventsTests(unittest.TestCase):
         # Mick: "In privacy mode, there's no recording, so stop shouldn't do anything."
         self.start(dismissal=Dismissal())
         self.say(heard("t0", 0, 900, "Jarvis, what time is it?"))
-        self.events.duck(True, now_ms=1000)
+        self.entered(1000)
 
         def state():
             events = self.events
@@ -688,8 +698,15 @@ class PrivacyEventsTests(unittest.TestCase):
         # starts a fresh conversation: no timeout, deferred or otherwise, no extension.
         self.assertEqual(
             [(e["state"], e["reason"], e.get("utterance_id")) for e in conversation],
-            [("engaged", "request", "r1"), ("engaged", "request", "r3")],
+            [
+                ("engaged", "request", "r1"),
+                ("ambient", "timeout", None),
+                ("engaged", "request", "r3"),
+            ],
         )
+        # The end is said at the entry itself, once (Jarvis on #245: no silent state change).
+        ended = conversation[1]
+        self.assertEqual((ended["at_ms"], ended["emitted_at_ms"]), (1000, 1000))
         # The pre-privacy follow-up is still decided, but opens nothing.
         self.assertIn("attention", self.types(e for e in stream if e.get("utterance_id") == "r2"))
         # Stamped after the on and before the exit: only the late follow-up's evidence
@@ -697,6 +714,36 @@ class PrivacyEventsTests(unittest.TestCase):
         inside = [e for e in stream if 1000 < e["emitted_at_ms"] < 40000]
         self.assertEqual({e["type"] for e in inside}, {"privacy", "attention"})
         self.assertEqual([e for e in inside if e["type"] == "attention"][0]["utterance_id"], "r2")
+
+    def test_privacy_entry_while_engaged_ends_the_conversation_once_at_the_entry(self):
+        # Jarvis on #245: the host must be told, at the entry it already knows of, and
+        # nothing while private nor at the exit.
+        self.start()
+        current = heard("r1", 0, 900, "Jarvis, what time is it?")
+        self.events.transcript(current, current.end_ms)
+        self.events.decision(decided(current, "attend"), 950)
+        self.events.drain()
+        self.events.duck(True, now_ms=1000)
+        ended = [e for e in self.events.drain() if e["type"] == "conversation"]
+        self.assertEqual(len(ended), 1)
+        self.assertEqual(
+            (ended[0]["state"], ended[0]["reason"], ended[0]["speaker_id"], ended[0]["at_ms"]),
+            ("ambient", "timeout", current.speaker_id, 1000),
+        )
+        self.assertNotIn("utterance_id", ended[0])
+        # A second entry (redundant) says nothing; nor do time, a reply, or the exit.
+        self.events.duck(True, now_ms=2000)
+        self.events.expire(60000)
+        self.events.reply("started", 61000)
+        self.events.reply("ended", 62000)
+        self.events.duck(False, now_ms=63000)
+        self.events.expire(120000)
+        self.assertNotIn("conversation", self.types(self.events.drain()))
+
+    def test_privacy_entry_with_nothing_engaged_says_nothing(self):
+        self.start()
+        self.events.duck(True, now_ms=1000)
+        self.assertNotIn("conversation", self.types(self.events.drain()))
 
     def conversation_events(self, since=0):
         return [

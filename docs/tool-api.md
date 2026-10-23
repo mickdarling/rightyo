@@ -1433,10 +1433,12 @@ request, but it opens no conversation while the mode is on.
 **No timing while private** ([#244](https://github.com/mickdarling/rightyo/issues/244)).
 No `conversation` event of any kind is emitted while privacy mode is on: a timeout's
 `emitted_at_ms` would show that private speech was being handled, and when. Turning the
-mode on ends any [conversation](#conversation-mode) silently, with nothing kept for a
-reply to revive. Nothing can then time out, end or revive while private, and nothing
-deferred is emitted at the exit: the next public request starts a fresh conversation. A
-host treats `{"duck": true}` as the end of any conversation. An `owner_voice` status is
+mode on ends any [conversation](#conversation-mode), said once at the entry itself: a
+`conversation` event back to `ambient`, reason `timeout` (no turn named), `at_ms` the
+entry, stamped at the moment the host already knows of, so the host is never left
+thinking a conversation is engaged. Nothing is kept for a reply to revive. Nothing can
+then time out, end or revive while private, and nothing deferred is emitted at the exit:
+the next public request starts a fresh conversation. An `owner_voice` status is
 not polled while private either; the first poll after the exit reports any change. That
 poll can still reveal, at most once, a change that fell due while private, and so that
 private speech may have happened, though not when.

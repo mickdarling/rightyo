@@ -1299,7 +1299,8 @@ class SpeechEvents:
 
         No `conversation` event is emitted while it is on (rightyo#244): a timer-driven
         timeout's `emitted_at_ms` would say that private speech was being handled, and when.
-        Turning it on ends any engagement silently, with nothing kept to revive, so nothing
+        Turning it on ends any engagement, said once at the entry (`conversation` back to
+        `ambient`, reason `timeout`, `at_ms` the entry), with nothing kept to revive, so nothing
         can lapse, end or revive while private, and nothing deferred is emitted at the exit:
         the next public request starts a fresh conversation. Nor is an owner-voice status
         polled while it is on: the first poll after the exit may still show, at most once,
@@ -1314,8 +1315,18 @@ class SpeechEvents:
             # A change of mode always ends a split exit.
             self._private_name_end = None
             if on and not self._duck:
-                # Privacy ends the conversation without a word (rightyo#244): no timeout can
-                # fall due while private, and none is owed at the exit.
+                # Privacy ends the conversation (rightyo#244), said at the entry itself, the
+                # moment the host already knows of, so the host never thinks it engaged: no
+                # timeout can fall due while private, and none is owed at the exit. The
+                # reason is `timeout` (no turn named), the end the host already accepts.
+                if self._engaged is not None and self._active:
+                    self._emit(
+                        "conversation",
+                        state="ambient",
+                        reason="timeout",
+                        speaker_id=self._engaged["speaker_id"],
+                        at_ms=at,
+                    )
                 self._engaged = None
                 self._dormant = None
                 # Defensive: with nothing engaged or dormant these no longer matter, and a
