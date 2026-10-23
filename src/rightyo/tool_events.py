@@ -1315,10 +1315,19 @@ class SpeechEvents:
             )
 
     def forget_speakers(self):
-        """Drop the speaker roles fixed per label (hailing-station #735 S-1): when privacy
-        ends the diarizer starts afresh, so a label may now name someone else."""
+        """Drop everything held per speaker label (hailing-station #735 S-1): when privacy
+        ends the diarizer starts afresh, so a label may now name someone else. The roles fixed
+        per label, the engaged speaker and a lapsed engagement a reply could revive, cool-downs,
+        explicit ends, appendix windows, and delivered requests a later dismissal by label could
+        withdraw: none may carry to a voice that inherits the label (round 16)."""
         with self._lock:
             self._roles.clear()
+            self._engaged = None
+            self._dormant = None
+            self._cooldowns.clear()
+            self._ended.clear()
+            self._appendix_from.clear()
+            self._delivered.clear()
 
     @property
     def ducked(self):

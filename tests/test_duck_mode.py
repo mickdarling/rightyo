@@ -988,6 +988,69 @@ class DuckControllerTests(unittest.TestCase):
         shadow.forget.assert_called_once_with()
         self.assertEqual(events._roles, {})
 
+    def test_a_guest_on_a_recycled_label_gets_no_follow_up_attention(self):
+        # Round 16 (Jarvis): every per-label state goes when speakers are forgotten, so a guest
+        # the fresh diarizer gives the owner's old label is never the engaged speaker.
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        guest = turn("g1", 1000, 1900, "and the other thing")
+        key = events._cooldown_key(events._facts(guest))
+        self.assertIsNotNone(key)
+        events._engaged = {
+            "key": key,
+            "speaker_id": guest.speaker_id,
+            "from_ms": 0,
+            "until_ms": 60_000,
+        }
+        events._dormant = {"engaged": dict(events._engaged), "at_ms": 0}
+        events._cooldowns[key] = (0, 60_000)
+        events._ended[key] = 0
+        events._appendix_from[key] = 0
+        events._delivered["request"] = {"speaker_id": guest.speaker_id}
+        events._roles[guest.speaker_id] = "owner"
+        self.assertTrue(events._engaged_with(guest))
+        events.forget_speakers()
+        self.assertFalse(events._engaged_with(guest))
+        self.assertEqual(
+            (events._engaged, events._dormant, events._cooldowns, events._ended),
+            (None, None, {}, {}),
+        )
+        self.assertEqual((events._appendix_from, events._delivered, events._roles), ({}, {}, {}))
+
+    def test_the_controller_hands_the_processor_its_renewal_hook(self):
+        # Round 16 (key 1's should-fix): the wiring that makes the renewal forget is pinned.
+        made = []
+
+        class Processor:
+            on_speakers_renewed = None
+
+            def __init__(self, config, on_turn):
+                made.append(self)
+
+            def push_pcm16(self, pcm):
+                pass
+
+            def finish(self):
+                pass
+
+            def close(self):
+                pass
+
+        events = SpeechEvents()
+        controller = self.controller(
+            constructor={"event_publisher": events, "processor_factory": Processor}
+        )
+        controller.start({"mode": "demo", "session_id": "wiring"})
+        deadline = time.monotonic() + 5
+        while not made and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(made), 1)
+        wait = time.monotonic() + 5
+        while made[0].on_speakers_renewed is None and time.monotonic() < wait:
+            time.sleep(0.01)
+        self.assertEqual(made[0].on_speakers_renewed, controller._speakers_renewed)
+
     def test_stop_drops_per_turn_notes_an_accept_never_took(self):
         # Jarvis on #242 round 5: a stop between the observation and the accept.
         controller = self.controller()
