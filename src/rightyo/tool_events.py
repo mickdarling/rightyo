@@ -875,8 +875,10 @@ class SpeechEvents:
                 # transcript, no memory, no decision, no digest of the words, and no use of
                 # the session's turn budget.
                 # Matched only while privacy is on (round 18): a turn of an ended period
-                # released after it can no longer exit, and matching it would repeat its
-                # status on every offer (its id is not kept) and count it in the next period.
+                # released while it is still off is dropped unmatched, since matching it
+                # would repeat its status on every offer (its id is not kept). Released once
+                # privacy is on again, it is matched in the new period: it can answer
+                # `status` and is counted there, but cannot exit it (see `_private`).
                 uid = turn.utterance_id
                 if self._duck and uid not in self._seen and uid not in self._private_seen:
                     # Kept only while privacy is on; cleared at its end (#735 S-1).

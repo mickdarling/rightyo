@@ -281,9 +281,8 @@ class ShadowSpeakerId:
         self._names: dict[str, str] = {}
         # Owner-voice evidence (rightyo#164), never reported: the identifiers compared this
         # session (replaced whole), every identifier a label has bound to (only added to),
-        # and the seconds of speech scored; the last two restart at `forget`. The worker
-        # records a binding before the seconds that produced it, so a reader that sees the
-        # seconds sees the binding.
+        # and the seconds of speech scored; the last two restart at `forget`, and are written
+        # and read together under `_epoch_lock`.
         self._compared: frozenset[str] = frozenset()
         self._bound_ids: set[str] = set()
         # Bumped by `forget` (hailing-station #735 S-1): a queued or in-flight turn scored for
@@ -335,20 +334,20 @@ class ShadowSpeakerId:
         return name if isinstance(name, str) else None
 
     def owner_evidence(self, owners) -> tuple[bool, bool, float]:
-        """Owner-voice evidence for `owners` (rightyo#164); never blocks.
+        """Owner-voice evidence for `owners` (rightyo#164); never waits on the worker.
 
         Whether an owner identifier's voiceprint is compared this session, whether any
         label has bound to one, and the seconds of speech scored so far. Scored speech is
-        always a single label's own, unoverlapped timeline audio (#148).
+        always a single label's own, unoverlapped timeline audio (#148). The seconds and the
+        bindings are read together under the epoch lock (held briefly by `_score` and
+        `forget`), so a `forget` between them never pairs old seconds with no bindings.
         """
-        seconds = self.scored_seconds  # read first: see the write order in `__init__`
         owners = tuple(owners)
         compared = self._compared
-        return (
-            any(owner in compared for owner in owners),
-            any(owner in self._bound_ids for owner in owners),
-            seconds,
-        )
+        with self._epoch_lock:
+            seconds = self.scored_seconds
+            bound = any(owner in self._bound_ids for owner in owners)
+        return any(owner in compared for owner in owners), bound, seconds
 
     def _report(self, message: str) -> None:
         if self._report_to is not None:

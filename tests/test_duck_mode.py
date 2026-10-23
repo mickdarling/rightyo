@@ -4,6 +4,7 @@ anyone's status question. Synthetic text only."""
 
 from __future__ import annotations
 
+import array
 import contextlib
 import copy
 import io
@@ -22,6 +23,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from test_conversation import MODE, SESSION, decided, turn
+from test_live_audio import FakeDiarizer, document
 
 from rightyo import tool_events
 from rightyo.contracts import Addressing, ContractError, Dismissal, SpeakerPriority
@@ -30,6 +32,7 @@ from rightyo.live_audio import (
     READ_CHUNK_BYTES,
     LiveAudioError,
     LiveConfig,
+    LiveProcessor,
     RecognizerSandboxError,
     WhisperCppTranscriber,
     _transcribe,
@@ -993,11 +996,12 @@ class DuckControllerTests(unittest.TestCase):
         controller.duck(True)
         self.assertEqual((processor.reset_speakers.call_count, shadow.forget.call_count), (0, 0))
         self.assertEqual(events._roles, {"Speaker A": "participant"})
-        controller._received_ms = 4321
+        controller._received_ms, controller._received_bytes = 4321, 4321 * 32 + 6
         controller.duck(False)
         self.assertEqual((processor.reset_speakers.call_count, shadow.forget.call_count), (1, 1))
-        # Round 18: the buffered audio before the end is silenced, on the mode's own clock.
-        processor.reset_speakers.assert_called_once_with(4321)
+        # Round 18: the buffered audio before the end is silenced, on the mode's own clock, in
+        # bytes so it is exact to the sample (round 19).
+        processor.reset_speakers.assert_called_once_with(4321 * 32 + 6)
         self.assertEqual(events._roles, {})
         controller.duck(False)
         self.assertEqual((processor.reset_speakers.call_count, shadow.forget.call_count), (1, 1))
@@ -1185,6 +1189,46 @@ class DuckControllerTests(unittest.TestCase):
         self.assertEqual(ring.span(1000, 3000)[0], bytes(len(voice) * 2))
         self.assertEqual(ring.span(3000, 4000)[0], voice)
         self.assertEqual(events._duck_spans, [[1000, 3000]])
+
+    def test_no_private_sample_reaches_asr_with_odd_sized_chunks(self):
+        # #242 round 19: the privacy end is stamped through the controller's own path, in bytes.
+        # A millisecond stamp rounded down left up to 15 private samples in front of the first
+        # public utterance when chunks end mid-millisecond.
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0)
+        events.drain()
+        controller._events = events
+        asset = Path(controller.config.whisper_model)
+        config = LiveConfig("causal-test", asset, asset, asset, asset, provenance="causal-replay")
+        with (
+            mock.patch("rightyo.live_audio._Diarizer", FakeDiarizer),
+            mock.patch("rightyo.live_audio._transcribe", return_value=document()) as transcribe,
+        ):
+            processor = LiveProcessor(config, lambda turn: None)
+            self.addCleanup(processor.close)
+            controller._processor = processor
+
+            def feed(pcm):
+                controller._feed(controller._generation, processor, pcm, "stdin")
+
+            for _ in range(3):
+                feed(bytes(640))
+            controller.duck(True)
+            marker = array.array("h", [77] * 167).tobytes()  # quiet, so kept in the pre-roll
+            for size in (222, 334) * 5:
+                feed(marker[:size])
+            self.assertNotEqual(controller._received_bytes % 32, 0)
+            controller.duck(False)
+            voice = array.array("h", [5000] * 320).tobytes()
+            for _ in range(20):
+                feed(voice)
+            for _ in range(75):
+                feed(bytes(640))
+            self.assertEqual(transcribe.call_count, 1)
+            sent = array.array("h", transcribe.call_args.args[1])
+            self.assertEqual(sent.count(77), 0)
+            self.assertEqual(sent.count(5000), 20 * 320)
 
     def test_spans_use_the_audio_clock_when_the_wall_clock_runs_ahead(self):
         controller = self.controller()

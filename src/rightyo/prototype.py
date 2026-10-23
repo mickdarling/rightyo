@@ -1808,14 +1808,15 @@ class PrototypeController:
         label binding is dropped and the publisher's per-label roles with it, so the owner is
         identified again from public speech. The owner's exit already used its labels. Audio
         heard before the end and still buffered is silenced, stamped on the same clock as the
-        mode (round 18), so none of it is sent to ASR with the next public utterance."""
+        mode (round 18) but in bytes, exact where the millisecond stamp rounds down (round 19),
+        so none of it, not one sample, is sent to ASR with the next public utterance."""
         forget = getattr(self._events, "forget_speakers", None)
         if callable(forget):
             forget()
         if self._processor is not None and callable(
             getattr(self._processor, "reset_speakers", None)
         ):
-            self._processor.reset_speakers(self._received_ms)
+            self._processor.reset_speakers(self._received_bytes)
         if self._shadow is not None:
             with contextlib.suppress(Exception):
                 self._shadow.forget()

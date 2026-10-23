@@ -1243,9 +1243,11 @@ class LiveProcessor:
             config.diarizer, "push"
         )
         self._speaker_reset = False
-        # The stream time privacy last ended, until every frame heard before it is processed;
-        # then what is still buffered from before it is silenced (`_silence_private`).
+        # The stream byte offset privacy last ended at, until the frame holding it is processed;
+        # then what is still buffered from before it is silenced (`_private_cutoff`). Written on
+        # the host thread and taken on the audio thread, both under `_private_lock`.
         self._private_until: int | None = None
+        self._private_lock = threading.Lock()
         # Told when the fresh diarizer takes over, before its first frame: labels restart there,
         # so whatever was bound to the old ones in the meantime must be forgotten again.
         self.on_speakers_renewed: Callable[[], None] | None = None
@@ -1337,33 +1339,47 @@ class LiveProcessor:
             self.close()
             raise
 
-    def reset_speakers(self, private_until_ms: int | None = None) -> None:
+    def reset_speakers(self, private_until_bytes: int | None = None) -> None:
         """Start a fresh diarizer once nothing is open (hailing-station #735 S-1): called when
         privacy ends, so no speaker channel or state a private voice made outlives it. Deferred
         to the first frame with no open utterance or held turn, so a turn under way keeps its
         labels; its timeline continues on the stream clock.
 
-        `private_until_ms` is the stream time privacy ended (by default, the end of the audio
-        pushed so far): audio before it still buffered once it is reached is silenced."""
-        if private_until_ms is None:
-            private_until_ms = self._received_ms + math.ceil(len(self._partial) / BYTES_PER_MS)
-        self._private_until = max(private_until_ms, self._private_until or 0)
+        `private_until_bytes` is the stream byte offset privacy ended at (by default, the end
+        of the audio pushed so far), exact to the sample (round 19): audio before it still
+        buffered once it is reached is silenced."""
+        if private_until_bytes is None:
+            private_until_bytes = self._received_ms * BYTES_PER_MS + len(self._partial)
+        private_until_bytes += private_until_bytes % 2  # a whole sample
+        with self._private_lock:
+            self._private_until = max(private_until_bytes, self._private_until or 0)
         if self._diarizer_renewable:
             self._speaker_reset = True
 
-    def _silence_private(self, until: int) -> None:
-        """Every frame heard before privacy ended is processed (#735 S-1, round 18): silence
-        what is still buffered from before then, the pre-roll kept between turns and the start
-        of an utterance open across the end, so no audio heard while private is prepended to
-        public speech and sent to ASR. Silence, not removal, keeps the stream offsets."""
-        start = self._received_ms - 20 * len(self._pre_roll)
+    def _private_cutoff(self, pcm: bytes, final: bool = False) -> bytes:
+        """`pcm`, the next audio processed, with what of it was heard before privacy ended
+        silenced (#735 S-1, rounds 18-19). Once the end falls within or before it (or at
+        `finish`, `final`), what is still buffered from before then is silenced too, the
+        pre-roll kept between turns and the start of an utterance open across the end, all
+        before `pcm` reaches the diarizer, the end-of-turn model or ASR, so no audio heard
+        while private is processed with public speech. Silence, not removal, keeps the stream
+        offsets. The end is taken under the lock, so a later one set meanwhile is kept."""
+        start = self._received_ms * BYTES_PER_MS
+        with self._private_lock:
+            until = self._private_until
+            if until is None or (until >= start + len(pcm) and not final):
+                return pcm
+            self._private_until = None
+        first = start - FRAME_BYTES * len(self._pre_roll)
         frames = list(self._pre_roll)
         self._pre_roll.clear()
         for index, frame in enumerate(frames):
-            private = min(len(frame), max(0, (until - start - 20 * index) * BYTES_PER_MS))
+            private = min(len(frame), max(0, until - first - FRAME_BYTES * index))
             self._pre_roll.append(bytes(private) + frame[private:])
-        private = min(len(self._utterance), max(0, (until - self._utterance_start) * BYTES_PER_MS))
+        private = min(len(self._utterance), max(0, until - self._utterance_start * BYTES_PER_MS))
         self._utterance[:private] = bytes(private)
+        private = min(len(pcm), max(0, until - start))
+        return bytes(private) + pcm[private:]
 
     def _renew_diarizer(self) -> None:
         self._speaker_reset = False
@@ -1381,9 +1397,8 @@ class LiveProcessor:
             self.on_speakers_renewed()
 
     def _frame(self, frame: bytes) -> None:
-        if self._private_until is not None and self._received_ms >= self._private_until:
-            until, self._private_until = self._private_until, None
-            self._silence_private(until)
+        if self._private_until is not None:
+            frame = self._private_cutoff(frame)
         if self._speaker_reset and not self._utterance and not self._merger.holding:
             self._renew_diarizer()
         self._diarizer.push(frame)
@@ -1662,10 +1677,11 @@ class LiveProcessor:
         if self.closed:
             return
         try:
-            if self._partial:
+            # Any privacy end not reached yet is applied here, to the tail and what is buffered.
+            pcm = self._private_cutoff(bytes(self._partial), final=True)
+            self._partial.clear()
+            if pcm:
                 # Process actual tail only. Synthetic zero-padding must not enter native history.
-                pcm = bytes(self._partial)
-                self._partial.clear()
                 self._diarizer.push(pcm)
                 if self._utterance:
                     self._utterance.extend(pcm)

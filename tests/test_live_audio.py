@@ -291,7 +291,7 @@ class LiveProcessorTests(unittest.TestCase):
         self.feed(quiet, 12)
         self.processor.push_pcm16(quiet[:320])
         # Stamped on the controller's clock: all audio received so far, the part frame too.
-        self.processor.reset_speakers(12 * 20 + 10)
+        self.processor.reset_speakers(12 * FRAME_BYTES + 320)
         self.feed(VOICE, 20)
         self.feed(SILENCE, 73)
         self.assertEqual(self.transcribe.call_count, 1)
@@ -305,7 +305,7 @@ class LiveProcessorTests(unittest.TestCase):
         private = array.array("h", [4321] * 320).tobytes()
         self.feed(SILENCE, 5)
         self.feed(private, 10)
-        self.processor.reset_speakers(15 * 20)
+        self.processor.reset_speakers(15 * FRAME_BYTES)
         self.feed(VOICE, 10)
         self.feed(SILENCE, 72)
         self.assertEqual(self.transcribe.call_count, 1)
@@ -318,6 +318,50 @@ class LiveProcessorTests(unittest.TestCase):
         self.feed(VOICE, 10)
         self.feed(SILENCE, 72)
         self.assertEqual(array.array("h", self.transcribe.call_args.args[1]).count(5000), 3200)
+
+    def test_the_frame_straddling_the_privacy_end_is_silenced_before_it_is_processed(self):
+        # #242 round 19: the end falls 10 ms into a frame that ends a private utterance (the
+        # hangover finalizes it there). Its private prefix, and the private speech buffered
+        # before it, are silenced before the diarizer, the voiced check or ASR see the frame.
+        speech = array.array("h", [4321] * 320).tobytes()
+        quiet = array.array("h", [77] * 320).tobytes()
+        self.feed(SILENCE, 5)
+        self.feed(speech, 10)
+        self.feed(quiet, 71)
+        self.processor.reset_speakers(86 * FRAME_BYTES + 10 * BYTES_PER_MS)
+        self.transcribe.assert_not_called()
+        straddling = quiet[: 10 * BYTES_PER_MS] + bytes(FRAME_BYTES - 10 * BYTES_PER_MS)
+        self.processor.push_pcm16(straddling)
+        self.assertEqual(self.transcribe.call_count, 1)
+        self.assertEqual(self.private_samples_sent_to_asr({4321, 77}), [])
+        self.assertEqual(self.processor._diarizer.frames[-1], bytes(FRAME_BYTES))
+
+    def test_finish_silences_audio_heard_before_a_privacy_end_not_yet_reached(self):
+        # The tail and the open utterance are finalized by `finish` without a further frame;
+        # the end stamped at the very end of the audio is applied there.
+        speech = array.array("h", [4321] * 320).tobytes()
+        self.feed(SILENCE, 2)
+        self.feed(speech, 5)
+        self.processor.push_pcm16(speech[:30])  # under 1 ms: the fake timeline stays in bounds
+        self.processor.reset_speakers()
+        self.processor.finish()
+        self.assertEqual(self.transcribe.call_count, 1)
+        self.assertEqual(self.private_samples_sent_to_asr({4321}), [])
+
+    def test_a_privacy_end_set_while_one_is_taken_is_kept(self):
+        # Set on the host thread and taken on the audio thread under one lock, so a second end
+        # stamped while a frame takes the first is never cleared unapplied.
+        self.processor.reset_speakers(FRAME_BYTES // 2)
+        with self.processor._private_lock:
+            setter = threading.Thread(target=self.processor.reset_speakers, args=(3 * FRAME_BYTES,))
+            setter.start()
+            setter.join(0.2)
+            self.assertTrue(setter.is_alive())
+        setter.join(5)
+        self.feed(SILENCE, 1)  # the merged end lies past this frame: kept for a later one
+        self.assertEqual(self.processor._private_until, 3 * FRAME_BYTES)
+        self.feed(SILENCE, 3)
+        self.assertIsNone(self.processor._private_until)
 
 
 class NativeStartupCancellationTests(unittest.TestCase):
