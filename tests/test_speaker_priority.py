@@ -603,6 +603,12 @@ class EnrolledEventTests(unittest.TestCase):
 
             return decide_then_prune
 
+        def queued():
+            # #242 round 26: formed before the forget and still queued across it, so its
+            # string, first rendered with "Owner (Speaker A)", is re-rendered after it.
+            formed()()
+            return lambda: self.events.expire(301200)
+
         def disengaged():
             context_turns()
             stale = said("s1", 2000, "Okay, that's enough of that.")
@@ -650,6 +656,7 @@ class EnrolledEventTests(unittest.TestCase):
         paths = {
             "formed": formed,
             "re-rendered": re_rendered,
+            "queued": queued,
             "disengaged": disengaged,
             "withdrawn": withdrawn,
             "follow-up": follow_up,
@@ -658,11 +665,13 @@ class EnrolledEventTests(unittest.TestCase):
         expected = {
             "formed": ["attention", "request"],
             "re-rendered": ["attention", "request"],
+            "queued": ["request"],
             "disengaged": ["attention", "dismiss"],
             "withdrawn": ["attention", "dismiss"],
             "follow-up": ["attention"],
             "role question": ["transcript"],
         }
+        kept = {"turn", "context", "formed_request"}
         for per_turn in (False, True):
             for path, arrange in paths.items():
                 if per_turn and path == "role question":
@@ -671,10 +680,34 @@ class EnrolledEventTests(unittest.TestCase):
                     reports = []
                     session(per_turn, reports)
                     act = arrange()
-                    before = self.events.drain()
+                    if path == "queued":
+                        # Left queued across the forget (round 26).
+                        before = json.loads(json.dumps([p for p, _ in self.events._queue]))
+                    else:
+                        before = self.events.drain()
                     self.events.forget_speakers()
                     act()
                     after = self.events.drain()
+                    if path == "queued":
+                        # Emitted before the forget: all but the request's string unchanged,
+                        # so only that string (and the fingerprinted turns) is checked below.
+                        first = [e for e in before if e["type"] == "request"]
+                        self.assertIn("Owner (Speaker A)", first[0]["formed_request"])
+                        for event in after:
+                            if event["type"] != "request":
+                                self.assertIn(event, before)
+                                continue
+                            self.assertEqual(
+                                *[
+                                    {k: v for k, v in e.items() if k not in kept}
+                                    for e in (event, *first)
+                                ]
+                            )
+                        after = [
+                            {k: v for k, v in e.items() if k in {"type", *kept}}
+                            for e in after
+                            if e["type"] == "request"
+                        ]
                     published = {
                         e["turn"]["utterance_id"]: e["turn"]
                         for e in [*before, *after]
@@ -682,7 +715,7 @@ class EnrolledEventTests(unittest.TestCase):
                     }
                     requests = [e for e in after if e["type"] == "request"]
                     self.assertEqual([e["type"] for e in after], expected[path])
-                    if path in {"formed", "re-rendered"}:
+                    if path in {"formed", "re-rendered", "queued"}:
                         self.assertEqual(len(requests), 1)
                         self.assertIn(
                             "The requester is not an owner.", requests[0]["formed_request"]
@@ -703,16 +736,35 @@ class EnrolledEventTests(unittest.TestCase):
                         self.assertNotIn('"role": "owner"', text)
                         self.assertNotIn("Owner (", text)
                         self.assertNotIn("owner (", text)
-                    if path == "re-rendered":
+                    if path in {"re-rendered", "queued"}:
                         self.assertEqual(
                             [t["utterance_id"] for t in requests[0]["context"]["turns"]], ["c1"]
                         )
                         self.assertIn(
                             "Earlier, an unknown speaker said", requests[0]["formed_request"]
                         )
+                    if path == "queued":
+                        self.assertTrue(
+                            requests[0]["formed_request"].startswith("An unknown speaker asked")
+                        )
                     for line in reports:
                         self.assertNotIn("Speaker A", line)
                         self.assertNotIn("role=owner", line)
+
+    def test_a_session_ended_without_its_queue_drops_its_formed_records(self):
+        # #242 round 26: a cancelled session clears its queue, so nothing is left to re-render.
+        self.events = SpeechEvents()
+        self.events.start(
+            "enrolled-demo",
+            priority=ConfiguredPriorityProvider(SpeakerPriority(owners=("Speaker A",))),
+            former=TemplateRequestFormer(),
+        )
+        current = self.heard("s1", 0, 500, "Rightyo, lights.", "Speaker A")
+        self.events.transcript(current, 500)
+        self.events.decision(decision(current), 600)
+        self.assertEqual(list(self.events._formed), ["enrolled-demo:s1"])
+        self.events.end("cancelled", 700)
+        self.assertEqual(self.events._formed, {})
 
     def test_owner_only_downgrades_non_owner_attend_to_ignore(self):
         self.start(SpeakerPriority(owners=("Speaker A",), trusted=("Speaker B",), owner_only=True))

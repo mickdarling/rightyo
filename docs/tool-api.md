@@ -1294,7 +1294,9 @@ published them before the forget, so a host's fingerprints of them still match. 
 derived after the forget names no label from before it and no owner or trusted role only that
 label gave: the request's `formed_request` (its asker unlabelled with the decided role, so a
 former says the requester is not an owner, and its earlier turns unlabelled), also when expiry
-re-renders it; a `dismiss` for a pending request withdrawn before the forget; what a later
+re-renders it, including a request formed before the forget and still queued when expiry
+re-renders it after the forget (asker and earlier turns unlabelled, an owner or trusted role
+read as `unknown`; its `turn`, `context.turns` and `decision` stay as first queued); a `dismiss` for a pending request withdrawn before the forget; what a later
 decision model is given (its past turns, participants, a turn heard before the forget but decided
 after it, and the latest request); a role question's past turns; and diagnostic lines, which
 never carry labels. While it is pending, an owner's later

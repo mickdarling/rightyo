@@ -838,6 +838,17 @@ class SpeechEvents:
                                 # never the published turn, which keeps a label the forget
                                 # may have made stale.
                                 record, unlabelled = self._formed[payload["request_id"]]
+                                # #242 round 26: a request formed before a later forget is
+                                # re-rendered as one formed after it: its asker and every
+                                # context turn heard before the forget unlabelled, with no
+                                # owner or trusted role. Its `turn` and `context` keep theirs.
+                                if record["utterance_id"] in self._old_labels:
+                                    record = _unlabelled(record)
+                                unlabelled = unlabelled | {
+                                    t["utterance_id"]
+                                    for t in turns
+                                    if t["utterance_id"] in self._old_labels
+                                }
                                 payload["formed_request"] = self._render_request(
                                     record, turns, unlabelled
                                 )
@@ -2531,6 +2542,8 @@ class SpeechEvents:
             if phase != "stopped":
                 self._queue.clear()
                 self._queue_bytes = 0
+                # #242 round 26: no queued request is left to re-render.
+                self._formed.clear()
             self._memory.clear()
             self._pending.clear()
             self._pending_bytes = 0
