@@ -371,6 +371,20 @@ class CoachingListenTests(unittest.TestCase):
         self.assert_terminal(child, "stopped")
         self.assert_no_actions(child)
 
+    def test_no_ordinary_control_capabilities_are_advertised_without_audio(self):
+        child = self.child()
+        child.enable(qualify=False)
+        child.qualify()
+        started = child.next(
+            lambda event: event.get("type") == "session" and event.get("phase") == "started"
+        )
+        self.assertNotIn("meeting", started)
+        self.assertNotIn("duck", started)
+        # No PCM is offered: qualification and startup alone establish the boundary.
+        child.process.stdin.close()
+        child.exited(0)
+        self.assertFalse(any(event.get("type") == "transcript" for event in child.events))
+
     def test_two_actual_finals_preserve_cadence_and_heartbeat_does_not_repeat_advice(self):
         child = self.child(
             utterances=["Authored first turn.", "Authored second turn."],
@@ -401,8 +415,9 @@ class CoachingListenTests(unittest.TestCase):
         child.enable()
         child.audio(PCM_TURN * 2)
         child.next(
-            lambda event: event.get("type") == "transcript"
-            and event["turn"]["utterance_id"] == "live-2"
+            lambda event: (
+                event.get("type") == "transcript" and event["turn"]["utterance_id"] == "live-2"
+            )
         )
         for _ in range(3):
             child.activity()

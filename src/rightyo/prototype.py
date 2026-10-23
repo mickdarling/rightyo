@@ -1031,6 +1031,14 @@ class PrototypeController:
                         and not self.config.hosted_speech
                         else {}
                     ),
+                    # Meeting uses ordinary host controls, including with hosted speech.
+                    # Coaching's descriptor carries only its separate record protocol.
+                    **(
+                        {"meeting": True}
+                        if getattr(self._events, "meeting_control", False) is True
+                        and callable(getattr(self._events, "meeting", None))
+                        else {}
+                    ),
                 )
                 self._event_terminal = False
                 if self.owner_voice is not None and not voiceprint and self.report is not None:

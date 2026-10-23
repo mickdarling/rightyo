@@ -903,8 +903,6 @@ class PrivacyEventsTests(unittest.TestCase):
             # Only these differ by design: the advertisement, and a voiceprint role source,
             # which is published only beside privacy control.
             stream[0].pop("duck", None)
-            # Meeting shares this advertisement boundary (#227), but is never on here.
-            stream[0].pop("meeting", None)
             for event in stream:
                 event.pop("role_source", None)
             streams.append(stream)
@@ -2632,7 +2630,7 @@ class PrivacyAckTests(unittest.TestCase):
         self.assertTrue(replay.ducked)
         self.assertEqual(replay.drain(), [])
         # A coaching listener's publisher: its controller never advertises duck.
-        events = SpeechEvents(duck_control=False)
+        events = SpeechEvents(duck_control=False, meeting_control=False)
 
         def no_audio(*_args, **_options):
             raise PrototypeError("no audio in this test")
@@ -2641,7 +2639,9 @@ class PrivacyAckTests(unittest.TestCase):
             constructor={"event_publisher": events, "processor_factory": no_audio}
         )
         controller.start({"mode": "demo", "session_id": "coaching"})
-        self.assertNotIn("duck", events.drain()[0])
+        started = events.drain()[0]
+        self.assertNotIn("duck", started)
+        self.assertNotIn("meeting", started)
         controller.duck(True)
         self.assertTrue(events.ducked)
         self.assertEqual(self.acks(events.drain()), [])

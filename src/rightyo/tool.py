@@ -299,11 +299,12 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
     if start_private and config.hosted_speech:
         raise PrototypeError("--start-private is refused with a hosted speech backend")
     # A coaching listener's control descriptor carries only coaching records (it refuses a
-    # `{"duck": ...}` line), so it never advertises duck mode (hailing-station #735).
+    # duck or meeting line), so it advertises neither mode (hailing-station #735).
     events = SpeechEvents(
         report=None if coaching else _stderr,
         retain_transcripts=not coaching,
         duck_control=not coaching,
+        meeting_control=not coaching,
     )
     if start_private:
         # Exactly as if `{"duck": true}` arrived at stream time 0, before any audio: the

@@ -151,6 +151,47 @@ class ToolTests(unittest.TestCase):
                 listen(self.args, controller_factory=self.no_capture)
         self.assertEqual(Processor.instances, [])
 
+    def test_meeting_is_advertised_through_listener_with_local_or_hosted_speech(self):
+        # Start the real listener/controller, refusing the processor before any audio.
+        for hosted in (False, True):
+            with self.subTest(hosted=hosted):
+                self.args.allow_hosted = hosted
+                config = json.loads(self.config.read_text())
+                if hosted:
+                    config["transcriber"] = {
+                        "kind": "hosted-openai-compatible",
+                        "endpoint": "https://transcribe.example.test/v1/audio/transcriptions",
+                        "model": "whisper-1",
+                    }
+                self.config.write_text(json.dumps(config))
+                controllers = []
+
+                def no_audio(*_args, **_options):
+                    raise PrototypeError("no audio in this test")
+
+                def factory(config, **options):
+                    controller = PrototypeController(
+                        config,
+                        processor_factory=no_audio,
+                        capture_factory=self.no_capture,
+                        provider_factory=self.no_hosted,
+                        **options,
+                    )
+                    controllers.append(controller)
+                    return controller
+
+                output = io.StringIO()
+                self.assertEqual(listen(self.args, output=output, controller_factory=factory), 2)
+                started = json.loads(output.getvalue().splitlines()[0])
+                self.assertEqual(started["phase"], "started")
+                self.assertEqual(started["meeting"], {"version": 1})
+                self.assertNotIn("meeting", started["capabilities"])
+                self.assertEqual(started.get("duck"), None if hosted else {"version": 3})
+                self.assertEqual(len(controllers), 1)
+                controllers[0].meeting(True)
+                self.assertTrue(controllers[0]._events._meeting)
+        self.assertEqual(Processor.instances, [])
+
     def test_slow_consumer_backlog_cancels_and_emits_only_safe_terminal(self):
         with wave.open(str(self.demo), "wb") as audio:
             audio.setnchannels(1)
@@ -185,6 +226,8 @@ class ToolTests(unittest.TestCase):
             self.assertEqual(main(["tool-replay", "--input", str(fixture)]), 0)
         events = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(sum(event["type"] == "transcript" for event in events), 4)
+        self.assertNotIn("meeting", events[0])
+        self.assertNotIn("duck", events[0])
         request = next(event for event in events if event["type"] == "request")
         self.assertEqual(request["decision"]["provider"], "mock")
         self.assertEqual(request["turn"]["revision"], 2)
