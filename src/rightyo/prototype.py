@@ -1810,9 +1810,18 @@ class PrototypeController:
             forget = getattr(self._events, "forget_speakers", None)
             if callable(forget):
                 forget()
+                self._note_forgotten_request()
             if self._shadow is not None:
                 with contextlib.suppress(Exception):
                     self._shadow.forget()
+
+    def _note_forgotten_request(self) -> None:
+        """#242 round 25: the decision runner's copy of the latest request loses its speaker
+        label with the publisher's, so no later decision is told an old label asked. Under
+        the lock, like every other `note_request`."""
+        runner = self._runner
+        if runner is not None and runner.request_context:
+            runner.note_request(getattr(self._events, "last_request", None))
 
     def _forget_speakers(self) -> None:
         """Privacy ended (#735 S-1, Codex P1 on #242): no speaker state from it may outlive it.
@@ -1825,6 +1834,7 @@ class PrototypeController:
         forget = getattr(self._events, "forget_speakers", None)
         if callable(forget):
             forget()
+            self._note_forgotten_request()
         if self._processor is not None and callable(
             getattr(self._processor, "reset_speakers", None)
         ):

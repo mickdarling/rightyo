@@ -1076,6 +1076,28 @@ class DuckControllerTests(unittest.TestCase):
         shadow.forget.assert_called_once_with()
         self.assertEqual(events._roles, {})
 
+    def test_the_decision_runner_is_told_the_latest_request_without_its_old_label(self):
+        # #242 round 25: the latest request a later decision is told of loses its speaker
+        # label at the forget, in the runner's copy as in the publisher's, at the off edge and
+        # when the fresh diarizer takes over.
+        for edge in ("off", "renewed"):
+            with self.subTest(edge=edge):
+                controller = self.controller()
+                events = SpeechEvents()
+                events.start(SESSION, now_ms=0, addressing=OURS)
+                events.drain()
+                controller._events = events
+                controller._processor, controller._shadow = mock.Mock(), mock.Mock()
+                runner = mock.Mock(request_context=True)
+                controller._runner = runner
+                events.last_request = (900, "Jarvis, add milk.", "u1", "Speaker A")
+                if edge == "off":
+                    controller.duck(True)
+                    controller.duck(False)
+                else:
+                    controller._speakers_renewed()
+                runner.note_request.assert_called_once_with((900, "Jarvis, add milk.", "u1", None))
+
     def test_a_guest_on_a_recycled_label_gets_no_follow_up_attention(self):
         # Round 16 (Jarvis): every per-label state goes when speakers are forgotten, so a guest
         # the fresh diarizer gives the owner's old label is never the engaged speaker.

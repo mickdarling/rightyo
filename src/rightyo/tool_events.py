@@ -309,6 +309,16 @@ def _with_role(turn, role):
     return record
 
 
+def _unlabelled(record):
+    """#242 round 25: a record heard before the speakers were forgotten (#735 S-1), as what is
+    derived from it after the forget sees it: no speaker label, which may now name someone
+    else, and no owner or trusted role, which only that label gave."""
+    record = {**record, "speaker_id": None}
+    if record.get("role") in {"owner", "trusted"}:
+        record["role"] = "unknown"
+    return record
+
+
 def encode_json(payload):
     """The ASCII-safe JSON representation shared by wire output and byte budgets."""
     return json.dumps(payload, ensure_ascii=True, allow_nan=False)
@@ -491,6 +501,15 @@ class SpeechEvents:
         # Utterances accepted before the speakers were last forgotten (hailing-station #735 S-1)
         # and not yet decided: their labels may now name someone else. Always within `_pending`.
         self._label_stale = set()
+        # #242 round 25: every utterance transcribed before the speakers were last forgotten
+        # this session. What is derived from one after the forget (a formed request's context,
+        # a role question's past turns) carries no label or role of it (`_unlabelled`); the
+        # published transcript, request turn and context keep them, as fingerprinted.
+        self._old_labels = set()
+        # #242 round 25: per queued request with a formed string, the request record and the
+        # context utterances it was formed with unlabelled, so a re-render after a pruning
+        # (`expire`) says what the first one did, never the published turn's old label.
+        self._formed = {}
         # Set once the speakers are forgotten (round 17, Jarvis): a diarizer label configured as
         # the owner or trusted may now name anyone, so until the session restarts only a live
         # voiceprint binding gives those roles.
@@ -588,6 +607,7 @@ class SpeechEvents:
         self._replied_at = None
         self._delivered.clear()
         self._withdrawn.clear()
+        self._formed.clear()
 
     def start(
         self,
@@ -693,6 +713,7 @@ class SpeechEvents:
             self._engaged = None
             self._dormant = None
             self._label_stale.clear()
+            self._old_labels.clear()
             self._labels_renewed = False
             self._ended.clear()
             self.role_status = "off" if priority is None else "ready"
@@ -813,8 +834,12 @@ class SpeechEvents:
                                 # window either: re-render it from the pruned context,
                                 # failing closed exactly as at emission. An unpruned
                                 # request keeps its string byte-identical.
+                                # #242 round 25: from the record it was first formed with,
+                                # never the published turn, which keeps a label the forget
+                                # may have made stale.
+                                record, unlabelled = self._formed[payload["request_id"]]
                                 payload["formed_request"] = self._render_request(
-                                    payload["turn"], turns
+                                    record, turns, unlabelled
                                 )
                 size = len(encode_json(payload)) + 1
                 # A re-rendered string may grow, so the rebuilt queue is held to the
@@ -831,6 +856,9 @@ class SpeechEvents:
                 kept.append((payload, size))
                 self._queue_bytes += size
             self._queue = kept
+            queued = {p["request_id"] for p, _size in kept if p["type"] == "request"}
+            for request_id in [r for r in self._formed if r not in queued]:
+                del self._formed[request_id]
             self._poll_owner_voice()
 
     def _poll_owner_voice(self):
@@ -1388,6 +1416,15 @@ class SpeechEvents:
             # either (round 17): its request still goes, without engagement, appendix,
             # explicit end, cool-down or a withdrawable record.
             self._label_stale = set(self._pending)
+            # #242 round 25: nothing derived after the forget names a label from before it,
+            # or a role only that label gave: not a formed request's context or a role
+            # question's past turns (`_old_labels`), not the latest request a later decision
+            # is told of, nor a pending turn's withdrawal, whose `dismiss` is still to come.
+            self._old_labels.update(self._seen)
+            if self.last_request is not None:
+                self.last_request = (*self.last_request[:3], None)
+            for key, fields in self._withdrawn.items():
+                self._withdrawn[key] = _unlabelled(fields)
             if not self._labels_renewed and self._report is not None:
                 # Counts and states only: which labels, never.
                 with contextlib.suppress(Exception):
@@ -1838,7 +1875,13 @@ class SpeechEvents:
         role = self._roles.get(turn.speaker_id)
         if role is not None:
             return role
-        recent = [_role_state(record) for record in past[-ROLE_CONTEXT_TURNS:]]
+        # #242 round 25: a past turn from before the forget carries no label or role here.
+        recent = [
+            _role_state(
+                _unlabelled(record) if record["utterance_id"] in self._old_labels else record
+            )
+            for record in past[-ROLE_CONTEXT_TURNS:]
+        ]
         current = _role_state(turn.to_dict())
         participants = sorted(
             {r["speaker_id"] for r in [*recent, current] if r["speaker_id"] is not None}
@@ -2099,7 +2142,10 @@ class SpeechEvents:
             # Form before any reservation or emission so the burst reserve below counts
             # the exact request bytes, formed string included, and a failing former
             # fails closed before anything of this decision is queued.
-            formed = self._form_request(turn, role, context) if attended else {}
+            # #242 round 25: formed with the decided role and the label as decided (none for a
+            # stale turn), like everything else derived at the decision; only the request's
+            # `turn` and `context` keep what their transcripts published.
+            formed = self._form_request(request_id, turn, decided, context) if attended else {}
             ack, ack_note = (
                 self._acknowledge(turn, event.decision, evidence) if attended else ({}, None)
             )
@@ -2156,7 +2202,9 @@ class SpeechEvents:
                             after,
                             {
                                 "request_id": request_id,
-                                "turn": _with_role(turn, role),
+                                # #242 round 25: the exact request emitted below, whose
+                                # turn is the heard one, label included.
+                                "turn": _with_role(heard, role),
                                 "decision": evidence,
                                 "context": context,
                                 "decision_at_ms": self._now,
@@ -2350,7 +2398,7 @@ class SpeechEvents:
                         raise ContractError("open request budget exceeded")
                     self._open[request_id] = turn.end_ms
                 if self._conversation is not None and not self._conversation.is_closing(turn.text):
-                    self._engage(turn, request_id, role)
+                    self._engage(turn, request_id, decided)
                 if ack.get("acknowledge") is True:
                     self._hold_ack(turn)
                 if ack_note is not None and self._report is not None:
@@ -2405,18 +2453,32 @@ class SpeechEvents:
         )
         return {"acknowledge": acknowledge}, note
 
-    def _form_request(self, turn, role, context):
+    def _form_request(self, request_id, turn, role, context):
         """The optional ``formed_request`` field, present only when a former is configured.
+
+        `turn` and `role` are as decided: a stale turn's has no label and its decided role
+        (#242 round 25). Context turns from before the speakers were forgotten are rendered
+        unlabelled. What it was formed with is kept for a re-render (`expire`).
 
         A former that raises or returns an invalid value fails closed: the session's
         content is released and the error ends the session, never a silently dropped field.
         """
         if self._former is None:
             return {}
-        return {"formed_request": self._render_request(_with_role(turn, role), context["turns"])}
+        record = _with_role(turn, role)
+        unlabelled = frozenset(
+            t["utterance_id"] for t in context["turns"] if t["utterance_id"] in self._old_labels
+        )
+        formed = self._render_request(record, context["turns"], unlabelled)
+        self._formed[request_id] = (record, unlabelled)
+        return {"formed_request": formed}
 
-    def _render_request(self, record, context_turns):
-        """Run the former on the bounded state for one request record and its context."""
+    def _render_request(self, record, context_turns, unlabelled):
+        """Run the former on the bounded state for one request record and its context;
+        context turns in `unlabelled` are rendered without their label and owner role."""
+        context_turns = [
+            _unlabelled(t) if t["utterance_id"] in unlabelled else t for t in context_turns
+        ]
         state = {
             "current_turn": copy.deepcopy(record),
             "context_turns": copy.deepcopy(context_turns),
@@ -2501,4 +2563,6 @@ class SpeechEvents:
             result = [payload for payload, _size in self._queue]
             self._queue.clear()
             self._queue_bytes = 0
+            # Delivered: never re-rendered again.
+            self._formed.clear()
             return copy.deepcopy(result)

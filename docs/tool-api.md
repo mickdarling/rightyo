@@ -1288,8 +1288,15 @@ turn accepted under the old labels and decided afterwards still forms its reques
 no one and leaves nothing keyed by its label. Its owner or trusted role gives it no authority
 then: it supersedes nothing, its stop phrase stops nothing, owner-only mode ignores it, and its
 decision publishes `role: "unknown"` (in `attention`, `request` and `dismiss` alike), so a host
-does not count it as the owner's. The request's `turn` still carries the role its `transcript`
-published before the forget, so the two still match. While it is pending, an owner's later
+does not count it as the owner's. Only two things carry the transcript-time role and label:
+the request's `turn` and its `context.turns`, which stay exactly as their `transcript` events
+published them before the forget, so a host's fingerprints of them still match. Everything else
+derived after the forget names no label from before it and no owner or trusted role only that
+label gave: the request's `formed_request` (its asker unlabelled with the decided role, so a
+former says the requester is not an owner, and its earlier turns unlabelled), also when expiry
+re-renders it; a `dismiss` for a pending request withdrawn before the forget; the latest request
+a later decision is told of; a role question's past turns; and diagnostic lines, which never
+carry labels. While it is pending, an owner's later
 override supersedes it like any non-owner turn. A speaker *configured* as owner or trusted by
 diarizer label (`speakers.owners`) gives no role after the speakers are forgotten, until the
 session restarts, since the fresh diarizer may give that label to anyone; only a live voiceprint
