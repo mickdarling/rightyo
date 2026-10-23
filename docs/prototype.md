@@ -42,7 +42,8 @@ of a name, for example `"variants": {"Hailing Station": ["Haling Station"]}`; se
 `"meeting": {"ask_anywhere": true}` configures meeting mode
 (hailing-station#735 meeting mode (#227)). The boolean defaults to true: while the host's
 meeting control is on, an owner-authority turn naming the assistant anywhere promotes
-`uncertain` to `attend`, never `ignore`. False keeps only media mode's name/owner bar.
+`uncertain` to `attend`, never `ignore`. False keeps the name/owner bar without promotion.
+With no speaker roles, meeting mode attends nothing; inferred or unlabelled turns never pass.
 The section accepts only `ask_anywhere`; it does not turn meeting mode on. See the
 [control contract](tool-api.md#meeting-mode). An optional
 `"turns": {"merge_gap_ms": 2000}` sets how long a finalized turn waits for a continuation

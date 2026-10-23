@@ -1200,14 +1200,18 @@ lines, not recordings; the PR records the tables.
 For hailing-station#735 meeting mode (#227), a host sends `{"meeting": true}` or
 `{"meeting": false}` over `listen --mode stdin --control-fd N` only to a child whose
 `started` advertises `"meeting": {"version": 1}`. This optional top-level object is
-advertised under the same host-control condition as `duck`; older Swift `Decodable`
-hosts ignore unknown top-level and decision-evidence keys, as with `media` evidence.
+advertised whenever the live controller's host channel accepts ordinary controls, as
+for media, including with an explicitly consented hosted speech backend. It is absent
+for replay and coaching listeners, whose descriptor carries only coaching records.
+Older Swift `Decodable` hosts ignore unknown top-level and decision-evidence keys,
+as with `media` evidence.
 Only that exact key set and a boolean are accepted; malformed lines are skipped with
 the content-free `invalid control line; skipped` stderr note. Changes emit nothing,
 persist across sessions, and apply to turns accepted afterward, never pending decisions.
 
-While on, media mode's bar applies: attends need the assistant's configured name and,
-with roles, owner authority; every follow-up is refused (`meeting`). By default
+While on, attends require both the assistant's configured name and owner authority;
+without speaker roles, nothing attends (fail closed). Inferred or unlabelled turns
+never pass. Every follow-up is refused (`meeting`). By default
 `"meeting": {"ask_anywhere": true}` in the prototype config also promotes an
 owner-authority turn naming the assistant anywhere from model `uncertain` to `attend`,
 with recipient `system` and optional evidence `"meeting": "ask_anywhere"`. It never

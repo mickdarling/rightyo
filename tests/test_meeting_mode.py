@@ -128,7 +128,7 @@ class MeetingModeTests(unittest.TestCase):
                     self.assertEqual(evidence["meeting"], "ask_anywhere")
                 self.assertNotIn("attention_promoted reason=named_owner", self.notes)
 
-    def test_ask_anywhere_false_leaves_only_the_media_bar(self):
+    def test_ask_anywhere_false_leaves_the_owner_and_name_bar(self):
         self.start(meeting_ask_anywhere=False)
         self.assert_no_request(self.say())
         self.start(meeting_ask_anywhere=False)
@@ -138,9 +138,51 @@ class MeetingModeTests(unittest.TestCase):
         for options in ({"priority": None}, {"addressing": None}):
             with self.subTest(options=options):
                 self.start(**options)
-                self.assert_no_request(
-                    self.say(), "ignore" if "addressing" in options else "uncertain"
-                )
+                self.assert_no_request(self.say(), "ignore")
+
+    def test_named_attends_without_roles_fail_closed_even_for_inferred_or_unlabelled_turns(self):
+        for speaker in ("Speaker A", "Speaker B", None):
+            for inferred in (False, True):
+                with self.subTest(speaker=speaker, inferred=inferred):
+                    self.start(priority=None)
+                    events = self.say(
+                        "Jarvis, open the synthetic ledger.",
+                        "attend",
+                        speaker=speaker,
+                        inferred=inferred,
+                    )
+                    self.assert_no_request(events, "ignore")
+                    self.assertIs(events[1]["decision"]["meeting"], True)
+
+    def test_unlabelled_named_turns_with_roles_never_promote_or_attend(self):
+        for label in ("uncertain", "attend"):
+            with self.subTest(label=label):
+                self.start()
+                self.assert_no_request(self.say(label=label, speaker=None), "ignore")
+
+    def test_pending_public_uncertain_is_not_promoted_after_privacy_entry(self):
+        self.start(duck=True)
+        current = turn("t1", 0, 900, ASK)
+        self.events.transcript(current, 900)
+        self.events.duck(True, now_ms=1000)
+        self.events.decision(decided(current, "uncertain"), 1100)
+        events = self.events.drain()
+        self.assertTrue(self.events.ducked)
+        self.assert_no_request(events)
+        self.assertNotIn("meeting", events[1]["decision"])
+
+    def test_named_owner_turn_heard_entirely_in_privacy_is_dropped_with_meeting_on(self):
+        for label in ("uncertain", "attend"):
+            with self.subTest(label=label):
+                self.start(duck=True)
+                self.events.duck(True, now_ms=1000)
+                current = turn("t1", 1100, 1900, ASK)
+                self.events.transcript(current, 1900)
+                self.events.decision(decided(current, label), 2000)
+                self.assertTrue(self.events.ducked)
+                self.assertEqual(self.events.drain(), [])
+                self.assertEqual(self.events._memory.retained_ids, set())
+                self.assertEqual(self.events._pending, {})
 
     def test_follow_up_is_refused_with_meeting_token_even_with_media_on(self):
         for media in (False, True):
@@ -214,10 +256,11 @@ class MeetingModeTests(unittest.TestCase):
 
     def test_advertised_only_with_host_control_beside_capabilities(self):
         for control in (False, True):
-            with self.subTest(control=control):
-                started = self.start(duck=control)
-                self.assertEqual(started.get("meeting"), {"version": 1} if control else None)
-                self.assertNotIn("meeting", started["capabilities"])
+            for duck in (False, True):
+                with self.subTest(control=control, duck=duck):
+                    started = self.start(meeting=control, duck=duck)
+                    self.assertEqual(started.get("meeting"), {"version": 1} if control else None)
+                    self.assertNotIn("meeting", started["capabilities"])
 
     def test_control_is_silent_strict_and_forwarded_without_a_session(self):
         events = SpeechEvents()
@@ -234,6 +277,10 @@ class MeetingModeTests(unittest.TestCase):
                 events.meeting(value)
             with self.assertRaises(ContractError):
                 events.start(SESSION, meeting_ask_anywhere=value)
+            with self.assertRaises(ContractError):
+                events.start(SESSION, meeting=value)
+            with self.assertRaises(ContractError):
+                SpeechEvents(meeting_control=value)
 
 
 class MeetingConfigTests(unittest.TestCase):

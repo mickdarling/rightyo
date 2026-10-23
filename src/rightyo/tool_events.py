@@ -430,15 +430,20 @@ class SpeechEvents:
         report=None,
         retain_transcripts=True,
         duck_control=True,
+        meeting_control=True,
     ):
         if type(retain_transcripts) is not bool:
             raise ContractError("invalid transcript retention setting")
         if type(duck_control) is not bool:
             raise ContractError("invalid duck control setting")
+        if type(meeting_control) is not bool:
+            raise ContractError("invalid meeting control setting")
         # Whether this publisher's host control channel takes `{"duck": ...}` lines
         # (hailing-station #735): false for a coaching listener, whose control descriptor
         # carries only coaching records, so a live controller never advertises duck mode.
         self.duck_control = duck_control
+        # Ordinary meeting controls are independent of privacy's speech-backend limits.
+        self.meeting_control = meeting_control
         self._retain_transcripts = retain_transcripts
         # At least five: one open request plus the owner's transcript, attention and
         # request, with a terminal slot, so the static and dynamic override bounds agree.
@@ -721,6 +726,7 @@ class SpeechEvents:
         other_agents=None,
         owner_voice=None,
         duck=False,
+        meeting=False,
     ):
         with self._lock:
             identifier(session_id, "session_id")
@@ -742,6 +748,8 @@ class SpeechEvents:
                 raise ContractError("attention requires transcript retention")
             if type(duck) is not bool:
                 raise ContractError("invalid duck capability")
+            if type(meeting) is not bool:
+                raise ContractError("invalid meeting capability")
             if type(meeting_ask_anywhere) is not bool:
                 raise ContractError("invalid meeting ask_anywhere setting")
             if other_agents is not None and not isinstance(other_agents, Addressing):
@@ -881,9 +889,9 @@ class SpeechEvents:
                     if duck
                     else {}
                 ),
-                # Same host-control boundary as duck; older Decodable hosts ignore this
-                # optional top-level key (hailing-station#735 meeting mode (#227)).
-                **({"meeting": {"version": 1}} if duck else {}),
+                # Ordinary host control, including hosted speech; older Decodable hosts
+                # ignore this optional top-level key (hailing-station#735, #227).
+                **({"meeting": {"version": 1}} if meeting else {}),
             )
 
     def expire(self, now_ms):
@@ -1411,8 +1419,9 @@ class SpeechEvents:
             self._media = on
 
     def meeting(self, on):
-        """hailing-station#735 meeting mode (#227): media's bar, optional named-owner
+        """hailing-station#735 meeting mode (#227): owner + name, optional named-owner
         promotion anywhere, no follow-ups. Keeps transcripts/context; emits nothing.
+        Without speaker roles, nothing attends; inferred/unlabelled turns never pass.
         Like media, held across sessions and snapshotted when accepting each turn.
         """
         if type(on) is not bool:
@@ -2353,10 +2362,10 @@ class SpeechEvents:
             if (
                 self._meeting_for(turn)
                 and evidence["label"] in {"attend", "uncertain"}
-                and not self._media_attends(turn, authority)
+                and not (authority == "owner" and mentions_name(self._addressing, turn.text))
             ):
-                # hailing-station#735 meeting mode (#227): apply media's bar before any
-                # promotion (#251 too), so inferred owners never acquire authority.
+                # Meeting (#227) always requires owner authority, even without roles.
+                # Gate before any promotion (#251 too); inferred labels never authorize.
                 evidence["label"] = "ignore"
                 evidence["meeting"] = True
             elif unavailable is None and not stop and not dismissed:
