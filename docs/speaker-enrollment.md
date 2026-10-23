@@ -72,8 +72,9 @@ Optional keys: `store` (an absolute directory, default
 `tentative_threshold` (default 0.45, below the bind threshold), `min_turn_seconds` (default
 1.0, 0.5 to 10), `threads` (1 to 8, default 4), `live` (default false; see
 [shadow identification](#shadow-identification-in-live-sessions)), `bind_min_seconds`
-(default 3.0, 0.5 to 120), `entry_threshold` (default 0.35, 0 to 1) and
-`entry_min_seconds` (default 0.5, 0.2 to 10), which decide the privacy-entry voice check
+(default 3.0, 0.5 to 120), `entry_threshold` (default 0.35, 0 to 1), `entry_min_seconds`
+(default 0.5, 0.2 to 10), `entry_remainder_threshold` (default 0.35, 0 to 1) and
+`entry_word_seconds` (default 0.3, 0.1 to 5), which decide the privacy-entry voice check
 (hailing-station #735; see [`role_source`](tool-api.md#voiceprint-owner-on-transcripts)),
 and `enabled` (default true). The section is off when absent or `"enabled": false`.
 

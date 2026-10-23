@@ -39,7 +39,7 @@ from rightyo.live_audio import (
     _transcribe,
     recognizer_dir,
 )
-from rightyo.live_speaker_id import EnrolledRoles, PcmRing
+from rightyo.live_speaker_id import EnrolledRoles, EntryScore, PcmRing
 from rightyo.memory import TranscriptMemory
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
 from rightyo.providers import ConfiguredPriorityProvider
@@ -103,16 +103,19 @@ class Bindings:
 
 
 class Checked(Bindings):
-    """`Bindings` with a privacy-entry voice check that scores every span `score`."""
+    """`Bindings` with a privacy-entry voice check that scores every turn's own pieces
+    `score`, with no inferred remainder to judge."""
 
     def __init__(self, labels, score):
         super().__init__(labels)
         self.score = score
-        self.settings = SimpleNamespace(entry_threshold=0.35)
+        self.settings = SimpleNamespace(
+            entry_threshold=0.35, entry_remainder_threshold=0.35, entry_word_seconds=0.3
+        )
         self.lines = []
 
-    def entry_score(self, start_ms, end_ms, owners):
-        return self.score, "scored"
+    def entry_score(self, start_ms, end_ms, spans, owners):
+        return EntryScore(self.score, None, 0, "scored")
 
     def _report(self, message):
         self.lines.append(message)
@@ -645,6 +648,7 @@ class PrivacyEventsTests(unittest.TestCase):
                 roles = EnrolledRoles(OWNER_ID)
                 roles.source = source
                 self.start(provider=roles)
+                roles.note_spans(name, ((0, 600),))
                 self.events.transcript(heard(name, 0, 900, text, speaker), 900, inferred=True)
                 (event, *_rest) = self.events.drain()
                 self.assertEqual(event.get("role_source"), expected)

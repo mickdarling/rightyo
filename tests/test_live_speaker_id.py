@@ -534,16 +534,19 @@ class ToneEmbedder:
 
 
 class EntryCheckTests(unittest.TestCase):
-    """The privacy-entry voice check (hailing-station #735): a turn's whole span, inferred
-    words included, scored against the owner's voiceprint; any failure refuses."""
+    """The privacy-entry voice check (hailing-station #735, rightyo#250): a turn's own-label
+    pieces and its inferred remainder, each scored on its own against the owner's voiceprint;
+    any failure refuses."""
 
     def shadow(self, **overrides):
         lines: list[str] = []
+        ring_ms = overrides.pop("ring_ms", 60000)
         shadow = ShadowSpeakerId(
             settings(**overrides),
             report=lines.append,
             embedder_factory=lambda _settings: ToneEmbedder(),
             entries=lambda _settings: [dict(entry) for entry in ENTRIES],
+            ring_ms=ring_ms,
         )
         shadow.start()
         self.addCleanup(shadow.close)
@@ -554,71 +557,109 @@ class EntryCheckTests(unittest.TestCase):
         roles.source = shadow
         return roles
 
-    def test_the_owners_whole_voice_scores_and_a_guests_does_not(self):
+    def entry(self, roles, start, end, spans):
+        current = turn(start, end)
+        roles.note_spans(current.utterance_id, spans)
+        return roles.entry_voice(current)
+
+    def test_the_owners_own_pieces_pass_and_a_guests_do_not(self):
         shadow, _lines = self.shadow()
         shadow.audio(tone(1.0, OWNER_F0) + tone(1.0, GUEST_F0))
-        owner = shadow.entry_score(0, 1000, ["owner"])
-        guest = shadow.entry_score(1000, 2000, ["owner"])
-        self.assertEqual(owner[1], "scored")
-        self.assertGreater(owner[0], 0.99)
-        self.assertEqual(guest[1], "scored")
-        self.assertLess(guest[0], 0.1)
+        owner = shadow.entry_score(0, 1000, ((0, 1000),), ["owner"])
+        self.assertEqual((owner.outcome, owner.remainder, owner.remainder_ms), ("scored", None, 0))
+        self.assertGreater(owner.labelled, 0.99)
+        self.assertLess(shadow.entry_score(1000, 2000, ((1000, 2000),), ["owner"]).labelled, 0.1)
 
-    def test_a_guests_words_joined_under_the_owners_label_refuse_entry(self):
-        # 0.4 s of the owner, then 1.6 s of a guest inferred under the owner's label.
+    def test_an_even_owner_and_guest_mix_refuses(self):
+        # Codex P1 on #250: the owner says "stop", a guest's "recording" is inferred under his
+        # label. Scored whole, the mix would pass; scored apart, the guest's part refuses.
         shadow, lines = self.shadow()
-        shadow.audio(tone(0.4, OWNER_F0) + tone(1.6, GUEST_F0) + tone(1.0, OWNER_F0))
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.6, GUEST_F0))
         roles = self.roles(shadow)
-        mixed, own = turn(0, 2000), turn(2000, 3000)
-        self.assertFalse(roles.entry_voice(mixed))
-        self.assertTrue(roles.entry_voice(own))
-        checks = [line for line in lines if "entry_check" in line]
-        prefix = "speaker_id entry_check outcome="
-        self.assertRegex(checks[0], rf"^{prefix}refuse reason=scored score=0\.\d+ threshold=0\.35$")
-        self.assertEqual(checks[1], f"{prefix}pass reason=scored score=1.000 threshold=0.35")
+        self.assertFalse(self.entry(roles, 0, 1200, ((0, 600),)))
+        (line,) = [line for line in lines if "entry_check" in line]
+        self.assertRegex(
+            line,
+            r"^speaker_id entry_check outcome=refuse reason=scored score=1\.000 threshold=0\.35"
+            r" remainder_ms=600 remainder_score=0\.\d{3} remainder_threshold=0\.35$",
+        )
         self.assertNotIn(PRIVATE_TEXT, " ".join(lines))
 
-    def test_the_threshold_and_minimum_come_from_the_config(self):
-        shadow, lines = self.shadow(entry_threshold=0.2, entry_min_seconds=1.5)
-        shadow.audio(tone(0.4, OWNER_F0) + tone(1.6, GUEST_F0) + tone(1.0, OWNER_F0))
+    def test_a_short_inferred_edge_is_ignored_and_the_owners_own_word_passes(self):
+        shadow, lines = self.shadow()
+        # 0.6 s of the owner with a 0.2 s edge (too short to carry a word), then 0.6 s of the
+        # owner with his own 0.5 s inferred word.
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.2, GUEST_F0))
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.5, OWNER_F0))
         roles = self.roles(shadow)
-        self.assertTrue(roles.entry_voice(turn(0, 2000)))
-        self.assertEqual(shadow.entry_score(2000, 3000, ["owner"]), (None, "short"))
-        self.assertFalse(roles.entry_voice(turn(2000, 3000)))
-        refused = "speaker_id entry_check outcome=refuse reason=short score=- threshold=0.20"
-        self.assertIn(refused, lines)
+        self.assertTrue(self.entry(roles, 0, 800, ((0, 600),)))
+        self.assertTrue(self.entry(roles, 800, 1900, ((800, 1400),)))
+        checks = [line for line in lines if "entry_check" in line]
+        self.assertIn("remainder_ms=200 remainder_score=- remainder_threshold=0.35", checks[0])
+        self.assertIn("remainder_ms=500 remainder_score=1.000", checks[1])
 
-    def test_too_little_speech_or_no_identifier_refuses(self):
-        shadow, _lines = self.shadow()
-        shadow.audio(tone(0.3, OWNER_F0))
-        self.assertEqual(shadow.entry_score(0, 300, ["owner"]), (None, "short"))
-        self.assertEqual(shadow.entry_score(5000, 6000, ["owner"]), (None, "unavailable"))
-        self.assertEqual(shadow.entry_score(0, 300, ["nobody"]), (None, "short"))
+    def test_a_clipped_span_refuses(self):
+        # Codex P2 on #250: never score what is left of a span the ring no longer holds.
+        shadow, _lines = self.shadow(ring_ms=1000)
+        shadow.audio(tone(2.0, OWNER_F0))
+        self.assertEqual(shadow.entry_score(0, 2000, ((0, 2000),), ["owner"]).outcome, "clipped")
+        self.assertFalse(self.entry(self.roles(shadow), 0, 2000, ((0, 2000),)))
+
+    def test_too_little_own_speech_or_no_spans_or_identifier_refuses(self):
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.3, OWNER_F0) + tone(0.9, OWNER_F0))
+        roles = self.roles(shadow)
+        self.assertEqual(shadow.entry_score(0, 1200, ((0, 300),), ["owner"]).outcome, "short")
+        self.assertFalse(self.entry(roles, 0, 1200, ((0, 300),)))
+        self.assertIn("outcome=refuse reason=short score=-", lines[-1])
+        # No pieces noted for this turn: nothing is the label's own.
+        self.assertFalse(roles.entry_voice(turn(0, 1200)))
+        self.assertEqual(
+            shadow.entry_score(0, 1200, ((0, 1200),), ["nobody"]).outcome, "unavailable"
+        )
         shadow.close()
-        self.assertEqual(shadow.entry_score(0, 300, ["owner"]), (None, "unavailable"))
-        roles = EnrolledRoles(SpeakerPriority.from_dict({"owner": ["owner"]}))
-        self.assertFalse(roles.entry_voice(turn(0, 300)))
+        self.assertEqual(
+            shadow.entry_score(0, 1200, ((0, 1200),), ["owner"]).outcome, "unavailable"
+        )
+        orphan = EnrolledRoles(SpeakerPriority.from_dict({"owner": ["owner"]}))
+        self.assertFalse(self.entry(orphan, 0, 1200, ((0, 1200),)))
+
+    def test_the_thresholds_and_lengths_come_from_the_config(self):
+        shadow, lines = self.shadow(
+            entry_threshold=0.2, entry_remainder_threshold=0.0, entry_word_seconds=0.1
+        )
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.6, GUEST_F0))
+        self.assertTrue(self.entry(self.roles(shadow), 0, 1200, ((0, 600),)))
+        self.assertIn("threshold=0.20 remainder_ms=600", lines[-1])
 
     def test_the_entry_keys_are_validated(self):
         base = {"python": "/synthetic/python", "model": "/synthetic/model.onnx", "live": True}
         config = SpeakerIdConfig.from_dict(base)
-        self.assertEqual((config.entry_threshold, config.entry_min_seconds), (0.35, 0.5))
-        tuned = SpeakerIdConfig.from_dict(base | {"entry_threshold": 0.5, "entry_min_seconds": 1})
-        self.assertEqual((tuned.entry_threshold, tuned.entry_min_seconds), (0.5, 1.0))
+        self.assertEqual(
+            (
+                config.entry_threshold,
+                config.entry_min_seconds,
+                config.entry_remainder_threshold,
+                config.entry_word_seconds,
+            ),
+            (0.35, 0.5, 0.35, 0.3),
+        )
+        tuned = SpeakerIdConfig.from_dict(
+            base | {"entry_remainder_threshold": 0.2, "entry_word_seconds": 1}
+        )
+        self.assertEqual((tuned.entry_remainder_threshold, tuned.entry_word_seconds), (0.2, 1.0))
         for bad in (
             {"entry_threshold": 1.5},
             {"entry_threshold": "0.4"},
             {"entry_threshold": True},
             {"entry_min_seconds": 0.1},
             {"entry_min_seconds": 11},
+            {"entry_remainder_threshold": -0.1},
+            {"entry_word_seconds": 0.05},
+            {"entry_word_seconds": 6},
         ):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 SpeakerIdConfig.from_dict(base | bad)
-
-    def test_a_check_with_no_owner_voiceprint_refuses(self):
-        shadow, _lines = self.shadow()
-        shadow.audio(tone(1.0, OWNER_F0))
-        self.assertEqual(shadow.entry_score(0, 1000, ["nobody"]), (None, "unavailable"))
 
 
 class SegmentScoringTests(unittest.TestCase):

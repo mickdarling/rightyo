@@ -664,8 +664,8 @@ differences:
   (#148), and inferred words lie outside them, so another voice's words joined under a
   label can never bind that label to an enrolled identity. The inference is internal: such a
   turn never carries [`role_source: "voiceprint"`](#voiceprint-owner-on-transcripts), and
-  carries `"voiceprint_label"` only as a privacy entry whose whole span passes the owner
-  voice check.
+  carries `"voiceprint_label"` only as a privacy entry whose own pieces and inferred words
+  each pass the owner voice check.
 - **Authority is re-checked when the decision arrives.** If the label's binding no longer
   gives the turn its owner or trusted role by then (it fell below `tentative_threshold`),
   the turn is treated as `unknown` for policy: it emits no `override` and acts with no
@@ -1446,16 +1446,28 @@ with `speaker_id` `"live": true` and `"roles": true`). Its value is `"voiceprint
 word of the turn has an inferred label. When some do (edge attribution, tail join, or a lone
 wake word joined to the next piece), it is `"voiceprint_label"` only for a turn that may be
 a privacy entry (it says "privacy" or "private", or "stop" with "recording" or "listening")
-whose **whole span**, the inferred words included, passes the entry voice check: at least
-`speaker_id` `entry_min_seconds` (default 0.5) of speech scoring at least `entry_threshold`
-(default 0.35) against an owner's voiceprint. A guest's words joined under the owner's label
-pull that score down, so they cannot enter for him (hailing-station #735, Mick: "I should be
-the only one to be able to turn it on"). Short commands usually carry an inferred word, so a
-host accepts `"voiceprint_label"` for privacy entry and requires `"voiceprint"` where every
-word must be the owner's. An inferred owner turn that is not entry-shaped, or fails the
-check, carries nothing. Each check logs one line of numbers (`speaker_id entry_check
-outcome=pass|refuse reason=… score=… threshold=…`), never words or audio, and waits at most
-2 s. It is absent in every other case: an owner configured by session label in
+that passes the entry voice check, which judges the turn's two parts **apart**
+(hailing-station #735, Mick: "I should be the only one to be able to turn it on"):
+
+- the label's own timeline pieces must hold at least `speaker_id` `entry_min_seconds`
+  (default 0.5) of speech scoring at least `entry_threshold` (default 0.35) against an
+  owner's voiceprint;
+- the rest of the span, the inferred words, when it holds at least `entry_word_seconds`
+  (default 0.3, about a word) of speech, must score at least `entry_remainder_threshold`
+  (default 0.35) on its own. Less speech than that cannot carry a command word and is not
+  judged.
+
+So a guest's words joined under the owner's label are scored as themselves, never averaged
+into his voice, and an entry they complete is refused unless they score as the owner. A span
+any part of which the session audio ring no longer holds is refused (`clipped`), as is any
+failure. Short commands usually carry an inferred word, so a host accepts
+`"voiceprint_label"` for privacy entry and requires `"voiceprint"` where every word must be
+the owner's. An inferred owner turn that is not entry-shaped, or fails the check, carries
+nothing. Each check logs one line of numbers (`speaker_id entry_check outcome=pass|refuse
+reason=… score=… threshold=… remainder_ms=… remainder_score=… remainder_threshold=…`), never
+words or audio. It waits at most 2 s, and the session's other work waits with it: it runs as
+the turn is published, so only an entry-shaped inferred owner turn ever pays it. It is absent
+in every other case: an owner configured by session label in
 `speakers` (a TV or another voice diarized into that slot would carry the label), a guest,
 an unbound or unlabelled speaker, and a session without roles. No other value is ever sent;
 absent means "not a voiceprint owner". It is never on `attention` or
