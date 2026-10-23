@@ -974,6 +974,56 @@ class ConservativeAlignmentTests(unittest.TestCase):
         self.assertLessEqual(renewed[0], end + SPEAKER_RENEWAL_LIMIT_MS)
         self.assertTrue(made[0].closed)
 
+    def test_an_end_stamped_as_a_renewal_starts_is_renewed_at_its_own_end(self):
+        # #242 round 22: the request is claimed before the swap, so an end stamped between the
+        # claim and the new diarizer keeps its own renewal; its private frames never reach the
+        # diarizer that serves public speech.
+        made = []
+
+        def diarizer(config):
+            made.append(FakeDiarizer(config))
+            return made[-1]
+
+        processor = LiveProcessor(self.renewable_config(diarizer), lambda _turn: None)
+        self.addCleanup(processor.close)
+        renew = processor._renew_diarizer
+
+        def stamped():
+            if len(made) == 1:
+                processor.reset_speakers(processor._received_ms * BYTES_PER_MS + 5 * FRAME_BYTES)
+            renew()
+
+        processor._renew_diarizer = stamped
+        quiet = array.array("h", [77] * 320).tobytes()
+        processor.push_pcm16(SILENCE)
+        processor.reset_speakers()
+        for _ in range(5):
+            processor.push_pcm16(quiet)
+        for _ in range(3):
+            processor.push_pcm16(SILENCE)
+        self.assertEqual(len(made), 3)
+        self.assertFalse(any(77 in array.array("h", frame) for frame in made[-1].frames))
+
+    def test_privacy_ending_again_never_restarts_the_renewal_bound(self):
+        # #242 round 22: privacy back on and ended again within every 10 s, under steady merged
+        # speech, must not keep the diarizer that heard private voices labelling public turns.
+        made, turns, renewed = [], [], []
+        processor = self.steady_speech(made, turns)
+        processor.on_speakers_renewed = lambda: renewed.append(processor._received_ms)
+        private = array.array("h", [4321] * 320).tobytes()
+        for _ in range(100):
+            processor.push_pcm16(private)
+        for _ in range(10):
+            processor.reset_speakers()
+            for _ in range(400):
+                processor.push_pcm16(VOICE)
+            for _ in range(25):
+                processor.push_pcm16(private)
+        self.assertTrue(renewed)
+        self.assertLessEqual(renewed[0], 2000 + SPEAKER_RENEWAL_LIMIT_MS)
+        for earlier, later in zip(renewed, renewed[1:], strict=False):
+            self.assertLessEqual(later - earlier, SPEAKER_RENEWAL_LIMIT_MS + 8500)
+
     def test_a_turn_spanning_a_forced_renewal_keeps_no_old_label(self):
         # #242 round 21: the turn under way when the renewal is forced was labelled by the old
         # diarizer (seeded while private); it is published unlabelled, with no label evidence.

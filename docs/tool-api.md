@@ -1267,7 +1267,8 @@ host must offer another way out.
 
 **Privacy keeps no speakers either.** When the host turns privacy off, rightyo forgets every
 speaker: the diarizer starts afresh (once no utterance is open, so a turn under way keeps its
-labels, but at most 10 s of audio after the off is reached: steady speech then forces it, and
+labels, but at most 10 s of audio after the first off reached since the last renewal, so
+privacy ended again meanwhile never postpones it further: steady speech then forces it, and
 the turn under way is published with no speaker label and adds no speaker evidence), every
 speaker-ID binding is dropped, and the per-label roles go with them; both are dropped again the
 moment the fresh diarizer takes over, since its labels restart there and a turn finished while
