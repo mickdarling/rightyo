@@ -1305,6 +1305,20 @@ diarizer label (`speakers.owners`) gives no role after the speakers are forgotte
 session restarts, since the fresh diarizer may give that label to anyone; only a live voiceprint
 binding gives those roles then (logged once).
 
+**An empty privacy interval forgets nothing.** A privacy interval in which no audio was received
+(judged on the stream clock in bytes, so even one sample counts as heard) heard no one, so when
+it ends no speaker is forgotten: no diarizer renewal, no binding dropped, and configured owner and
+trusted labels keep their roles. `--start-private` followed by `{"duck": false}` before any audio
+leaves an `owner_only` listener working. With off, on and off again, only an interval that
+received audio forgets.
+
+**No private turn outlives the off.** When the stream reaches the privacy end, what the turn
+merger still holds (a turn waiting out the merge gap, the owner pause or a lone wake word, and
+any bridged backchannel) was all heard before it. If any of it was heard in privacy, all of it
+is discarded, words and all; otherwise it is released at once on its own. So nothing said after
+the end can be joined to a private turn, and the first public request after privacy is decided
+on its own instead of being dropped with the private turn it was joined to.
+
 The phrases match loosely: anywhere in the turn, ignoring case, punctuation and filler
 ("um", "uh", "ok", "okay", "so", "hey", "well", "please" and similar). A filler word that
 is part of a configured name or variant ("Okay", "Hey Jarvis") is kept only where it is
@@ -1363,6 +1377,15 @@ private. A session that would not advertise version 2 refuses the option and exi
 an error rather than starting un-private: `--coaching`, and a hosted transcriber or
 diarizer.
 
+**Hosted speech never runs private.** Privacy is never active while any audio consumer is
+hosted (a hosted transcriber or diarizer; the end-of-turn model and speaker identification are
+always local, and decisions never receive audio). Every way in is refused: `{"duck": true}`,
+`--start-private`, an embedding host's publisher that is already private when the controller is
+built or when any session starts (a restart, a demo or replay, or backends changed since), all
+with the same error. As a last line, the one point audio is fed to every consumer sends a
+hosted consumer nothing while privacy is on, whatever made it so: the session ends at once with
+`phase: "error"`, `reason: "privacy-hosted-speech"`.
+
 ### Voiceprint owner on transcripts
 
 For the host's owner-only decisions (privacy entry is owner-only on the host,
@@ -1398,7 +1421,8 @@ starting at it was heard after. A span turned on and off with no audio between (
 session that starts in privacy mode and is turned off before any audio) covers nothing.
 A turn the merger held across the off edge (the merge gap or the
 [owner pause](#joined-turns)), a continuation joined to a piece said in privacy mode, a
-bridged backchannel and a tail join all count, and so does speech said before the mode
+bridged backchannel and a tail join all count (and a turn held when the stream reaches the
+off is discarded there, so speech after the off is never joined to it), and so does speech said before the mode
 went on that is joined with speech said during it: none of it is ever emitted. A
 session's spans are kept for the whole session, at most 64; beyond that the oldest two
 are merged into one, which can only widen them.

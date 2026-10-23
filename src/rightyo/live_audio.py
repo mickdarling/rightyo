@@ -1385,6 +1385,7 @@ class LiveProcessor:
         if self._end_reached_ms is None:
             # The first end not yet renewed for (round 22): a later one never restarts the bound.
             self._end_reached_ms = self._received_ms
+        self._settle_held_at_privacy_end()
         first = start - FRAME_BYTES * len(self._pre_roll)
         frames = list(self._pre_roll)
         self._pre_roll.clear()
@@ -1395,6 +1396,23 @@ class LiveProcessor:
         self._utterance[:private] = bytes(private)
         private = min(len(pcm), max(0, until - start))
         return bytes(private) + pcm[private:]
+
+    def _settle_held_at_privacy_end(self) -> None:
+        """#242 round 27 (Codex P1): what the merger holds when the privacy end is reached was
+        all heard before it. If any of it, the held turn or a bridged backchannel, was heard in
+        privacy (`LiveConfig.private`; unknown counts), all of it is discarded, words and
+        all, so no speech after the end can be joined to it: a joined turn would overlap the
+        privacy span and be dropped whole, losing the first public request. Otherwise it is
+        released now, on its own, for the same reason. The end-of-turn judgement of an
+        utterance open across the end was made on private audio, so it is made again."""
+        self._end_of_turn_asked = self._complete = False
+        spans = self._merger.held_spans()
+        if not spans:
+            return
+        if self.config.private is None or any(self._heard_private(*span) for span in spans):
+            self._merger.discard()
+        else:
+            self._merger.flush()
 
     def _take_renewal(self) -> bool:
         """Claims a requested renewal once its privacy end is reached (round 21): the request

@@ -28,6 +28,7 @@ from test_live_audio import FakeDiarizer, document
 from rightyo import tool_events
 from rightyo.contracts import Addressing, ContractError, Dismissal, SpeakerPriority
 from rightyo.live_audio import (
+    FRAME_BYTES,
     MAX_RESPONSE_BYTES,
     READ_CHUNK_BYTES,
     LiveAudioError,
@@ -984,9 +985,10 @@ class DuckControllerTests(unittest.TestCase):
         current = heard("t1", 0, 4000, "synthetic")
 
         def cycle_first(*args, **kwargs):
-            controller._received_ms = 5000
+            controller._received_ms, controller._received_bytes = 5000, 5000 * 32
             controller.duck(True)
-            controller._received_ms = 6000
+            # Audio was received in the interval (#242 round 27: an empty one forgets nothing).
+            controller._received_ms, controller._received_bytes = 6000, 6000 * 32
             controller.duck(False)
             return ShadowSpeakerId.turn(shadow, *args, **kwargs)
 
@@ -1094,6 +1096,7 @@ class DuckControllerTests(unittest.TestCase):
                 events.last_request = (900, "Jarvis, add milk.", "u1", "Speaker A")
                 if edge == "off":
                     controller.duck(True)
+                    controller._received_bytes += 2  # one sample heard (#242 round 27)
                     controller.duck(False)
                 else:
                     controller._speakers_renewed()
@@ -1340,7 +1343,11 @@ class DuckControllerTests(unittest.TestCase):
         events = SpeechEvents()
         local = SimpleNamespace(hosted_speech=False)
         controller = SimpleNamespace(
-            _lock=threading.RLock(), _events=events, _received_ms=7, config=local
+            _lock=threading.RLock(),
+            _events=events,
+            _received_ms=7,
+            _received_bytes=224,
+            config=local,
         )
         PrototypeController.duck(controller, True)
         self.assertIs(events._duck, True)
@@ -1895,6 +1902,299 @@ class DuckControlTests(unittest.TestCase):
             _read_control(read, recorder)
         self.assertEqual(recorder.calls, [("duck", True), ("media", True), ("duck", False)])
         self.assertEqual(errors.getvalue().count("skipped"), 5)
+
+
+HOSTED_CONSUMERS = {
+    "transcriber": {
+        "transcriber": {
+            "kind": "hosted-openai-compatible",
+            "endpoint": "https://transcribe.example.test/v1/audio/transcriptions",
+            "model": "whisper-1",
+        }
+    },
+    "diarizer": {"diarizer": {"kind": "hosted-deepgram", "model": "nova-3"}},
+}
+
+
+class Round27Tests(unittest.TestCase):
+    """#242 round 27 (Codex P1 x3 on 5c8a870), one test per class, over its members."""
+
+    controller = DuckControllerTests.controller
+
+    def publisher(self, private=False):
+        events = SpeechEvents()
+        if private:
+            events.duck(True, now_ms=0)
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        return events
+
+    def test_hosted_speech_never_runs_private_by_any_path(self):
+        # Class A: with any hosted audio consumer configured, every path to privacy is refused
+        # (or startup rejected), and the one choke point feeds a hosted consumer nothing while
+        # private, whatever path made privacy active.
+        from test_turn_merge import TEXTS, ScriptedDiarizer, ScriptedTranscriber
+
+        from rightyo.tool import listen
+
+        voice = b"\x01\x02" * 16_000
+
+        def cli(extra):
+            # `listen --start-private`.
+            directory = tempfile.TemporaryDirectory()
+            self.addCleanup(directory.cleanup)
+            asset = Path(directory.name) / "asset"
+            asset.touch()
+            path = Path(directory.name) / "config.json"
+            keys = ("whisper_executable", "whisper_model", "diarization_library")
+            keys += ("diarization_model", "microphone_helper", "demo_audio")
+            path.write_text(json.dumps({**dict.fromkeys(keys, str(asset)), **extra}))
+            args = SimpleNamespace(
+                config=path,
+                mode="demo",
+                session_id="r27-cli",
+                use_jev=False,
+                allow_hosted=True,
+                names=None,
+                start_private=True,
+                coaching=False,
+            )
+            with contextlib.redirect_stderr(io.StringIO()):
+                listen(args, output=io.StringIO())
+
+        def ducked_publisher(extra):
+            # A caller's publisher already private before the controller is built.
+            self.controller(
+                constructor={
+                    "event_publisher": self.publisher(private=True),
+                    "allow_hosted_speech": True,
+                },
+                **extra,
+            )
+
+        def duck_line(extra):
+            controller = self.controller(constructor={"allow_hosted_speech": True}, **extra)
+            controller._events = self.publisher()
+            controller.duck(True)
+
+        def no_audio(*_args, **_options):
+            raise PrototypeError("no audio in this test")
+
+        def restart(mode):
+            def path(extra):
+                # Made private outside the controller between sessions, then started again.
+                events = self.publisher()
+                controller = self.controller(
+                    constructor={
+                        "event_publisher": events,
+                        "allow_hosted_speech": True,
+                        "processor_factory": no_audio,
+                    },
+                    **extra,
+                )
+                events.duck(True, now_ms=0)
+                controller.start({"mode": mode, "session_id": f"r27-{mode}"})
+
+            return path
+
+        def swap(extra):
+            # A local session made private, then its speech backends swapped to a hosted one.
+            controller = self.controller(
+                constructor={
+                    "event_publisher": self.publisher(private=True),
+                    "allow_hosted_speech": True,
+                    "processor_factory": no_audio,
+                }
+            )
+            hosted = self.controller(constructor={"allow_hosted_speech": True}, **extra)
+            controller.config = hosted.config
+            controller.start({"mode": "demo", "session_id": "r27-swap"})
+
+        refused = {
+            "cli --start-private": cli,
+            "programmatic ducked publisher": ducked_publisher,
+            "duck(True) line": duck_line,
+            "restart (microphone)": restart("microphone"),
+            "replay (demo)": restart("demo"),
+            "backend swap": swap,
+        }
+        for consumer, extra in HOSTED_CONSUMERS.items():
+            for name, path in refused.items():
+                with self.subTest(consumer=consumer, path=name):
+                    with self.assertRaisesRegex(PrototypeError, "refused with a hosted"):
+                        path(extra)
+
+        # Privacy made active mid-session by a path that bypasses every refusal (the
+        # publisher's own `duck`), before and after a forced diarizer renewal built a NEW
+        # diarizer: the hosted transcriber and diarizer receive nothing while private, and the
+        # session ends as an error.
+        for consumer, extra in HOSTED_CONSUMERS.items():
+            for renewal in (False, True):
+                with self.subTest(consumer=consumer, path="bypass", renewal=renewal):
+                    events = self.publisher()
+                    controller = self.controller(
+                        constructor={"event_publisher": events, "allow_hosted_speech": True},
+                        **extra,
+                    )
+                    controller._event_terminal = False
+                    transcriber, made = ScriptedTranscriber(TEXTS), []
+
+                    def diarizer(_config, made=made):
+                        made.append(ScriptedDiarizer())
+                        return made[-1]
+
+                    processor = LiveProcessor(
+                        LiveConfig(
+                            "r27-bypass",
+                            provenance="causal-replay",
+                            transcriber=transcriber,
+                            diarizer=diarizer,
+                        ),
+                        lambda turn: None,
+                    )
+                    self.addCleanup(processor.close)
+                    controller._processor = processor
+                    generation = controller._generation
+                    public = bytes(len(voice))  # nothing opens, so a renewal is not deferred
+                    self.assertTrue(controller._feed(generation, processor, public, "stdin"))
+                    if renewal:
+                        processor.reset_speakers()
+                        controller._feed(generation, processor, public, "stdin")
+                        self.assertEqual(len(made), 2)
+                    heard = [d.pushed_ms for d in made]
+                    events.duck(True, now_ms=controller._received_ms)
+                    self.assertFalse(controller._feed(generation, processor, voice, "stdin"))
+                    self.assertEqual([d.pushed_ms for d in made], heard)
+                    self.assertEqual(processor.received_ms, heard[-1] + (1000 if renewal else 0))
+                    self.assertEqual(controller._phase, "error")
+                    end = events.drain()[-1]
+                    self.assertEqual(
+                        (end["phase"], end["reason"]), ("error", "privacy-hosted-speech")
+                    )
+
+    def test_an_empty_privacy_interval_forgets_no_speaker(self):
+        # Class B: every effect of privacy-off that assumes private audio was heard is skipped
+        # when the interval received no audio, judged on the stream clock in bytes; one sample
+        # is enough to forget; with off -> on -> off only the interval with audio forgets.
+        def arrange(start_private):
+            events = self.publisher(private=start_private)
+            controller = self.controller(constructor={"event_publisher": events})
+            controller._processor, controller._shadow = mock.Mock(), mock.Mock()
+            controller._runner = mock.Mock(request_context=True)
+            events._roles["Speaker A"] = "owner"
+            events._seen["u1"] = None
+            events._pending["u1"] = (None, None, 0, None)
+            events._withdrawn["u0"] = {"speaker_id": "Speaker A"}
+            events.last_request = (900, "Jarvis, add milk.", "u1", "Speaker A")
+            return controller, events
+
+        members = {
+            "publisher forget_speakers / _labels_renewed": lambda c, e: e._labels_renewed,
+            "_label_stale": lambda c, e: bool(e._label_stale),
+            "_old_labels": lambda c, e: bool(e._old_labels),
+            "per-label roles": lambda c, e: e._roles == {},
+            "last_request unlabelled": lambda c, e: e.last_request[3] is None,
+            "withdrawals unlabelled": lambda c, e: e._withdrawn["u0"]["speaker_id"] is None,
+            "runner forget_speakers": lambda c, e: c._runner.forget_speakers.called,
+            "reset_speakers / diarizer renewal": lambda c, e: c._processor.reset_speakers.called,
+            "shadow forget (epoch, bindings, owner-voice evidence)": (
+                lambda c, e: c._shadow.forget.called
+            ),
+        }
+
+        def cases():
+            # (name, heard): start private, off before any audio / after one sample.
+            for heard_bytes in (0, 2):
+                controller, events = arrange(start_private=True)
+                controller._received_bytes += heard_bytes
+                controller.duck(False)
+                yield f"start-private, {heard_bytes} bytes", controller, events, heard_bytes > 0
+            # Off -> on -> off: only the second interval had audio.
+            controller, events = arrange(start_private=False)
+            controller._received_bytes = 6400
+            controller.duck(True)
+            controller.duck(False)
+            yield "first of two, empty", controller, events, False
+            controller.duck(True)
+            controller._received_bytes += 2
+            controller.duck(False)
+            yield "second of two, one sample", controller, events, True
+
+        for case, controller, events, heard in cases():
+            for member, forgotten in members.items():
+                with self.subTest(case=case, member=member):
+                    self.assertIs(bool(forgotten(controller, events)), heard)
+
+    def test_no_private_turn_held_at_the_off_survives_or_swallows_the_first_public_one(self):
+        # Class C: a private turn finalized and still held by the merger when privacy ends (the
+        # merge gap, the owner pause, a lone wake word held for the owner) is discarded at the
+        # cutoff, words and all. The first public request, within the hold, stands on its own.
+        from test_turn_merge import (
+            SILENCE,
+            VOICE,
+            LateLabelDiarizer,
+            ScriptedDiarizer,
+            ScriptedTranscriber,
+            audio,
+        )
+
+        members = {
+            "merge gap": ({"turn_merge_gap_ms": 2000}, ScriptedDiarizer, "Marmalade zeppelin"),
+            "owner pause": (
+                {
+                    "turn_merge_gap_ms": 500,
+                    "turn_owner": lambda fragment: fragment["speaker"] == "Speaker A",
+                    "turn_owner_pause_ms": 3000,
+                },
+                ScriptedDiarizer,
+                "Marmalade zeppelin",
+            ),
+            "wake word hold": (
+                {
+                    "turn_merge_gap_ms": 2000,
+                    "turn_wake_word": lambda text: text.strip(" ,.").lower() == "jarvis",
+                    "turn_owner": lambda fragment: fragment["speaker"] == "Speaker A",
+                },
+                lambda: LateLabelDiarizer(1000, 1),
+                "Jarvis,",
+            ),
+        }
+        public = "Jarvis, add the quokka to the list."
+        for member, (options, diarizer, private) in members.items():
+            with self.subTest(member=member):
+                events = self.publisher()
+                controller = self.controller(constructor={"event_publisher": events})
+                work, memory = queue.Queue(), TranscriptMemory()
+                processor = LiveProcessor(
+                    LiveConfig(
+                        SESSION,
+                        provenance="causal-replay",
+                        transcriber=ScriptedTranscriber((private, public)),
+                        diarizer=diarizer(),
+                        private=controller._heard_private_span,
+                        **options,
+                    ),
+                    lambda turn: controller._accept(controller._generation, work, memory, turn),
+                )
+                self.addCleanup(processor.close)
+                controller._processor = processor
+
+                def feed(pcm):
+                    for offset in range(0, len(pcm), FRAME_BYTES * 10):
+                        chunk = pcm[offset : offset + FRAME_BYTES * 10]
+                        controller._feed(controller._generation, processor, chunk, "stdin")
+
+                controller.duck(True)
+                feed(audio((VOICE, 200), (SILENCE, 1500)))  # finalized at 1,640 ms, held
+                self.assertTrue(processor._merger.holding)
+                controller.duck(False)
+                feed(audio((VOICE, 200), (SILENCE, 3000)))
+                processor.release_pending()
+                published = [e for e in events.drain() if e["type"] == "transcript"]
+                self.assertEqual([e["turn"]["text"] for e in published], [public])
+                self.assertEqual(published[0]["turn"]["start_ms"], 1700)
+                self.assertEqual(memory.snapshot(10_000)["turns"][0]["text"], public)
+                self.assertFalse(processor._merger.holding)
 
 
 if __name__ == "__main__":

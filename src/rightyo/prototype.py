@@ -370,9 +370,22 @@ class PrototypeConfig:
         return self.speaker_id is not None and self.speaker_id.roles
 
     @property
+    def hosted_audio_consumers(self) -> tuple[str, ...]:
+        """#242 round 27: every consumer of session audio that is not local, by name. Each one
+        declares it here: the transcriber and diarizer by their selected kind; the end-of-turn
+        model (`end_of_turn`) and the speaker-ID embedder (`speaker_id`) are local subprocesses
+        by construction (no hosted kind exists); decisions and roles never take audio (a private
+        turn's words never reach them, `_accept`, and model-sourced roles are refused live)."""
+        return tuple(
+            name
+            for name, spec in (("transcriber", self.transcriber), ("diarizer", self.diarizer))
+            if is_hosted(spec)
+        )
+
+    @property
     def hosted_speech(self) -> bool:
         """Whether a selected speech backend would send audio to a hosted service."""
-        return is_hosted(self.transcriber) or is_hosted(self.diarizer)
+        return bool(self.hosted_audio_consumers)
 
     @property
     def synthetic_speech(self) -> bool:
@@ -658,6 +671,10 @@ class PrototypeController:
         self._stdin_used = False
         # Optional host-facing stream. The lab retains its browser lease and UI controls.
         self._events = event_publisher
+        # #242 round 27: a publisher already private (as `--start-private` makes it) is refused
+        # here with hosted speech, as the CLI and `duck(True)` refuse it: the audio heard while
+        # private would still be sent to the hosted backend. Checked again at every start.
+        self._refuse_private_hosted()
         self._event_terminal = True
         self._lock = threading.RLock()
         self._generation = 0
@@ -692,6 +709,9 @@ class PrototypeController:
         self._request_limit: int | None = DEFAULT_REQUEST_LIMIT
         self._received_ms = 0
         self._received_bytes = 0
+        # #242 round 27: the stream byte offset the current privacy interval began at, or None
+        # when unknown or public; an interval that received no audio forgets no speaker (`duck`).
+        self._private_from_bytes: int | None = 0 if self._private_audio() else None
         self._budget_ms: int | None = None
         self._budget_reached = False
         self._audio_started: float | None = None
@@ -811,6 +831,10 @@ class PrototypeController:
             )
         if self.config.hosted_speech and not self.allow_hosted_speech:
             raise PrototypeError("Hosted speech backends require explicit hosted consent")
+        # #242 round 27: a restart, a replay or a demo, a configuration swapped since
+        # construction, or a publisher made private outside the controller since: none starts
+        # a hosted-speech session in privacy.
+        self._refuse_private_hosted()
         if self.processor_factory is LiveProcessor and self.config.transcriber["kind"] == (
             "whisper.cpp"
         ):
@@ -945,6 +969,9 @@ class PrototypeController:
             self._turn_spans = {}
             self._pending = self._requests = self._received_ms = 0
             self._received_bytes = 0
+            # #242 round 27: a session that starts private (`--start-private`, or the mode held
+            # from before) has heard nothing in it yet; one that starts public, nothing private.
+            self._private_from_bytes = 0 if self._private_audio() else None
             self._budget_ms = None if budget_seconds is None else budget_seconds * 1000
             self._budget_reached = False
             self._audio_started = None
@@ -1506,6 +1533,13 @@ class PrototypeController:
             # Read with the clock under the lock, so a change stamped after this chunk
             # never leaves a chunk heard in privacy in the speaker ring.
             private = self._private_audio()
+            if private and self.config.hosted_speech:
+                # #242 round 27, the one choke point every audio consumer is fed through: in
+                # privacy, a hosted consumer (`hosted_audio_consumers`) receives nothing, by
+                # whatever path privacy became active. Unreachable while the refusals hold;
+                # if one is bypassed, the session ends as an error before this chunk goes on.
+                self._end_private_hosted(generation)
+                return False
         if shadow is not None:
             # Before the processor, so a turn it finalizes on this chunk finds its audio.
             # In privacy mode (hailing-station #735 S-1) the speaker ring keeps silence of
@@ -1528,6 +1562,28 @@ class PrototypeController:
     def _private_audio(self) -> bool:
         """Whether privacy mode is on now, as the publisher holds it."""
         return getattr(self._events, "ducked", False) is True
+
+    def _refuse_private_hosted(self) -> None:
+        """#242 round 27: privacy is never active with a hosted audio consumer configured; the
+        same refusal as `duck(True)` and `--start-private`, fail closed and announced."""
+        if self.config.hosted_speech and self._private_audio():
+            raise PrototypeError("duck mode is refused with a hosted speech backend")
+
+    def _end_private_hosted(self, generation: int) -> None:
+        """End the session as an error: privacy became active with a hosted audio consumer by
+        a path that bypassed every refusal (#242 round 27). Under the lock."""
+        if generation != self._generation or self._stop.is_set():
+            return
+        self._phase = "error"
+        self._error = "Privacy mode is refused with a hosted speech backend; the session ended."
+        self._stop.set()
+        if self._decision_status != "off":
+            self._decision_status = "unavailable"
+        self._completed_at = time.monotonic()
+        self._discard_pending()
+        if self._runner is not None:
+            self._runner.clear(clear_memory=False)
+        self._event_end("error", "privacy-hosted-speech")
 
     def _decide(self, generation, stop, work, runner, hosted):
         enabled = hosted
@@ -1708,6 +1764,8 @@ class PrototypeController:
             self._turn_spans.clear()
             self._pending = self._received_ms = 0
             self._received_bytes = 0
+            # #242 round 27: the stream clock restarts; nothing is heard in privacy until audio.
+            self._private_from_bytes = 0 if self._private_audio() else None
             self._budget_ms = None
             self._budget_reached = False
             self._audio_started = None
@@ -1796,10 +1854,22 @@ class PrototypeController:
         with self._lock:
             if self._events is not None:
                 ending = not on and self._events.ducked is True
+                if on and self._events.ducked is not True:
+                    # #242 round 27: where this privacy interval starts, in stream bytes.
+                    self._private_from_bytes = self._received_bytes
                 # At least the end of every piece received so far, held ones included.
                 self._events.duck(on, now_ms=self._received_ms)
                 if ending:
-                    self._forget_speakers()
+                    # #242 round 27: an interval in which no audio was received, judged on the
+                    # stream clock in bytes (one sample counts), heard no one, so it forgets no
+                    # speaker: every effect of `_forget_speakers` (the publisher's renewed and
+                    # stale labels, the runner's, the diarizer renewal, the identifier's
+                    # bindings) assumes private audio was heard. Unknown (privacy began outside
+                    # the controller mid-session) forgets, fail closed.
+                    start = self._private_from_bytes
+                    self._private_from_bytes = None
+                    if start is None or self._received_bytes > start:
+                        self._forget_speakers()
 
     def _speakers_renewed(self) -> None:
         """The fresh diarizer takes over (#735 S-1, round 15): its labels restart from the first
