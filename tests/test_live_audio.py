@@ -11,12 +11,14 @@ import threading
 import time
 import unittest
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from rightyo.live_audio import (
     BYTES_PER_MS,
     FRAME_BYTES,
+    SPEAKER_RENEWAL_LIMIT_MS,
     TIMELINE_WINDOW_MS,
     LiveAudioError,
     LiveConfig,
@@ -27,6 +29,7 @@ from rightyo.live_audio import (
     _NativeStream,
     _units,
 )
+from rightyo.turn_merge import TurnMerger
 
 SILENCE = bytes(FRAME_BYTES)
 VOICE = array.array("h", [5000] * 320).tobytes()
@@ -275,6 +278,93 @@ class LiveProcessorTests(unittest.TestCase):
             values = vars(self.config) | {name: value}
             with self.assertRaises(LiveAudioError):
                 LiveConfig(**values)
+
+    def private_samples_sent_to_asr(self, marks):
+        return [
+            value
+            for call in self.transcribe.call_args_list
+            for value in array.array("h", call.args[1])
+            if value in marks
+        ]
+
+    def test_privacy_off_silences_private_pre_roll_and_partial_audio(self):
+        # #242 round 18: quiet audio heard while private waits in the pre-roll (and a part
+        # frame in the buffer) with no utterance open; none may lead the next public one.
+        quiet = array.array("h", [77] * 320).tobytes()
+        self.feed(quiet, 12)
+        self.processor.push_pcm16(quiet[:320])
+        # Stamped on the controller's clock: all audio received so far, the part frame too.
+        self.processor.reset_speakers(12 * FRAME_BYTES + 320)
+        self.feed(VOICE, 20)
+        self.feed(SILENCE, 73)
+        self.assertEqual(self.transcribe.call_count, 1)
+        self.assertEqual(self.private_samples_sent_to_asr({77}), [])
+        # Public audio is kept: the stream offsets are unchanged and the speech is all there.
+        pcm = array.array("h", self.transcribe.call_args.args[1])
+        self.assertEqual(pcm.count(5000), 20 * 320)
+
+    def test_privacy_off_silences_the_private_start_of_an_open_utterance(self):
+        # The same with speech heard while private still open when privacy ends.
+        private = array.array("h", [4321] * 320).tobytes()
+        self.feed(SILENCE, 5)
+        self.feed(private, 10)
+        self.processor.reset_speakers(15 * FRAME_BYTES)
+        self.feed(VOICE, 10)
+        self.feed(SILENCE, 72)
+        self.assertEqual(self.transcribe.call_count, 1)
+        self.assertEqual(self.private_samples_sent_to_asr({4321}), [])
+        self.assertEqual(array.array("h", self.transcribe.call_args.args[1]).count(5000), 3200)
+
+    def test_audio_pushed_after_the_privacy_end_is_kept(self):
+        # Applied in stream order, not when called: audio stamped after the end is public.
+        self.processor.reset_speakers(0)
+        self.feed(VOICE, 10)
+        self.feed(SILENCE, 72)
+        self.assertEqual(array.array("h", self.transcribe.call_args.args[1]).count(5000), 3200)
+
+    def test_the_frame_straddling_the_privacy_end_is_silenced_before_it_is_processed(self):
+        # #242 round 19: the end falls 10 ms into a frame that ends a private utterance (the
+        # hangover finalizes it there). Its private prefix, and the private speech buffered
+        # before it, are silenced before the diarizer, the voiced check or ASR see the frame.
+        speech = array.array("h", [4321] * 320).tobytes()
+        quiet = array.array("h", [77] * 320).tobytes()
+        self.feed(SILENCE, 5)
+        self.feed(speech, 10)
+        self.feed(quiet, 71)
+        self.processor.reset_speakers(86 * FRAME_BYTES + 10 * BYTES_PER_MS)
+        self.transcribe.assert_not_called()
+        straddling = quiet[: 10 * BYTES_PER_MS] + bytes(FRAME_BYTES - 10 * BYTES_PER_MS)
+        self.processor.push_pcm16(straddling)
+        self.assertEqual(self.transcribe.call_count, 1)
+        self.assertEqual(self.private_samples_sent_to_asr({4321, 77}), [])
+        self.assertEqual(self.processor._diarizer.frames[-1], bytes(FRAME_BYTES))
+
+    def test_finish_silences_audio_heard_before_a_privacy_end_not_yet_reached(self):
+        # The tail and the open utterance are finalized by `finish` without a further frame;
+        # the end stamped at the very end of the audio is applied there.
+        speech = array.array("h", [4321] * 320).tobytes()
+        self.feed(SILENCE, 2)
+        self.feed(speech, 5)
+        self.processor.push_pcm16(speech[:30])  # under 1 ms: the fake timeline stays in bounds
+        self.processor.reset_speakers()
+        self.processor.finish()
+        self.assertEqual(self.transcribe.call_count, 1)
+        self.assertEqual(self.private_samples_sent_to_asr({4321}), [])
+
+    def test_a_privacy_end_set_while_one_is_taken_is_kept(self):
+        # Set on the host thread and taken on the audio thread under one lock, so a second end
+        # stamped while a frame takes the first is never cleared unapplied.
+        self.processor.reset_speakers(FRAME_BYTES // 2)
+        with self.processor._private_lock:
+            setter = threading.Thread(target=self.processor.reset_speakers, args=(3 * FRAME_BYTES,))
+            setter.start()
+            setter.join(0.2)
+            self.assertTrue(setter.is_alive())
+        setter.join(5)
+        self.feed(SILENCE, 1)  # the merged end lies past this frame: kept for a later one
+        self.assertEqual(self.processor._private_until, 3 * FRAME_BYTES)
+        self.feed(SILENCE, 3)
+        self.assertIsNone(self.processor._private_until)
 
 
 class NativeStartupCancellationTests(unittest.TestCase):
@@ -716,6 +806,269 @@ class ConservativeAlignmentTests(unittest.TestCase):
             ([{"text": " Hello.", "start_ms": 50, "end_ms": 200}], 0),
         )
 
+    def renewable_config(self, diarizer):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "supplied-local-runtime"
+        path.touch()
+        return LiveConfig(
+            "reset-test", path, path, path, path, provenance="causal-replay", diarizer=diarizer
+        )
+
+    def test_reset_speakers_starts_a_fresh_diarizer_on_the_stream_clock(self):
+        # Codex P1 on #242: when privacy ends, no channel a private voice took survives.
+        made = []
+
+        def diarizer(config):
+            made.append(FakeDiarizer(config))
+            return made[-1]
+
+        processor = LiveProcessor(self.renewable_config(diarizer), lambda _turn: None)
+        self.addCleanup(processor.close)
+        for _ in range(10):
+            processor.push_pcm16(SILENCE)
+        renewed = []
+        processor.on_speakers_renewed = lambda: renewed.append(len(made[-1].frames))
+        processor.reset_speakers()
+        processor.push_pcm16(SILENCE)
+        self.assertEqual(len(made), 2)
+        # Round 15: told once, before the fresh diarizer's first frame.
+        self.assertEqual(renewed, [0])
+        self.assertTrue(made[0].closed)
+        self.assertEqual(len(made[0].frames), 10)
+        self.assertEqual(len(made[1].frames), 1)
+        # The new diarizer's own clock starts at zero; its timeline is shifted onto the stream.
+        self.assertEqual(processor._diarizer.segments()[0]["start_ms"], 200)
+
+    def test_reset_speakers_waits_for_an_open_utterance(self):
+        made = []
+
+        def diarizer(config):
+            made.append(FakeDiarizer(config))
+            return made[-1]
+
+        processor = LiveProcessor(self.renewable_config(diarizer), lambda _turn: None)
+        self.addCleanup(processor.close)
+        renewed = []
+        processor.on_speakers_renewed = lambda: renewed.append(processor._received_ms)
+        processor.push_pcm16(VOICE)
+        processor.reset_speakers()
+        for _ in range(5):
+            processor.push_pcm16(VOICE)
+        self.assertEqual(len(made), 1)  # Its labels stay with the turn under way.
+        self.assertEqual(renewed, [])  # Round 15: told only when the fresh diarizer takes over.
+
+    def test_the_fresh_diarizer_waits_for_the_privacy_end(self):
+        # #242 round 20: the end is stamped ahead of the frames still being pushed (the
+        # controller counts a chunk before pushing it); quiet frames heard while private must
+        # go to the old diarizer, never the fresh one.
+        made = []
+
+        def diarizer(config):
+            made.append(FakeDiarizer(config))
+            return made[-1]
+
+        processor = LiveProcessor(self.renewable_config(diarizer), lambda _turn: None)
+        self.addCleanup(processor.close)
+        quiet = array.array("h", [77] * 320).tobytes()
+        for _ in range(3):
+            processor.push_pcm16(SILENCE)
+        processor.reset_speakers(8 * FRAME_BYTES)
+        for _ in range(5):
+            processor.push_pcm16(quiet)
+        for _ in range(3):
+            processor.push_pcm16(SILENCE)
+        self.assertEqual(len(made), 2)
+        self.assertEqual(len(made[0].frames), 8)
+        self.assertEqual(len(made[1].frames), 3)
+        self.assertFalse(any(77 in array.array("h", frame) for frame in made[1].frames))
+
+    def test_an_end_stamped_while_a_deferred_renewal_is_taken_is_kept(self):
+        # #242 round 21: a renewal still deferred from an earlier end is taken on the frame where
+        # the host stamps a new one ahead; that new end's renewal must survive, so the private
+        # frames up to it never reach the diarizer that serves public speech.
+        made = []
+
+        def diarizer(config):
+            made.append(FakeDiarizer(config))
+            return made[-1]
+
+        processor = LiveProcessor(self.renewable_config(diarizer), lambda _turn: None)
+        self.addCleanup(processor.close)
+        quiet = array.array("h", [77] * 320).tobytes()
+        for _ in range(3):
+            processor.push_pcm16(SILENCE)
+        processor._speaker_reset = True  # deferred from an earlier end, already reached
+        holding = TurnMerger.holding
+
+        def stamped(merger):
+            # The host thread runs here, between the frame's reads of the request and the end.
+            if processor._received_ms == 60 and processor._private_until is None:
+                processor.reset_speakers(8 * FRAME_BYTES)
+            return holding.fget(merger)
+
+        with patch.object(TurnMerger, "holding", property(stamped)):
+            for _ in range(5):
+                processor.push_pcm16(quiet)
+        for _ in range(3):
+            processor.push_pcm16(SILENCE)
+        # One renewal, at the new end: the private frames all went to the old diarizer.
+        self.assertEqual(len(made), 2)
+        self.assertEqual(len(made[0].frames), 8)
+        self.assertFalse(any(77 in array.array("h", frame) for frame in made[-1].frames))
+        self.assertFalse(processor._speaker_reset)
+
+    def steady_speech(self, made, turns, **settings):
+        """A processor whose diarizers label everyone with their own channel (the first made
+        `speaker=2`, "Speaker B", later ones "Speaker A") and whose recognizer gives one word
+        per 200 ms; turns are merged across a 2 s gap."""
+
+        class Diarizer(FakeDiarizer):
+            def __init__(self, config):
+                super().__init__(config)
+                self.speaker = 2 if not made else 1
+
+            def segments(self):
+                return [{**segment, "speaker": self.speaker} for segment in super().segments()]
+
+        class Words:
+            recognizer_id = "steady-words"
+
+            def transcribe(self, pcm, _register):
+                duration = len(pcm) // BYTES_PER_MS
+                return [
+                    {"text": " w", "start_ms": start, "end_ms": min(start + 200, duration)}
+                    for start in range(0, duration, 200)
+                ]
+
+        def diarizer(config):
+            made.append(Diarizer(config))
+            return made[-1]
+
+        config = replace(
+            self.renewable_config(diarizer),
+            transcriber=Words(),
+            turn_merge_gap_ms=2000,
+            max_utterance_ms=4000,
+            **settings,
+        )
+        processor = LiveProcessor(config, turns.append)
+        self.addCleanup(processor.close)
+        return processor
+
+    def test_steady_speech_cannot_postpone_the_renewal_past_ten_seconds(self):
+        # #242 round 21: continuous speech with merged, held turns never leaves a frame with
+        # nothing open; the renewal is forced 10 s after the privacy end is reached, not before.
+        made, turns, renewed = [], [], []
+        processor = self.steady_speech(made, turns)
+        processor.on_speakers_renewed = lambda: renewed.append(processor._received_ms)
+        for _ in range(50):
+            processor.push_pcm16(VOICE)
+        end = 3000  # stamped ahead of the audio pushed so far (round 20)
+        processor.reset_speakers(end * BYTES_PER_MS)
+        for _ in range(1500):  # 30 s more of steady speech
+            processor.push_pcm16(VOICE)
+        self.assertEqual(len(made), 2)
+        self.assertEqual(len(renewed), 1)
+        self.assertGreaterEqual(renewed[0], end)
+        self.assertLessEqual(renewed[0], end + SPEAKER_RENEWAL_LIMIT_MS)
+        self.assertTrue(made[0].closed)
+
+    def test_an_end_stamped_as_a_renewal_starts_is_renewed_at_its_own_end(self):
+        # #242 round 22: the request is claimed before the swap, so an end stamped between the
+        # claim and the new diarizer keeps its own renewal; its private frames never reach the
+        # diarizer that serves public speech.
+        made = []
+
+        def diarizer(config):
+            made.append(FakeDiarizer(config))
+            return made[-1]
+
+        processor = LiveProcessor(self.renewable_config(diarizer), lambda _turn: None)
+        self.addCleanup(processor.close)
+        renew = processor._renew_diarizer
+
+        def stamped():
+            if len(made) == 1:
+                processor.reset_speakers(processor._received_ms * BYTES_PER_MS + 5 * FRAME_BYTES)
+            renew()
+
+        processor._renew_diarizer = stamped
+        quiet = array.array("h", [77] * 320).tobytes()
+        processor.push_pcm16(SILENCE)
+        processor.reset_speakers()
+        for _ in range(5):
+            processor.push_pcm16(quiet)
+        for _ in range(3):
+            processor.push_pcm16(SILENCE)
+        self.assertEqual(len(made), 3)
+        self.assertFalse(any(77 in array.array("h", frame) for frame in made[-1].frames))
+
+    def test_privacy_ending_again_never_restarts_the_renewal_bound(self):
+        # #242 round 22: privacy back on and ended again within every 10 s, under steady merged
+        # speech, must not keep the diarizer that heard private voices labelling public turns.
+        made, turns, renewed = [], [], []
+        processor = self.steady_speech(made, turns)
+        processor.on_speakers_renewed = lambda: renewed.append(processor._received_ms)
+        private = array.array("h", [4321] * 320).tobytes()
+        for _ in range(100):
+            processor.push_pcm16(private)
+        for _ in range(10):
+            processor.reset_speakers()
+            for _ in range(400):
+                processor.push_pcm16(VOICE)
+            for _ in range(25):
+                processor.push_pcm16(private)
+        self.assertTrue(renewed)
+        self.assertLessEqual(renewed[0], 2000 + SPEAKER_RENEWAL_LIMIT_MS)
+        for earlier, later in zip(renewed, renewed[1:], strict=False):
+            self.assertLessEqual(later - earlier, SPEAKER_RENEWAL_LIMIT_MS + 8500)
+
+    def test_a_turn_spanning_a_forced_renewal_keeps_no_old_label(self):
+        # #242 round 21: the turn under way when the renewal is forced was labelled by the old
+        # diarizer (seeded while private); it is published unlabelled, with no label evidence.
+        # Privacy ends 1 s in (forced mid-utterance, a turn held too) or 10 s in (held only).
+        for lead_frames in (50, 500):
+            with self.subTest(lead_ms=lead_frames * 20):
+                made, turns, renewed, spans, inferred = [], [], [], [], []
+                processor = self.steady_speech(
+                    made,
+                    turns,
+                    on_labelled_spans=lambda turn_id, _pieces, spans=spans: spans.append(turn_id),
+                    on_inferred=inferred.append,
+                    edge_attribution_ms=400,
+                )
+                processor.on_speakers_renewed = lambda turns=turns, renewed=renewed: (
+                    renewed.append(len(turns))
+                )
+                for _ in range(lead_frames):
+                    processor.push_pcm16(VOICE)
+                processor.reset_speakers()
+                for _ in range(1000):
+                    processor.push_pcm16(VOICE)
+                for _ in range(200):
+                    processor.push_pcm16(SILENCE)
+                processor.release_pending()
+                self.assertEqual(len(renewed), 1)
+                before, after = turns[: renewed[0]], turns[renewed[0] :]
+                self.assertTrue(all(turn.speaker_id == "Speaker B" for turn in before))
+                self.assertTrue(after)
+                # The turn under way is unlabelled; later ones carry only the fresh labels.
+                self.assertIsNone(after[0].speaker_id)
+                self.assertNotIn("Speaker B", {turn.speaker_id for turn in after})
+                self.assertIn("Speaker A", {turn.speaker_id for turn in after})
+                # No label evidence (speaker-ID spans, inferred marks) for an unlabelled turn.
+                stale = {turn.utterance_id for turn in after if turn.speaker_id is None}
+                self.assertFalse(stale & (set(spans) | set(inferred)))
+
+    def test_a_supplied_diarizer_instance_is_never_replaced(self):
+        supplied = FakeDiarizer(None)
+        processor = LiveProcessor(self.renewable_config(supplied), lambda _turn: None)
+        self.addCleanup(processor.close)
+        processor.reset_speakers()
+        processor.push_pcm16(SILENCE)
+        self.assertIs(processor._diarizer, supplied)
+
     def test_whisper_suppresses_a_bad_utterance_and_keeps_listening(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -755,6 +1108,31 @@ class ConservativeAlignmentTests(unittest.TestCase):
                 "(1 recognizer segment(s) with unusable timestamps); the session continues"
             ],
         )
+        # Heard in privacy (hailing-station #735 S-1): counted, never reported.
+        turns, reports = [], []
+        with (
+            patch("rightyo.live_audio._Diarizer", FakeDiarizer),
+            patch("rightyo.live_audio._transcribe", side_effect=[bad, good]),
+        ):
+            processor = LiveProcessor(
+                LiveConfig(
+                    **{
+                        **config.__dict__,
+                        "report": reports.append,
+                        "private": lambda _start_ms, _end_ms: True,
+                    }
+                ),
+                turns.append,
+            )
+            for _ in range(2):
+                for _ in range(10):
+                    processor.push_pcm16(VOICE)
+                for _ in range(72):
+                    processor.push_pcm16(SILENCE)
+            processor.finish()
+        # Nor counted in the session's totals, which the terminal event reports.
+        self.assertEqual((processor.skipped_segments, processor.skipped_utterances), (0, 0))
+        self.assertEqual(reports, [])
 
     def test_reporter_must_be_callable(self):
         with self.assertRaisesRegex(LiveAudioError, "reporter"):

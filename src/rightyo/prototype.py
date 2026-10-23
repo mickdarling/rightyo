@@ -49,6 +49,8 @@ from rightyo.live_audio import (
     LiveAudioError,
     LiveConfig,
     LiveProcessor,
+    RecognizerSandboxError,
+    recognizer_dir,
     timeline_window,
 )
 from rightyo.live_speaker_id import (
@@ -85,6 +87,7 @@ from rightyo.speech_backends import (
     utterance_local_labels,
 )
 from rightyo.state_log import DecisionStateLog
+from rightyo.tool_events import privacy_phrase
 from rightyo.turn_merge import (
     DEFAULT_TURN_MERGE_GAP_MS,
     complete_hold,
@@ -367,9 +370,22 @@ class PrototypeConfig:
         return self.speaker_id is not None and self.speaker_id.roles
 
     @property
+    def hosted_audio_consumers(self) -> tuple[str, ...]:
+        """#242 round 27: every consumer of session audio that is not local, by name. Each one
+        declares it here: the transcriber and diarizer by their selected kind; the end-of-turn
+        model (`end_of_turn`) and the speaker-ID embedder (`speaker_id`) are local subprocesses
+        by construction (no hosted kind exists); decisions and roles never take audio (a private
+        turn's words never reach them, `_accept`, and model-sourced roles are refused live)."""
+        return tuple(
+            name
+            for name, spec in (("transcriber", self.transcriber), ("diarizer", self.diarizer))
+            if is_hosted(spec)
+        )
+
+    @property
     def hosted_speech(self) -> bool:
         """Whether a selected speech backend would send audio to a hosted service."""
-        return is_hosted(self.transcriber) or is_hosted(self.diarizer)
+        return bool(self.hosted_audio_consumers)
 
     @property
     def synthetic_speech(self) -> bool:
@@ -593,84 +609,6 @@ def _takes_keyword(factory: Any, name: str) -> bool:
     )
 
 
-# Hailing Station's whole-turn duck-mode phrases (hailing-station #735, `VoiceDuck` in
-# #783). The host matches them only as a whole named owner turn, so the turn merger
-# releases them alone, like a stop phrase: an exit joined onto the owner's thinking aloud
-# would leave duck mode on until its auto-end. The exit only while ducking and the entry
-# only while not, so outside duck mode nothing changes for an exit-shaped turn. Keep in
-# step with the host's sets.
-DUCK_ENTRY = frozenset(
-    {
-        "duck mode",
-        "duck mode on",
-        "let me think out loud",
-        "i'm going to think out loud",
-        "think out loud with me",
-    }
-)
-DUCK_EXIT = frozenset(
-    {
-        "duck mode off",
-        "end duck mode",
-        "done thinking",
-        "i'm done thinking",
-        "done thinking out loud",
-    }
-)
-DUCK_GREETINGS = frozenset({"hey", "ok", "okay"})
-# The host's short cues while ducking (hailing-station #735 H-3 and H-4), named or not:
-# matched only while duck mode is on, so outside it "what do you think" can still take a
-# continuation. Never the unnamed entry or exit: a lone wake word ("Jarvis,") must still
-# join "done thinking" (#230). Keep in step with the host's cue tables.
-DUCK_CUES = frozenset(
-    {"what do you think", "play that back", "mute", "are you still listening", "discard that"}
-)
-
-
-def _duck_words(text: str, addressing: Addressing | None) -> tuple[str, bool]:
-    """`text` trimmed as the host trims a duck phrase, and whether it named the assistant.
-
-    Words of letters and apostrophes, lowercased; a trailing "please", one leading
-    greeting, a configured name or variant of up to three words, then a "please" dropped.
-    """
-    cleaned = "".join(c if c.isalpha() or c == "'" else " " for c in text.replace("\u2019", "'"))
-    words = cleaned.lower().split()
-    while words and words[-1] == "please":
-        words.pop()
-    if words and words[0] in DUCK_GREETINGS:
-        words = words[1:]
-    width = None
-    if addressing is not None:
-        width = next(
-            (
-                size
-                for size in range(1, 4)
-                if size < len(words) and addressing.name_for(" ".join(words[:size])) is not None
-            ),
-            None,
-        )
-    if width is not None:
-        words = words[width:]
-    if words and words[0] == "please":
-        words = words[1:]
-    return " ".join(words), width is not None
-
-
-def duck_phrase_shaped(text: str, addressing: Addressing | None, ducking: bool) -> bool:
-    """Whether `text` is a whole named duck-mode exit while `ducking` ("Jarvis, done
-    thinking"), or a whole named entry while not.
-
-    The name is required, as the host requires it; without names, nothing is one.
-    """
-    phrase, named = _duck_words(text, addressing)
-    return named and phrase in (DUCK_EXIT if ducking else DUCK_ENTRY)
-
-
-def duck_cue_shaped(text: str, addressing: Addressing | None) -> bool:
-    """Whether `text` is a whole duck-mode cue ("what do you think?"), named or not."""
-    return _duck_words(text, addressing)[0] in DUCK_CUES
-
-
 def _no_report(_message: str) -> None:
     """The diagnostic sink when a session has no channel (the lab)."""
 
@@ -733,6 +671,16 @@ class PrototypeController:
         self._stdin_used = False
         # Optional host-facing stream. The lab retains its browser lease and UI controls.
         self._events = event_publisher
+        # #242 round 27: a publisher already private (as `--start-private` makes it) is refused
+        # here with hosted speech, as the CLI and `duck(True)` refuse it: the audio heard while
+        # private would still be sent to the hosted backend. Checked again at every start.
+        self._refuse_private_hosted()
+        # #242 round 28: a publisher that can be private must say what it heard in privacy
+        # (`heard_ducked`); one that cannot would leave every privacy judgement unknown.
+        if callable(getattr(event_publisher, "duck", None)) and not callable(
+            getattr(event_publisher, "heard_ducked", None)
+        ):
+            raise PrototypeError("A private-capable publisher must report what it heard privately")
         self._event_terminal = True
         self._lock = threading.RLock()
         self._generation = 0
@@ -747,6 +695,8 @@ class PrototypeController:
         self._runner: ReplayRunner | None = None
         self._capture = None
         self._processor = None
+        # The session's speaker identifier, while one runs (forgotten when privacy ends).
+        self._shadow = None
         self._audio_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._decision_cancel = threading.Event()
@@ -765,6 +715,9 @@ class PrototypeController:
         self._request_limit: int | None = DEFAULT_REQUEST_LIMIT
         self._received_ms = 0
         self._received_bytes = 0
+        # #242 round 27: the stream byte offset the current privacy interval began at, or None
+        # when unknown or public; an interval that received no audio forgets no speaker (`duck`).
+        self._private_from_bytes: int | None = 0 if self._private_audio() else None
         self._budget_ms: int | None = None
         self._budget_reached = False
         self._audio_started: float | None = None
@@ -884,6 +837,22 @@ class PrototypeController:
             )
         if self.config.hosted_speech and not self.allow_hosted_speech:
             raise PrototypeError("Hosted speech backends require explicit hosted consent")
+        # #242 round 27: a restart, a replay or a demo, a configuration swapped since
+        # construction, or a publisher made private outside the controller since: none starts
+        # a hosted-speech session in privacy.
+        self._refuse_private_hosted()
+        if self.processor_factory is LiveProcessor and self.config.transcriber["kind"] == (
+            "whisper.cpp"
+        ):
+            # The local recognizer runs only in a directory this process cannot write
+            # (hailing-station #735 S-1); without one, refuse before any audio.
+            try:
+                recognizer_dir()
+            except RecognizerSandboxError:
+                raise PrototypeError(
+                    "Transcription refused: the local recognizer needs a directory this "
+                    "process cannot write, such as /var/empty"
+                ) from None
         roles = self.config.speakers
         if (
             roles is not None
@@ -1006,6 +975,9 @@ class PrototypeController:
             self._turn_spans = {}
             self._pending = self._requests = self._received_ms = 0
             self._received_bytes = 0
+            # #242 round 27: a session that starts private (`--start-private`, or the mode held
+            # from before) has heard nothing in it yet; one that starts public, nothing private.
+            self._private_from_bytes = 0 if self._private_audio() else None
             self._budget_ms = None if budget_seconds is None else budget_seconds * 1000
             self._budget_reached = False
             self._audio_started = None
@@ -1035,13 +1007,16 @@ class PrototypeController:
                     acknowledgement=self.config.acknowledgement,
                     other_agents=self.config.other_agents,
                     **({} if self.owner_voice is None else {"owner_voice": self.owner_voice}),
-                    # Duck mode (hailing-station #735): the live controller takes the
-                    # control, so a publisher that holds it advertises it, unless its host
-                    # control channel does not carry the line (a coaching listener).
+                    # Privacy mode (internally duck, hailing-station #735): the live
+                    # controller takes the control, so a publisher that holds it advertises
+                    # it, unless its host control channel does not carry the line (a
+                    # coaching listener), or a hosted speech backend would still be sent the
+                    # audio heard while private (S-1, fail closed: the host then refuses).
                     **(
                         {"duck": True}
                         if getattr(self._events, "duck_control", False) is True
                         and callable(getattr(self._events, "duck", None))
+                        and not self.config.hosted_speech
                         else {}
                     ),
                 )
@@ -1069,16 +1044,22 @@ class PrototypeController:
             )
             self._audio_thread.start()
 
-    def _accept(self, generation: int, work: queue.Queue, memory: TranscriptMemory, turn: Turn):
+    def _accept(
+        self, generation: int, work: queue.Queue, memory: TranscriptMemory, turn: Turn
+    ) -> bool | None:
+        """Accept a final turn; whether it was heard in privacy, or None once stopped."""
         with self._lock:
             if generation != self._generation or self._stop.is_set():
-                return
-            # Duck mode (hailing-station #735), judged by when the turn was heard (see
-            # `SpeechEvents.heard_ducked`): the turn is still published, but no hosted
-            # decision is ever asked for it, and it is kept out of the memory every later
-            # decision's context is read from.
-            heard_ducked = getattr(self._events, "heard_ducked", None)
-            ducked = callable(heard_ducked) and heard_ducked(turn) is True
+                return None
+            # Privacy mode (internally duck, hailing-station #735 S-1), judged by when the
+            # turn was heard (see `SpeechEvents.heard_ducked`): no hosted decision is ever
+            # asked for it and it is kept out of the memory every later decision's context
+            # is read from. It is still passed to the publisher, which only matches it for
+            # the local exit and status phrases and emits no transcript (`_private`).
+            ducked = self._heard_private(turn)
+            if ducked:
+                # Observed just before this accept (#96); no decision will ever take it.
+                self._turn_gaps.pop(turn.utterance_id, None)
             if self.retain_transcripts and not ducked:
                 memory.append(turn)
             inferred = turn.utterance_id in self._inferred_turns
@@ -1087,7 +1068,7 @@ class PrototypeController:
                 # Passed only when set, so publishers without live roles see no change.
                 self._publish("transcript", turn, **({"inferred": True} if inferred else {}))
             if self._decision_status == "off" or self._decision_cancel.is_set() or ducked:
-                return
+                return ducked
             try:
                 work.put_nowait(turn)
             except queue.Full:
@@ -1096,16 +1077,34 @@ class PrototypeController:
                     self._decision_status = "unavailable"
                 self._discard_pending()
                 self._tool_attention_error("attention-backlog")
-                return
+                return ducked
             self._pending += 1
+            return ducked
+
+    def _heard_private_span(self, start_ms: int, end_ms: int) -> bool | None:
+        """Whether audio over this stream span was heard in privacy mode (#735 S-1), by the
+        same rule as a turn (`SpeechEvents.heard_ducked`); for the processor's diagnostics and
+        its settle at a privacy end. A publisher that can be private but cannot say gives None,
+        which the processor counts as private (#242 round 28: unknown counts); one with no
+        privacy at all never heard anything privately."""
+        heard_ducked = getattr(self._events, "heard_ducked", None)
+        if not callable(heard_ducked):
+            return None if callable(getattr(self._events, "duck", None)) else False
+        return heard_ducked(SimpleNamespace(start_ms=start_ms, end_ms=end_ms)) is True
+
+    def _heard_private(self, turn: Turn) -> bool:
+        """Whether the publisher heard this turn in privacy mode (hailing-station #735)."""
+        heard_ducked = getattr(self._events, "heard_ducked", None)
+        return callable(heard_ducked) and heard_ducked(turn) is True
 
     def _turn_break(self):
         """The predicate for turns that are never joined or held (#89, #98).
 
-        With names configured, a whole named duck-mode exit while the publisher is in duck
-        mode, or entry while it is not (hailing-station #735), and while in duck mode a
-        whole duck cue ("what do you think?"), so the host can match them on the live
-        transcript.
+        Privacy mode (internally duck, hailing-station #735 S-1): while it is on, a piece
+        holding a named exit or a status question, so the owner pause never delays the way
+        back in; while it is off, a piece that is an intentional entry ("stop recording",
+        "privacy mode", "go private" and the like as the whole piece), so the host's safety
+        matcher sees it at once. Matched as `privacy_phrase` does; nothing is kept.
         """
         stop = (self.config.speakers or SpeakerPriority()).is_stop_phrase
         addressing = self.config.addressing
@@ -1118,10 +1117,11 @@ class PrototypeController:
         def breaks(text: str) -> bool:
             if stop(text) or (dismissal and dismissal_shaped(text)):
                 return True
-            ducked = ducking()
-            return duck_phrase_shaped(text, addressing, ducked) or (
-                ducked and duck_cue_shaped(text, addressing)
-            )
+            try:
+                kinds = privacy_phrase(text, addressing)
+            except Exception:  # noqa: BLE001 - the words must never reach an error or a log
+                return False
+            return bool(kinds & ({"exit", "status"} if ducking() else {"entry"}))
 
         return breaks
 
@@ -1283,16 +1283,35 @@ class PrototypeController:
             # voiceprint evidence (#137), in shadow mode or with roles.
             inferred = turn.utterance_id in self._inferred_turns
             spans = self._turn_spans.pop(turn.utterance_id, None)
-        self._accept(generation, work, memory, turn)
-        if shadow is not None:
+        # A private turn is never scored (#735 S-1): no label evidence, binding or count is
+        # derived from speech heard in privacy, judged by the same decision `_accept` made
+        # (so a mode change between the two cannot split them). The exit's voiceprint
+        # check reads only bindings made from public speech.
+        with self._lock:
+            private = self._accept(generation, work, memory, turn)
+            # #242 round 23: the speaker epoch is read in the same critical section as the
+            # privacy state, so a privacy cycle completing before `shadow.turn` queues the
+            # turn (`forget` advances the epoch) discards it instead of binding its old label.
+            epoch = (
+                getattr(shadow, "epoch", None) if shadow is not None and private is False else None
+            )
+        if shadow is not None and private is False:
             # After the turn is accepted and published; it never raises or blocks.
-            shadow.turn(turn, inferred=inferred, spans=spans)
+            shadow.turn(
+                turn,
+                inferred=inferred,
+                spans=spans,
+                **({"epoch": epoch} if type(epoch) is int else {}),
+            )
 
     def _audio(self, generation, stop, session, work, memory, mode):
         capture = processor = end_of_turn = shadow = None
         try:
             end_of_turn = self._end_of_turn_model(stop)
             shadow = self._shadow_speaker_id()
+            with self._lock:
+                if generation == self._generation:
+                    self._shadow = shadow
             settings = self.config.end_of_turn
             wake_word, owner = self._wake_join()
             if owner is None and self.config.turn_owner_pause_ms:
@@ -1314,6 +1333,7 @@ class PrototypeController:
                     ),
                     cancelled=stop.is_set,
                     report=self.report,
+                    private=self._heard_private_span,
                     session_budget_ms=self._budget_ms,
                     transcriber=transcriber_factory(
                         self.config.transcriber, allow_hosted=self.allow_hosted_speech
@@ -1364,6 +1384,8 @@ class PrototypeController:
                 if generation != self._generation or stop.is_set():
                     return
                 self._processor = self._session_processor = processor
+                if hasattr(processor, "on_speakers_renewed"):
+                    processor.on_speakers_renewed = self._speakers_renewed
             if mode == "microphone":
                 capture = self.capture_factory(self.config.microphone_helper)
                 with self._lock:
@@ -1491,6 +1513,8 @@ class PrototypeController:
                 with contextlib.suppress(Exception):
                     shadow.close(drain=not stop.is_set())
             with self._lock:
+                if self._shadow is shadow:
+                    self._shadow = None
                 if generation == self._generation:
                     self._capture = self._processor = None
                 elif generation + 1 == self._generation and self._phase == "stopping":
@@ -1515,9 +1539,23 @@ class PrototypeController:
             if self._audio_started is None:
                 self._audio_started = time.monotonic()
             self._phase = "listening" if self._live() else "replaying"
+            # Read with the clock under the lock, so a change stamped after this chunk
+            # never leaves a chunk heard in privacy in the speaker ring.
+            private = self._private_audio()
+            if private and self.config.hosted_speech:
+                # #242 round 27, the one choke point every audio consumer is fed through: in
+                # privacy, a hosted consumer (`hosted_audio_consumers`) receives nothing, by
+                # whatever path privacy became active. Unreachable while the refusals hold;
+                # if one is bypassed, the session ends as an error before this chunk goes on.
+                self._end_private_hosted(generation)
+                return False
         if shadow is not None:
             # Before the processor, so a turn it finalizes on this chunk finds its audio.
-            shadow.audio(pcm)
+            # In privacy mode (hailing-station #735 S-1) the speaker ring keeps silence of
+            # the same length instead: its stream offsets stay aligned, and none of the
+            # audio heard while private is retained. Identification then relies on the
+            # bindings made before; a private turn is never voiceprint evidence.
+            shadow.audio(bytes(len(pcm)) if private else pcm)
         processor.push_pcm16(pcm)
         if boundary:
             # The budget discards the open utterance, but a turn already finalized and
@@ -1529,6 +1567,32 @@ class PrototypeController:
                 if generation == self._generation:
                     self._budget_reached = True
         return not boundary
+
+    def _private_audio(self) -> bool:
+        """Whether privacy mode is on now, as the publisher holds it."""
+        return getattr(self._events, "ducked", False) is True
+
+    def _refuse_private_hosted(self) -> None:
+        """#242 round 27: privacy is never active with a hosted audio consumer configured; the
+        same refusal as `duck(True)` and `--start-private`, fail closed and announced."""
+        if self.config.hosted_speech and self._private_audio():
+            raise PrototypeError("duck mode is refused with a hosted speech backend")
+
+    def _end_private_hosted(self, generation: int) -> None:
+        """End the session as an error: privacy became active with a hosted audio consumer by
+        a path that bypassed every refusal (#242 round 27). Under the lock."""
+        if generation != self._generation or self._stop.is_set():
+            return
+        self._phase = "error"
+        self._error = "Privacy mode is refused with a hosted speech backend; the session ended."
+        self._stop.set()
+        if self._decision_status != "off":
+            self._decision_status = "unavailable"
+        self._completed_at = time.monotonic()
+        self._discard_pending()
+        if self._runner is not None:
+            self._runner.clear(clear_memory=False)
+        self._event_end("error", "privacy-hosted-speech")
 
     def _decide(self, generation, stop, work, runner, hosted):
         enabled = hosted
@@ -1703,8 +1767,14 @@ class PrototypeController:
             self._error = None
             self._memory.clear()
             self._decisions.clear()
+            # Per-turn notes observed before an accept that the stop cut off (#735 S-1).
+            self._turn_gaps.clear()
+            self._inferred_turns.clear()
+            self._turn_spans.clear()
             self._pending = self._received_ms = 0
             self._received_bytes = 0
+            # #242 round 27: the stream clock restarts; nothing is heard in privacy until audio.
+            self._private_from_bytes = 0 if self._private_audio() else None
             self._budget_ms = None
             self._budget_reached = False
             self._audio_started = None
@@ -1782,14 +1852,79 @@ class PrototypeController:
         clock, which runs ahead of it for good after lost audio), so a turn heard while it
         was on is never decided, even when it is released after it was turned off (see
         `_accept`), and speech after it is. A malformed value raises before anything is
-        forwarded.
+        forwarded. Turning it on is refused with a hosted speech backend, which would
+        still be sent the audio heard while private (S-1; `started` never advertises it
+        there, and `--start-private` is refused): fail closed, never apparently private.
         """
         if type(on) is not bool:
             raise PrototypeError("invalid duck mode")
+        if on and self.config.hosted_speech:
+            raise PrototypeError("duck mode is refused with a hosted speech backend")
         with self._lock:
             if self._events is not None:
+                ending = not on and self._events.ducked is True
+                if on and self._events.ducked is not True:
+                    # #242 round 27: where this privacy interval starts, in stream bytes.
+                    self._private_from_bytes = self._received_bytes
                 # At least the end of every piece received so far, held ones included.
                 self._events.duck(on, now_ms=self._received_ms)
+                if ending:
+                    # #242 round 27: an interval in which no audio was received, judged on the
+                    # stream clock in bytes (one sample counts), heard no one, so it forgets no
+                    # speaker: every effect of `_forget_speakers` (the publisher's renewed and
+                    # stale labels, the runner's, the diarizer renewal, the identifier's
+                    # bindings) assumes private audio was heard. Unknown (privacy began outside
+                    # the controller mid-session) forgets, fail closed.
+                    start = self._private_from_bytes
+                    self._private_from_bytes = None
+                    if start is None or self._received_bytes > start:
+                        self._forget_speakers()
+
+    def _speakers_renewed(self) -> None:
+        """The fresh diarizer takes over (#735 S-1, round 15): its labels restart from the first
+        voice heard, so every binding or role made for the old labels since privacy ended (a
+        turn finalized while the renewal waited) is forgotten again before any new label is
+        scored. Called on the audio thread."""
+        with self._lock:
+            forget = getattr(self._events, "forget_speakers", None)
+            if callable(forget):
+                forget()
+                self._runner_forgets_speakers()
+            if self._shadow is not None:
+                with contextlib.suppress(Exception):
+                    self._shadow.forget()
+
+    def _runner_forgets_speakers(self) -> None:
+        """#242 round 25: the decision runner forgets the old labels with the publisher, so no
+        later decision state names one: not its past turns or participants, a turn decided
+        after the forget, nor the latest request, whose copy loses its label too. Stamped on
+        the received-audio clock turns are timed in. Under the lock, like `note_request`."""
+        runner = self._runner
+        if runner is None:
+            return
+        runner.forget_speakers(self._received_ms)
+        if runner.request_context:
+            runner.note_request(getattr(self._events, "last_request", None))
+
+    def _forget_speakers(self) -> None:
+        """Privacy ended (#735 S-1, Codex P1 on #242): no speaker state from it may outlive it.
+        Under the lock. The diarizer starts afresh (once nothing is open), every speaker-ID
+        label binding is dropped and the publisher's per-label roles with it, so the owner is
+        identified again from public speech. The owner's exit already used its labels. Audio
+        heard before the end and still buffered is silenced, stamped on the same clock as the
+        mode (round 18) but in bytes, exact where the millisecond stamp rounds down (round 19),
+        so none of it, not one sample, is sent to ASR with the next public utterance."""
+        forget = getattr(self._events, "forget_speakers", None)
+        if callable(forget):
+            forget()
+            self._runner_forgets_speakers()
+        if self._processor is not None and callable(
+            getattr(self._processor, "reset_speakers", None)
+        ):
+            self._processor.reset_speakers(self._received_bytes)
+        if self._shadow is not None:
+            with contextlib.suppress(Exception):
+                self._shadow.forget()
 
     def _publish(self, method, value, **fields):
         """Run under the controller lock; a broken consumer cancels observation."""

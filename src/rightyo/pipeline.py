@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from rightyo.addressedness import mentions_name, scene_text
 from rightyo.addressedness import post_turn_gap as checked_gap
-from rightyo.contracts import Addressing, ContractError, DecisionEvent, Turn, identifier
+from rightyo.contracts import Addressing, ContractError, DecisionEvent, Turn, identifier, integer
 from rightyo.memory import TranscriptMemory
 from rightyo.providers import DecisionProvider, dismissal_hints
 
@@ -109,6 +109,10 @@ class ReplayRunner:
         # assistant last acted on, and how long ago, for follow-ups that refer back to it.
         self.request_context = request_context is True
         self._last_request: tuple[int, str, str, str | None] | None = None
+        # #242 round 25 (hailing-station #735 S-1): the stream time the speakers were last
+        # forgotten this session, or None. A turn ending by then carries a label from before
+        # the forget, which may now name someone else: no decision state names it.
+        self._labels_until_ms: int | None = None
         # Configured stop phrases sent as hints with the dismissal question (#98); None
         # asks no dismissal question.
         self.dismissal_phrases = (
@@ -156,6 +160,7 @@ class ReplayRunner:
         self._last_end_ms = 0
         self._replies.clear()
         self._last_request = None
+        self._labels_until_ms = None
 
     @_locked
     def clear(self, *, clear_memory: bool = True) -> None:
@@ -172,6 +177,7 @@ class ReplayRunner:
         if self.memory is not None and clear_memory:
             self.memory.clear()
         self._last_request = None
+        self._labels_until_ms = None
 
     @_locked
     def expire(self, now_ms: int) -> None:
@@ -206,11 +212,28 @@ class ReplayRunner:
             self.memory.append(turn)
             self.expire(turn.end_ms)
 
+    @_locked
+    def forget_speakers(self, now_ms: int) -> None:
+        """The speakers were forgotten at stream time `now_ms` (#242 round 25, hailing-station
+        #735 S-1): every turn ending by then, held in the history, being decided or the latest
+        request, is given to later decisions with no speaker label, as the publisher does."""
+        integer(now_ms, "now_ms")
+        if self._labels_until_ms is None or now_ms > self._labels_until_ms:
+            self._labels_until_ms = now_ms
+
+    def _label(self, speaker_id: str | None, end_ms: int) -> str | None:
+        """A turn's speaker label as decision state carries it: none without speakers or
+        for a turn ending by the latest forget (#242 round 25)."""
+        until = self._labels_until_ms
+        if self.no_speakers or (until is not None and end_ms <= until):
+            return None
+        return speaker_id
+
     def _turn_state(self, turn: Turn) -> dict[str, Any]:
         # Session/source identifiers are not needed for addressee inference.
         return {
             "text": turn.text,
-            "speaker_id": None if self.no_speakers else turn.speaker_id,
+            "speaker_id": self._label(turn.speaker_id, turn.end_ms),
             "start_ms": turn.start_ms,
             "end_ms": turn.end_ms,
             "overlap": turn.overlap,
@@ -271,7 +294,7 @@ class ReplayRunner:
         return {
             "ms_before": before,
             "text": text,
-            "speaker_id": None if self.no_speakers else speaker_id,
+            "speaker_id": self._label(speaker_id, end_ms),
         }
 
     def _reply_state(self, turn: Turn) -> dict[str, Any] | None:
@@ -302,9 +325,9 @@ class ReplayRunner:
             past.insert(0, previous)
         participants = sorted(
             {
-                item.speaker_id
+                label
                 for item in [*past, turn]
-                if item.speaker_id is not None and not self.no_speakers
+                if (label := self._label(item.speaker_id, item.end_ms)) is not None
             }
         )
         return {

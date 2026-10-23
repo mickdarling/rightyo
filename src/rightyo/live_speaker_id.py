@@ -281,10 +281,14 @@ class ShadowSpeakerId:
         self._names: dict[str, str] = {}
         # Owner-voice evidence (rightyo#164), never reported: the identifiers compared this
         # session (replaced whole), every identifier a label has bound to (only added to),
-        # and the seconds of speech scored. The worker records a binding before the
-        # seconds that produced it, so a reader that sees the seconds sees the binding.
+        # and the seconds of speech scored; the last two restart at `forget`, and are written
+        # and read together under `_epoch_lock`.
         self._compared: frozenset[str] = frozenset()
         self._bound_ids: set[str] = set()
+        # Bumped by `forget` (hailing-station #735 S-1): a queued or in-flight turn scored for
+        # an earlier epoch never commits, so nothing from before a reset survives it.
+        self._epoch = 0
+        self._epoch_lock = threading.Lock()
         self.scored_seconds = 0.0
         self._stop = threading.Event()  # discard pending work and exit
         self._closing = threading.Event()  # finish pending work, then exit
@@ -330,20 +334,20 @@ class ShadowSpeakerId:
         return name if isinstance(name, str) else None
 
     def owner_evidence(self, owners) -> tuple[bool, bool, float]:
-        """Owner-voice evidence for `owners` (rightyo#164); never blocks.
+        """Owner-voice evidence for `owners` (rightyo#164); never waits on the worker.
 
         Whether an owner identifier's voiceprint is compared this session, whether any
         label has bound to one, and the seconds of speech scored so far. Scored speech is
-        always a single label's own, unoverlapped timeline audio (#148).
+        always a single label's own, unoverlapped timeline audio (#148). The seconds and the
+        bindings are read together under the epoch lock (held briefly by `_score` and
+        `forget`), so a `forget` between them never pairs old seconds with no bindings.
         """
-        seconds = self.scored_seconds  # read first: see the write order in `__init__`
         owners = tuple(owners)
         compared = self._compared
-        return (
-            any(owner in compared for owner in owners),
-            any(owner in self._bound_ids for owner in owners),
-            seconds,
-        )
+        with self._epoch_lock:
+            seconds = self.scored_seconds
+            bound = any(owner in self._bound_ids for owner in owners)
+        return any(owner in compared for owner in owners), bound, seconds
 
     def _report(self, message: str) -> None:
         if self._report_to is not None:
@@ -358,7 +362,15 @@ class ShadowSpeakerId:
             with contextlib.suppress(Exception):
                 self._ring.append(pcm)
 
-    def turn(self, turn, *, inferred: bool = False, spans=None) -> None:
+    @property
+    def epoch(self) -> int:
+        """The current speaker epoch, bumped by each `forget` (#735 S-1). A caller that decides
+        a turn is public reads it in the same step (#242 round 23) and passes it to `turn`, so
+        a `forget` in between discards the turn instead of scoring it for the new labels."""
+        with self._epoch_lock:
+            return self._epoch
+
+    def turn(self, turn, *, inferred: bool = False, spans=None, epoch: int | None = None) -> None:
         """Queue one finalized turn for scoring; never blocks, never raises.
 
         `spans` are the `(start_ms, end_ms)` stream-time pieces of the turn's span that the
@@ -370,8 +382,17 @@ class ShadowSpeakerId:
         counted as inferred and scored on its labelled pieces only. The inferred words lie
         outside the label's timeline segments, so their audio, which may be another
         speaker's, is never accumulated into the label.
+
+        `epoch` is the speaker epoch read when the turn was accepted (see `epoch`): a turn
+        from an earlier epoch is never queued, and one queued just before a `forget` is
+        dropped by the worker. None takes the epoch now.
         """
         try:
+            if epoch is None:
+                epoch = self.epoch
+            elif epoch != self.epoch:
+                # #242 round 23: accepted before a `forget`; its label may now be someone else.
+                return
             if (
                 not self.active
                 or turn.speaker_id is None
@@ -402,7 +423,7 @@ class ShadowSpeakerId:
                 return
             try:
                 self._queue.put_nowait(
-                    (turn.speaker_id, turn.end_ms - turn.start_ms, labelled_ms, pcm)
+                    (epoch, turn.speaker_id, turn.end_ms - turn.start_ms, labelled_ms, pcm)
                 )
             except queue.Full:
                 self.dropped += 1
@@ -461,10 +482,25 @@ class ShadowSpeakerId:
                 with contextlib.suppress(Exception):
                     embedder.close()
 
+    def forget(self) -> None:
+        """Drop every label's evidence and binding (hailing-station #735 S-1): called when
+        privacy ends, with the diarizer reset, so no speaker state from before it survives.
+        The owner binds again from public speech. Never blocks on the worker.
+
+        The owner-voice evidence restarts with them (round 18): seconds scored before, kept
+        without the bindings they produced, would soon report a recognised owner as not."""
+        with self._epoch_lock:
+            self._epoch += 1
+            self._labels = {}
+            self._bound_ids = set()
+            self.scored_seconds = 0.0
+        self._discard_queue()
+
     def _score(
         self,
         embedder,
         prints: dict[str, list[float]],
+        epoch: int,
         label: str,
         turn_ms: int,
         labelled_ms: int,
@@ -484,15 +520,23 @@ class ShadowSpeakerId:
         turn_scores = {key: cosine(vector, value) for key, value in comparable.items()}
         # Update a copy and commit it only once complete, so a failure part-way never
         # leaves a label half-updated (or created without a score).
-        previous = self._labels.get(label)
-        state = LabelState() if previous is None else replace(previous)
-        mean = state.add(vector, seconds)
-        bind(state, {key: cosine(mean, value) for key, value in comparable.items()}, self.settings)
-        self._labels[label] = state
-        self.scored += 1
-        if state.state == "bound" and state.identity is not None:
-            self._bound_ids.add(state.identity)
-        self.scored_seconds += seconds
+        with self._epoch_lock:
+            if epoch != self._epoch:
+                return  # Queued before a `forget`: its label may now be someone else.
+            previous = self._labels.get(label)
+            state = LabelState() if previous is None else replace(previous)
+            mean = state.add(vector, seconds)
+            bind(
+                state,
+                {key: cosine(mean, value) for key, value in comparable.items()},
+                self.settings,
+            )
+            self._labels[label] = state
+            self.scored += 1
+            if state.state == "bound" and state.identity is not None:
+                self._bound_ids.add(state.identity)
+            # In the same epoch as its binding: never counted after a `forget`.
+            self.scored_seconds += seconds
         # Report after the bookkeeping, best-effort: a failing channel changes nothing.
         self._report(
             f"speaker_id label={_quoted(label)} turn_ms={turn_ms}"
@@ -598,6 +642,23 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         (#230): it leaves the binding `name_for` reads untouched. Never blocks or raises.
         """
         return self._lookup(turn)[0]
+
+    def resolved_by_voiceprint(self, utterance_id: str) -> bool:
+        """Whether the latest `role_for`, for this utterance, came from a live
+        identification binding rather than a label configured in `speakers`."""
+        resolved = self._resolved
+        return resolved is not None and resolved[0] == utterance_id
+
+    def enrolled_owner(self, turn) -> bool:
+        """Whether `turn` is the owner's by live voiceprint identification now (hailing-station
+        #735 S-1): its label is bound to an enrolled owner identity. A label configured as the
+        owner by session label is not, so a TV diarized into that slot never qualifies.
+        Looked up without side effects; never blocks or raises."""
+        try:
+            role, binding = self._lookup(turn)
+        except Exception:  # noqa: BLE001 - identification never fails the session
+            return False
+        return role == "owner" and binding is not None and binding[0] == "bound"
 
     def _lookup(self, turn) -> tuple[str, tuple | None]:
         """A turn's role and the binding it came from (None when no binding was used)."""
