@@ -2142,6 +2142,10 @@ class Round27Tests(unittest.TestCase):
         heard = LiveProcessor._heard_private
         processor = SimpleNamespace(config=SimpleNamespace(private=lambda _start, _end: None))
         self.assertTrue(heard(processor, 0, 20))
+        # And no such publisher reaches a session: it is refused at construction, so the
+        # per-turn judgement (`_heard_private`) never meets an unknown either.
+        with self.assertRaisesRegex(PrototypeError, "report what it heard privately"):
+            self.controller(constructor={"event_publisher": silent})
 
     def test_no_private_turn_held_at_the_off_survives_or_swallows_the_first_public_one(self):
         # Class C: a private turn finalized and still held by the merger when privacy ends (the

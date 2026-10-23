@@ -675,6 +675,12 @@ class PrototypeController:
         # here with hosted speech, as the CLI and `duck(True)` refuse it: the audio heard while
         # private would still be sent to the hosted backend. Checked again at every start.
         self._refuse_private_hosted()
+        # #242 round 28: a publisher that can be private must say what it heard in privacy
+        # (`heard_ducked`); one that cannot would leave every privacy judgement unknown.
+        if callable(getattr(event_publisher, "duck", None)) and not callable(
+            getattr(event_publisher, "heard_ducked", None)
+        ):
+            raise PrototypeError("A private-capable publisher must report what it heard privately")
         self._event_terminal = True
         self._lock = threading.RLock()
         self._generation = 0
