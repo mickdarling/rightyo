@@ -875,6 +875,10 @@ ignore the key if they do not know it.
 **Back to ambient**, with the `reason`:
 - `timeout`: the window lapsed. Stream time is judged at each decided turn, so the event
   is emitted with the next decision after the window, with `at_ms` set to the window end.
+  The same reason (naming no turn) also ends a conversation at a privacy entry, with `at_ms`
+  the entry ([#244](https://github.com/mickdarling/rightyo/issues/244)), and when a speaker
+  forget after privacy clears it, with `at_ms` the forget; `at_ms` is never after
+  `emitted_at_ms`.
 - `closed`: the engaged speaker's turn is a closing (below). That turn never re-engages,
   even if it was attended. A closing with no speaker label, said inside the window,
   also ends the engagement ([#167](https://github.com/mickdarling/rightyo/issues/167)):
@@ -1326,7 +1330,9 @@ then: it supersedes nothing, its stop phrase stops nothing, owner-only mode igno
 decision publishes `role: "unknown"` (in `attention`, `request` and `dismiss` alike), so a host
 does not count it as the owner's. Only two things carry the transcript-time role and label:
 the request's `turn` and its `context.turns`, which stay exactly as their `transcript` events
-published them before the forget, so a host's fingerprints of them still match. Everything else
+published them before the forget, so a host's fingerprints of them still match; and the
+`conversation` end a forget says for an engagement it clears names that engagement's own label,
+which the host already holds for it. Everything else
 derived after the forget names no label from before it and no owner or trusted role only that
 label gave: the request's `formed_request` (its asker unlabelled with the decided role, so a
 former says the requester is not an owner, and its earlier turns unlabelled), also when expiry
