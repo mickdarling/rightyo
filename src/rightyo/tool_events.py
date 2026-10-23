@@ -1314,6 +1314,12 @@ class SpeechEvents:
                 if off_ms is None or off_ms > on_ms
             )
 
+    def forget_speakers(self):
+        """Drop the speaker roles fixed per label (hailing-station #735 S-1): when privacy
+        ends the diarizer starts afresh, so a label may now name someone else."""
+        with self._lock:
+            self._roles.clear()
+
     @property
     def ducked(self):
         """Whether duck mode is on now (see `duck`)."""

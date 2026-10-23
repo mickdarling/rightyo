@@ -285,6 +285,10 @@ class ShadowSpeakerId:
         # seconds that produced it, so a reader that sees the seconds sees the binding.
         self._compared: frozenset[str] = frozenset()
         self._bound_ids: set[str] = set()
+        # Bumped by `forget` (hailing-station #735 S-1): a queued or in-flight turn scored for
+        # an earlier epoch never commits, so nothing from before a reset survives it.
+        self._epoch = 0
+        self._epoch_lock = threading.Lock()
         self.scored_seconds = 0.0
         self._stop = threading.Event()  # discard pending work and exit
         self._closing = threading.Event()  # finish pending work, then exit
@@ -402,7 +406,7 @@ class ShadowSpeakerId:
                 return
             try:
                 self._queue.put_nowait(
-                    (turn.speaker_id, turn.end_ms - turn.start_ms, labelled_ms, pcm)
+                    (self._epoch, turn.speaker_id, turn.end_ms - turn.start_ms, labelled_ms, pcm)
                 )
             except queue.Full:
                 self.dropped += 1
@@ -461,10 +465,21 @@ class ShadowSpeakerId:
                 with contextlib.suppress(Exception):
                     embedder.close()
 
+    def forget(self) -> None:
+        """Drop every label's evidence and binding (hailing-station #735 S-1): called when
+        privacy ends, with the diarizer reset, so no speaker state from before it survives.
+        The owner binds again from public speech. Never blocks on the worker."""
+        with self._epoch_lock:
+            self._epoch += 1
+            self._labels = {}
+            self._bound_ids = set()
+        self._discard_queue()
+
     def _score(
         self,
         embedder,
         prints: dict[str, list[float]],
+        epoch: int,
         label: str,
         turn_ms: int,
         labelled_ms: int,
@@ -484,14 +499,21 @@ class ShadowSpeakerId:
         turn_scores = {key: cosine(vector, value) for key, value in comparable.items()}
         # Update a copy and commit it only once complete, so a failure part-way never
         # leaves a label half-updated (or created without a score).
-        previous = self._labels.get(label)
-        state = LabelState() if previous is None else replace(previous)
-        mean = state.add(vector, seconds)
-        bind(state, {key: cosine(mean, value) for key, value in comparable.items()}, self.settings)
-        self._labels[label] = state
-        self.scored += 1
-        if state.state == "bound" and state.identity is not None:
-            self._bound_ids.add(state.identity)
+        with self._epoch_lock:
+            if epoch != self._epoch:
+                return  # Queued before a `forget`: its label may now be someone else.
+            previous = self._labels.get(label)
+            state = LabelState() if previous is None else replace(previous)
+            mean = state.add(vector, seconds)
+            bind(
+                state,
+                {key: cosine(mean, value) for key, value in comparable.items()},
+                self.settings,
+            )
+            self._labels[label] = state
+            self.scored += 1
+            if state.state == "bound" and state.identity is not None:
+                self._bound_ids.add(state.identity)
         self.scored_seconds += seconds
         # Report after the bookkeeping, best-effort: a failing channel changes nothing.
         self._report(

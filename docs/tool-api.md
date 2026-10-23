@@ -1258,6 +1258,15 @@ from `started` to `ended`, with 300 ms either side), so the echo of a clip such 
 counted as `exit_refused` and emits nothing. Without enrollment, roles or names, the
 host must offer another way out.
 
+**Privacy keeps no speakers either.** When the host turns privacy off, rightyo forgets every
+speaker: the diarizer starts afresh (once no utterance is open, so a turn under way keeps its
+labels), every speaker-ID binding is dropped, and the per-label roles go with them. Nothing a
+voice heard only in privacy did, a diarizer channel or a binding, outlives it. So right after
+privacy ends, voice features gated on the owner (the owner's role, `role_source`, and with them
+a host's voice privacy entry) wait until the owner has spoken publicly long enough to bind
+again (`speaker_id.bind_min_seconds`). Speaker turns heard in privacy are never scored, and
+utterances in privacy add nothing to the session's skipped-segment or suppressed-utterance totals.
+
 The phrases match loosely: anywhere in the turn, ignoring case, punctuation and filler
 ("um", "uh", "ok", "okay", "so", "hey", "well", "please" and similar). A configured name
 variant that is itself a filler word plus a name ("Hey Jarvis") cannot be matched as a

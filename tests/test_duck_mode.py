@@ -952,6 +952,27 @@ class DuckControllerTests(unittest.TestCase):
         self.assertEqual(len(configs), 1)
         self.assertEqual(configs[0].private, controller._heard_private_span)
 
+    def test_privacy_ending_forgets_every_speaker(self):
+        # Codex P1 on #242: at the off edge only, the diarizer is renewed, speaker-ID bindings
+        # are dropped and the publisher's per-label roles with them.
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        processor, shadow = mock.Mock(), mock.Mock()
+        controller._processor, controller._shadow = processor, shadow
+        events._roles["Speaker A"] = "participant"
+        controller.duck(False)  # Already off: no edge, nothing forgotten.
+        controller.duck(True)
+        self.assertEqual((processor.reset_speakers.call_count, shadow.forget.call_count), (0, 0))
+        self.assertEqual(events._roles, {"Speaker A": "participant"})
+        controller.duck(False)
+        self.assertEqual((processor.reset_speakers.call_count, shadow.forget.call_count), (1, 1))
+        self.assertEqual(events._roles, {})
+        controller.duck(False)
+        self.assertEqual((processor.reset_speakers.call_count, shadow.forget.call_count), (1, 1))
+
     def test_stop_drops_per_turn_notes_an_accept_never_took(self):
         # Jarvis on #242 round 5: a stop between the observation and the accept.
         controller = self.controller()

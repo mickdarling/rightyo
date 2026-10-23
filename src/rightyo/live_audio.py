@@ -1179,6 +1179,44 @@ def _select(value: Any, default: Callable[[LiveConfig], Any], config: LiveConfig
     return value if _is_backend_instance(value, method) else value(config)
 
 
+class _OffsetDiarizer:
+    """A diarizer started mid-stream (#735 S-1): its own clock starts at zero, so its timeline
+    is shifted onto the stream clock the processor's utterances use."""
+
+    def __init__(self, inner: Diarizer, offset_ms: int):
+        self._inner, self._offset = inner, offset_ms
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def _shifted(self, timeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                **segment,
+                **{
+                    key: segment[key] + self._offset
+                    for key in ("start_ms", "end_ms")
+                    if type(segment.get(key)) is int
+                },
+            }
+            if isinstance(segment, dict)
+            else segment
+            for segment in timeline
+        ]
+
+    def push(self, pcm: bytes) -> None:
+        self._inner.push(pcm)
+
+    def segments(self) -> list[dict[str, Any]]:
+        return self._shifted(self._inner.segments())
+
+    def finish(self) -> list[dict[str, Any]]:
+        return self._shifted(self._inner.finish())
+
+    def close(self) -> None:
+        self._inner.close()
+
+
 class LiveProcessor:
     """Single-owner synchronous processor; feed only explicitly consented audio.
 
@@ -1199,6 +1237,12 @@ class LiveProcessor:
         self._diarizer: Diarizer = _select(
             config.diarizer, lambda value: _Diarizer(value), config, "push"
         )
+        # A diarizer the processor made (the default, or a factory) can be made again when
+        # privacy ends (`reset_speakers`, hailing-station #735 S-1); a supplied instance cannot.
+        self._diarizer_renewable = config.diarizer is None or not _is_backend_instance(
+            config.diarizer, "push"
+        )
+        self._speaker_reset = False
         # The per-response segment bound for this session's timeline window (#226).
         self._timeline_limit = timeline_segment_limit(config.timeline_window_ms)
         self._partial = bytearray()
@@ -1210,6 +1254,10 @@ class LiveProcessor:
         self._counter = 0
         self._utterances = 0
         self._skipped_utterances = 0
+        # Of those, the ones from utterances heard in privacy (hailing-station #735 S-1): kept
+        # apart so the session's reported totals never count private speech.
+        self._private_skipped_segments = 0
+        self._private_skipped_utterances = 0
         self._end_of_turn = config.end_of_turn
         # Whether the end-of-turn model was already asked during the current pause, and
         # whether it judged the turn complete while the diarizer timeline lagged behind.
@@ -1240,9 +1288,11 @@ class LiveProcessor:
 
     @property
     def skipped_segments(self) -> int:
-        """whisper.cpp segments skipped this session for unusable offsets (see `_units`)."""
+        """whisper.cpp segments skipped this session for unusable offsets (see `_units`), not
+        counting those in utterances heard in privacy."""
         inner = getattr(self._transcriber, "skipped_segments", 0)
-        return inner if type(inner) is int and inner > 0 else 0
+        inner = inner if type(inner) is int and inner > 0 else 0
+        return max(0, inner - self._private_skipped_segments)
 
     @property
     def skipped_utterances(self) -> int:
@@ -1253,7 +1303,7 @@ class LiveProcessor:
         """
         inner = getattr(self._transcriber, "suppressed_utterances", 0)
         inner = inner if type(inner) is int and inner > 0 else 0
-        return self._skipped_utterances + inner
+        return max(0, self._skipped_utterances + inner - self._private_skipped_utterances)
 
     @property
     def buffered_audio_bytes(self) -> int:
@@ -1281,7 +1331,30 @@ class LiveProcessor:
             self.close()
             raise
 
+    def reset_speakers(self) -> None:
+        """Start a fresh diarizer once nothing is open (hailing-station #735 S-1): called when
+        privacy ends, so no speaker channel or state a private voice made outlives it. Deferred
+        to the first frame with no open utterance or held turn, so a turn under way keeps its
+        labels; its timeline continues on the stream clock."""
+        if self._diarizer_renewable:
+            self._speaker_reset = True
+
+    def _renew_diarizer(self) -> None:
+        self._speaker_reset = False
+        offset = self._received_ms
+        old, self._diarizer = (
+            self._diarizer,
+            _OffsetDiarizer(
+                _select(self.config.diarizer, lambda value: _Diarizer(value), self.config, "push"),
+                offset,
+            ),
+        )
+        with contextlib.suppress(Exception):
+            old.close()
+
     def _frame(self, frame: bytes) -> None:
+        if self._speaker_reset and not self._utterance and not self._merger.holding:
+            self._renew_diarizer()
         self._diarizer.push(frame)
         frame_start = self._received_ms
         self._received_ms += 20
@@ -1426,11 +1499,14 @@ class LiveProcessor:
             self._skipped_utterances += 1
         skipped = self.skipped_segments - before[0]
         suppressed = self.skipped_utterances > before[1]
-        if (
-            (skipped or suppressed)
-            and self.config.report is not None
-            and not self._heard_private(offset, offset + len(pcm) // BYTES_PER_MS)
-        ):
+        private = (skipped or suppressed) and self._heard_private(
+            offset, offset + len(pcm) // BYTES_PER_MS
+        )
+        if private:
+            # Taken out of the session's totals too, not only its note (Codex P2 on #242).
+            self._private_skipped_segments += skipped
+            self._private_skipped_utterances += 1 if suppressed else 0
+        if (skipped or suppressed) and self.config.report is not None and not private:
             # Content-free: counts only, never recognizer text or timestamps. A failing
             # diagnostic channel never ends the session.
             segments = f"{skipped} recognizer segment(s) with unusable timestamps"

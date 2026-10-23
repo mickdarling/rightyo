@@ -255,6 +255,37 @@ class ShadowTests(unittest.TestCase):
         )
         self.assertTrue(embedder.closed)
 
+    def test_forget_drops_every_binding_and_the_owner_binds_again(self):
+        # Codex P1 on #242: no speaker state outlives privacy; the owner rebinds from public
+        # speech after `bind_min_seconds`.
+        embedder = ScriptedEmbedder(
+            [unit(1, 0.2, 0), unit(1, 0.1, 0), unit(1, 0.2, 0), unit(1, 0.1, 0)]
+        )
+        harness = Harness(embedder)
+        harness.shadow.start()
+        harness.speak(2.0)
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
+        harness.shadow.forget()
+        self.assertIsNone(harness.shadow.binding("Speaker A"))
+        self.assertEqual(harness.shadow._bound_ids, set())
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.scored == 3)
+        self.assertNotEqual(harness.shadow.binding("Speaker A"), ("bound", "owner"))
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
+        harness.shadow.close(drain=True)
+
+    def test_a_turn_queued_before_forget_never_commits(self):
+        embedder = ScriptedEmbedder([unit(1, 0.2, 0)])
+        harness = Harness(embedder)
+        harness.speak(2.0)  # queued (epoch 0); the worker is not started yet
+        harness.shadow.forget()
+        harness.shadow.start()
+        harness.shadow.close(drain=True)
+        self.assertIsNone(harness.shadow.binding("Speaker A"))
+        self.assertEqual(harness.shadow.scored, 0)
+
     def test_short_overlapping_and_unlabelled_turns_are_not_scored(self):
         embedder = ScriptedEmbedder()
         harness = Harness(embedder)

@@ -672,6 +672,8 @@ class PrototypeController:
         self._runner: ReplayRunner | None = None
         self._capture = None
         self._processor = None
+        # The session's speaker identifier, while one runs (forgotten when privacy ends).
+        self._shadow = None
         self._audio_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._decision_cancel = threading.Event()
@@ -1259,6 +1261,9 @@ class PrototypeController:
         try:
             end_of_turn = self._end_of_turn_model(stop)
             shadow = self._shadow_speaker_id()
+            with self._lock:
+                if generation == self._generation:
+                    self._shadow = shadow
             settings = self.config.end_of_turn
             wake_word, owner = self._wake_join()
             if owner is None and self.config.turn_owner_pause_ms:
@@ -1458,6 +1463,8 @@ class PrototypeController:
                 with contextlib.suppress(Exception):
                     shadow.close(drain=not stop.is_set())
             with self._lock:
+                if self._shadow is shadow:
+                    self._shadow = None
                 if generation == self._generation:
                     self._capture = self._processor = None
                 elif generation + 1 == self._generation and self._phase == "stopping":
@@ -1774,8 +1781,27 @@ class PrototypeController:
             raise PrototypeError("duck mode is refused with a hosted speech backend")
         with self._lock:
             if self._events is not None:
+                ending = not on and self._events.ducked is True
                 # At least the end of every piece received so far, held ones included.
                 self._events.duck(on, now_ms=self._received_ms)
+                if ending:
+                    self._forget_speakers()
+
+    def _forget_speakers(self) -> None:
+        """Privacy ended (#735 S-1, Codex P1 on #242): no speaker state from it may outlive it.
+        Under the lock. The diarizer starts afresh (once nothing is open), every speaker-ID
+        label binding is dropped and the publisher's per-label roles with it, so the owner is
+        identified again from public speech. The owner's exit already used its labels."""
+        forget = getattr(self._events, "forget_speakers", None)
+        if callable(forget):
+            forget()
+        if self._processor is not None and callable(
+            getattr(self._processor, "reset_speakers", None)
+        ):
+            self._processor.reset_speakers()
+        if self._shadow is not None:
+            with contextlib.suppress(Exception):
+                self._shadow.forget()
 
     def _publish(self, method, value, **fields):
         """Run under the controller lock; a broken consumer cancels observation."""

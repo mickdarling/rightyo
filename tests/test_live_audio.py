@@ -716,6 +716,59 @@ class ConservativeAlignmentTests(unittest.TestCase):
             ([{"text": " Hello.", "start_ms": 50, "end_ms": 200}], 0),
         )
 
+    def renewable_config(self, diarizer):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "supplied-local-runtime"
+        path.touch()
+        return LiveConfig(
+            "reset-test", path, path, path, path, provenance="causal-replay", diarizer=diarizer
+        )
+
+    def test_reset_speakers_starts_a_fresh_diarizer_on_the_stream_clock(self):
+        # Codex P1 on #242: when privacy ends, no channel a private voice took survives.
+        made = []
+
+        def diarizer(config):
+            made.append(FakeDiarizer(config))
+            return made[-1]
+
+        processor = LiveProcessor(self.renewable_config(diarizer), lambda _turn: None)
+        self.addCleanup(processor.close)
+        for _ in range(10):
+            processor.push_pcm16(SILENCE)
+        processor.reset_speakers()
+        processor.push_pcm16(SILENCE)
+        self.assertEqual(len(made), 2)
+        self.assertTrue(made[0].closed)
+        self.assertEqual(len(made[0].frames), 10)
+        self.assertEqual(len(made[1].frames), 1)
+        # The new diarizer's own clock starts at zero; its timeline is shifted onto the stream.
+        self.assertEqual(processor._diarizer.segments()[0]["start_ms"], 200)
+
+    def test_reset_speakers_waits_for_an_open_utterance(self):
+        made = []
+
+        def diarizer(config):
+            made.append(FakeDiarizer(config))
+            return made[-1]
+
+        processor = LiveProcessor(self.renewable_config(diarizer), lambda _turn: None)
+        self.addCleanup(processor.close)
+        processor.push_pcm16(VOICE)
+        processor.reset_speakers()
+        for _ in range(5):
+            processor.push_pcm16(VOICE)
+        self.assertEqual(len(made), 1)  # Its labels stay with the turn under way.
+
+    def test_a_supplied_diarizer_instance_is_never_replaced(self):
+        supplied = FakeDiarizer(None)
+        processor = LiveProcessor(self.renewable_config(supplied), lambda _turn: None)
+        self.addCleanup(processor.close)
+        processor.reset_speakers()
+        processor.push_pcm16(SILENCE)
+        self.assertIs(processor._diarizer, supplied)
+
     def test_whisper_suppresses_a_bad_utterance_and_keeps_listening(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -777,7 +830,8 @@ class ConservativeAlignmentTests(unittest.TestCase):
                 for _ in range(72):
                     processor.push_pcm16(SILENCE)
             processor.finish()
-        self.assertEqual(processor.skipped_utterances, 1)
+        # Nor counted in the session's totals, which the terminal event reports.
+        self.assertEqual((processor.skipped_segments, processor.skipped_utterances), (0, 0))
         self.assertEqual(reports, [])
 
     def test_reporter_must_be_callable(self):
