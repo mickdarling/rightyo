@@ -276,6 +276,49 @@ class LiveProcessorTests(unittest.TestCase):
             with self.assertRaises(LiveAudioError):
                 LiveConfig(**values)
 
+    def private_samples_sent_to_asr(self, marks):
+        return [
+            value
+            for call in self.transcribe.call_args_list
+            for value in array.array("h", call.args[1])
+            if value in marks
+        ]
+
+    def test_privacy_off_silences_private_pre_roll_and_partial_audio(self):
+        # #242 round 18: quiet audio heard while private waits in the pre-roll (and a part
+        # frame in the buffer) with no utterance open; none may lead the next public one.
+        quiet = array.array("h", [77] * 320).tobytes()
+        self.feed(quiet, 12)
+        self.processor.push_pcm16(quiet[:320])
+        # Stamped on the controller's clock: all audio received so far, the part frame too.
+        self.processor.reset_speakers(12 * 20 + 10)
+        self.feed(VOICE, 20)
+        self.feed(SILENCE, 73)
+        self.assertEqual(self.transcribe.call_count, 1)
+        self.assertEqual(self.private_samples_sent_to_asr({77}), [])
+        # Public audio is kept: the stream offsets are unchanged and the speech is all there.
+        pcm = array.array("h", self.transcribe.call_args.args[1])
+        self.assertEqual(pcm.count(5000), 20 * 320)
+
+    def test_privacy_off_silences_the_private_start_of_an_open_utterance(self):
+        # The same with speech heard while private still open when privacy ends.
+        private = array.array("h", [4321] * 320).tobytes()
+        self.feed(SILENCE, 5)
+        self.feed(private, 10)
+        self.processor.reset_speakers(15 * 20)
+        self.feed(VOICE, 10)
+        self.feed(SILENCE, 72)
+        self.assertEqual(self.transcribe.call_count, 1)
+        self.assertEqual(self.private_samples_sent_to_asr({4321}), [])
+        self.assertEqual(array.array("h", self.transcribe.call_args.args[1]).count(5000), 3200)
+
+    def test_audio_pushed_after_the_privacy_end_is_kept(self):
+        # Applied in stream order, not when called: audio stamped after the end is public.
+        self.processor.reset_speakers(0)
+        self.feed(VOICE, 10)
+        self.feed(SILENCE, 72)
+        self.assertEqual(array.array("h", self.transcribe.call_args.args[1]).count(5000), 3200)
+
 
 class NativeStartupCancellationTests(unittest.TestCase):
     """A real sleeping Python child stands in for model initialization."""

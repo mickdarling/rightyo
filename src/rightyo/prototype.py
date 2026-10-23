@@ -1806,14 +1806,16 @@ class PrototypeController:
         """Privacy ended (#735 S-1, Codex P1 on #242): no speaker state from it may outlive it.
         Under the lock. The diarizer starts afresh (once nothing is open), every speaker-ID
         label binding is dropped and the publisher's per-label roles with it, so the owner is
-        identified again from public speech. The owner's exit already used its labels."""
+        identified again from public speech. The owner's exit already used its labels. Audio
+        heard before the end and still buffered is silenced, stamped on the same clock as the
+        mode (round 18), so none of it is sent to ASR with the next public utterance."""
         forget = getattr(self._events, "forget_speakers", None)
         if callable(forget):
             forget()
         if self._processor is not None and callable(
             getattr(self._processor, "reset_speakers", None)
         ):
-            self._processor.reset_speakers()
+            self._processor.reset_speakers(self._received_ms)
         if self._shadow is not None:
             with contextlib.suppress(Exception):
                 self._shadow.forget()

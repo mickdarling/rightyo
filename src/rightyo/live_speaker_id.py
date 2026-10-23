@@ -281,8 +281,9 @@ class ShadowSpeakerId:
         self._names: dict[str, str] = {}
         # Owner-voice evidence (rightyo#164), never reported: the identifiers compared this
         # session (replaced whole), every identifier a label has bound to (only added to),
-        # and the seconds of speech scored. The worker records a binding before the
-        # seconds that produced it, so a reader that sees the seconds sees the binding.
+        # and the seconds of speech scored; the last two restart at `forget`. The worker
+        # records a binding before the seconds that produced it, so a reader that sees the
+        # seconds sees the binding.
         self._compared: frozenset[str] = frozenset()
         self._bound_ids: set[str] = set()
         # Bumped by `forget` (hailing-station #735 S-1): a queued or in-flight turn scored for
@@ -468,11 +469,15 @@ class ShadowSpeakerId:
     def forget(self) -> None:
         """Drop every label's evidence and binding (hailing-station #735 S-1): called when
         privacy ends, with the diarizer reset, so no speaker state from before it survives.
-        The owner binds again from public speech. Never blocks on the worker."""
+        The owner binds again from public speech. Never blocks on the worker.
+
+        The owner-voice evidence restarts with them (round 18): seconds scored before, kept
+        without the bindings they produced, would soon report a recognised owner as not."""
         with self._epoch_lock:
             self._epoch += 1
             self._labels = {}
             self._bound_ids = set()
+            self.scored_seconds = 0.0
         self._discard_queue()
 
     def _score(
@@ -514,7 +519,8 @@ class ShadowSpeakerId:
             self.scored += 1
             if state.state == "bound" and state.identity is not None:
                 self._bound_ids.add(state.identity)
-        self.scored_seconds += seconds
+            # In the same epoch as its binding: never counted after a `forget`.
+            self.scored_seconds += seconds
         # Report after the bookkeeping, best-effort: a failing channel changes nothing.
         self._report(
             f"speaker_id label={_quoted(label)} turn_ms={turn_ms}"

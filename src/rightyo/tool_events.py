@@ -198,6 +198,22 @@ def _filler_for(addressing):
     return PRIVACY_FILLER - named
 
 
+def _matched_words(text, addressing):
+    """`text` as privacy words with filler dropped, except where a filler word is part of a
+    configured name or variant matched at that place (round 18): "please" stays in "Please
+    Jarvis, I'm back", but is still filler in "Jarvis, please, I'm back"."""
+    filler = _filler_for(addressing)
+    words = _privacy_words(text, filler)
+    if filler == PRIVACY_FILLER:
+        return words
+    named = set()
+    for at in range(len(words)):
+        for width in range(1, min(3, len(words) - at) + 1):
+            if addressing.name_for(" ".join(words[at : at + width])) is not None:
+                named.update(range(at, at + width))
+    return [word for at, word in enumerate(words) if word not in PRIVACY_FILLER or at in named]
+
+
 def _negated(words, at):
     """Whether "don't" or "do not" comes in the three words before `at`."""
     before = words[max(0, at - 3) : at]
@@ -229,7 +245,7 @@ def privacy_phrase(text, addressing):
     no match. The entry counts only as the whole turn (`_standalone_entry`) and never as a
     question. Nothing is kept: the words exist only inside this call.
     """
-    words = _privacy_words(text, _filler_for(addressing))
+    words = _matched_words(text, addressing)
     kinds = set()
     if addressing is not None:
         if words and addressing.name_for(" ".join(words)) is not None:
@@ -858,11 +874,13 @@ class SpeechEvents:
                 # Privacy mode (hailing-station #735 S-1): matched locally, then dropped. No
                 # transcript, no memory, no decision, no digest of the words, and no use of
                 # the session's turn budget.
+                # Matched only while privacy is on (round 18): a turn of an ended period
+                # released after it can no longer exit, and matching it would repeat its
+                # status on every offer (its id is not kept) and count it in the next period.
                 uid = turn.utterance_id
-                if uid not in self._seen and uid not in self._private_seen:
-                    if self._duck:
-                        # Kept only while privacy is on; cleared at its end (#735 S-1).
-                        self._private_seen.append(uid)
+                if self._duck and uid not in self._seen and uid not in self._private_seen:
+                    # Kept only while privacy is on; cleared at its end (#735 S-1).
+                    self._private_seen.append(uid)
                     self._private(turn, inferred)
                 return
             # Any turn heard outside privacy ends a split exit.

@@ -745,7 +745,9 @@ set, `"owner_voice": {"threshold_s": 20}`, and a host that accepts this object m
   owner identifier that has a voiceprint enrolled with the session's model; at least
   `threshold_s` seconds of speech have been scored by live identification this session
   (scored speech is always a single label's own, unoverlapped timeline audio); and no
-  label has bound to an owner identifier.
+  label has bound to an owner identifier. When privacy ends, the bindings and the scored
+  seconds both restart, so only speech since then counts; an event already emitted is not
+  repeated.
 - `recognized` is emitted once, when a label later binds to an owner identifier, and only
   if `unrecognized` was emitted before. An owner who binds before the threshold produces
   neither event.
@@ -1224,7 +1226,9 @@ A turn heard in privacy mode:
   never context for a later decision or request, and not even as a digest for duplicate
   detection (only its utterance id, in a bounded list of the last 64, so it never spends
   the session's 1,000-turn budget);
-- is matched once against the phrases below, and then dropped.
+- is matched once against the phrases below, and then dropped. A private turn released
+  only after privacy has ended (held or finalized late) is dropped unmatched: it can no
+  longer exit, and its status question is not answered or counted.
 
 The only events a private turn can produce carry no words:
 
@@ -1266,8 +1270,12 @@ turn finished while it waited was bound to the old ones. Nothing a
 voice heard only in privacy did, a diarizer channel or a binding, outlives it. So right after
 privacy ends, voice features gated on the owner (the owner's role, `role_source`, and with them
 a host's voice privacy entry) wait until the owner has spoken publicly long enough to bind
-again (`speaker_id.bind_min_seconds`). Speaker turns heard in privacy are never scored, and
-utterances in privacy add nothing to the session's skipped-segment or suppressed-utterance totals.
+again (`speaker_id.bind_min_seconds`), and the owner-voice evidence restarts with the bindings
+(below). Audio heard before the off and still buffered when the stream reaches it (the pre-roll
+kept between utterances, or the start of an utterance open across it) is silenced, so none of it
+is sent to the recognizer with the first public utterance. Speaker turns heard in privacy are
+never scored, and utterances in privacy add nothing to the session's skipped-segment or
+suppressed-utterance totals.
 Everything else held per speaker label goes too: the engaged speaker and a lapsed engagement,
 cool-downs, explicit ends, appendix windows and delivered requests a dismissal could withdraw. A
 turn accepted under the old labels and decided afterwards still forms its request, but engages
@@ -1277,9 +1285,10 @@ session restarts, since the fresh diarizer may give that label to anyone; only a
 binding gives those roles then (logged once).
 
 The phrases match loosely: anywhere in the turn, ignoring case, punctuation and filler
-("um", "uh", "ok", "okay", "so", "hey", "well", "please" and similar). A configured name
-variant that is itself a filler word plus a name ("Hey Jarvis") cannot be matched as a
-name, so it cannot exit; the plain name can. "Don't" or "do not" in the three words
+("um", "uh", "ok", "okay", "so", "hey", "well", "please" and similar). A filler word that
+is part of a configured name or variant ("Okay", "Hey Jarvis") is kept only where it is
+matched as part of that name; everywhere else it is still filler, so with a variant "Please
+Jarvis", "Jarvis, please, I'm back" still exits. "Don't" or "do not" in the three words
 before the phrase (before the name, for the exit) means no match.
 
 A split exit is the enrolled owner's lone name fragment ("Jarvis,") heard while privacy

@@ -150,6 +150,20 @@ class PrivacyEventsTests(unittest.TestCase):
         self.assertEqual(self.say(heard("p1", 100, 900, "synthetic words")), [])
         self.assertEqual(list(self.events._private_seen), [])
 
+    def test_a_late_private_turn_is_never_matched_again_after_privacy_ends(self):
+        # #242 round 18: a status question from an ended period, released and offered again
+        # after the off, emits nothing and is not counted in the next period.
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events.duck(False, now_ms=1000)
+        late = heard("s1", 100, 900, "Are you recording?")
+        for _ in range(3):
+            self.assertEqual(self.say(late), [])
+        self.assertEqual(list(self.events._private_seen), [])
+        self.events.duck(True, now_ms=2000)
+        self.events.duck(False, now_ms=3000)
+        self.assertEqual(self.notes[-1], self.note())
+
     def test_the_session_end_drops_a_split_exit_in_progress(self):
         # Round 7 (key 2's nit): no per-turn time from privacy outlives the session.
         self.start()
@@ -706,6 +720,18 @@ class PrivacyPhraseTests(unittest.TestCase):
         self.assertEqual(privacy_phrase("Okay, um, Jarvis, I'm back.", OURS), frozenset({"exit"}))
         self.assertEqual(privacy_phrase("Okay, I'm back.", OURS), frozenset({"rest"}))
 
+    def test_a_filler_word_in_a_variant_is_kept_only_inside_the_name(self):
+        # #242 round 18: a variant "Please Jarvis" keeps "please" where it is matched as part
+        # of the name, and leaves it filler everywhere else, so the plain exit still works.
+        polite = Addressing(names=("Jarvis",), variants=(("Jarvis", ("Please Jarvis",)),))
+        for text in ("Jarvis, please, I'm back.", "Please Jarvis, I'm back.", "Jarvis, I'm back."):
+            with self.subTest(text=text):
+                self.assertEqual(privacy_phrase(text, polite), frozenset({"exit"}))
+        self.assertEqual(privacy_phrase("Please, I'm back.", polite), frozenset({"rest"}))
+        self.assertEqual(privacy_phrase("Please Jarvis.", polite), frozenset({"name"}))
+        self.assertEqual(privacy_phrase("Jarvis, please.", polite), frozenset({"name"}))
+        self.assertEqual(privacy_phrase("Don't, Jarvis, please, I'm back.", polite), frozenset())
+
     def test_entry_is_intentional_only(self):
         # The host's S-2 rule: a standalone turn, after an optional name or address, with
         # small fillers at the edges only. Never mid-sentence, with an object, or a question.
@@ -967,8 +993,11 @@ class DuckControllerTests(unittest.TestCase):
         controller.duck(True)
         self.assertEqual((processor.reset_speakers.call_count, shadow.forget.call_count), (0, 0))
         self.assertEqual(events._roles, {"Speaker A": "participant"})
+        controller._received_ms = 4321
         controller.duck(False)
         self.assertEqual((processor.reset_speakers.call_count, shadow.forget.call_count), (1, 1))
+        # Round 18: the buffered audio before the end is silenced, on the mode's own clock.
+        processor.reset_speakers.assert_called_once_with(4321)
         self.assertEqual(events._roles, {})
         controller.duck(False)
         self.assertEqual((processor.reset_speakers.call_count, shadow.forget.call_count), (1, 1))
