@@ -309,6 +309,32 @@ def _standalone_entry(words, addressing):
     return False
 
 
+def _starts_named(text, addressing):
+    """Whether a turn opens with our name or variant (#735), after only the leading
+    edge words and optional address allowed by privacy entry. Never a mid-sentence name.
+    """
+    if addressing is None:
+        return False
+    words = _privacy_words(text, ())
+    at = 0
+    starts = {at}
+    while at < len(words) and words[at] in PRIVACY_EDGE:
+        at += 1
+        starts.add(at)
+    # Try before dropping an edge word too: a configured name may itself be "Okay".
+    starts |= {at + 1 for at in starts if at < len(words) and words[at] in PRIVACY_ADDRESS}
+    longest = max(
+        len(_privacy_words(spelling, ()))
+        for name in addressing.names
+        for spelling in (name, *addressing.spellings(name))
+    )
+    return any(
+        addressing.name_for(" ".join(words[at : at + width])) is not None
+        for at in starts
+        for width in range(1, min(longest, len(words) - at) + 1)
+    )
+
+
 def _role_state(record):
     """The bounded fields a role provider needs; session/source identifiers are omitted."""
     state = {name: record[name] for name in ("text", "speaker_id", "start_ms", "end_ms", "overlap")}
@@ -1153,6 +1179,19 @@ class SpeechEvents:
         if key in self._inferred and role in {"owner", "trusted"}:
             return "unknown"
         return role
+
+    def _named_owner(self, turn, role):
+        """A direct named address by the voiceprint-bound owner (#735), never a configured
+        owner label. Inferred words are allowed, as for ordinary attend requests.
+        Privacy stays closed; identification fails closed.
+        """
+        check = getattr(self._priority, "enrolled_owner", None)
+        if self._duck or role != "owner" or not self._per_turn or not callable(check):
+            return False
+        try:
+            return check(turn) is True and _starts_named(turn.text, self._addressing)
+        except Exception:  # noqa: BLE001 - identification never fails the session
+            return False
 
     def _plan(self, turn, role, kind, reason, confidence, *, loose, authority=None):
         """What a dismissal does, without changing state; None when it does nothing.
@@ -2165,7 +2204,22 @@ class SpeechEvents:
                 if evidence["label"] == "attend":
                     evidence["label"] = "uncertain"
                 evidence["answered_by_other"] = True
-            would_attend = evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
+            named_owner = (
+                unavailable is None
+                and event.decision.label == "uncertain"
+                and evidence["label"] == "uncertain"
+                and not stop
+                and not dismissed
+                and self._named_owner(turn, current)
+            )
+            if named_owner:
+                # #735: the owner's direct address beats abstention, never an ignore. Like
+                # a follow-up, keep the provider's recipient and confidence as evidence;
+                # the ordinary request path acknowledges and re-engages the conversation.
+                evidence["label"] = "attend"
+            would_attend = named_owner or (
+                evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
+            )
             # False: no follow-up note; None: a formed follow-up; else the refusal token.
             follow_up_note: str | None | bool = False
             follow_up_text = None
@@ -2520,6 +2574,11 @@ class SpeechEvents:
                         self._report(ack_note)
                     except Exception:  # noqa: BLE001
                         pass
+            if named_owner and self._report is not None:
+                # Content-free and last, like ack/follow-up notes; a failed report never
+                # changes delivery or engagement. One token per promoted decision (#735).
+                with contextlib.suppress(Exception):
+                    self._report("attention_promoted reason=named_owner")
             if follow_up_text is not None:
                 # After the request, if any, is out: a former or queue failure that ends the
                 # session raises before this, so `formed` is never reported for a lost one.
