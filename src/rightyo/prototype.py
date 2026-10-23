@@ -1866,8 +1866,10 @@ class PrototypeController:
                 if on and self._events.ducked is not True:
                     # #242 round 27: where this privacy interval starts, in stream bytes.
                     self._private_from_bytes = self._received_bytes
-                # At least the end of every piece received so far, held ones included.
-                self._events.duck(on, now_ms=self._received_ms)
+                # At least the end of every piece received so far, held ones included. Every
+                # applied on, a redundant one included, is acked (#735 S-8): audio received
+                # after the ack's `at_ms` falls inside the span.
+                self._events.duck(on, now_ms=self._received_ms, ack=on)
                 if ending:
                     # #242 round 27: an interval in which no audio was received, judged on the
                     # stream clock in bytes (one sample counts), heard no one, so it forgets no

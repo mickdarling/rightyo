@@ -225,6 +225,12 @@ def _apply_control(line: bytes, controller) -> None:
             controller.reply("ended", asked=message["asked"])
         else:
             controller.reply(message["reply"])
+    except ContractError:
+        # The session failed while applying a valid line (#735 S-8: a `privacy` ack that
+        # overran the event backlog, after the duck itself was applied). The reader lives
+        # on, so later lines (an off included) still apply; the host's ack deadline fails
+        # closed on the missing ack.
+        _stderr("control line not acknowledged; session failed")
     except (ValueError, TypeError, AttributeError, PrototypeError):
         _stderr("invalid control line; skipped")
 
@@ -281,7 +287,7 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
         config = replace(config, dismissal=dismissal_from_args(args))
     # Stdout carries the events; acknowledgement-gating notes (#132) go to stderr.
     coaching = getattr(args, "coaching", False)
-    # Starting private (hailing-station #735 S-2b) is honoured only where privacy mode v2 is
+    # Starting private (hailing-station #735 S-2b) is honoured only where privacy mode v3 is
     # advertised; anywhere else it is refused rather than starting un-private.
     start_private = getattr(args, "start_private", False) is True
     if start_private and coaching:
