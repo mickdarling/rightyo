@@ -1399,7 +1399,15 @@ class LiveProcessor:
     def _frame(self, frame: bytes) -> None:
         if self._private_until is not None:
             frame = self._private_cutoff(frame)
-        if self._speaker_reset and not self._utterance and not self._merger.holding:
+        # Renewed only once the privacy end is reached (#242 round 20): the controller counts a
+        # chunk before pushing it, so the end can lie ahead, and the fresh diarizer must never
+        # be fed a frame heard while private.
+        if (
+            self._speaker_reset
+            and self._private_until is None
+            and not self._utterance
+            and not self._merger.holding
+        ):
             self._renew_diarizer()
         self._diarizer.push(frame)
         frame_start = self._received_ms

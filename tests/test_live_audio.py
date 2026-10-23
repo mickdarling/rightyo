@@ -855,6 +855,31 @@ class ConservativeAlignmentTests(unittest.TestCase):
         self.assertEqual(len(made), 1)  # Its labels stay with the turn under way.
         self.assertEqual(renewed, [])  # Round 15: told only when the fresh diarizer takes over.
 
+    def test_the_fresh_diarizer_waits_for_the_privacy_end(self):
+        # #242 round 20: the end is stamped ahead of the frames still being pushed (the
+        # controller counts a chunk before pushing it); quiet frames heard while private must
+        # go to the old diarizer, never the fresh one.
+        made = []
+
+        def diarizer(config):
+            made.append(FakeDiarizer(config))
+            return made[-1]
+
+        processor = LiveProcessor(self.renewable_config(diarizer), lambda _turn: None)
+        self.addCleanup(processor.close)
+        quiet = array.array("h", [77] * 320).tobytes()
+        for _ in range(3):
+            processor.push_pcm16(SILENCE)
+        processor.reset_speakers(8 * FRAME_BYTES)
+        for _ in range(5):
+            processor.push_pcm16(quiet)
+        for _ in range(3):
+            processor.push_pcm16(SILENCE)
+        self.assertEqual(len(made), 2)
+        self.assertEqual(len(made[0].frames), 8)
+        self.assertEqual(len(made[1].frames), 3)
+        self.assertFalse(any(77 in array.array("h", frame) for frame in made[1].frames))
+
     def test_a_supplied_diarizer_instance_is_never_replaced(self):
         supplied = FakeDiarizer(None)
         processor = LiveProcessor(self.renewable_config(supplied), lambda _turn: None)
