@@ -323,15 +323,19 @@ def _starts_named(text, addressing):
         starts.add(at)
     # Try before dropping an edge word too: a configured name may itself be "Okay".
     starts |= {at + 1 for at in starts if at < len(words) and words[at] in PRIVACY_ADDRESS}
-    named_words = [
-        _privacy_words(spelling, ())
+
+    def key(value):
+        return "".join(char for char in value if char.isalnum()).casefold()
+
+    named_keys = {
+        key(spelling)
         for name in addressing.names
         for spelling in (name, *addressing.spellings(name))
-    ]
+    }
     return any(
-        candidate and words[at : at + len(candidate)] == candidate
+        key("".join(words[at : at + width])) in named_keys
         for at in starts
-        for candidate in named_words
+        for width in range(1, len(words) - at + 1)
     )
 
 

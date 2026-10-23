@@ -193,10 +193,12 @@ class NamedOwnerTests(unittest.TestCase):
         self.start(addressing=None)
         self.assert_unpromoted(self.say(heard("t3", 4000, "Jarvis, that's for you."), "uncertain"))
 
-    def test_non_ascii_text_attached_to_names_is_never_promoted(self):
+    def test_text_attached_to_names_is_never_promoted(self):
         cases = (
             (OURS, "我告诉Jarvis这件事。"),
             (OURS, "Jarvis这件事。"),
+            (OURS, "我告诉Jarvis"),
+            (OURS, "Jarvisonian, that's for you."),
             (
                 Addressing(names=("Synthetic Ledger Assistant Unit",)),
                 "我告诉Synthetic Ledger Assistant Unit, that's for you.",
@@ -215,6 +217,18 @@ class NamedOwnerTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.start(addressing=Addressing(names=(name,)))
                 events = self.say(heard("t3", 4000, name + ", that's for you."), "uncertain")
+                self.assertEqual(len([e for e in events if e["type"] == "request"]), 1)
+                self.assertEqual(self.notes.count(PROMOTED), 1)
+
+    def test_punctuation_and_spacing_inside_names_are_supported(self):
+        for name, text in (
+            ("R2D2", "R2-D2, help"),
+            ("R2D2", "R2 D2, help"),
+            ("RightyO", "Righty O, help"),
+        ):
+            with self.subTest(name=name, text=text):
+                self.start(addressing=Addressing(names=(name,)))
+                events = self.say(heard("t3", 4000, text), "uncertain")
                 self.assertEqual(len([e for e in events if e["type"] == "request"]), 1)
                 self.assertEqual(self.notes.count(PROMOTED), 1)
 
