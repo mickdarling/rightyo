@@ -1283,6 +1283,11 @@ class PrototypeController:
             # voiceprint evidence (#137), in shadow mode or with roles.
             inferred = turn.utterance_id in self._inferred_turns
             spans = self._turn_spans.pop(turn.utterance_id, None)
+            roles = self._enrolled_roles
+            if roles is not None:
+                # The privacy-entry voice check (hailing-station #735) scores these pieces and
+                # the rest of the span apart, when the transcript is published below.
+                roles.note_spans(turn.utterance_id, spans)
         # A private turn is never scored (#735 S-1): no label evidence, binding or count is
         # derived from speech heard in privacy, judged by the same decision `_accept` made
         # (so a mode change between the two cannot split them). The exit's voiceprint

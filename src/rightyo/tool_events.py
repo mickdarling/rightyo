@@ -6,6 +6,7 @@ import contextlib
 import copy
 import hashlib
 import json
+import re
 import unicodedata
 from collections import deque
 from dataclasses import replace
@@ -65,6 +66,12 @@ PRIVACY_ENTRY = frozenset(
     }
 )
 PRIVACY_EDGE = frozenset({"please", "okay", "ok", "now", "um", "uh", "so", "thanks"})
+# A turn that may be a privacy entry anywhere it is judged, the host's wider grammar
+# included (hailing-station #735): it says "privacy" or "private", or "stop" with
+# "recording" or "listening". Only these turns get the entry voice check
+# (`role_source: "voiceprint_label"`), so ordinary turns never wait on it.
+PRIVACY_ENTRY_WORDS = frozenset({"privacy", "private"})
+PRIVACY_STOPPED = frozenset({"recording", "recordings", "listening"})
 # Words that may open an address before the name ("hey Jarvis, privacy mode").
 PRIVACY_ADDRESS = frozenset({"hey"})
 # Words dropped anywhere before matching, so "um, ok Jarvis, so I'm back" still matches.
@@ -267,6 +274,13 @@ def privacy_phrase(text, addressing):
     if not text.rstrip().endswith("?") and _standalone_entry(_privacy_words(text, ()), addressing):
         kinds.add("entry")
     return frozenset(kinds)
+
+
+def _entry_shaped(text):
+    """Whether `text` may be a privacy entry, by its words alone (`PRIVACY_ENTRY_WORDS`).
+    Nothing is kept: the words exist only inside this call."""
+    words = set(re.findall(r"[a-z]+", str(text).lower()))
+    return bool(words & PRIVACY_ENTRY_WORDS) or ("stop" in words and bool(words & PRIVACY_STOPPED))
 
 
 def _standalone_entry(words, addressing):
@@ -545,16 +559,27 @@ class SpeechEvents:
         """ "voiceprint" when `turn` is the owner by live voiceprint identification, else
         None (hailing-station #735, #807): the published role is `owner`, it came from a
         live identification binding of the label to an enrolled owner voice when the role
-        was resolved for this turn, and no word of the turn has an inferred label. Never for
-        a label configured as the owner, an inferred label, a guest or an unlabelled
-        speaker, and only in a live session with privacy control and roles. Never raises.
+        was resolved for this turn, and no word of the turn has an inferred label.
+        "voiceprint_label" for the same binding when some words have an inferred label
+        (edge attribution or a tail join), only for a turn that may be a privacy entry
+        (`_entry_shaped`) whose whole span, inferred words included, the entry voice check
+        passes (`entry_voice`; #735, Mick: "I should be the only one to be able to turn it
+        on"). So a guest's word joined under the owner's label pulls the score down and is
+        refused. Never for a label configured as the owner, a guest, an unbound or
+        unlabelled speaker, and only in a live session with privacy control and roles.
+        Never raises.
         """
-        if role != "owner" or inferred or not self._role_sources or not self._per_turn:
+        if role != "owner" or not self._role_sources or not self._per_turn:
             return None
         try:
             check = getattr(self._priority, "resolved_by_voiceprint", None)
-            if callable(check) and check(turn.utterance_id) is True:
+            if not callable(check) or check(turn.utterance_id) is not True:
+                return None
+            if not inferred:
                 return "voiceprint"
+            entry = getattr(self._priority, "entry_voice", None)
+            if _entry_shaped(turn.text) and callable(entry) and entry(turn) is True:
+                return "voiceprint_label"
         except Exception:  # noqa: BLE001 - a source is descriptive and never fails the turn
             pass
         return None

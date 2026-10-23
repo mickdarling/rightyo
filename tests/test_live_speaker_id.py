@@ -533,6 +533,215 @@ class ToneEmbedder:
         self.closed = True
 
 
+class EntryCheckTests(unittest.TestCase):
+    """The privacy-entry voice check (hailing-station #735, rightyo#250): a turn's own-label
+    pieces and its inferred remainder, each scored on its own against the owner's voiceprint;
+    any failure refuses."""
+
+    def shadow(self, **overrides):
+        lines: list[str] = []
+        ring_ms = overrides.pop("ring_ms", 60000)
+        shadow = ShadowSpeakerId(
+            settings(**overrides),
+            report=lines.append,
+            embedder_factory=lambda _settings: ToneEmbedder(),
+            entries=lambda _settings: [dict(entry) for entry in ENTRIES],
+            ring_ms=ring_ms,
+        )
+        shadow.start()
+        self.addCleanup(shadow.close)
+        return shadow, lines
+
+    def roles(self, shadow):
+        roles = EnrolledRoles(SpeakerPriority.from_dict({"owner": ["owner"]}))
+        roles.source = shadow
+        return roles
+
+    def entry(self, roles, start, end, spans):
+        current = turn(start, end)
+        roles.note_spans(current.utterance_id, spans)
+        return roles.entry_voice(current)
+
+    def test_the_owners_own_pieces_pass_and_a_guests_do_not(self):
+        shadow, _lines = self.shadow()
+        shadow.audio(tone(1.0, OWNER_F0) + tone(1.0, GUEST_F0))
+        owner = shadow.entry_score(0, 1000, ((0, 1000),), ["owner"])
+        self.assertEqual((owner.outcome, owner.remainder, owner.remainder_ms), ("scored", None, 0))
+        self.assertGreater(owner.labelled, 0.99)
+        self.assertLess(shadow.entry_score(1000, 2000, ((1000, 2000),), ["owner"]).labelled, 0.1)
+
+    def test_an_even_owner_and_guest_mix_refuses(self):
+        # Codex P1 on #250: the owner says "stop", a guest's "recording" is inferred under his
+        # label. Scored whole, the mix would pass; scored apart, the guest's part refuses.
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.6, GUEST_F0))
+        roles = self.roles(shadow)
+        self.assertFalse(self.entry(roles, 0, 1200, ((0, 600),)))
+        (line,) = [line for line in lines if "entry_check" in line]
+        self.assertRegex(
+            line,
+            r"^speaker_id entry_check outcome=refuse reason=scored score=1\.000 threshold=0\.35"
+            r" remainder_ms=600 remainder_gap_ms=600 remainder_score=0\.\d{3}"
+            r" remainder_threshold=0\.35 gap_max_ms=600$",
+        )
+        self.assertNotIn(PRIVATE_TEXT, " ".join(lines))
+
+    def test_a_short_guest_word_refuses_and_the_owners_own_words_pass(self):
+        # Codex P1 on #250 (2b90c8c): a guest's 0.2 s "go" before the owner's "private" is
+        # judged, however short, and refuses; the owner's own short edge and his own 0.5 s
+        # inferred word pass.
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.2, GUEST_F0) + tone(0.6, OWNER_F0))
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.2, OWNER_F0))
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.5, OWNER_F0))
+        roles = self.roles(shadow)
+        self.assertFalse(self.entry(roles, 0, 800, ((200, 800),)))
+        self.assertTrue(self.entry(roles, 800, 1600, ((800, 1400),)))
+        self.assertTrue(self.entry(roles, 1600, 2700, ((1600, 2200),)))
+        checks = [line for line in lines if "entry_check" in line]
+        self.assertRegex(
+            checks[0],
+            r"outcome=refuse .* remainder_ms=200 remainder_gap_ms=200 remainder_score=0\.\d{3} ",
+        )
+        self.assertIn("remainder_ms=200 remainder_gap_ms=200 remainder_score=1.000", checks[1])
+        self.assertIn("remainder_ms=500 remainder_gap_ms=500 remainder_score=1.000", checks[2])
+
+    def test_each_inferred_gap_is_judged_alone(self):
+        # Codex P1 on #250 (0f40847): the owner's inferred "please", his own labelled "stop",
+        # then a guest's inferred "recording". Joined, the two gaps would average past the
+        # threshold; scored apart, the guest's gap refuses. Two gaps of his own pass.
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.4, OWNER_F0) + tone(0.6, OWNER_F0) + tone(0.4, GUEST_F0))
+        shadow.audio(tone(0.4, OWNER_F0) + tone(0.6, OWNER_F0) + tone(0.4, OWNER_F0))
+        roles = self.roles(shadow)
+        self.assertFalse(self.entry(roles, 0, 1400, ((400, 1000),)))
+        self.assertTrue(self.entry(roles, 1400, 2800, ((1800, 2400),)))
+        checks = [line for line in lines if "entry_check" in line]
+        self.assertRegex(
+            checks[0],
+            r"outcome=refuse .* remainder_ms=800 remainder_gap_ms=400 remainder_score=0\.\d{3} ",
+        )
+        self.assertIn("outcome=pass", checks[1])
+
+    def test_a_gap_long_enough_to_hold_two_words_refuses(self):
+        # Codex P1 on #250 (c9b3907): one gap holding the owner's "stop" and a guest's
+        # "recording" is one embedding; a voiced gap over `entry_gap_max_seconds` refuses,
+        # and the bound comes from the config.
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.6, OWNER_F0) + tone(0.6, GUEST_F0))
+        roles = self.roles(shadow)
+        self.assertFalse(self.entry(roles, 0, 1800, ((0, 600),)))
+        self.assertIn("outcome=refuse reason=scored", lines[-1])
+        self.assertIn("remainder_gap_ms=1200", lines[-1])
+        self.assertIn("gap_max_ms=600", lines[-1])
+        loose, loose_lines = self.shadow(entry_gap_max_seconds=1.5, entry_remainder_threshold=0.5)
+        loose.audio(tone(0.6, OWNER_F0) + tone(1.2, OWNER_F0))
+        self.assertTrue(self.entry(self.roles(loose), 0, 1800, ((0, 600),)))
+        self.assertIn("gap_max_ms=1500", loose_lines[-1])
+
+    def test_room_noise_under_his_voice_is_not_a_word_but_a_guest_word_is(self):
+        # #250 round 6: a pause gap of room noise 40 dB under his speech is not voiced, so
+        # neither the gap bound nor the remainder score refuses him for it; a guest's word
+        # at speaking level in a gap is still judged, and refuses.
+        quiet = array(
+            "h",
+            (int(90 * math.sin(2 * math.pi * GUEST_F0 * n / RATE)) for n in range(int(0.9 * RATE))),
+        )
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.6, OWNER_F0) + quiet.tobytes() + tone(0.6, OWNER_F0))
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.4, GUEST_F0))
+        roles = self.roles(shadow)
+        self.assertTrue(self.entry(roles, 0, 2100, ((0, 600), (1500, 2100))))
+        self.assertIn("remainder_ms=0 remainder_gap_ms=0 remainder_score=-", lines[-1])
+        self.assertFalse(self.entry(roles, 2100, 3100, ((2100, 2700),)))
+        self.assertIn("remainder_gap_ms=400", lines[-1])
+
+    def test_a_gap_mixing_his_word_and_a_guests_refuses_window_by_window(self):
+        # Codex P1 on #250 (caff9c4): 300 ms of the owner then 300 ms of a guest in ONE gap
+        # fits the gap bound, but its windows over the guest's part score as the guest.
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.3, OWNER_F0) + tone(0.3, GUEST_F0))
+        roles = self.roles(shadow)
+        self.assertFalse(self.entry(roles, 0, 1200, ((0, 600),)))
+        self.assertIn("remainder_gap_ms=600", lines[-1])
+        self.assertRegex(lines[-1], r"remainder_score=0\.[0-2]\d\d ")
+        # 600 ms + 600 ms (Codex P1 at c9b3907) refuses too, with the bound lifted out of the way.
+        wide, wide_lines = self.shadow(entry_gap_max_seconds=2.0)
+        wide.audio(tone(0.6, OWNER_F0) + tone(0.6, OWNER_F0) + tone(0.6, GUEST_F0))
+        self.assertFalse(self.entry(self.roles(wide), 0, 1800, ((0, 600),)))
+        self.assertIn("remainder_gap_ms=1200", wide_lines[-1])
+
+    def test_his_own_inferred_word_passes_window_by_window(self):
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.6, OWNER_F0))
+        self.assertTrue(self.entry(self.roles(shadow), 0, 1200, ((0, 600),)))
+        self.assertIn("remainder_gap_ms=600 remainder_score=1.000", lines[-1])
+
+    def test_a_clipped_span_refuses(self):
+        # Codex P2 on #250: never score what is left of a span the ring no longer holds.
+        shadow, _lines = self.shadow(ring_ms=1000)
+        shadow.audio(tone(2.0, OWNER_F0))
+        self.assertEqual(shadow.entry_score(0, 2000, ((0, 2000),), ["owner"]).outcome, "clipped")
+        self.assertFalse(self.entry(self.roles(shadow), 0, 2000, ((0, 2000),)))
+
+    def test_too_little_own_speech_or_no_spans_or_identifier_refuses(self):
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.3, OWNER_F0) + tone(0.9, OWNER_F0))
+        roles = self.roles(shadow)
+        self.assertEqual(shadow.entry_score(0, 1200, ((0, 300),), ["owner"]).outcome, "short")
+        self.assertFalse(self.entry(roles, 0, 1200, ((0, 300),)))
+        self.assertIn("outcome=refuse reason=short score=-", lines[-1])
+        # No pieces noted for this turn: nothing is the label's own.
+        self.assertFalse(roles.entry_voice(turn(0, 1200)))
+        self.assertEqual(
+            shadow.entry_score(0, 1200, ((0, 1200),), ["nobody"]).outcome, "unavailable"
+        )
+        shadow.close()
+        self.assertEqual(
+            shadow.entry_score(0, 1200, ((0, 1200),), ["owner"]).outcome, "unavailable"
+        )
+        orphan = EnrolledRoles(SpeakerPriority.from_dict({"owner": ["owner"]}))
+        self.assertFalse(self.entry(orphan, 0, 1200, ((0, 1200),)))
+
+    def test_the_thresholds_and_lengths_come_from_the_config(self):
+        shadow, lines = self.shadow(entry_threshold=0.2, entry_remainder_threshold=0.0)
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.6, GUEST_F0))
+        self.assertTrue(self.entry(self.roles(shadow), 0, 1200, ((0, 600),)))
+        self.assertIn("threshold=0.20 remainder_ms=600", lines[-1])
+
+    def test_the_entry_keys_are_validated(self):
+        base = {"python": "/synthetic/python", "model": "/synthetic/model.onnx", "live": True}
+        config = SpeakerIdConfig.from_dict(base)
+        self.assertEqual(
+            (
+                config.entry_threshold,
+                config.entry_min_seconds,
+                config.entry_remainder_threshold,
+                config.entry_gap_max_seconds,
+                config.entry_window_seconds,
+            ),
+            (0.35, 0.5, 0.35, 0.6, 0.25),
+        )
+        tuned = SpeakerIdConfig.from_dict(base | {"entry_remainder_threshold": 0.2})
+        self.assertEqual(tuned.entry_remainder_threshold, 0.2)
+        for bad in (
+            {"entry_threshold": 1.5},
+            {"entry_threshold": "0.4"},
+            {"entry_threshold": True},
+            {"entry_min_seconds": 0.1},
+            {"entry_min_seconds": 11},
+            {"entry_remainder_threshold": -0.1},
+            {"entry_gap_max_seconds": 0.05},
+            {"entry_gap_max_seconds": 11},
+            {"entry_window_seconds": 0.05},
+            {"entry_window_seconds": 6},
+            # No length below which a remainder goes unjudged (Codex P1 on #250).
+            {"entry_word_seconds": 0.3},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                SpeakerIdConfig.from_dict(base | bad)
+
+
 class SegmentScoringTests(unittest.TestCase):
     """Only the label's own diarization pieces of a turn are embedded (#148)."""
 

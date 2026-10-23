@@ -39,7 +39,16 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from rightyo.contracts import SpeakerPriority
-from rightyo.enroll import MAX_VERIFY_SECONDS, Store, cosine, normalize, speech, voiceprint
+from rightyo.enroll import (
+    MAX_VERIFY_SECONDS,
+    Store,
+    cosine,
+    frame_energies,
+    normalize,
+    speech,
+    voiceprint,
+    windows,
+)
 from rightyo.providers import ConfiguredPriorityProvider
 from rightyo.speaker_id import SAMPLE_RATE, SpeakerEmbedder, SpeakerIdConfig
 
@@ -52,6 +61,41 @@ RING_MS = 60000
 MIN_RING_MS = 10000
 MAX_RING_MS = 600000
 QUEUE_SIZE = 4
+# A privacy-entry voice check (hailing-station #735) waits at most this long for the worker;
+# a check not done by then refuses, the safe failure. At most this many wait at once.
+ENTRY_CHECK_TIMEOUT_S = 2.0
+ENTRY_CHECKS = 4
+
+
+class _EntryCheck:
+    """One privacy-entry voice check: a turn's own-label audio (`labelled`) and each gap of
+    the rest of its span (`gaps`, the inferred words), each scored on its own by the worker
+    against the owners' voiceprints. `result` is an `EntryScore`, set once before `done`."""
+
+    def __init__(self, labelled: bytes, gaps: tuple[bytes, ...], owners: tuple[str, ...]):
+        self.labelled = labelled
+        self.gaps = gaps
+        self.owners = owners
+        self.done = threading.Event()
+        self.result = EntryScore(None, None, 0, "unavailable")
+
+
+@dataclass(frozen=True)
+class EntryScore:
+    """A privacy-entry voice check's numbers (hailing-station #735): the own-label audio's
+    best owner score, the remainder's (the lowest of its voiced gaps' scores, each scored on
+    its own; None when no gap held speech, or a voiced gap could not be scored), the
+    remainder's speech in ms over all gaps, the outcome: `scored`, or why not (`short`,
+    `clipped`, `timeout`, `busy`, `unavailable`), and the longest voiced gap's speech in ms
+    (logged only, for tuning)."""
+
+    labelled: float | None
+    remainder: float | None
+    remainder_ms: int
+    outcome: str
+    longest_gap_ms: int = 0
+
+
 CLOSE_DRAIN_SECONDS = 3.0
 # The input route kinds a host may name for diagnostics (rightyo#164): exactly
 # HailProtocol's diagnostic `route` tokens, never a port or device name.
@@ -274,6 +318,8 @@ class ShadowSpeakerId:
         self._embedder_factory = embedder_factory
         self._entries = entries
         self._queue: queue.Queue[tuple[str, int, int, bytes]] = queue.Queue(maxsize=queue_size)
+        # Privacy-entry voice checks (#735), taken before queued turns: a caller waits on one.
+        self._checks: queue.Queue[_EntryCheck] = queue.Queue(maxsize=ENTRY_CHECKS)
         self._ring = PcmRing(ring_ms)
         self._labels: dict[str, LabelState] = {}
         # Enrolled display names by identifier (hailing-station #434), for the voiceprints
@@ -463,6 +509,13 @@ class ShadowSpeakerId:
             self._report(f"speaker_id start enrolled={len(prints)}{self._route}")
             while not self._stop.is_set():
                 try:
+                    check = self._checks.get_nowait()
+                except queue.Empty:
+                    pass
+                else:
+                    self._check(embedder, prints, check)
+                    continue
+                try:
                     item = self._queue.get(timeout=0.05)
                 except queue.Empty:
                     if self._closing.is_set():
@@ -478,6 +531,7 @@ class ShadowSpeakerId:
         finally:
             self._off.set()
             self._discard_queue()
+            self._release_checks()
             if embedder is not None:
                 with contextlib.suppress(Exception):
                     embedder.close()
@@ -544,6 +598,109 @@ class ShadowSpeakerId:
             f" turn_score={turn_scores[state.identity]:.3f} acc_score={state.score:.3f}"
             f" acc_s={state.seconds:.1f} state={state.state} id={state.identity}{self._route}"
         )
+
+    def entry_score(self, start_ms: int, end_ms: int, spans, owners) -> EntryScore:
+        """A privacy-entry voice check (hailing-station #735, rightyo#250): the turn's own
+        label timeline pieces (`spans`, #148) and the rest of `[start_ms, end_ms)`, the
+        inferred words, each taken from the ring and scored on its own against `owners`'
+        voiceprints by the worker, so a guest's words joined under the owner's label are
+        judged as themselves, never averaged into his. Any part outside the ring is
+        `clipped`. Blocks the caller at most `ENTRY_CHECK_TIMEOUT_S`; never raises. Nothing
+        is kept or reported here."""
+        try:
+            if not self.active:
+                return EntryScore(None, None, 0, "unavailable")
+            pieces = _pieces(spans, start_ms, end_ms)
+            gaps, at = [], start_ms
+            for start, end in pieces:
+                if start > at:
+                    gaps.append((at, start))
+                at = end
+            if end_ms > at:
+                gaps.append((at, end_ms))
+            parts: list[list[bytes]] = [[], []]
+            for index, ranges in enumerate((pieces, gaps)):
+                for start, end in ranges:
+                    pcm, clipped = self._ring.span(start, end)
+                    if clipped or not pcm:
+                        return EntryScore(None, None, 0, "clipped")
+                    parts[index].append(pcm)
+            check = _EntryCheck(b"".join(parts[0]), tuple(parts[1]), tuple(owners))
+            try:
+                self._checks.put_nowait(check)
+            except queue.Full:
+                return EntryScore(None, None, 0, "busy")
+            if not check.done.wait(ENTRY_CHECK_TIMEOUT_S):
+                return EntryScore(None, None, 0, "timeout")
+            return check.result
+        except Exception:  # noqa: BLE001 - a check that fails refuses, never raises
+            return EntryScore(None, None, 0, "unavailable")
+
+    def _check(self, embedder, prints: dict[str, list[float]], check: _EntryCheck) -> None:
+        """Scores one entry check on the worker; any failure is its outcome, never the
+        worker's (the turn scoring and the session carry on)."""
+
+        def best(samples) -> float | None:
+            samples = samples[: int(MAX_VERIFY_SECONDS * SAMPLE_RATE)]
+            vector, _ = voiceprint(embedder.embed, samples)
+            scores = [
+                cosine(vector, prints[owner])
+                for owner in check.owners
+                if owner in prints and len(prints[owner]) == len(vector)
+            ]
+            return max(scores) if scores else None
+
+        result = EntryScore(None, None, 0, "unavailable")
+        try:
+            own = speech(_samples(check.labelled)) if check.labelled else array("h")
+            # Codex P1 on #250 (0f40847): each gap is its own inferred piece, possibly another
+            # voice, so each is scored alone, never averaged with the others. Its speech is
+            # measured from the owner's own loudest frame (#250 round 6): room noise 35 dB
+            # under his voice is not a word, while a word at speaking level still is.
+            peak = max(frame_energies(_samples(check.labelled)), default=0.0)
+            voiced = [
+                rest
+                for rest in (speech(_samples(gap), peak=peak) for gap in check.gaps)
+                if len(rest)
+            ]
+            rest_ms = round(sum(len(rest) for rest in voiced) * 1000 / SAMPLE_RATE)
+            longest = round(max((len(rest) for rest in voiced), default=0) * 1000 / SAMPLE_RATE)
+            if len(own) / SAMPLE_RATE < self.settings.entry_min_seconds:
+                result = EntryScore(None, None, rest_ms, "short", longest)
+            else:
+                labelled = best(own)
+                # Codex P1 on #250 (2b90c8c): any voiced gap is scored, however short, since a
+                # short word ("go") can complete an entry; one that cannot be scored refuses
+                # (`entry_voice`: no score with speech), never passes unjudged.
+                # #250 round 7 (Codex P1 at caff9c4): one gap may still hold his short word and
+                # a guest's; every half-overlapping window of it must score as him, so the
+                # guest's part is judged nearly on its own, never averaged across the gap.
+                size = self.settings.entry_window_seconds
+                scores = [
+                    min(scored, default=None) if None not in scored else None
+                    for scored in (
+                        [best(window) for window in windows(rest, size, size / 2)]
+                        for rest in voiced
+                    )
+                ]
+                remainder = (
+                    min(scores) if scores and all(score is not None for score in scores) else None
+                )
+                if labelled is not None:
+                    result = EntryScore(labelled, remainder, rest_ms, "scored", longest)
+        except Exception:  # noqa: BLE001 - one check's failure refuses that entry only
+            result = EntryScore(None, None, 0, "unavailable")
+        finally:
+            check.result = result
+            check.done.set()
+
+    def _release_checks(self) -> None:
+        while True:
+            try:
+                check = self._checks.get_nowait()
+            except queue.Empty:
+                return
+            check.done.set()
 
     def _discard_queue(self) -> None:
         while True:
@@ -627,6 +784,8 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         # The binding the latest `role_for` resolved, as (utterance id, label, binding), so
         # `name_for` names the identity that role came from, never a later rebinding.
         self._resolved = None
+        # The latest turn's own-label pieces, as (utterance id, spans), for `entry_voice`.
+        self._spans = None
 
     def role_for(self, turn) -> str:
         self._resolved = None
@@ -648,6 +807,62 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         identification binding rather than a label configured in `speakers`."""
         resolved = self._resolved
         return resolved is not None and resolved[0] == utterance_id
+
+    def note_spans(self, utterance_id: str, spans) -> None:
+        """The label's own timeline pieces of the turn about to be published (#148), for its
+        entry voice check; only the latest is kept, as `role_for` keeps its binding."""
+        self._spans = (utterance_id, spans)
+
+    def entry_voice(self, turn) -> bool:
+        """Whether `turn` is the owner's voice for privacy entry (hailing-station #735,
+        rightyo#250): its label's own pieces hold at least `entry_min_seconds` of speech
+        scoring at least `entry_threshold` against an owner's voiceprint, and the rest of
+        its span (the inferred words), gap by gap, each that holds any speech holding no
+        more than `entry_gap_max_seconds` of it and scoring at least
+        `entry_remainder_threshold` on its own however short, so a guest's words joined
+        under the owner's label are judged as themselves and never pass unjudged. Reports
+        one line of numbers per check, pass or refuse; blocks at most
+        `ENTRY_CHECK_TIMEOUT_S`; never raises (a failure refuses)."""
+        source = self.source
+        check = getattr(source, "entry_score", None)
+        if not callable(check):
+            return False
+        try:
+            noted = self._spans
+            spans = noted[1] if noted is not None and noted[0] == turn.utterance_id else None
+            if spans is None:
+                return False
+            result = check(turn.start_ms, turn.end_ms, spans, self.priority.owners)
+            settings = source.settings
+            # Codex P1 on #250 (c9b3907): one gap is one embedding and cannot be split
+            # without word boundaries, so a voiced gap longer than about a word, which could
+            # hold his word and a guest's together, refuses.
+            passed = (
+                result.outcome == "scored"
+                and result.longest_gap_ms <= settings.entry_gap_max_seconds * 1000
+                and type(result.labelled) is float
+                and result.labelled >= settings.entry_threshold
+                and (
+                    result.remainder >= settings.entry_remainder_threshold
+                    if result.remainder is not None
+                    else result.remainder_ms == 0
+                )
+            )
+            report = getattr(source, "_report", None)
+            if callable(report):
+                report(
+                    f"speaker_id entry_check outcome={'pass' if passed else 'refuse'}"
+                    f" reason={result.outcome} score={_number(result.labelled, '.3f')}"
+                    f" threshold={_number(settings.entry_threshold, '.2f')}"
+                    f" remainder_ms={result.remainder_ms}"
+                    f" remainder_gap_ms={result.longest_gap_ms}"
+                    f" remainder_score={_number(result.remainder, '.3f')}"
+                    f" remainder_threshold={_number(settings.entry_remainder_threshold, '.2f')}"
+                    f" gap_max_ms={round(settings.entry_gap_max_seconds * 1000)}"
+                )
+            return passed
+        except Exception:  # noqa: BLE001 - a failed check refuses entry, never the turn
+            return False
 
     def enrolled_owner(self, turn) -> bool:
         """Whether `turn` is the owner's by live voiceprint identification now (hailing-station

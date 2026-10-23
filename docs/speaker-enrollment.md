@@ -72,8 +72,12 @@ Optional keys: `store` (an absolute directory, default
 `tentative_threshold` (default 0.45, below the bind threshold), `min_turn_seconds` (default
 1.0, 0.5 to 10), `threads` (1 to 8, default 4), `live` (default false; see
 [shadow identification](#shadow-identification-in-live-sessions)), `bind_min_seconds`
-(default 3.0, 0.5 to 120) and `enabled` (default true). The section is off when absent or
-`"enabled": false`.
+(default 3.0, 0.5 to 120), `entry_threshold` (default 0.35, 0 to 1), `entry_min_seconds`
+(default 0.5, 0.2 to 10), `entry_remainder_threshold` (default 0.35, 0 to 1) and
+`entry_gap_max_seconds` (default 0.6, 0.1 to 10) and `entry_window_seconds` (default 0.25,
+0.1 to 5), which decide the privacy-entry voice check
+(hailing-station #735; see [`role_source`](tool-api.md#voiceprint-owner-on-transcripts)),
+and `enabled` (default true). The section is off when absent or `"enabled": false`.
 
 The thresholds come from the evaluation's per-turn scores on synthetic voices. They are
 starting points: recalibrate them on your own enrollment with `verify`. Live shadow

@@ -662,9 +662,10 @@ differences:
   exercises owner authority. Nor are its inferred words ever voiceprint evidence: the
   identifier embeds only the parts of a turn the diarizer timeline gave its label alone
   (#148), and inferred words lie outside them, so another voice's words joined under a
-  label can never bind that label to an enrolled identity. The inference is internal; no event
-  field marks it, but such a turn never carries
-  [`role_source: "voiceprint"`](#voiceprint-owner-on-transcripts).
+  label can never bind that label to an enrolled identity. The inference is internal: such a
+  turn never carries [`role_source: "voiceprint"`](#voiceprint-owner-on-transcripts), and
+  carries `"voiceprint_label"` only as a privacy entry whose own pieces and inferred words
+  each pass the owner voice check.
 - **Authority is re-checked when the decision arrives.** If the label's binding no longer
   gives the turn its owner or trusted role by then (it fell below `tentative_threshold`),
   the turn is treated as `unknown` for policy: it emits no `override` and acts with no
@@ -1439,14 +1440,42 @@ beside the turn (never inside it, so turn fingerprints are unchanged):
 "role_source": "voiceprint"
 ```
 
-It is present only when the turn's `role` is `owner`, that role came from live voiceprint
+It is present only when the turn's `role` is `owner` and that role came from live voiceprint
 identification (the label bound to an enrolled owner voice when the role was resolved,
-with `speaker_id` `"live": true` and `"roles": true`), and no word of the turn has an
-inferred label. It is absent in every other case: an owner configured by session label in
-`speakers` (a TV or another voice diarized into that slot would carry the label), an
-inferred label (edge attribution, tail join, or a lone wake word joined to the next
-piece), a guest, an unbound or unlabelled speaker, and a session without roles. No other
-value is ever sent; absent means "not a voiceprint owner". It is never on `attention` or
+with `speaker_id` `"live": true` and `"roles": true`). Its value is `"voiceprint"` when no
+word of the turn has an inferred label. When some do (edge attribution, tail join, or a lone
+wake word joined to the next piece), it is `"voiceprint_label"` only for a turn that may be
+a privacy entry (it says "privacy" or "private", or "stop" with "recording" or "listening")
+that passes the entry voice check, which judges the turn's two parts **apart**
+(hailing-station #735, Mick: "I should be the only one to be able to turn it on"):
+
+- the label's own timeline pieces must hold at least `speaker_id` `entry_min_seconds`
+  (default 0.5) of speech scoring at least `entry_threshold` (default 0.35) against an
+  owner's voiceprint;
+- the rest of the span, the inferred words, is judged gap by gap: every gap that holds any
+  speech at all must hold no more than `entry_gap_max_seconds` (default 0.6, about one
+  word) of it, and must score at least `entry_remainder_threshold` (default 0.35) in every
+  half-overlapping window of `entry_window_seconds` (default 0.25), however short, never
+  averaged with another gap: a gap holding his short word and a guest's has windows that
+  are nearly all the guest's, and those refuse. A short word ("go") can complete an
+  entry, so voiced audio that cannot be scored refuses rather than pass unjudged.
+
+So a guest's words joined under the owner's label are scored as themselves, never averaged
+into his voice, and an entry they complete is refused unless they score as the owner. A span
+any part of which the session audio ring no longer holds is refused (`clipped`), as is any
+failure. Short commands usually carry an inferred word, so a host accepts
+`"voiceprint_label"` for privacy entry and requires `"voiceprint"` where every word must be
+the owner's. An inferred owner turn that is not entry-shaped, or fails the check, carries
+nothing. Each check logs one line of numbers (`speaker_id entry_check outcome=pass|refuse
+reason=… score=… threshold=… remainder_ms=… remainder_gap_ms=… remainder_score=…
+remainder_threshold=… gap_max_ms=…`, the gap figure being the longest voiced gap's
+speech), never
+words or audio. It waits at most 2 s, and the session's other work waits with it: it runs as
+the turn is published, so only an entry-shaped inferred owner turn ever pays it. It is absent
+in every other case: an owner configured by session label in
+`speakers` (a TV or another voice diarized into that slot would carry the label), a guest,
+an unbound or unlabelled speaker, and a session without roles. No other value is ever sent;
+absent means "not a voiceprint owner". It is never on `attention` or
 `request` events, which repeat the transcript's role and are joined to it by
 `utterance_id`, and only a live `listen` session that advertises privacy mode sends it, so
 `tool-replay`, `--coaching` and the authored fixtures are unchanged.
