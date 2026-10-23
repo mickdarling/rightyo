@@ -585,18 +585,22 @@ class EntryCheckTests(unittest.TestCase):
         )
         self.assertNotIn(PRIVATE_TEXT, " ".join(lines))
 
-    def test_a_short_inferred_edge_is_ignored_and_the_owners_own_word_passes(self):
+    def test_a_short_guest_word_refuses_and_the_owners_own_words_pass(self):
+        # Codex P1 on #250 (2b90c8c): a guest's 0.2 s "go" before the owner's "private" is
+        # judged, however short, and refuses; the owner's own short edge and his own 0.5 s
+        # inferred word pass.
         shadow, lines = self.shadow()
-        # 0.6 s of the owner with a 0.2 s edge (too short to carry a word), then 0.6 s of the
-        # owner with his own 0.5 s inferred word.
-        shadow.audio(tone(0.6, OWNER_F0) + tone(0.2, GUEST_F0))
+        shadow.audio(tone(0.2, GUEST_F0) + tone(0.6, OWNER_F0))
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.2, OWNER_F0))
         shadow.audio(tone(0.6, OWNER_F0) + tone(0.5, OWNER_F0))
         roles = self.roles(shadow)
-        self.assertTrue(self.entry(roles, 0, 800, ((0, 600),)))
-        self.assertTrue(self.entry(roles, 800, 1900, ((800, 1400),)))
+        self.assertFalse(self.entry(roles, 0, 800, ((200, 800),)))
+        self.assertTrue(self.entry(roles, 800, 1600, ((800, 1400),)))
+        self.assertTrue(self.entry(roles, 1600, 2700, ((1600, 2200),)))
         checks = [line for line in lines if "entry_check" in line]
-        self.assertIn("remainder_ms=200 remainder_score=- remainder_threshold=0.35", checks[0])
-        self.assertIn("remainder_ms=500 remainder_score=1.000", checks[1])
+        self.assertRegex(checks[0], r"outcome=refuse .* remainder_ms=200 remainder_score=0\.\d{3} ")
+        self.assertIn("remainder_ms=200 remainder_score=1.000", checks[1])
+        self.assertIn("remainder_ms=500 remainder_score=1.000", checks[2])
 
     def test_a_clipped_span_refuses(self):
         # Codex P2 on #250: never score what is left of a span the ring no longer holds.
@@ -625,9 +629,7 @@ class EntryCheckTests(unittest.TestCase):
         self.assertFalse(self.entry(orphan, 0, 1200, ((0, 1200),)))
 
     def test_the_thresholds_and_lengths_come_from_the_config(self):
-        shadow, lines = self.shadow(
-            entry_threshold=0.2, entry_remainder_threshold=0.0, entry_word_seconds=0.1
-        )
+        shadow, lines = self.shadow(entry_threshold=0.2, entry_remainder_threshold=0.0)
         shadow.audio(tone(0.6, OWNER_F0) + tone(0.6, GUEST_F0))
         self.assertTrue(self.entry(self.roles(shadow), 0, 1200, ((0, 600),)))
         self.assertIn("threshold=0.20 remainder_ms=600", lines[-1])
@@ -636,18 +638,11 @@ class EntryCheckTests(unittest.TestCase):
         base = {"python": "/synthetic/python", "model": "/synthetic/model.onnx", "live": True}
         config = SpeakerIdConfig.from_dict(base)
         self.assertEqual(
-            (
-                config.entry_threshold,
-                config.entry_min_seconds,
-                config.entry_remainder_threshold,
-                config.entry_word_seconds,
-            ),
-            (0.35, 0.5, 0.35, 0.3),
+            (config.entry_threshold, config.entry_min_seconds, config.entry_remainder_threshold),
+            (0.35, 0.5, 0.35),
         )
-        tuned = SpeakerIdConfig.from_dict(
-            base | {"entry_remainder_threshold": 0.2, "entry_word_seconds": 1}
-        )
-        self.assertEqual((tuned.entry_remainder_threshold, tuned.entry_word_seconds), (0.2, 1.0))
+        tuned = SpeakerIdConfig.from_dict(base | {"entry_remainder_threshold": 0.2})
+        self.assertEqual(tuned.entry_remainder_threshold, 0.2)
         for bad in (
             {"entry_threshold": 1.5},
             {"entry_threshold": "0.4"},
@@ -655,8 +650,8 @@ class EntryCheckTests(unittest.TestCase):
             {"entry_min_seconds": 0.1},
             {"entry_min_seconds": 11},
             {"entry_remainder_threshold": -0.1},
-            {"entry_word_seconds": 0.05},
-            {"entry_word_seconds": 6},
+            # No length below which a remainder goes unjudged (Codex P1 on #250).
+            {"entry_word_seconds": 0.3},
         ):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 SpeakerIdConfig.from_dict(base | bad)

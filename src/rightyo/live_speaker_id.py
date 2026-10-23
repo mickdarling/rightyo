@@ -74,9 +74,9 @@ class _EntryCheck:
 @dataclass(frozen=True)
 class EntryScore:
     """A privacy-entry voice check's numbers (hailing-station #735): the own-label audio's
-    best owner score, the remainder's (None when it held less than `entry_word_seconds` of
-    speech, or there was none), the remainder's speech in ms, and the outcome: `scored`,
-    or why not (`short`, `clipped`, `timeout`, `busy`, `unavailable`)."""
+    best owner score, the remainder's (None when it held no speech), the remainder's speech
+    in ms, and the outcome: `scored`, or why not (`short`, `clipped`, `timeout`, `busy`,
+    `unavailable`)."""
 
     labelled: float | None
     remainder: float | None
@@ -647,11 +647,10 @@ class ShadowSpeakerId:
                 result = EntryScore(None, None, rest_ms, "short")
             else:
                 labelled = best(own)
-                remainder = (
-                    best(rest)
-                    if len(rest) / SAMPLE_RATE >= self.settings.entry_word_seconds
-                    else None
-                )
+                # Codex P1 on #250 (2b90c8c): any voiced remainder is scored, however short,
+                # since a short word ("go") can complete an entry; one that cannot be scored
+                # refuses (`entry_voice`), never passes unjudged.
+                remainder = best(rest) if len(rest) else None
                 if labelled is not None:
                     result = EntryScore(labelled, remainder, rest_ms, "scored")
         except Exception:  # noqa: BLE001 - one check's failure refuses that entry only
@@ -783,11 +782,11 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         """Whether `turn` is the owner's voice for privacy entry (hailing-station #735,
         rightyo#250): its label's own pieces hold at least `entry_min_seconds` of speech
         scoring at least `entry_threshold` against an owner's voiceprint, and the rest of
-        its span (the inferred words), when it holds at least `entry_word_seconds` of
-        speech, scores at least `entry_remainder_threshold` on its own, so a guest's words
-        joined under the owner's label are judged as themselves. Reports one line of
-        numbers per check, pass or refuse; blocks at most `ENTRY_CHECK_TIMEOUT_S`; never
-        raises (a failure refuses)."""
+        its span (the inferred words), if it holds any speech, scores at least
+        `entry_remainder_threshold` on its own however short, so a guest's words joined
+        under the owner's label are judged as themselves and never pass unjudged. Reports
+        one line of numbers per check, pass or refuse; blocks at most
+        `ENTRY_CHECK_TIMEOUT_S`; never raises (a failure refuses)."""
         source = self.source
         check = getattr(source, "entry_score", None)
         if not callable(check):
@@ -804,12 +803,9 @@ class EnrolledRoles(ConfiguredPriorityProvider):
                 and type(result.labelled) is float
                 and result.labelled >= settings.entry_threshold
                 and (
-                    result.remainder is None
-                    or result.remainder >= settings.entry_remainder_threshold
-                )
-                and (
-                    result.remainder is not None
-                    or result.remainder_ms < settings.entry_word_seconds * 1000
+                    result.remainder >= settings.entry_remainder_threshold
+                    if result.remainder is not None
+                    else result.remainder_ms == 0
                 )
             )
             report = getattr(source, "_report", None)
