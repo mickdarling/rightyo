@@ -167,6 +167,22 @@ class PrivacyEventsTests(unittest.TestCase):
         self.events.duck(False, now_ms=3000)
         self.assertEqual(self.notes[-1], self.note())
 
+    def test_a_status_turn_of_an_earlier_period_released_in_the_next_is_dropped_unmatched(self):
+        # #242 round 23 (Codex P2): a status question from period 1, released only once period 2
+        # is on, emits no `status`, is not counted in period 2 and keeps no id.
+        self.start()
+        self.events.duck(True, now_ms=0)
+        self.events.duck(False, now_ms=1000)
+        self.events.duck(True, now_ms=2000)
+        late = heard("s1", 100, 900, "Are you recording?")
+        self.assertEqual(self.say(late), [])
+        self.assertEqual(list(self.events._private_seen), [])
+        # A status question heard in period 2 is still answered and counted.
+        events = self.say(heard("s2", 2100, 2900, "Are you recording?"))
+        self.assertEqual([e.get("action") for e in events], ["status"])
+        self.events.duck(False, now_ms=3000)
+        self.assertEqual(self.notes[-1], self.note(discarded=1, status=1))
+
     def test_the_session_end_drops_a_split_exit_in_progress(self):
         # Round 7 (key 2's nit): no per-turn time from privacy outlives the session.
         self.start()
@@ -944,6 +960,45 @@ class DuckControllerTests(unittest.TestCase):
         controller._turn(controller._generation, work, memory, shadow, turn("t1", 0, 900, "x"))
         self.assertEqual(work.qsize(), 1)
         self.assertEqual(scored, ["t1"])
+
+    def test_a_privacy_cycle_between_the_accept_and_the_scoring_discards_the_turn(self):
+        # #242 round 23 (Codex P1): a public turn accepted under the old labels, then a whole
+        # privacy on/off (a `forget`) before `shadow.turn` queues it. The epoch read at the
+        # accept goes with it, so the worker never binds the old label's audio.
+        from test_live_speaker_id import ENTRIES, Harness, ScriptedEmbedder, unit
+
+        from rightyo.live_speaker_id import ShadowSpeakerId
+
+        controller = self.controller()
+        events = SpeechEvents()
+        events.start(SESSION, now_ms=0, addressing=OURS)
+        events.drain()
+        controller._events = events
+        harness = Harness(ScriptedEmbedder([unit(1, 0, 0)] * 4), entries=ENTRIES)
+        shadow = harness.shadow
+        controller._shadow = shadow
+        pcm = array.array("h", [8000, -8000] * 32000).tobytes()  # four seconds
+        shadow.audio(pcm)
+        generation = controller._generation
+        controller._observe_spans(generation, "t1", ((0, 4000),))
+        current = heard("t1", 0, 4000, "synthetic")
+
+        def cycle_first(*args, **kwargs):
+            controller._received_ms = 5000
+            controller.duck(True)
+            controller._received_ms = 6000
+            controller.duck(False)
+            return ShadowSpeakerId.turn(shadow, *args, **kwargs)
+
+        work, memory = queue.Queue(), TranscriptMemory()
+        with mock.patch.object(shadow, "turn", side_effect=cycle_first):
+            controller._turn(generation, work, memory, shadow, current)
+        shadow.start()
+        shadow.close(drain=True)
+        self.assertEqual(shadow.scored, 0)
+        self.assertIsNone(shadow.binding("Speaker A"))
+        self.assertEqual(shadow._labels, {})
+        self.assertEqual(shadow.offered, 0)  # never queued at all
 
     def test_the_processor_is_told_which_audio_was_heard_in_privacy(self):
         # Codex P1 on #242: the processor withholds per-utterance diagnostics by this rule.

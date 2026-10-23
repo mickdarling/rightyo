@@ -362,7 +362,15 @@ class ShadowSpeakerId:
             with contextlib.suppress(Exception):
                 self._ring.append(pcm)
 
-    def turn(self, turn, *, inferred: bool = False, spans=None) -> None:
+    @property
+    def epoch(self) -> int:
+        """The current speaker epoch, bumped by each `forget` (#735 S-1). A caller that decides
+        a turn is public reads it in the same step (#242 round 23) and passes it to `turn`, so
+        a `forget` in between discards the turn instead of scoring it for the new labels."""
+        with self._epoch_lock:
+            return self._epoch
+
+    def turn(self, turn, *, inferred: bool = False, spans=None, epoch: int | None = None) -> None:
         """Queue one finalized turn for scoring; never blocks, never raises.
 
         `spans` are the `(start_ms, end_ms)` stream-time pieces of the turn's span that the
@@ -374,8 +382,17 @@ class ShadowSpeakerId:
         counted as inferred and scored on its labelled pieces only. The inferred words lie
         outside the label's timeline segments, so their audio, which may be another
         speaker's, is never accumulated into the label.
+
+        `epoch` is the speaker epoch read when the turn was accepted (see `epoch`): a turn
+        from an earlier epoch is never queued, and one queued just before a `forget` is
+        dropped by the worker. None takes the epoch now.
         """
         try:
+            if epoch is None:
+                epoch = self.epoch
+            elif epoch != self.epoch:
+                # #242 round 23: accepted before a `forget`; its label may now be someone else.
+                return
             if (
                 not self.active
                 or turn.speaker_id is None
@@ -406,7 +423,7 @@ class ShadowSpeakerId:
                 return
             try:
                 self._queue.put_nowait(
-                    (self._epoch, turn.speaker_id, turn.end_ms - turn.start_ms, labelled_ms, pcm)
+                    (epoch, turn.speaker_id, turn.end_ms - turn.start_ms, labelled_ms, pcm)
                 )
             except queue.Full:
                 self.dropped += 1

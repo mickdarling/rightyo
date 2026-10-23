@@ -1251,10 +1251,22 @@ class PrototypeController:
         # derived from speech heard in privacy, judged by the same decision `_accept` made
         # (so a mode change between the two cannot split them). The exit's voiceprint
         # check reads only bindings made from public speech.
-        private = self._accept(generation, work, memory, turn)
+        with self._lock:
+            private = self._accept(generation, work, memory, turn)
+            # #242 round 23: the speaker epoch is read in the same critical section as the
+            # privacy state, so a privacy cycle completing before `shadow.turn` queues the
+            # turn (`forget` advances the epoch) discards it instead of binding its old label.
+            epoch = (
+                getattr(shadow, "epoch", None) if shadow is not None and private is False else None
+            )
         if shadow is not None and private is False:
             # After the turn is accepted and published; it never raises or blocks.
-            shadow.turn(turn, inferred=inferred, spans=spans)
+            shadow.turn(
+                turn,
+                inferred=inferred,
+                spans=spans,
+                **({"epoch": epoch} if type(epoch) is int else {}),
+            )
 
     def _audio(self, generation, stop, session, work, memory, mode):
         capture = processor = end_of_turn = shadow = None

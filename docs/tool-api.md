@@ -1226,12 +1226,12 @@ A turn heard in privacy mode:
   never context for a later decision or request, and not even as a digest for duplicate
   detection (only its utterance id, in a bounded list of the last 64, so it never spends
   the session's 1,000-turn budget);
-- is matched once against the phrases below, and then dropped. A private turn released
-  only after privacy has ended (held or finalized late) is dropped unmatched while privacy
-  is still off: its status question is not answered or counted. If privacy is already on
-  again by then, it is matched in the new period instead: it can produce a `status` event
-  and is counted there, but it can never exit the new period (only a turn heard entirely
-  since the mode last went on can).
+- is matched once against the phrases below, and then dropped. Only a turn heard entirely
+  since the mode last went on, while it is still on, is matched. A private turn released
+  only after privacy has ended (held or finalized late) is dropped unmatched, whether
+  privacy is still off or already on again by then: its status question is not answered
+  or counted, it can never exit a later period, and its id is not kept. A turn begun before
+  the mode went on is dropped unmatched the same way.
 
 The only events a private turn can produce carry no words:
 

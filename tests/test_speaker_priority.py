@@ -389,6 +389,40 @@ class EnrolledEventTests(unittest.TestCase):
             self.events.decision(decision(current, "uncertain", "unknown"), current.end_ms)
             self.assertEqual([e["type"] for e in self.events.drain()], ["transcript", "attention"])
 
+    def test_a_configured_owner_turn_pending_across_a_forget_has_no_owner_authority(self):
+        # #242 round 23 (Codex P1): accepted as the configured owner, decided only after the
+        # speakers were forgotten. Its label may now name someone else, so it supersedes no
+        # one, its stop phrase stops nothing, and owner-only mode does not let it through;
+        # the published role stays "owner".
+        def open_request():
+            other = turn("other", 0, 1500, "Rightyo, delete the project.")
+            self.events.transcript(other, 1500)
+            self.events.decision(decision(other), 1600)
+            self.events.drain()
+
+        def stale(name, text):
+            own = turn(name, 2000, 2500, text, "Speaker A")
+            self.events.transcript(own, 2500)
+            self.events.forget_speakers()
+            self.events.decision(decision(own), 2600)
+            return [e for e in self.events.drain() if e["type"] != "transcript"]
+
+        for case, text in (("override", "Rightyo, keep the project."), ("stop", "Stop!")):
+            with self.subTest(case=case):
+                self.start()
+                open_request()
+                out = stale(case, text)
+                self.assertEqual([e["type"] for e in out], ["attention", "request"])
+                self.assertEqual(out[0]["decision"]["role"], "owner")
+                self.assertEqual(out[1]["turn"]["role"], "owner")
+                self.assertIn("enrolled-demo:other", self.events._open)
+        with self.subTest(case="owner-only"):
+            self.start(SpeakerPriority(owners=("Speaker A",), owner_only=True))
+            out = stale("gated", "Rightyo, keep the project.")
+            self.assertEqual([e["type"] for e in out], ["attention"])
+            self.assertEqual(out[0]["decision"]["label"], "ignore")
+            self.assertEqual(out[0]["decision"]["role"], "owner")
+
     def test_owner_only_downgrades_non_owner_attend_to_ignore(self):
         self.start(SpeakerPriority(owners=("Speaker A",), trusted=("Speaker B",), owner_only=True))
         other = turn("other", 0, 500, "Rightyo, delete the project.")

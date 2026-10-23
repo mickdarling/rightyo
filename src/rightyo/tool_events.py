@@ -876,11 +876,18 @@ class SpeechEvents:
                 # the session's turn budget.
                 # Matched only while privacy is on (round 18): a turn of an ended period
                 # released while it is still off is dropped unmatched, since matching it
-                # would repeat its status on every offer (its id is not kept). Released once
-                # privacy is on again, it is matched in the new period: it can answer
-                # `status` and is counted there, but cannot exit it (see `_private`).
+                # would repeat its status on every offer (its id is not kept).
+                # #242 round 23: and only if heard entirely since the mode last went on. A
+                # turn of an earlier period released once privacy is on again is dropped
+                # unmatched too, with no id kept: no `status`, no exit, and no count in the
+                # new period, which it was not heard in.
                 uid = turn.utterance_id
-                if self._duck and uid not in self._seen and uid not in self._private_seen:
+                if (
+                    self._duck
+                    and self._in_current_privacy(turn)
+                    and uid not in self._seen
+                    and uid not in self._private_seen
+                ):
                     # Kept only while privacy is on; cleared at its end (#735 S-1).
                     self._private_seen.append(uid)
                     self._private(turn, inferred)
@@ -1291,13 +1298,12 @@ class SpeechEvents:
             kinds = frozenset()
             self._private_counts["failed"] += 1
         split, self._private_name_end = self._private_name_end, None
-        # Heard entirely since the mode last went on, and it is still on: a turn heard in an
-        # earlier private period and released late can never end this one (#735 S-1).
-        current = self._duck and bool(self._duck_spans) and turn.start_ms >= self._duck_spans[-1][0]
+        # Only a turn heard entirely since the mode last went on, while it is still on, is
+        # matched at all (#242 round 23, see `transcript`): one heard in an earlier private
+        # period and released late can never end this one, answer its status or be counted.
         if "name" in kinds:
-            # Only the enrolled owner's own name fragment, in the current period, can
-            # begin a split exit.
-            if current and self._may_exit(turn, inferred):
+            # Only the enrolled owner's own name fragment can begin a split exit.
+            if self._may_exit(turn, inferred):
                 self._private_name_end = turn.end_ms
             return
         named = "exit" in kinds or (
@@ -1306,7 +1312,7 @@ class SpeechEvents:
             and 0 <= turn.start_ms - split <= PRIVACY_SPLIT_NAME_MS
         )
         if named:
-            if current and self._may_exit(turn, inferred):
+            if self._may_exit(turn, inferred):
                 self._private_counts["exit"] += 1
                 self._emit("privacy", action="exit")
                 return
@@ -1314,6 +1320,11 @@ class SpeechEvents:
         if "status" in kinds:
             self._private_counts["status"] += 1
             self._emit("privacy", action="status")
+
+    def _in_current_privacy(self, turn):
+        """Whether `turn` was heard entirely since privacy last went on, and it is still on
+        (#735 S-1). Called with the lock held."""
+        return self._duck and bool(self._duck_spans) and turn.start_ms >= self._duck_spans[-1][0]
 
     def _may_exit(self, turn, inferred):
         """Whether `turn` may leave privacy: the enrolled owner's voice, by live voiceprint
@@ -1939,6 +1950,13 @@ class SpeechEvents:
             # The published role stays as emitted (the host fingerprints it); policy uses
             # the role re-checked now (#137), and authority also drops inferred labels.
             current = self._current_role(turn, role)
+            if stale and current in {"owner", "trusted"} and not self._voiceprinted(heard):
+                # #242 round 23: a configured label's owner or trusted role was fixed before the
+                # speakers were forgotten, and the label may now name someone else. Like a turn
+                # accepted after it (round 17), it is `unknown` for policy: no override or
+                # supersession, owner-only gating, owner stop phrase, follow-up or authority.
+                # The published role, in the evidence and the request, is unchanged.
+                current = "unknown"
             authority = self._authority_role(key, current)
             if role is not None:
                 evidence["role"] = role
