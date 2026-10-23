@@ -164,15 +164,16 @@ class SpeakerIdConfig:
     bound non-owner voice to its `transcript` event as `speaker_name` (hailing-station
     #434), and the session advertises `speaker_names`.
 
-    Four keys decide a privacy-entry voice check (hailing-station #735): an owner turn with
+    Five keys decide a privacy-entry voice check (hailing-station #735): an owner turn with
     an inferred word is marked `role_source: "voiceprint_label"` only if its label's own
     timeline pieces hold at least `entry_min_seconds` (default 0.5, 0.2 to 10) of speech
     scoring at least `entry_threshold` (default 0.35, 0 to 1) against an owner's
     voiceprint, and each gap of the rest of its span (the inferred words) that holds any
     speech holds no more than `entry_gap_max_seconds` (default 0.6, 0.1 to 10; about one
-    word, so a gap cannot hold his word and a guest's together) and scores at least
-    `entry_remainder_threshold` (default 0.35, 0 to 1) on its own however short it is.
-    Tuned from the logged scores, not code.
+    word) of it and scores at least `entry_remainder_threshold` (default 0.35, 0 to 1) in
+    every window of `entry_window_seconds` (default 0.25, 0.1 to 5, half overlapping), so
+    a guest's part of a gap shared with his word is judged nearly on its own. Tuned from
+    the logged scores, not code.
     """
 
     python: Path
@@ -191,6 +192,7 @@ class SpeakerIdConfig:
     entry_min_seconds: float = 0.5
     entry_remainder_threshold: float = 0.35
     entry_gap_max_seconds: float = 0.6
+    entry_window_seconds: float = 0.25
 
     @classmethod
     def from_dict(cls, value: Any) -> SpeakerIdConfig | None:
@@ -212,6 +214,7 @@ class SpeakerIdConfig:
             "entry_min_seconds",
             "entry_remainder_threshold",
             "entry_gap_max_seconds",
+            "entry_window_seconds",
         }
         if not isinstance(value, dict) or set(value) - keys:
             raise ValueError("invalid speaker_id section")
@@ -239,6 +242,7 @@ class SpeakerIdConfig:
         entry_min = value.get("entry_min_seconds", 0.5)
         remainder_threshold = value.get("entry_remainder_threshold", 0.35)
         gap_max = value.get("entry_gap_max_seconds", 0.6)
+        window = value.get("entry_window_seconds", 0.25)
         if (
             type(roles) is not bool
             or (roles and not live)
@@ -263,6 +267,7 @@ class SpeakerIdConfig:
             or not _bounded(entry_min, 0.2, 10.0)
             or not _bounded(remainder_threshold, 0.0, 1.0)
             or not _bounded(gap_max, 0.1, 10.0)
+            or not _bounded(window, 0.1, 5.0)
         ):
             raise ValueError("invalid speaker_id section")
         return cls(
@@ -282,6 +287,7 @@ class SpeakerIdConfig:
             float(entry_min),
             float(remainder_threshold),
             float(gap_max),
+            float(window),
         )
 
     def band(self, score: float) -> str:

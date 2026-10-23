@@ -1454,9 +1454,10 @@ that passes the entry voice check, which judges the turn's two parts **apart**
   owner's voiceprint;
 - the rest of the span, the inferred words, is judged gap by gap: every gap that holds any
   speech at all must hold no more than `entry_gap_max_seconds` (default 0.6, about one
-  word) of it, since one gap is one embedding and could otherwise average his word with a
-  guest's, and must score at least `entry_remainder_threshold` (default 0.35) on its own,
-  however short, never averaged with another gap. A short word ("go") can complete an
+  word) of it, and must score at least `entry_remainder_threshold` (default 0.35) in every
+  half-overlapping window of `entry_window_seconds` (default 0.25), however short, never
+  averaged with another gap: a gap holding his short word and a guest's has windows that
+  are nearly all the guest's, and those refuse. A short word ("go") can complete an
   entry, so voiced audio that cannot be scored refuses rather than pass unjudged.
 
 So a guest's words joined under the owner's label are scored as themselves, never averaged

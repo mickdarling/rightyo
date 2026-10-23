@@ -47,6 +47,7 @@ from rightyo.enroll import (
     normalize,
     speech,
     voiceprint,
+    windows,
 )
 from rightyo.providers import ConfiguredPriorityProvider
 from rightyo.speaker_id import SAMPLE_RATE, SpeakerEmbedder, SpeakerIdConfig
@@ -671,7 +672,17 @@ class ShadowSpeakerId:
                 # Codex P1 on #250 (2b90c8c): any voiced gap is scored, however short, since a
                 # short word ("go") can complete an entry; one that cannot be scored refuses
                 # (`entry_voice`: no score with speech), never passes unjudged.
-                scores = [best(rest) for rest in voiced]
+                # #250 round 7 (Codex P1 at caff9c4): one gap may still hold his short word and
+                # a guest's; every half-overlapping window of it must score as him, so the
+                # guest's part is judged nearly on its own, never averaged across the gap.
+                size = self.settings.entry_window_seconds
+                scores = [
+                    min(scored, default=None) if None not in scored else None
+                    for scored in (
+                        [best(window) for window in windows(rest, size, size / 2)]
+                        for rest in voiced
+                    )
+                ]
                 remainder = (
                     min(scores) if scores and all(score is not None for score in scores) else None
                 )
