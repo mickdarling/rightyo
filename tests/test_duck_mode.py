@@ -225,9 +225,9 @@ class PrivacyEventsTests(unittest.TestCase):
         keys = ("discarded", "exit", "exit_refused", "status", "failed")
         return "privacy off: " + " ".join(f"{key}={counts.get(key, 0)}" for key in keys)
 
-    def test_started_advertises_version_2(self):
+    def test_started_advertises_version_3(self):
         (started,) = self.start()
-        self.assertEqual(started["duck"], {"version": 2})
+        self.assertEqual(started["duck"], {"version": 3})
         # Beside the strictly validated capability set, never inside it.
         self.assertNotIn("duck", started["capabilities"])
         # A producer that takes no control (replay) does not advertise it.
@@ -444,7 +444,7 @@ class PrivacyEventsTests(unittest.TestCase):
             SESSION, now_ms=0, addressing=OURS, conversation=MODE, priority=enrolled(), duck=True
         )
         (started,) = self.events.drain()
-        self.assertEqual(started["duck"], {"version": 2, "private": True})
+        self.assertEqual(started["duck"], {"version": 3, "private": True})
         self.assertEqual(self.events._duck_spans, [[0, None]])
         self.assertEqual(self.hear(*MONOLOGUE, start=0), [])
         self.events.duck(False, now_ms=5000)
@@ -453,7 +453,7 @@ class PrivacyEventsTests(unittest.TestCase):
         (request,) = [e for e in events if e["type"] == "request"]
         self.assertEqual(request["context"]["turns"], [])
         # Not private at start: no `private` key.
-        self.assertEqual(self.start()[0]["duck"], {"version": 2})
+        self.assertEqual(self.start()[0]["duck"], {"version": 3})
 
     def test_a_public_turn_between_ends_a_split_exit(self):
         self.start()
@@ -743,6 +743,23 @@ class PrivacyEventsTests(unittest.TestCase):
         self.events.duck(False, now_ms=63000)
         self.events.expire(120000)
         self.assertNotIn("conversation", self.types(self.events.drain()))
+
+    def test_an_acked_entry_while_engaged_says_the_end_then_the_ack(self):
+        # #245 with #248: one entry, both said at it, the conversation end first, then the
+        # S-8 ack; each stamped no earlier than its `at_ms`, in sequence order.
+        self.start()
+        current = heard("r1", 0, 900, "Jarvis, what time is it?")
+        self.events.transcript(current, current.end_ms)
+        self.events.decision(decided(current, "attend"), 950)
+        self.events.drain()
+        self.events.duck(True, now_ms=5000, ack=True)
+        said = self.events.drain()
+        self.assertEqual(
+            [(e["type"], e.get("state") or e.get("action"), e["at_ms"]) for e in said],
+            [("conversation", "ambient", 5000), ("privacy", "on", 5000)],
+        )
+        self.assertTrue(all(e["emitted_at_ms"] >= e["at_ms"] for e in said))
+        self.assertLess(said[0]["sequence"], said[1]["sequence"])
 
     def test_privacy_entry_with_nothing_engaged_says_nothing(self):
         self.start()
@@ -1411,7 +1428,7 @@ class DuckControllerTests(unittest.TestCase):
                 self.assertEqual(started["phase"], "started")
                 self.assertEqual("duck" in started, advertised)
                 if advertised:
-                    self.assertEqual(started["duck"], {"version": 2})
+                    self.assertEqual(started["duck"], {"version": 3})
 
     def test_privacy_is_refused_with_hosted_speech(self):
         # Codex P1 on #242: a stale or misconfigured host must not put a hosted-speech
@@ -2420,6 +2437,210 @@ class Round27Tests(unittest.TestCase):
                 self.assertEqual(published[0]["turn"]["start_ms"], 1700)
                 self.assertEqual(memory.snapshot(10_000)["turns"][0]["text"], public)
                 self.assertFalse(processor._merger.holding)
+
+
+class PrivacyAckTests(unittest.TestCase):
+    """#735 S-8 RO-1: duck v3 acks every applied `{"duck": true}` with a `privacy` `on`
+    event (haild counts one per on-line it wrote), and never the start-private duck."""
+
+    controller = DuckControllerTests.controller
+
+    def setUp(self):
+        self.errors = io.StringIO()
+        redirect = contextlib.redirect_stderr(self.errors)
+        redirect.__enter__()
+        self.addCleanup(redirect.__exit__, None, None, None)
+
+    def arrange(self, *, private=False, advertise=True, **options):
+        events = SpeechEvents(**options)
+        if private:
+            events.duck(True, now_ms=0)
+        events.start(SESSION, now_ms=0, addressing=OURS, duck=advertise)
+        started = events.drain()
+        controller = self.controller(constructor={"event_publisher": events})
+        controller._events = events
+        return controller, events, started
+
+    @staticmethod
+    def acks(drained):
+        return [e for e in drained if e["type"] == "privacy" and e["action"] == "on"]
+
+    def control(self, controller, *lines):
+        """Feed `lines` through the real control descriptor reader (`listen --control-fd`)."""
+        from rightyo.tool import _read_control
+
+        read, write = os.pipe()
+        os.write(write, b"".join(line + b"\n" for line in lines))
+        os.close(write)
+        _read_control(read, controller)
+
+    def test_the_ack_follows_the_span_with_the_received_audio_position(self):
+        controller, events, _started = self.arrange()
+        work, memory = queue.Queue(), TranscriptMemory()
+        PrototypeController._accept(
+            controller, controller._generation, work, memory, turn("t1", 0, 900, "A")
+        )
+        controller._received_ms = 1234
+        controller.duck(True)
+        drained = events.drain()
+        # Queued after every event queued before the stamp, in the standard envelope.
+        self.assertEqual([e["type"] for e in drained], ["transcript", "privacy"])
+        ack = drained[-1]
+        self.assertEqual(
+            ack,
+            {
+                "schema_version": 1,
+                "type": "privacy",
+                "session_id": SESSION,
+                "sequence": drained[0]["sequence"] + 1,
+                "emitted_at_ms": ack["emitted_at_ms"],
+                "action": "on",
+                "at_ms": 1234,
+            },
+        )
+        self.assertEqual(events._duck_spans[-1], [1234, None])
+        # Audio received after the ack's stamp is inside the span.
+        self.assertTrue(events.heard_ducked(turn("t2", 1234, 1800, "B")))
+        self.assertTrue(controller._heard_private_span(1234, 1800))
+        PrototypeController._accept(
+            controller, controller._generation, work, memory, turn("t2", 1234, 1800, "B")
+        )
+        self.assertEqual(events.drain(), [])
+
+    def test_every_on_line_is_acked_a_redundant_one_included_and_off_never(self):
+        controller, events, _started = self.arrange()
+        controller._received_ms = 1000
+        controller.duck(True)
+        controller._received_ms = 2000
+        controller.duck(True)  # Redundant: already private, still acked.
+        controller.duck(False)
+        controller.duck(False)
+        controller._received_ms = 3000
+        controller.duck(True)
+        self.assertEqual([a["at_ms"] for a in self.acks(events.drain())], [1000, 2000, 3000])
+        # The redundant on opened no new span.
+        self.assertEqual(events._duck_spans, [[1000, 2000], [3000, None]])
+
+    def test_a_redundant_on_keeps_the_current_privacy_period(self):
+        # #242 round 23: a turn heard since privacy went on is still matched after a
+        # redundant on, which opens no new period; its ack changes nothing about that.
+        controller, events, _started = self.arrange()
+        controller._received_ms = 1000
+        controller.duck(True)
+        controller._received_ms = 2000
+        controller.duck(True)
+        events.drain()
+        work, memory = queue.Queue(), TranscriptMemory()
+        status = heard("p1", 1100, 1900, "Are you recording?")
+        PrototypeController._accept(controller, controller._generation, work, memory, status)
+        self.assertEqual([e.get("action") for e in events.drain()], ["status"])
+
+    def test_a_refused_line_is_never_acked(self):
+        controller, events, _started = self.arrange()
+        self.control(
+            controller, b'{"duck": "yes"}', b'{"duck": 1}', b'{"duck": true, "x": 1}', b"junk"
+        )
+        self.assertFalse(events.ducked)
+        self.assertEqual(events.drain(), [])
+        self.assertEqual(self.errors.getvalue().count("invalid control line; skipped"), 4)
+        # Refused with a hosted speech backend (which would also never advertise duck).
+        hosted = self.controller(**HOSTED_CONSUMERS["transcriber"])
+        hosted._events = events
+        with self.assertRaises(PrototypeError):
+            hosted.duck(True)
+        self.assertFalse(events.ducked)
+        self.assertEqual(events.drain(), [])
+
+    def test_the_start_private_duck_is_never_acked(self):
+        controller, events, started = self.arrange(private=True)
+        self.assertEqual(started[0]["duck"], {"version": 3, "private": True})
+        self.assertEqual(self.acks(started), [])
+        self.assertEqual(events.drain(), [])
+        # Off, then on: only the later on is acked.
+        controller._received_ms = 500
+        controller.duck(False)
+        controller._received_ms = 900
+        controller.duck(True)
+        self.assertEqual([a["at_ms"] for a in self.acks(events.drain())], [900])
+
+    def test_started_advertises_version_3(self):
+        _controller, _events, started = self.arrange()
+        self.assertEqual(started[0]["duck"], {"version": 3})
+        self.assertEqual(tool_events.DUCK_VERSION, 3)
+
+    def test_a_session_that_advertised_no_duck_never_acks(self):
+        # Replay (no control, no `duck` on `started`).
+        replay = SpeechEvents()
+        replay.start("replay", now_ms=0)
+        replay.drain()
+        replay.duck(True, now_ms=10, ack=True)
+        self.assertTrue(replay.ducked)
+        self.assertEqual(replay.drain(), [])
+        # A coaching listener's publisher: its controller never advertises duck.
+        events = SpeechEvents(duck_control=False)
+
+        def no_audio(*_args, **_options):
+            raise PrototypeError("no audio in this test")
+
+        controller = self.controller(
+            constructor={"event_publisher": events, "processor_factory": no_audio}
+        )
+        controller.start({"mode": "demo", "session_id": "coaching"})
+        self.assertNotIn("duck", events.drain()[0])
+        controller.duck(True)
+        self.assertTrue(events.ducked)
+        self.assertEqual(self.acks(events.drain()), [])
+        # Without a running session: nothing to ack in.
+        idle = SpeechEvents()
+        idle.duck(True, now_ms=0, ack=True)
+        self.assertEqual(idle.drain(), [])
+        with self.assertRaises(ContractError):
+            idle.duck(True, now_ms=0, ack="yes")
+
+    def test_acks_through_the_control_descriptor(self):
+        controller, events, _started = self.arrange()
+        controller._received_ms = 4000
+        self.control(
+            controller,
+            b'{"duck": true}',
+            b'{"duck": true}',
+            b'{"duck": "on"}',
+            b'{"duck": false}',
+            b'{"duck": true}',
+        )
+        self.assertTrue(events.ducked)
+        acks = self.acks(events.drain())
+        self.assertEqual([a["at_ms"] for a in acks], [4000, 4000, 4000])
+        self.assertEqual(self.errors.getvalue().count("skipped"), 1)
+
+    def test_an_ack_that_cannot_be_queued_leaves_the_reader_and_privacy_working(self):
+        controller, events, _started = self.arrange(max_pending=5)
+        # The publisher was started here, not by `controller.start`: the stream is live.
+        controller._event_terminal = False
+        work, memory = queue.Queue(), TranscriptMemory()
+        for index in range(5):
+            PrototypeController._accept(
+                controller,
+                controller._generation,
+                work,
+                memory,
+                turn(f"t{index}", index * 1000, index * 1000 + 900, "A"),
+            )
+        self.assertEqual(len(events._queue), 5)
+        controller._received_ms = 6000
+        self.control(controller, b'{"duck": true}', b'{"media": true}', b'{"duck": false}')
+        # The on was applied before its ack failed; the reader lived on to apply the off.
+        self.assertFalse(events.ducked)
+        self.assertEqual(events._duck_spans, [[6000, 6000]])
+        self.assertTrue(events._media)
+        self.assertIn("control line not acknowledged; session failed", self.errors.getvalue())
+        # Codex on #248: the session fails terminally, as any lost event fails it.
+        self.assertEqual(controller._phase, "error")
+        self.assertTrue(controller._stop.is_set())
+        drained = events.drain()
+        self.assertEqual(self.acks(drained), [])
+        ends = [e for e in drained if e["type"] == "session" and e.get("phase") == "error"]
+        self.assertEqual([e.get("reason") for e in ends], ["event-delivery-failed"])
 
 
 if __name__ == "__main__":

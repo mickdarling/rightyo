@@ -32,8 +32,9 @@ from rightyo.providers import ConfiguredPriorityProvider, ProviderError
 
 MAX_EVENT_BYTES = 1200000
 # The duck-mode control version advertised on `started` (hailing-station #735). Version 2
-# is privacy mode, which keeps nothing: a host enters it only for a child advertising 2+.
-DUCK_VERSION = 2
+# is privacy mode, which keeps nothing; version 3 (S-8) also acks every `{"duck": true}`
+# line it applies with a `privacy` `on` event, and a host enters privacy only for 3+.
+DUCK_VERSION = 3
 # Privacy mode's local phrases (hailing-station #735 S-1), as filler-free word tuples. The
 # exit needs a configured name and the owner; the status works for anyone, named or not;
 # the entry is the host's (S-2) and is only released as a whole turn here.
@@ -451,7 +452,7 @@ class SpeechEvents:
         # Turns accepted while media mode was on (utterance id -> turn end, pruned by
         # retention): the mode each pending turn is decided under (see `_media_for`).
         self._media_turns = {}
-        # Privacy mode (internally duck, v2; hailing-station #735 S-1), set by the host: a
+        # Privacy mode (internally duck, v3; hailing-station #735 S-1), set by the host: a
         # turn heard while it is on is never emitted, decided or kept, and is matched only
         # for the local exit and status phrases (see `duck`). Like media mode it outlasts
         # sessions.
@@ -465,6 +466,9 @@ class SpeechEvents:
         # Whether `transcript` events may carry `role_source` this session: a live session
         # with privacy control and roles (see `start` and `_role_source`).
         self._role_sources = False
+        # Whether this session advertised `duck`, so a host's `{"duck": true}` gets a
+        # `privacy` `on` ack (#735 S-8; see `duck`).
+        self._duck_acks = False
         # Counts only, reported when privacy goes off.
         self._private_counts = dict.fromkeys(
             ("discarded", "exit", "exit_refused", "status", "failed"), 0
@@ -680,6 +684,7 @@ class SpeechEvents:
             self._private_name_end = None
             self._private_seen.clear()
             self._role_sources = duck and priority is not None
+            self._duck_acks = duck
             self._priority = priority
             self._per_turn = (
                 priority is not None
@@ -773,7 +778,7 @@ class SpeechEvents:
                 ),
                 # And for privacy mode (internally duck, hailing-station #735), when the
                 # producer takes the `{"duck": true|false}` control (live `listen`, not
-                # replay): a host enters it only for a child that advertised version 2+, and
+                # replay): a host enters it only for a child that advertised version 3+, and
                 # must then accept `privacy` events, which are never emitted without it.
                 # `private` reports a session that starts in privacy mode.
                 **(
@@ -1284,8 +1289,8 @@ class SpeechEvents:
         with self._lock:
             self._media = on
 
-    def duck(self, on, *, now_ms):
-        """The host's privacy mode (internally duck, v2; hailing-station #735), on or off;
+    def duck(self, on, *, now_ms, ack=False):
+        """The host's privacy mode (internally duck, v3; hailing-station #735), on or off;
         it outlasts sessions.
 
         `now_ms` is the stream time it changed, on the received-audio clock turns are timed
@@ -1304,10 +1309,19 @@ class SpeechEvents:
         can lapse, end or revive while private, and nothing deferred is emitted at the exit:
         the next public request starts a fresh conversation. Nor is an owner-voice status
         polled while it is on: the first poll after the exit may still show, at most once,
-        that private speech happened, though not when. Emits nothing; turning it off
-        reports counts only.
+        that private speech happened, though not when. Emits nothing else (but the on ack
+        below); turning it off reports counts only.
+
+        `ack` (#735 S-8) is true only for a host's applied `{"duck": true}` control line. Each
+        such on, a redundant one while already on included, then emits one content-free
+        `privacy` `on` event with `at_ms` = `now_ms`, after the mode and its span are set, so
+        it follows every event queued before the stamp: the host counts one ack per on-line
+        it wrote. Only in a running session that advertised `duck`. Never for off, nor for
+        a session that starts private (`--start-private`), whose `started` is the proof. A
+        backlog failure raises after the mode is applied (the session ends; the host's ack
+        deadline fails closed).
         """
-        if type(on) is not bool:
+        if type(on) is not bool or type(ack) is not bool:
             raise ContractError("invalid duck mode")
         integer(now_ms, "now_ms")
         with self._lock:
@@ -1357,6 +1371,8 @@ class SpeechEvents:
                 self._emit(
                     "conversation", state="ambient", reason="timeout", speaker_id=ended, at_ms=at
                 )
+            if on and ack and self._active and self._duck_acks:
+                self._emit("privacy", action="on", at_ms=at)
 
     def _private(self, turn, inferred):
         """Match a turn heard in privacy against the local phrases, then drop it.

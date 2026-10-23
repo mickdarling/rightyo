@@ -1190,7 +1190,7 @@ to another person). Without the question (the #96 request), 9 of the 20 dismissa
 attended and would have been delivered as requests. These are authored
 lines, not recordings; the PR records the tables.
 
-## Privacy mode (internally `duck`, v2)
+## Privacy mode (internally `duck`, v3)
 
 Privacy mode ([hailing-station #735](https://github.com/mickdarling/hailing-station/issues/735))
 keeps nothing. While it is on, rightyo emits no content and keeps no memory or audio of
@@ -1199,9 +1199,10 @@ match the way back in, locally, and is then dropped. "Stop recording", "stop lis
 and "privacy mode" all mean this one state.
 
 The wire name stays `duck`. A live `listen` session's `started` event advertises it as a
-separate top-level object beside the capability set, `"duck": {"version": 2}`. Version 2
-means "keeps nothing"; version 1 still emitted transcripts. A host enters privacy mode
-only for a child that advertised version 2 or higher, and a host that accepts the object
+separate top-level object beside the capability set, `"duck": {"version": 3}`. Version 3
+means "keeps nothing, acks every on-line" (see [The on ack](#the-on-ack)); version 2 kept
+nothing but sent no ack, and version 1 still emitted transcripts. A host enters privacy mode
+only for a child that advertised version 3 or higher, and a host that accepts the object
 must accept `privacy` events, which are never emitted without it. `tool-replay` takes no
 control and does not advertise it, so the authored fixtures are unchanged. Neither does
 `listen --coaching`: its control descriptor carries only coaching records and refuses
@@ -1213,6 +1214,34 @@ and media mode's `{"media": true|false}`
 ([hailing-station #551](https://github.com/mickdarling/hailing-station/issues/551)). A
 non-boolean value or any other key is a malformed line: skipped with a content-free
 stderr note, like any other.
+
+### The on ack
+
+From version 3 ([hailing-station #735](https://github.com/mickdarling/hailing-station/issues/735)
+S-8) rightyo acks each `{"duck": true}` line it applies with one content-free event, in the
+standard envelope:
+
+```json
+{"schema_version": 1, "type": "privacy", "session_id": "…", "sequence": 9, "emitted_at_ms": 48000, "action": "on", "at_ms": 51200}
+```
+
+- `at_ms` is the received-audio position the duck was stamped at (the end of every piece
+  received by then), a non-negative integer on the session's own audio clock, so not
+  comparable with `emitted_at_ms`. Audio received after it falls inside the privacy span.
+- It is queued after the mode and its span are applied, under the publisher lock, so it
+  follows every event queued before the stamp. A host that withholds audio until the ack
+  sends no private audio that could be decided publicly.
+- **One ack per applied on-line**, a redundant one included: an on while already private
+  is acked too, since a host counts acks against the on-lines it wrote (two ons before the
+  first ack, or an on after an off-write that failed, each get one).
+- **Never** for `{"duck": false}`; for a refused line (malformed, or refused because a hosted
+  transcriber or diarizer is configured); for the `--start-private` duck, whose `started`
+  (`"private": true`) is the proof and whose ack would be an excess the host refuses; or for
+  a session that advertised no `duck` (`--coaching`, `tool-replay`). Only in a running session.
+- If the ack cannot be queued (the event backlog is full, which ends the session as any
+  backlog failure does), privacy is still applied, the control reader keeps running and
+  later lines (an off included) still apply, with the content-free stderr note
+  `control line not acknowledged; session failed`. The host's ack deadline then fails closed.
 
 ### What a private turn produces
 
@@ -1370,10 +1399,11 @@ counts only: when privacy goes off, one stderr note
 `{"duck": true}` had arrived at stream time 0, before any audio: nothing is transcribed
 into an event, kept in memory or in the speaker ring from the first frame, and the
 session's privacy span starts at 0 on the audio clock. `started` reports it:
-`"duck": {"version": 2, "private": true}` (the key is present only when the session
-starts private). Only the host's `{"duck": false}` (with `--control-fd`) leaves privacy;
+`"duck": {"version": 3, "private": true}` (the key is present only when the session
+starts private). That `started` is the proof the session is private: the start-private duck
+is never acked. Only the host's `{"duck": false}` (with `--control-fd`) leaves privacy;
 the option is never a way out, and without a control descriptor the whole session stays
-private. A session that would not advertise version 2 refuses the option and exits with
+private. A session that would not advertise version 3 refuses the option and exits with
 an error rather than starting un-private: `--coaching`, and a hosted transcriber or
 diarizer.
 
