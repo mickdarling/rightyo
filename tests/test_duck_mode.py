@@ -2125,6 +2125,24 @@ class Round27Tests(unittest.TestCase):
                 with self.subTest(case=case, member=member):
                     self.assertIs(bool(forgotten(controller, events)), heard)
 
+    def test_a_publisher_that_cannot_say_counts_as_private(self):
+        # #242 round 28: a publisher that can be private but has no `heard_ducked` gives no
+        # answer, and the processor counts that as private, so a turn held at the privacy end is
+        # discarded, not released. One with no privacy at all never heard anything privately.
+        span = PrototypeController._heard_private_span
+        silent = SimpleNamespace(duck=lambda *_args, **_kwargs: None)
+        for name, events, expected in (
+            ("reports", self.publisher(), False),
+            ("reports private", self.publisher(private=True), True),
+            ("cannot say", silent, None),
+            ("no privacy", SimpleNamespace(), False),
+        ):
+            with self.subTest(publisher=name):
+                self.assertIs(span(SimpleNamespace(_events=events), 0, 20), expected)
+        heard = LiveProcessor._heard_private
+        processor = SimpleNamespace(config=SimpleNamespace(private=lambda _start, _end: None))
+        self.assertTrue(heard(processor, 0, 20))
+
     def test_no_private_turn_held_at_the_off_survives_or_swallows_the_first_public_one(self):
         # Class C: a private turn finalized and still held by the merger when privacy ends (the
         # merge gap, the owner pause, a lone wake word held for the owner) is discarded at the
