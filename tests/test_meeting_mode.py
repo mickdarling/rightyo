@@ -239,6 +239,120 @@ class MeetingModeTests(unittest.TestCase):
                 self.events.media(media)
                 self.assert_no_request(self.say())
 
+    def test_media_and_meeting_together_are_the_stricter_of_the_two(self):
+        # Meeting's bar is media's bar plus owner authority, so with both on every turn is
+        # decided exactly as under meeting alone, and nothing attends past media's bar.
+        cases = (
+            ("owner named abstention", ASK, "uncertain", {}),
+            ("owner named attend", ASK, "attend", {}),
+            ("owner unnamed attend", "What time is it?", "attend", {}),
+            ("guest named attend", ASK, "attend", {"speaker": "Speaker B"}),
+            ("inferred owner named attend", ASK, "attend", {"inferred": True}),
+            ("unlabelled named attend", ASK, "attend", {"speaker": None}),
+            ("no roles named attend", ASK, "attend", {"priority": None}),
+            ("no roles named abstention", ASK, "uncertain", {"priority": None}),
+        )
+        for name, text, label, options in cases:
+            priority = options.pop("priority", OWNER)
+            outcomes = {}
+            for meeting, media in ((True, False), (False, True), (True, True)):
+                with self.subTest(case=name, meeting=meeting, media=media):
+                    self.start(on=meeting, priority=priority)
+                    self.events.media(media)
+                    events = self.say(text, label, **options)
+                    evidence = events[1]["decision"]
+                    outcomes[meeting, media] = (
+                        any(e["type"] == "request" for e in events),
+                        evidence["label"],
+                        evidence.get("meeting"),
+                        evidence.get("media"),
+                    )
+            with self.subTest(case=name):
+                # Identical to meeting alone: meeting's refusal, never a separate media one.
+                self.assertEqual(outcomes[True, True], outcomes[True, False])
+                if outcomes[True, True][0] and label == "attend":
+                    # A provider-labeled attend that passes both passes media alone too.
+                    self.assertTrue(outcomes[False, True][0])
+
+    def test_meeting_bar_implies_media_bar(self):
+        self.start()
+        for text in (ASK, "What time is it?"):
+            for authority in ("owner", "trusted", "unknown", None):
+                for priority in (None, OWNER):
+                    with self.subTest(text=text, authority=authority, priority=priority):
+                        self.events._priority = (
+                            None if priority is None else ConfiguredPriorityProvider(priority)
+                        )
+                        current = turn("t1", 0, 900, text)
+                        meeting = self.events._meeting_attends(current, authority)
+                        self.assertEqual(meeting, authority == "owner" and "Jarvis" in text)
+                        if meeting:
+                            self.assertTrue(self.events._media_attends(current, authority))
+
+    def test_named_owner_promotion_never_bypasses_the_meeting_bar(self):
+        # #251 promotes a start-named abstention by the live voiceprint-bound owner, even
+        # with inferred words or a split name. With meeting on, its turns face meeting's
+        # bar first and the promotion re-checks it, so none of these turns attends.
+        split = Addressing(names=("RightyO",))
+        cases = (
+            # (case, text, speaker, inferred, addressing, roles, promoted with meeting off)
+            ("inferred owner", "Jarvis, what do you think?", "Speaker A", True, OURS, True, True),
+            ("split name", "Righty O, what do you think?", "Speaker A", False, split, True, True),
+            ("guest", "Jarvis, what do you think?", "Speaker B", False, OURS, True, False),
+            ("unlabelled", "Jarvis, what do you think?", None, False, OURS, True, False),
+            ("no roles", "Jarvis, what do you think?", "Speaker A", False, OURS, False, False),
+        )
+
+        def live_roles():
+            roles = EnrolledRoles(SpeakerPriority(owners=("owner",)))
+            roles.source = SimpleNamespace(
+                binding=lambda label: ("bound", "owner" if label == "Speaker A" else "guest")
+            )
+            return roles
+
+        for case, text, speaker, inferred, addressing, roles, promoted in cases:
+            for on in (False, True):
+                for ask_anywhere in (False, True):
+                    with self.subTest(case=case, meeting=on, ask_anywhere=ask_anywhere):
+                        self.start(
+                            on=on,
+                            priority=live_roles() if roles else None,
+                            addressing=addressing,
+                            duck=True,
+                            meeting_ask_anywhere=ask_anywhere,
+                        )
+                        events = self.say(
+                            text,
+                            speaker=speaker,
+                            inferred=inferred,
+                            provenance="diarization-timeline",
+                        )
+                        named = "attention_promoted reason=named_owner" in self.notes
+                        if not on:
+                            # Control: #251 alone promotes exactly the owner's turns.
+                            self.assertIs(named, promoted)
+                            continue
+                        self.assert_no_request(events, "ignore")
+                        self.assertIs(events[1]["decision"]["meeting"], True)
+                        self.assertNotIn("media", events[1]["decision"])
+                        self.assertFalse(named)
+
+    def test_named_owner_promotion_still_attends_when_meeting_bar_passes(self):
+        # With ask-anywhere off, #251's start-of-turn promotion is the only one, and it
+        # attends the bound owner's named abstention under meeting, with or without media.
+        roles = EnrolledRoles(SpeakerPriority(owners=("owner",)))
+        roles.source = SimpleNamespace(binding=lambda label: ("bound", "owner"))
+        for media in (False, True):
+            with self.subTest(media=media):
+                self.start(priority=roles, duck=True, meeting_ask_anywhere=False)
+                self.events.media(media)
+                events = self.say("Jarvis, what do you think?", provenance="diarization-timeline")
+                request = next(e for e in events if e["type"] == "request")
+                self.assertEqual(request["decision"]["label"], "attend")
+                self.assertNotIn("meeting", request["decision"])
+                self.assertNotIn("media", request["decision"])
+                self.assertEqual(self.notes.count("attention_promoted reason=named_owner"), 1)
+
     def test_media_and_meeting_together_promote_and_keep_the_bar(self):
         self.start()
         self.events.media(True)

@@ -55,6 +55,19 @@ class Processor:
         self.closed = True
 
 
+class Written(io.StringIO):
+    """Listener output that signals its first write, so a test can order a refusal after it."""
+
+    def __init__(self):
+        super().__init__()
+        self.written = threading.Event()
+
+    def write(self, text):
+        count = super().write(text)
+        self.written.set()
+        return count
+
+
 class ToolTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -165,8 +178,12 @@ class ToolTests(unittest.TestCase):
                     }
                 self.config.write_text(json.dumps(config))
                 controllers = []
+                output = Written()
 
                 def no_audio(*_args, **_options):
+                    # An error terminal clears undrained events, so refuse only once the
+                    # listener has written its first line; it must still be `started`.
+                    output.written.wait(timeout=10)
                     raise PrototypeError("no audio in this test")
 
                 def factory(config, **options):
@@ -180,7 +197,6 @@ class ToolTests(unittest.TestCase):
                     controllers.append(controller)
                     return controller
 
-                output = io.StringIO()
                 self.assertEqual(listen(self.args, output=output, controller_factory=factory), 2)
                 started = json.loads(output.getvalue().splitlines()[0])
                 self.assertEqual(started["phase"], "started")

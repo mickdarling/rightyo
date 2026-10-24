@@ -1660,6 +1660,29 @@ class SpeechEvents:
         """Acceptance-time snapshot, in both directions, just like `_media_for` (#227)."""
         return turn.utterance_id in self._meeting_turns
 
+    def _meeting_attends(self, turn, authority):
+        """Meeting's bar (#227): media's bar plus owner authority, with no exception for a
+        session without speaker roles. Passing it implies passing media's, so meeting with
+        media on is exactly as strict as meeting alone.
+        """
+        return authority == "owner" and self._media_attends(turn, authority)
+
+    def _meeting_blocks(self, turn, authority):
+        """Whether meeting mode rejects this turn if considered for attention."""
+        return self._meeting_for(turn) and not self._meeting_attends(turn, authority)
+
+    def _attention_blocked(self, turn, authority):
+        """The mode whose bar rejects this turn, `meeting` before `media`, or None.
+
+        Every promotion (meeting's and #251's) goes through this, so no promotion attends
+        a turn that the provider-labeled attend gates would refuse.
+        """
+        if self._meeting_blocks(turn, authority):
+            return "meeting"
+        if self._media_blocks(turn, authority):
+            return "media"
+        return None
+
     def _meeting_promote(self, turn, authority, decision, evidence):
         """hailing-station#735 meeting mode (#227): owner + name anywhere beats only
         abstention, never ignore/another agent. Inferred labels carry no authority.
@@ -1669,8 +1692,7 @@ class SpeechEvents:
             self._meeting_for(turn)
             and self._meeting_ask_anywhere
             and not self._duck
-            and authority == "owner"
-            and mentions_name(self._addressing, turn.text)
+            and self._attention_blocked(turn, authority) is None
             and decision.label == "uncertain"
             and evidence["label"] == "uncertain"
         ):
@@ -2267,10 +2289,8 @@ class SpeechEvents:
                 # a follow-up or an acknowledgement here, and it ends this assistant's
                 # conversation with them below. Naming this assistant too keeps it ours.
                 evidence["label"] = "ignore"
-            if (
-                self._meeting_for(turn)
-                and evidence["label"] in {"attend", "uncertain"}
-                and not (authority == "owner" and mentions_name(self._addressing, turn.text))
+            if evidence["label"] in {"attend", "uncertain"} and self._meeting_blocks(
+                turn, authority
             ):
                 # Meeting (#227) always requires owner authority, even without roles.
                 # Gate before any promotion (#251 too); inferred labels never authorize.
@@ -2298,11 +2318,14 @@ class SpeechEvents:
                 and self._named_owner(turn, current)
             )
             if named_owner:
-                if self._media_blocks(turn, authority):
-                    # A promotion faces the same media gate as a provider-labeled attend.
+                blocked = self._attention_blocked(turn, authority)
+                if blocked is not None:
+                    # A promotion faces the same meeting and media gates as a provider-labeled
+                    # attend. Meeting's bar has already refused its turns above; checking it
+                    # again keeps the promotion from depending on that order.
                     named_owner = False
                     evidence["label"] = "ignore"
-                    evidence["media"] = True
+                    evidence[blocked] = True
                 else:
                     # #735: the owner's direct address beats abstention, never an ignore. Like
                     # a follow-up, keep the provider's recipient and confidence as evidence;
