@@ -319,9 +319,13 @@ class MeetingModeTests(unittest.TestCase):
             return roles
 
         for case, text, speaker, inferred, addressing, roles, promoted in cases:
-            for on in (False, True):
+            # Meeting with media on too must decide exactly as meeting alone: a refused
+            # promotion is meeting's refusal, never media's.
+            for on, media in ((False, False), (True, False), (True, True)):
                 for ask_anywhere in (False, True):
-                    with self.subTest(case=case, meeting=on, ask_anywhere=ask_anywhere):
+                    with self.subTest(
+                        case=case, meeting=on, media=media, ask_anywhere=ask_anywhere
+                    ):
                         self.start(
                             on=on,
                             priority=live_roles() if roles else None,
@@ -329,6 +333,7 @@ class MeetingModeTests(unittest.TestCase):
                             duck=True,
                             meeting_ask_anywhere=ask_anywhere,
                         )
+                        self.events.media(media)
                         events = self.say(
                             text,
                             speaker=speaker,
@@ -343,7 +348,7 @@ class MeetingModeTests(unittest.TestCase):
                         if promoted:
                             # #251 would promote it: its re-check of the bar refuses it.
                             self.assert_no_request(events, "ignore")
-                            self.assertIs(events[1]["decision"]["meeting"], True)
+                            self.assertIs(events[1]["decision"].get("meeting"), True)
                         else:
                             # Like media, an abstention #251 never promotes stays uncertain.
                             self.assert_refused(events, "uncertain")
