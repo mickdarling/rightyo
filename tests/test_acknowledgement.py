@@ -12,6 +12,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from rightyo.contracts import (
     Acknowledgement,
@@ -25,7 +26,7 @@ from rightyo.contracts import (
 )
 from rightyo.prototype import PrototypeConfig, PrototypeError
 from rightyo.providers import ConfiguredPriorityProvider
-from rightyo.tool_events import SpeechEvents
+from rightyo.tool_events import SpeechEvents, _starts_named
 
 SESSION = "acknowledgement-test"
 # Gating alone, for tests whose requests fall inside the default dedup window (#122).
@@ -107,6 +108,23 @@ class AcknowledgementEventTests(SessionHarness, unittest.TestCase):
             ["ack outcome=ack reason=confident attend_confidence=0.92 min=0.70 follow_up=false"],
         )
 
+    def test_no_alphanumeric_names_still_emits_and_acknowledges_a_request(self):
+        for names in ((), ("---",)):
+            with self.subTest(names=names):
+                self.events = SpeechEvents(report=self.notes.append)
+                self.notes.clear()
+                # The constructor currently rejects these names; exercise the
+                # consumer's defensive handling without changing that contract.
+                with patch.object(Addressing, "__post_init__"):
+                    addressing = Addressing(names=names)
+                self.start(addressing=addressing)
+                text = "What time is it?"
+                self.assertFalse(_starts_named(text, addressing))
+                request = self.say(turn("t1", 0, 900, text), "attend", 0.92)
+                self.assertIsNotNone(request)
+                self.assertIs(request["acknowledge"], True)
+                self.assertIn("outcome=ack reason=confident", self.notes[0])
+
     def test_a_low_confidence_attend_is_submitted_without_an_ack(self):
         self.start()
         request = self.say(turn("t1", 0, 900, "What time is it?"), "attend", 0.6)
@@ -131,6 +149,19 @@ class AcknowledgementEventTests(SessionHarness, unittest.TestCase):
         request = self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend", 0.5)
         self.assertIs(request["acknowledge"], True)
         self.assertIn("outcome=ack reason=named", self.notes[0])
+
+    def test_a_split_name_is_acknowledged_below_the_threshold(self):
+        for text in ("Righty O, help", "Righty-O, help"):
+            with self.subTest(text=text):
+                self.events = SpeechEvents(report=self.notes.append)
+                self.notes.clear()
+                self.start(
+                    acknowledgement=Acknowledgement(min_confidence=0.95),
+                    addressing=Addressing(names=("RightyO",)),
+                )
+                request = self.say(turn("t1", 0, 900, text), "attend", 0.55)
+                self.assertIs(request["acknowledge"], True)
+                self.assertIn("outcome=ack reason=named", self.notes[0])
 
     def test_the_threshold_is_inclusive(self):
         self.start()
