@@ -1213,11 +1213,14 @@ While on, attends require both the assistant's configured name and owner authori
 without speaker roles, nothing attends (fail closed). Inferred or unlabelled turns
 never pass. A model `attend` that fails this bar is published as `ignore` with the
 optional evidence key `"meeting": true`, as media mode marks its refusals with
-`"media": true`. Like media, a model `uncertain` stays `uncertain`: an unavailable
-decision keeps its documented `uncertain` evidence, and an abstention never ends a
-conversation that normal mode would keep. The voiceprint-bound owner's start-of-turn
-named promotion (hailing-station #735) faces the same bar; one that fails it is also
-published as `ignore` with `"meeting": true`. Every follow-up is refused (`meeting`).
+`"media": true`. Like media, a model `uncertain` otherwise stays `uncertain`: an
+unavailable decision keeps its documented `uncertain` evidence, and an abstention does
+not end a conversation that normal mode would keep. The one exception is the
+voiceprint-bound owner's start-of-turn named promotion (hailing-station #735), which
+faces the same bar: one that fails it, such as a turn with inferred-label words or a
+split name, is published as `ignore` with `"meeting": true` and, exactly as under media,
+ends an engaged conversation when the model's recipient is another person. Every
+follow-up is refused (`meeting`).
 By default
 `"meeting": {"ask_anywhere": true}` in the prototype config also promotes an
 owner-authority turn naming the assistant anywhere from model `uncertain` to `attend`,
