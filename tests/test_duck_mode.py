@@ -2630,7 +2630,7 @@ class PrivacyAckTests(unittest.TestCase):
         self.assertTrue(replay.ducked)
         self.assertEqual(replay.drain(), [])
         # A coaching listener's publisher: its controller never advertises duck.
-        events = SpeechEvents(duck_control=False)
+        events = SpeechEvents(duck_control=False, meeting_control=False)
 
         def no_audio(*_args, **_options):
             raise PrototypeError("no audio in this test")
@@ -2639,7 +2639,9 @@ class PrivacyAckTests(unittest.TestCase):
             constructor={"event_publisher": events, "processor_factory": no_audio}
         )
         controller.start({"mode": "demo", "session_id": "coaching"})
-        self.assertNotIn("duck", events.drain()[0])
+        started = events.drain()[0]
+        self.assertNotIn("duck", started)
+        self.assertNotIn("meeting", started)
         controller.duck(True)
         self.assertTrue(events.ducked)
         self.assertEqual(self.acks(events.drain()), [])

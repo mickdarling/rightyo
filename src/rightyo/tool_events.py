@@ -418,15 +418,20 @@ class SpeechEvents:
         report=None,
         retain_transcripts=True,
         duck_control=True,
+        meeting_control=True,
     ):
         if type(retain_transcripts) is not bool:
             raise ContractError("invalid transcript retention setting")
         if type(duck_control) is not bool:
             raise ContractError("invalid duck control setting")
+        if type(meeting_control) is not bool:
+            raise ContractError("invalid meeting control setting")
         # Whether this publisher's host control channel takes `{"duck": ...}` lines
         # (hailing-station #735): false for a coaching listener, whose control descriptor
         # carries only coaching records, so a live controller never advertises duck mode.
         self.duck_control = duck_control
+        # Ordinary meeting controls are independent of privacy's speech-backend limits.
+        self.meeting_control = meeting_control
         self._retain_transcripts = retain_transcripts
         # At least five: one open request plus the owner's transcript, attention and
         # request, with a terminal slot, so the static and dynamic override bounds agree.
@@ -505,6 +510,10 @@ class SpeechEvents:
         # Turns accepted while media mode was on (utterance id -> turn end, pruned by
         # retention): the mode each pending turn is decided under (see `_media_for`).
         self._media_turns = {}
+        # hailing-station#735 meeting mode (#227): independent of media and privacy,
+        # with the same acceptance-time snapshot and retention as media.
+        self._meeting = False
+        self._meeting_turns = {}
         # Privacy mode (internally duck, v3; hailing-station #735 S-1), set by the host: a
         # turn heard while it is on is never emitted, decided or kept, and is matched only
         # for the local exit and status phrases (see `duck`). Like media mode it outlasts
@@ -691,9 +700,11 @@ class SpeechEvents:
         dismissal=None,
         conversation=None,
         acknowledgement=None,
+        meeting_ask_anywhere=True,
         other_agents=None,
         owner_voice=None,
         duck=False,
+        meeting=False,
     ):
         with self._lock:
             identifier(session_id, "session_id")
@@ -715,6 +726,10 @@ class SpeechEvents:
                 raise ContractError("attention requires transcript retention")
             if type(duck) is not bool:
                 raise ContractError("invalid duck capability")
+            if type(meeting) is not bool:
+                raise ContractError("invalid meeting capability")
+            if type(meeting_ask_anywhere) is not bool:
+                raise ContractError("invalid meeting ask_anywhere setting")
             if other_agents is not None and not isinstance(other_agents, Addressing):
                 raise ContractError("invalid other agents")
             if addressing is not None and not isinstance(addressing, Addressing):
@@ -743,6 +758,8 @@ class SpeechEvents:
             self._roles.clear()
             self._inferred.clear()
             self._media_turns.clear()
+            self._meeting_turns.clear()
+            self._meeting_ask_anywhere = meeting_ask_anywhere
             # A new session's stream clock starts again; a mode still on covers all of it.
             self._duck_spans = [[0, None]] if self._duck else []
             self._private_name_end = None
@@ -850,6 +867,9 @@ class SpeechEvents:
                     if duck
                     else {}
                 ),
+                # Ordinary host control, including hosted speech; older Decodable hosts
+                # ignore this optional top-level key (hailing-station#735, #227).
+                **({"meeting": {"version": 1}} if meeting else {}),
             )
 
     def expire(self, now_ms):
@@ -884,6 +904,9 @@ class SpeechEvents:
             for key, end_ms in list(self._media_turns.items()):
                 if end_ms <= cutoff:
                     del self._media_turns[key]
+            for key, end_ms in list(self._meeting_turns.items()):
+                if end_ms <= cutoff:
+                    del self._meeting_turns[key]
             for key in list(self._superseded):
                 if key not in self._pending:
                     del self._superseded[key]
@@ -1044,6 +1067,8 @@ class SpeechEvents:
                 self._inferred[turn.utterance_id] = turn.end_ms
             if self._media:
                 self._media_turns[turn.utterance_id] = turn.end_ms
+            if self._meeting:
+                self._meeting_turns[turn.utterance_id] = turn.end_ms
             if self._retain_transcripts:
                 self._memory.append(turn, role=role)
             self._seen[turn.utterance_id] = digest
@@ -1366,6 +1391,17 @@ class SpeechEvents:
         with self._lock:
             self._media = on
 
+    def meeting(self, on):
+        """hailing-station#735 meeting mode (#227): owner + name, optional named-owner
+        promotion anywhere, no follow-ups. Keeps transcripts/context; emits nothing.
+        Without speaker roles, nothing attends; inferred/unlabelled turns never pass.
+        Like media, held across sessions and snapshotted when accepting each turn.
+        """
+        if type(on) is not bool:
+            raise ContractError("invalid meeting mode")
+        with self._lock:
+            self._meeting = on
+
     def duck(self, on, *, now_ms, ack=False):
         """The host's privacy mode (internally duck, v3; hailing-station #735), on or off;
         it outlasts sessions.
@@ -1619,6 +1655,51 @@ class SpeechEvents:
     def _media_blocks(self, turn, authority):
         """Whether media mode rejects this turn if considered for attention."""
         return self._media_for(turn) and not self._media_attends(turn, authority)
+
+    def _meeting_for(self, turn):
+        """Acceptance-time snapshot, in both directions, just like `_media_for` (#227)."""
+        return turn.utterance_id in self._meeting_turns
+
+    def _meeting_attends(self, turn, authority):
+        """Meeting's bar (#227): media's bar plus owner authority, with no exception for a
+        session without speaker roles. Passing it implies passing media's, so meeting with
+        media on is exactly as strict as meeting alone.
+        """
+        return authority == "owner" and self._media_attends(turn, authority)
+
+    def _meeting_blocks(self, turn, authority):
+        """Whether meeting mode rejects this turn if considered for attention."""
+        return self._meeting_for(turn) and not self._meeting_attends(turn, authority)
+
+    def _attention_blocked(self, turn, authority):
+        """The mode whose bar rejects this turn, `meeting` before `media`, or None.
+
+        Every promotion (meeting's and #251's) goes through this, so no promotion attends
+        a turn that the provider-labeled attend gates would refuse.
+        """
+        if self._meeting_blocks(turn, authority):
+            return "meeting"
+        if self._media_blocks(turn, authority):
+            return "media"
+        return None
+
+    def _meeting_promote(self, turn, authority, decision, evidence):
+        """hailing-station#735 meeting mode (#227): owner + name anywhere beats only
+        abstention, never ignore/another agent. Inferred labels carry no authority.
+        Kept separate from #251's start-of-turn promotion; an attend needs no promotion.
+        """
+        if (
+            self._meeting_for(turn)
+            and self._meeting_ask_anywhere
+            and not self._duck
+            and self._attention_blocked(turn, authority) is None
+            and decision.label == "uncertain"
+            and evidence["label"] == "uncertain"
+        ):
+            evidence["label"] = "attend"
+            evidence["recipient_kind"] = "system"
+            # Optional evidence, like `media`; strict hosts ignore unknown keys.
+            evidence["meeting"] = "ask_anywhere"
 
     def reply(self, phase, now_ms, asked=False):
         """The host's report that the assistant's spoken reply `started` or `ended` (#124).
@@ -1919,6 +2000,8 @@ class SpeechEvents:
         conversation = self._conversation
         if conversation is None or not self._engaged_with(turn):
             return "not_engaged"
+        if self._meeting_for(turn):
+            return "meeting"
         if self._media_for(turn):
             # Media mode: a show's dialogue in the window is never a follow-up.
             return "media"
@@ -2206,6 +2289,15 @@ class SpeechEvents:
                 # a follow-up or an acknowledgement here, and it ends this assistant's
                 # conversation with them below. Naming this assistant too keeps it ours.
                 evidence["label"] = "ignore"
+            if evidence["label"] == "attend" and self._meeting_blocks(turn, authority):
+                # Meeting (#227) always requires owner authority, even without roles, and
+                # inferred labels never authorize. Like media, only an attend is relabeled:
+                # an abstention stays `uncertain` (unavailable evidence stays as documented,
+                # and it never ends a conversation), and both promotions re-check this bar.
+                evidence["label"] = "ignore"
+                evidence["meeting"] = True
+            elif unavailable is None and not stop and not dismissed:
+                self._meeting_promote(turn, authority, event.decision, evidence)
             if evidence["label"] == "attend" and self._media_blocks(turn, authority):
                 # Media mode (hailing-station #551): TV dialogue stays context. An optional
                 # key, like role_status: strict hosts ignore unknown keys.
@@ -2226,11 +2318,14 @@ class SpeechEvents:
                 and self._named_owner(turn, current)
             )
             if named_owner:
-                if self._media_blocks(turn, authority):
-                    # A promotion faces the same media gate as a provider-labeled attend.
+                blocked = self._attention_blocked(turn, authority)
+                if blocked is not None:
+                    # A promotion faces the same meeting and media gates as a provider-labeled
+                    # attend; those gates relabel only an attend, so this check is the one
+                    # that refuses an abstention the bars reject.
                     named_owner = False
                     evidence["label"] = "ignore"
-                    evidence["media"] = True
+                    evidence[blocked] = True
                 else:
                     # #735: the owner's direct address beats abstention, never an ignore. Like
                     # a follow-up, keep the provider's recipient and confidence as evidence;
