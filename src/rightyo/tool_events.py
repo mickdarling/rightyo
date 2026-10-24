@@ -332,10 +332,19 @@ def _starts_named(text, addressing):
         for name in addressing.names
         for spelling in (name, *addressing.spellings(name))
     }
+    named_keys.discard("")
+    if not named_keys:
+        return False
+    # A name may be split anywhere ("Righty O"), so each character can be a word.
+    # Drop apostrophe-only words after locating starts; they add no name characters.
+    word_keys = [key(word) for word in words]
+    starts = {sum(bool(word) for word in word_keys[:at]) for at in starts}
+    words = [word for word in word_keys if word]
+    max_width = max(map(len, named_keys))
     return any(
-        key("".join(words[at : at + width])) in named_keys
+        "".join(words[at : at + width]) in named_keys
         for at in starts
-        for width in range(1, len(words) - at + 1)
+        for width in range(1, min(max_width, len(words) - at) + 1)
     )
 
 
@@ -1607,6 +1616,10 @@ class SpeechEvents:
         named = mentions_name(self._addressing, turn.text)
         return named and (self._priority is None or authority == "owner")
 
+    def _media_blocks(self, turn, authority):
+        """Whether media mode rejects this turn if considered for attention."""
+        return self._media_for(turn) and not self._media_attends(turn, authority)
+
     def reply(self, phase, now_ms, asked=False):
         """The host's report that the assistant's spoken reply `started` or `ended` (#124).
 
@@ -2193,11 +2206,7 @@ class SpeechEvents:
                 # a follow-up or an acknowledgement here, and it ends this assistant's
                 # conversation with them below. Naming this assistant too keeps it ours.
                 evidence["label"] = "ignore"
-            if (
-                self._media_for(turn)
-                and evidence["label"] == "attend"
-                and not self._media_attends(turn, authority)
-            ):
+            if evidence["label"] == "attend" and self._media_blocks(turn, authority):
                 # Media mode (hailing-station #551): TV dialogue stays context. An optional
                 # key, like role_status: strict hosts ignore unknown keys.
                 evidence["label"] = "ignore"
@@ -2217,10 +2226,16 @@ class SpeechEvents:
                 and self._named_owner(turn, current)
             )
             if named_owner:
-                # #735: the owner's direct address beats abstention, never an ignore. Like
-                # a follow-up, keep the provider's recipient and confidence as evidence;
-                # the ordinary request path acknowledges and re-engages the conversation.
-                evidence["label"] = "attend"
+                if self._media_blocks(turn, authority):
+                    # A promotion faces the same media gate as a provider-labeled attend.
+                    named_owner = False
+                    evidence["label"] = "ignore"
+                    evidence["media"] = True
+                else:
+                    # #735: the owner's direct address beats abstention, never an ignore. Like
+                    # a follow-up, keep the provider's recipient and confidence as evidence;
+                    # the ordinary request path acknowledges and re-engages the conversation.
+                    evidence["label"] = "attend"
             would_attend = named_owner or (
                 evidence["label"] == "attend" and evidence["recipient_kind"] == "system"
             )
@@ -2607,7 +2622,9 @@ class SpeechEvents:
             return {}, None
         follow_up = evidence.get("follow_up") is True
         score = decision.probabilities["attend"] if follow_up else decision.confidence
-        named = mentions_name(self._addressing, turn.text)
+        named = mentions_name(self._addressing, turn.text) or _starts_named(
+            turn.text, self._addressing
+        )
         bar = gate.min_confidence
         if follow_up and gate.follow_up_min_confidence is not None:
             # A follow-up's own, usually stricter, bar (#199).

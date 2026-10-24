@@ -154,6 +154,7 @@ class NamedOwnerTests(unittest.TestCase):
 
     def test_inferred_live_bound_owner_is_promoted(self):
         self.start()
+        self.events.media(False)
         events = self.say(heard("t3", 4000, "Jarvis, that's for you."), "uncertain", inferred=True)
         self.assertEqual(
             [e["type"] for e in events],
@@ -167,6 +168,32 @@ class NamedOwnerTests(unittest.TestCase):
         self.assertEqual(attention["decision"]["label"], "attend")
         self.assertIs(request["acknowledge"], True)
         self.assertEqual((conversation["state"], conversation["reason"]), ("engaged", "request"))
+        self.assertEqual(self.notes.count(PROMOTED), 1)
+
+    def test_media_blocks_inferred_owner_attends_and_promotions_equally(self):
+        outcomes = []
+        for label in ("attend", "uncertain"):
+            with self.subTest(label=label):
+                self.start()
+                self.events.media(True)
+                events = self.say(
+                    heard("t3", 4000, "Jarvis, pause the show."), label, inferred=True
+                )
+                self.assert_unpromoted(events, "ignore")
+                evidence = events[1]["decision"]
+                self.assertIs(evidence["media"], True)
+                outcomes.append((evidence["label"], evidence["media"]))
+        self.assertEqual(outcomes, [("ignore", True), ("ignore", True)])
+
+    def test_media_allows_named_owner_promotion_with_owner_authority(self):
+        self.start()
+        self.events.media(True)
+        current = heard("t3", 4000, "Jarvis, pause the show.")
+        self.assertTrue(self.events._media_attends(current, "owner"))
+        events = self.say(current, "uncertain")
+        request = next(e for e in events if e["type"] == "request")
+        self.assertEqual(request["decision"]["label"], "attend")
+        self.assertNotIn("media", request["decision"])
         self.assertEqual(self.notes.count(PROMOTED), 1)
 
     def test_unbound_label_is_not_promoted(self):
@@ -229,7 +256,9 @@ class NamedOwnerTests(unittest.TestCase):
             with self.subTest(name=name, text=text):
                 self.start(addressing=Addressing(names=(name,)))
                 events = self.say(heard("t3", 4000, text), "uncertain")
-                self.assertEqual(len([e for e in events if e["type"] == "request"]), 1)
+                requests = [e for e in events if e["type"] == "request"]
+                self.assertEqual(len(requests), 1)
+                self.assertIs(requests[0]["acknowledge"], True)
                 self.assertEqual(self.notes.count(PROMOTED), 1)
 
     def test_an_unavailable_placeholder_is_never_promoted(self):
