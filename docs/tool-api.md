@@ -1211,13 +1211,22 @@ persist across sessions, and apply to turns accepted afterward, never pending de
 
 While on, attends require both the assistant's configured name and owner authority;
 without speaker roles, nothing attends (fail closed). Inferred or unlabelled turns
-never pass. Every follow-up is refused (`meeting`). By default
+never pass. A model `attend` that fails this bar is published as `ignore` with the
+optional evidence key `"meeting": true`, as media mode marks its refusals with
+`"media": true`. Like media, a model `uncertain` stays `uncertain`: an unavailable
+decision keeps its documented `uncertain` evidence, and an abstention never ends a
+conversation that normal mode would keep. The voiceprint-bound owner's start-of-turn
+named promotion (hailing-station #735) faces the same bar; one that fails it is also
+published as `ignore` with `"meeting": true`. Every follow-up is refused (`meeting`).
+By default
 `"meeting": {"ask_anywhere": true}` in the prototype config also promotes an
 owner-authority turn naming the assistant anywhere from model `uncertain` to `attend`,
 with recipient `system` and optional evidence `"meeting": "ask_anywhere"`. It never
 promotes `ignore`, inferred owner labels, unavailable decisions or turns to another
-configured agent. False disables this promotion. Media and meeting may both be on:
-media's bar and the meeting promotion both apply. Normal/media-only behavior is unchanged.
+configured agent, nor a turn the model marks as a dismissal or an owner stop phrase.
+False disables this promotion. Media and meeting may both be on: meeting's bar is
+media's bar plus owner authority, so turns are decided exactly as under meeting alone.
+Normal/media-only behavior is unchanged.
 Transcripts, retention and context continue normally; this is separate from privacy mode.
 
 ## Privacy mode (internally `duck`, v3)

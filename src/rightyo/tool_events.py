@@ -2289,11 +2289,11 @@ class SpeechEvents:
                 # a follow-up or an acknowledgement here, and it ends this assistant's
                 # conversation with them below. Naming this assistant too keeps it ours.
                 evidence["label"] = "ignore"
-            if evidence["label"] in {"attend", "uncertain"} and self._meeting_blocks(
-                turn, authority
-            ):
-                # Meeting (#227) always requires owner authority, even without roles.
-                # Gate before any promotion (#251 too); inferred labels never authorize.
+            if evidence["label"] == "attend" and self._meeting_blocks(turn, authority):
+                # Meeting (#227) always requires owner authority, even without roles, and
+                # inferred labels never authorize. Like media, only an attend is relabeled:
+                # an abstention stays `uncertain` (unavailable evidence stays as documented,
+                # and it never ends a conversation), and both promotions re-check this bar.
                 evidence["label"] = "ignore"
                 evidence["meeting"] = True
             elif unavailable is None and not stop and not dismissed:
@@ -2321,8 +2321,8 @@ class SpeechEvents:
                 blocked = self._attention_blocked(turn, authority)
                 if blocked is not None:
                     # A promotion faces the same meeting and media gates as a provider-labeled
-                    # attend. Meeting's bar has already refused its turns above; checking it
-                    # again keeps the promotion from depending on that order.
+                    # attend; those gates relabel only an attend, so this check is the one
+                    # that refuses an abstention the bars reject.
                     named_owner = False
                     evidence["label"] = "ignore"
                     evidence[blocked] = True

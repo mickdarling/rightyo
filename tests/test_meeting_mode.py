@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import tempfile
 import threading
@@ -11,7 +12,7 @@ from types import SimpleNamespace
 
 from test_conversation import MODE, SESSION, decided, turn
 
-from rightyo.contracts import Addressing, ContractError, SpeakerPriority
+from rightyo.contracts import Addressing, ContractError, Dismissal, SpeakerPriority
 from rightyo.live_speaker_id import EnrolledRoles
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
 from rightyo.providers import ConfiguredPriorityProvider
@@ -61,6 +62,14 @@ class MeetingModeTests(unittest.TestCase):
         self.assertEqual(events[1]["decision"]["label"], label)
         self.assertNotEqual(events[1]["decision"].get("meeting"), "ask_anywhere")
 
+    def assert_refused(self, events, label):
+        """Meeting's bar relabels only a model attend (`ignore`, `meeting: true`), as media
+        does; a model abstention stays `uncertain` with no meeting refusal key.
+        """
+        refused = label == "attend"
+        self.assert_no_request(events, "ignore" if refused else "uncertain")
+        self.assertEqual(events[1]["decision"].get("meeting"), True if refused else None)
+
     def test_owner_named_anywhere_promotes_only_uncertain_and_sets_system_recipient(self):
         for name in ("Jarvis", "Travis"):
             for recipient in ("system", "unknown"):
@@ -87,21 +96,20 @@ class MeetingModeTests(unittest.TestCase):
         for label in ("uncertain", "attend"):
             with self.subTest(label=label):
                 self.start()
-                self.assert_no_request(self.say(label=label, speaker="Speaker B"), "ignore")
+                self.assert_refused(self.say(label=label, speaker="Speaker B"), label)
 
     def test_unnamed_owner_never_promotes_or_attends(self):
         for label in ("uncertain", "attend"):
             with self.subTest(label=label):
                 self.start()
-                self.assert_no_request(self.say("What do you think?", label), "ignore")
+                self.assert_refused(self.say("What do you think?", label), label)
 
     def test_inferred_owner_never_promotes_or_attends(self):
         for label in ("uncertain", "attend"):
             with self.subTest(label=label):
                 self.start()
-                self.assert_no_request(
-                    self.say("Jarvis, what do you think?", label, inferred=True),
-                    "ignore",
+                self.assert_refused(
+                    self.say("Jarvis, what do you think?", label, inferred=True), label
                 )
 
     def test_another_configured_agent_never_promotes(self):
@@ -138,7 +146,7 @@ class MeetingModeTests(unittest.TestCase):
         for options in ({"priority": None}, {"addressing": None}):
             with self.subTest(options=options):
                 self.start(**options)
-                self.assert_no_request(self.say(), "ignore")
+                self.assert_refused(self.say(), "uncertain")
 
     def test_named_attends_without_roles_fail_closed_even_for_inferred_or_unlabelled_turns(self):
         for speaker in ("Speaker A", "Speaker B", None):
@@ -158,7 +166,7 @@ class MeetingModeTests(unittest.TestCase):
         for label in ("uncertain", "attend"):
             with self.subTest(label=label):
                 self.start()
-                self.assert_no_request(self.say(label=label, speaker=None), "ignore")
+                self.assert_refused(self.say(label=label, speaker=None), label)
 
     def test_pending_public_uncertain_is_not_promoted_after_privacy_entry(self):
         self.start(duck=True)
@@ -193,7 +201,7 @@ class MeetingModeTests(unittest.TestCase):
                 current = turn("t2", 2000, 2900, "And tomorrow?")
                 self.events.transcript(current, current.end_ms)
                 self.events.decision(decided(current, "uncertain", attend=0.9), 3000)
-                self.assert_no_request(self.events.drain(), "ignore")
+                self.assert_refused(self.events.drain(), "uncertain")
                 self.assertIn("follow_up outcome=refused reason=meeting", self.notes[-1])
 
     def test_transcripts_and_context_are_retained(self):
@@ -291,8 +299,8 @@ class MeetingModeTests(unittest.TestCase):
 
     def test_named_owner_promotion_never_bypasses_the_meeting_bar(self):
         # #251 promotes a start-named abstention by the live voiceprint-bound owner, even
-        # with inferred words or a split name. With meeting on, its turns face meeting's
-        # bar first and the promotion re-checks it, so none of these turns attends.
+        # with inferred words or a split name. With meeting on, the promotion re-checks
+        # meeting's bar, so none of these turns attends.
         split = Addressing(names=("RightyO",))
         cases = (
             # (case, text, speaker, inferred, addressing, roles, promoted with meeting off)
@@ -332,8 +340,13 @@ class MeetingModeTests(unittest.TestCase):
                             # Control: #251 alone promotes exactly the owner's turns.
                             self.assertIs(named, promoted)
                             continue
-                        self.assert_no_request(events, "ignore")
-                        self.assertIs(events[1]["decision"]["meeting"], True)
+                        if promoted:
+                            # #251 would promote it: its re-check of the bar refuses it.
+                            self.assert_no_request(events, "ignore")
+                            self.assertIs(events[1]["decision"]["meeting"], True)
+                        else:
+                            # Like media, an abstention #251 never promotes stays uncertain.
+                            self.assert_refused(events, "uncertain")
                         self.assertNotIn("media", events[1]["decision"])
                         self.assertFalse(named)
 
@@ -367,6 +380,107 @@ class MeetingModeTests(unittest.TestCase):
         self.events.transcript(current, 900)
         self.events.decision(decided(current, "uncertain"), 1000, unavailable="timeout")
         self.assert_no_request(self.events.drain())
+
+    def test_unavailable_decisions_keep_their_documented_uncertain_evidence(self):
+        # docs/tool-api.md: a transiently unavailable turn carries `uncertain` evidence.
+        # Meeting's bar never rewrites it, whoever spoke and whatever they said.
+        for text, speaker in (
+            ("Maybe later.", "Speaker A"),
+            (ASK, "Speaker B"),
+            (ASK, None),
+        ):
+            for meeting, media in ((True, False), (False, True), (True, True)):
+                with self.subTest(text=text, speaker=speaker, meeting=meeting, media=media):
+                    self.start(on=meeting)
+                    self.events.media(media)
+                    current = turn("t1", 0, 900, text, speaker)
+                    self.events.transcript(current, 900)
+                    self.events.decision(decided(current, "uncertain"), 1000, unavailable="timeout")
+                    events = self.events.drain()
+                    self.assert_no_request(events)
+                    evidence = events[1]["decision"]
+                    self.assertEqual(
+                        (evidence["decision_status"], evidence["reason"]),
+                        ("unavailable", "timeout"),
+                    )
+                    self.assertNotIn("meeting", evidence)
+                    self.assertNotIn("media", evidence)
+
+    def test_meeting_relabels_only_a_model_attend_like_media(self):
+        # A guest's named attend is refused with `meeting: true`; its abstention is not
+        # rewritten, exactly as media treats an unnamed turn.
+        for label in ("attend", "uncertain"):
+            with self.subTest(label=label):
+                self.start()
+                self.assert_refused(self.say(label=label, speaker="Speaker B"), label)
+                self.start(on=False)
+                self.events.media(True)
+                events = self.say("What time is it?", label)
+                self.assert_no_request(events, "ignore" if label == "attend" else "uncertain")
+                self.assertEqual(
+                    events[1]["decision"].get("media"), True if label == "attend" else None
+                )
+
+    def test_owner_abstention_to_another_person_keeps_the_conversation_as_media_does(self):
+        # An engaged owner's `uncertain` turn to another person never ends the
+        # conversation in normal or media mode, and meeting mode behaves the same way.
+        outcomes = {}
+        for meeting, media in ((False, False), (False, True), (True, False), (True, True)):
+            with self.subTest(meeting=meeting, media=media):
+                self.start(on=False)
+                self.say("Jarvis, set a timer.", "attend")
+                self.assertIsNotNone(self.events._engaged)
+                self.events.meeting(meeting)
+                self.events.media(media)
+                current = turn("t2", 2000, 2900, "Bob, can you check the numbers?")
+                self.events.transcript(current, current.end_ms)
+                self.events.decision(decided(current, "uncertain", recipient="other_human"), 3000)
+                events = self.events.drain()
+                outcomes[meeting, media] = [
+                    (e["type"], e.get("decision", {}).get("label")) for e in events
+                ]
+                self.assert_no_request(events)
+                self.assertNotIn("meeting", events[1]["decision"])
+                self.assertIsNotNone(self.events._engaged)
+        self.assertEqual(len(set(map(tuple, outcomes.values()))), 1)
+
+    def test_dismissals_and_stop_phrases_naming_the_assistant_are_never_promoted(self):
+        # Owner + name anywhere, but the turn ends or stops the exchange: ask_anywhere
+        # must not publish it as an attend.
+        dismissing = "Thanks Jarvis, that's all for now."
+        self.start(dismissal=Dismissal())
+        current = turn("t1", 0, 900, dismissing)
+        self.events.transcript(current, 900)
+        decision = decided(current, "uncertain")
+        decision = dataclasses.replace(
+            decision,
+            decision=dataclasses.replace(
+                decision.decision,
+                dismissal="disengage",
+                dismissal_choice="disengage",
+                dismissal_confidence=0.9,
+            ),
+        )
+        self.events.decision(decision, 1000)
+        events = self.events.drain()
+        self.assertEqual([e["type"] for e in events], ["transcript", "attention", "dismiss"])
+        self.assertEqual(events[1]["decision"]["label"], "uncertain")
+        self.assertNotIn("meeting", events[1]["decision"])
+
+        stopping = SpeakerPriority(owners=("Speaker A",), stop_phrases=("Jarvis stop",))
+        self.start(priority=stopping)
+        events = self.say("Jarvis, stop.")
+        self.assertNotIn("request", [e["type"] for e in events])
+        attention = next(e for e in events if e["type"] == "attention")
+        self.assertEqual(attention["decision"]["label"], "uncertain")
+        self.assertNotIn("meeting", attention["decision"])
+        # Control: the same named turn is promoted when it is not a stop phrase.
+        self.start()
+        events = self.say("Jarvis, stop.")
+        self.assertEqual(
+            next(e for e in events if e["type"] == "request")["decision"]["meeting"],
+            "ask_anywhere",
+        )
 
     def test_advertised_only_with_host_control_beside_capabilities(self):
         for control in (False, True):
