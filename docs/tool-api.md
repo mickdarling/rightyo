@@ -1256,7 +1256,7 @@ A turn heard in privacy mode:
   acknowledgement or `conversation` event, and no event carrying its words;
 - is never decided: no hosted decision is asked for it (no Jev request), and no hosted
   role question either; no role is fixed for the speaker from it;
-- is never kept: not in the publisher's or the controller's transcript memory, so it is
+- keeps no transcript: not in the publisher's or the controller's transcript memory, so it is
   never context for a later decision or request, and not even as a digest for duplicate
   detection (only its utterance id, in a bounded list of the last 64, so it never spends
   the session's 1,000-turn budget);
@@ -1289,7 +1289,13 @@ leaves privacy mode.
 
 **Leaving privacy by voice requires enrollment.** Only the enrolled owner's voice, by
 live voiceprint identification (`speaker_id` with `"live": true` and `"roles": true`),
-can exit: the turn's diarizer label must be bound to an enrolled owner identity now. An
+can exit: either the existing check finds its diarizer label bound to an enrolled owner,
+or an isolated voice check on this turn's own buffered PCM passes against an enrolled
+owner. The latter needs no earlier public speech, including with `--start-private`.
+It uses the privacy-entry settings `entry_threshold` (default **0.35**) and
+`entry_min_seconds` (default **0.5 s** after silence trimming), with the same 3 s
+overlapping windows and renormalised mean embedding as entry. These are experimental
+thresholds, not validated speaker-authentication accuracy. An
 owner configured by session label (`speakers.owners: ["Speaker A"]`) never can, since a
 TV or another voice diarized into that slot would carry the label. Neither can a turn
 whose label is partly inferred (edge attribution, tail join, or a lone wake word joined
@@ -1299,6 +1305,8 @@ from `started` to `ended`, with 300 ms either side), so the echo of a clip such 
 counted as `exit_refused` plus its content-free reason counter (below) and emits nothing.
 A refused name-only fragment also increments `exit_name_refused` and the refusal counters;
 an exit phrase without a recent accepted name fragment increments `exit_unnamed`.
+Name-only fragments use only the existing owner-binding check, never the isolated voice
+check, so they cannot produce a score or score log line.
 Without enrollment, roles or names, the host must offer another way out.
 
 **Privacy keeps no speakers either.** When the host turns privacy off, rightyo forgets every
@@ -1315,8 +1323,9 @@ a host's voice privacy entry) wait until the owner has spoken publicly long enou
 again (`speaker_id.bind_min_seconds`), and the owner-voice evidence restarts with the bindings
 (below). Audio heard before the off and still buffered when the stream reaches it (the pre-roll
 kept between utterances, or the start of an utterance open across it) is silenced, so none of it
-is sent to the recognizer with the first public utterance. Speaker turns heard in privacy are
-never scored, and utterances in privacy add nothing to the session's skipped-segment or
+is sent to the recognizer with the first public utterance. Private turns never contribute
+to label scoring, binding, accumulation or owner-voice evidence; only matched exit
+candidates may receive the isolated voice check. Utterances in privacy add nothing to the session's skipped-segment or
 suppressed-utterance totals.
 Everything else held per speaker label goes too: the engaged speaker and a lapsed engagement,
 cool-downs, explicit ends, appendix windows and delivered requests a dismissal could withdraw.
@@ -1373,13 +1382,20 @@ before the phrase (before the name, for the exit) means no match.
 
 A split exit is the enrolled owner's lone name fragment ("Jarvis,") heard while privacy
 is on, followed within 4 seconds by a turn that starts with an exit phrase. Both turns
-must pass the exit checks above, the name turn included, so a guest or a TV supplying
-the name never counts. Any other turn between them, private or not, and any change of
+must authenticate: the name fragment requires an existing enrolled-owner binding and
+is never voice-scored; the completing turn may pass its own binding check or an isolated
+voice check on its own buffered audio alone. The fragment's binding need not remain
+present for that completing voice check. A guest or a TV supplying the name never
+counts. Any other turn between them, private or not, and any change of
 the mode, ends it, and a name piece released after the off (heard across it) never
-starts one. With `turns.wake_join` on, the merger usually joins the two pieces into one
-turn first; an unlabelled "Jarvis," joined to the owner's piece makes the turn's label
-partly inferred, so that joined exit is refused (fail closed) and the owner says it
-again as one sentence. The text exists only for the length of the match; a matcher failure
+starts one. Private finalized pieces bypass continuation holds and wake joining: each
+piece replaces the retained sentence, and each half of a split exit authenticates its
+own turn. The name fragment's audio is zeroed after its binding check and never used by
+the completing turn's voice check. The inferred-word refusal remains conservative even
+for a start-private child: a whole-sentence embedding cannot prove that every inferred
+word was the owner's.
+Say the exit again as one directly attributed sentence if it refuses. The text exists
+only for the length of the match; a matcher failure
 counts, matches nothing, and its exception, which might carry the words, never leaves
 the matcher.
 
@@ -1387,9 +1403,46 @@ the matcher.
 
 The live speaker-identification ring (`audio_retention.speaker_ring_seconds`) receives
 silence of the same length for every chunk received while privacy is on, so none of that
-audio is retained and its stream offsets stay aligned. A private turn is therefore never
-voiceprint evidence, and the exit relies on bindings made before privacy started. The
-local recognizer, diarizer and end-of-turn model still hear the audio in memory, in
+audio enters that ring and its stream offsets stay aligned. Public ring feeding and scoring
+are unchanged. A separate **single-sentence RAM buffer** holds only the most recent
+finalized private turn's exact PCM span, for the exit check alone
+([hailing-station #946](https://github.com/mickdarling/hailing-station/issues/946), step 1;
+the refined #735 option (a), 2026-10-27). It is a mutable `bytearray`, capped at
+**320,000 bytes: 10 s of mono 16 kHz s16le**. A longer or incompletely available turn
+retains no audio and cannot pass the new voice check: scoring a clipped fragment could
+omit another voice's words. The previous sentence is overwritten with zeros in place
+before replacement and release, so references to the old object see zeros. The new
+buffer contains no public prefix if privacy began mid-turn; that crossing turn refuses.
+Between finalized turns, only the existing bounded local ASR assembly holds current
+utterance/pre-roll audio; there is no additional streaming private ring or archive.
+
+Only a complete named exit phrase matched by the existing local matcher (the `exit`
+kind, or `rest` completing an accepted split-name fragment) can invoke the scorer.
+Name-only fragments, other non-exit turns, unnamed remainders and status questions
+are never scored. Every exit check, including a name fragment's binding-only check,
+wipes and releases the sentence immediately after the check, whether a binding already
+passed, the voice passed, a precheck refused, or
+scoring/emission failed. Replacement, privacy-on/off, speaker forget/renewal, session
+end, Stop and error teardown also wipe it. The score's worker receives borrowed mutable
+PCM; a queued timeout cancels further access. Queue waiting is at most 2 s; an already
+running local embed must finish or hit its configured worker timeout before its PCM
+can be wiped and the check returned. There is no asynchronous private-audio backlog.
+The local embedding process receives mutable PCM through its local pipe, without
+base64/JSON audio copies, and wipes its mutable input after inference; this is local
+computation, with no network destination. No private audio is ever used for binding or
+accumulation, written to disk, logged, or sent to hosted speech. The retained sentence
+buffer and some owned scratch copies are explicitly wiped; this is not a claim to erase
+OS/runtime/model internal allocations.
+
+Retained while private: the single rolling buffer holding the most recent finalized
+private turn, in RAM, zeroed on overwrite, after any exit check and at privacy-off or
+stop. Some owned scratch copies (the scorer input, returned samples, worker PCM and
+features) are zeroed; transient library copies (speech filtering, NumPy feature
+extraction, ONNX Runtime internals) are freed, not zeroed, when the check returns.
+These transient copies exist only for the check's duration. They never reach disk, logs
+or the network. Python cannot guarantee that freed memory is overwritten.
+
+The local recognizer, diarizer and end-of-turn model still hear the audio in memory, in
 order to run (the open utterance's PCM). Nothing is written to disk, even briefly: the
 whisper.cpp transcriber, for every utterance whether private or not, takes the WAV on
 stdin (`--file -`) and returns its JSON on stdout (`--output-file -`), and runs with a working
@@ -1406,13 +1459,18 @@ refuses to run, so a kill mid-transcription leaves nothing behind and nothing
 is ever put in the shared temporary root. Its stdout is read in chunks and the recognizer
 is stopped as soon as it passes 2 MiB ("Local recognizer failed"); its stderr goes to the
 null device. There is no debug dump. Logs carry
-counts only: when privacy goes off, one stderr note
-`privacy off: discarded=N exit=N exit_refused=N status=N failed=N exit_unnamed=N exit_name_refused=N exit_refused_inferred=N exit_refused_no_owner_check=N exit_refused_playback=N exit_refused_unlabelled=N exit_refused_unbound=N exit_refused_not_owner=N exit_refused_error=N`.
+fixed tokens and numbers only. An isolated scored exit may report
+`speaker_id exit_check score=N.NNN`, with no identity, label, words or timings.
+When privacy goes off, one stderr note reports
+`privacy off: discarded=N exit=N exit_refused=N status=N failed=N exit_unnamed=N exit_name_refused=N exit_refused_inferred=N exit_refused_no_owner_check=N exit_refused_playback=N exit_refused_unlabelled=N exit_refused_unbound=N exit_refused_not_owner=N exit_refused_error=N exit_refused_voice_below_threshold=N exit_refused_voice_unavailable=N`.
 
 All keys, including zero counts, are printed in that fixed order, with the existing five
 keys first. Counts reset when privacy goes off. `exit_refused` remains the total refused
 named exits, now including refused name-only fragments. Each refusal increments exactly
-one reason counter, in check order:
+one reason counter. Inferred words, missing owner-check capability and playback remain
+prechecks. The remaining original binding reasons apply when the isolated exit-voice
+path is not installed, and for name-only fragments; with it installed, a failed binding
+for a complete named exit phrase falls back to that check:
 
 - `inferred`: the turn has inferred-label words.
 - `no_owner_check`: no per-turn identification or no callable `enrolled_owner` check.
@@ -1421,28 +1479,33 @@ one reason counter, in check order:
 - `unbound`: a label exists but has no bound owner identity, including tentative/unknown bindings.
 - `not_owner`: bound to someone else, or another false check result.
 - `error`: the owner check or its diagnostic lookup raised; no exception text is logged.
+- `voice_below_threshold`: this turn was scored below the configured entry threshold.
+- `voice_unavailable`: no usable complete sentence, overlap, insufficient speech,
+  unavailable enrollment/model, queue busy/timeout, or a failed voice check.
 
 `exit_unnamed` counts an exit-phrase remainder without an accepted name fragment within
 the split window, including a missing, expired or previously refused name fragment. It
 does not increment `exit_refused`: no owner check was attempted for that remainder.
 `exit_name_refused` is a subset of `exit_refused`. These diagnostics
-([hailing-station #946](https://github.com/mickdarling/hailing-station/issues/946), step 0)
-do not change who may exit. The note contains only fixed tokens and numbers, never words,
+([hailing-station #946](https://github.com/mickdarling/hailing-station/issues/946), steps 0–1)
+contain only fixed tokens and numbers, never words,
 speaker labels, identities, turn IDs, timestamps or exception text.
 
 ### Starting private
 
 `listen --start-private` starts the session in privacy mode, exactly as if
 `{"duck": true}` had arrived at stream time 0, before any audio: nothing is transcribed
-into an event, kept in memory or in the speaker ring from the first frame, and the
+into an event or kept in transcript memory or the speaker ring from the first frame.
+The single-sentence exit-only RAM buffer described above applies from startup, and the
 session's privacy span starts at 0 on the audio clock. `started` reports it:
 `"duck": {"version": 3, "private": true}` (the key is present only when the session
 starts private). That `started` is the proof the session is private: the start-private duck
 is never acked. Only the host's `{"duck": false}` (with `--control-fd`) leaves privacy;
 the option is never a way out, and without a control descriptor the whole session stays
-private. The local matcher can catch an exit phrase, but a start-private session cannot
-establish the enrolled owner binding needed to authorize it: identification requires
-public speech, and private speech builds no owner evidence. A session that would not
+private. With enrollment and live roles, the local matcher can authenticate an exit
+from its own buffered sentence without a previous binding, and emits `privacy` `exit`
+for the host to act on. Private speech still builds no label or owner evidence.
+A session that would not
 advertise version 3 refuses the option and exits with
 an error rather than starting un-private: `--coaching`, and a hosted transcriber or
 diarizer.

@@ -58,6 +58,7 @@ from rightyo.live_speaker_id import (
     MIN_RING_MS,
     RING_MS,
     EnrolledRoles,
+    PrivateTurnAudio,
     ShadowSpeakerId,
     speaker_ring_ms,
 )
@@ -710,6 +711,7 @@ class PrototypeController:
         self._turn_spans: dict[str, tuple[tuple[int, int], ...]] = {}
         # The session's live identification role provider, or None (#137 step 4b).
         self._enrolled_roles: EnrolledRoles | None = None
+        self._private_sentence = PrivateTurnAudio()
         self._pending = 0
         self._requests = 0
         self._request_limit: int | None = DEFAULT_REQUEST_LIMIT
@@ -961,6 +963,9 @@ class PrototypeController:
                 else ConfiguredPriorityProvider(self.config.speakers)
             )
             self._enrolled_roles = priority if voiceprint else None
+            self._private_sentence.clear()
+            if self._enrolled_roles is not None:
+                self._enrolled_roles.exit_audio = self._private_sentence
             runner.restart(session)
             self._generation += 1
             generation = self._generation
@@ -1288,10 +1293,10 @@ class PrototypeController:
                 # The privacy-entry voice check (hailing-station #735) scores these pieces and
                 # the rest of the span apart, when the transcript is published below.
                 roles.note_spans(turn.utterance_id, spans)
-        # A private turn is never scored (#735 S-1): no label evidence, binding or count is
+        # A private turn is never speaker evidence (#735 S-1): no binding or count is
         # derived from speech heard in privacy, judged by the same decision `_accept` made
-        # (so a mode change between the two cannot split them). The exit's voiceprint
-        # check reads only bindings made from public speech.
+        # (so a mode change between the two cannot split them). Only a matched local exit
+        # may score its isolated sentence, without ever offering it to shadow.turn.
         with self._lock:
             private = self._accept(generation, work, memory, turn)
             # #242 round 23: the speaker epoch is read in the same critical section as the
@@ -1308,6 +1313,19 @@ class PrototypeController:
                 spans=spans,
                 **({"epoch": epoch} if type(epoch) is int else {}),
             )
+
+    def _private_turn_audio(self, generation, turn, pcm):
+        with self._lock:
+            if generation != self._generation:
+                return
+            self._private_sentence.clear()
+            if self._stop.is_set() or not self._private_audio() or self._enrolled_roles is None:
+                return
+            start = self._private_from_bytes
+            # Unknown on-edge or a public prefix: refuse instead of copying public audio.
+            if start is None or turn.start_ms * PCM_BYTES_PER_MS < start:
+                return
+            self._private_sentence.replace(turn, pcm)
 
     def _audio(self, generation, stop, session, work, memory, mode):
         capture = processor = end_of_turn = shadow = None
@@ -1339,6 +1357,9 @@ class PrototypeController:
                     cancelled=stop.is_set,
                     report=self.report,
                     private=self._heard_private_span,
+                    on_private_turn_audio=lambda turn, pcm: self._private_turn_audio(
+                        generation, turn, pcm
+                    ),
                     session_budget_ms=self._budget_ms,
                     transcriber=transcriber_factory(
                         self.config.transcriber, allow_hosted=self.allow_hosted_speech
@@ -1506,6 +1527,9 @@ class PrototypeController:
                         self._runner.clear(clear_memory=False)
                     self._event_end("error", "audio-unavailable")
         finally:
+            with self._lock:
+                if generation == self._generation:
+                    self._private_sentence.clear()
             if capture is not None:
                 capture.stop()
             if processor is not None:
@@ -1558,8 +1582,8 @@ class PrototypeController:
             # Before the processor, so a turn it finalizes on this chunk finds its audio.
             # In privacy mode (hailing-station #735 S-1) the speaker ring keeps silence of
             # the same length instead: its stream offsets stay aligned, and none of the
-            # audio heard while private is retained. Identification then relies on the
-            # bindings made before; a private turn is never voiceprint evidence.
+            # private audio enters the speaker ring. A separate single-sentence buffer
+            # may authenticate a matched exit; private audio is never speaker evidence.
             shadow.audio(bytes(len(pcm)) if private else pcm)
         processor.push_pcm16(pcm)
         if boundary:
@@ -1867,6 +1891,7 @@ class PrototypeController:
             raise PrototypeError("duck mode is refused with a hosted speech backend")
         with self._lock:
             if self._events is not None:
+                self._private_sentence.clear()
                 ending = not on and self._events.ducked is True
                 if on and self._events.ducked is not True:
                     # #242 round 27: where this privacy interval starts, in stream bytes.
@@ -1901,6 +1926,7 @@ class PrototypeController:
         turn finalized while the renewal waited) is forgotten again before any new label is
         scored. Called on the audio thread."""
         with self._lock:
+            self._private_sentence.clear()
             if self._publisher_forgets_speakers():
                 self._runner_forgets_speakers()
             if self._shadow is not None:
@@ -1942,6 +1968,7 @@ class PrototypeController:
         heard before the end and still buffered is silenced, stamped on the same clock as the
         mode (round 18) but in bytes, exact where the millisecond stamp rounds down (round 19),
         so none of it, not one sample, is sent to ASR with the next public utterance."""
+        self._private_sentence.clear()
         if self._publisher_forgets_speakers():
             self._runner_forgets_speakers()
         if self._processor is not None and callable(
@@ -1995,6 +2022,7 @@ class PrototypeController:
         self._event_end("error", reason)
 
     def _event_end(self, phase, reason=None):
+        self._private_sentence.clear()
         if self._events is not None and not self._event_terminal:
             capture = self._stdin_capture
             gaps = None

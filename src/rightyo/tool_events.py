@@ -45,6 +45,8 @@ EXIT_REFUSAL_REASONS = (
     "unbound",
     "not_owner",
     "error",
+    "voice_below_threshold",
+    "voice_unavailable",
 )
 # Privacy mode's local phrases (hailing-station #735 S-1), as filler-free word tuples. The
 # exit needs a configured name and the owner; the status works for anyone, named or not;
@@ -1397,10 +1399,11 @@ class SpeechEvents:
 
         `now_ms` is the stream time it changed, on the received-audio clock turns are timed
         in, and is required (#238): a default to the latest event time could drift from it. A
-        turn heard in privacy (`heard_ducked`) keeps nothing (see `_private`): no
+        turn heard in privacy (`heard_ducked`) keeps no transcript (see `_private`): no
         `transcript`, attention, request, follow-up, acknowledgement or conversation event,
         no memory or context, and no hosted decision or role question. Only a local match
-        of the exit and status phrases may emit a content-free `privacy` event; a stop
+        of the exit and status phrases may emit a content-free `privacy` event. An exit
+        candidate alone may consume one wipeable sentence for owner verification; a stop
         phrase is a no-op. A turn accepted before it was turned on and
         heard before it is still decided, but engages no conversation while it is on.
 
@@ -1428,6 +1431,7 @@ class SpeechEvents:
         integer(now_ms, "now_ms")
         with self._lock:
             at = now_ms
+            self._clear_exit_audio()
             ended = None
             # A change of mode always ends a split exit.
             self._private_name_end = None
@@ -1491,13 +1495,18 @@ class SpeechEvents:
         except Exception:  # noqa: BLE001 - the words must never reach an error or a log
             kinds = frozenset()
             self._private_counts["failed"] += 1
+            self._clear_exit_audio()
         split, self._private_name_end = self._private_name_end, None
         # Only a turn heard entirely since the mode last went on, while it is still on, is
         # matched at all (#242 round 23, see `transcript`): one heard in an earlier private
         # period and released late can never end this one, answer its status or be counted.
         if "name" in kinds:
-            # Only the enrolled owner's own name fragment can begin a split exit.
-            allowed, reason = self._exit_check(turn, inferred)
+            # A name alone is not an exit: only an existing owner binding may accept
+            # the fragment. Never voice-score its audio, and erase it after the check.
+            try:
+                allowed, reason = self._binding_exit_check(turn, inferred)
+            finally:
+                self._clear_exit_audio()
             if allowed:
                 self._private_name_end = turn.end_ms
             else:
@@ -1528,18 +1537,46 @@ class SpeechEvents:
         return self._duck and bool(self._duck_spans) and turn.start_ms >= self._duck_spans[-1][0]
 
     def _may_exit(self, turn, inferred):
-        """Whether `turn` may leave privacy: the enrolled owner's voice, by live voiceprint
-        identification (a label configured as the owner never is, so a TV in the owner's
-        diarizer slot cannot), with no inferred-label words, and not heard while the host
-        reported its own playback (an echo of a clip). Never raises."""
+        """Whether `turn` may leave privacy: an enrolled-owner binding OR this turn's
+        isolated owner-voice check, with no inferred words or host playback. A configured
+        owner label alone never suffices. Called only for matched candidates; never raises.
+        """
         return self._exit_check(turn, inferred)[0]
 
     def _count_exit_refused(self, reason):
         self._private_counts["exit_refused"] += 1
         self._private_counts[f"exit_refused_{reason}"] += 1
 
+    def _clear_exit_audio(self):
+        clear = getattr(self._priority, "clear_exit_audio", None)
+        if callable(clear):
+            with contextlib.suppress(Exception):
+                clear()
+
     def _exit_check(self, turn, inferred):
-        """The unchanged exit decision, with a fixed, content-free refusal token.
+        """Check binding OR this turn's voice, retaining the conservative prechecks.
+
+        Always erase candidate audio, even if a binding passes or a precheck refuses.
+        """
+        try:
+            allowed, reason = self._binding_exit_check(turn, inferred)
+            if allowed or reason in {"inferred", "playback", "no_owner_check"}:
+                return allowed, reason
+            voice = getattr(self._priority, "exit_voice", None)
+            if callable(voice):
+                outcome = voice(turn)
+                if outcome == "pass":
+                    return True, None
+                if outcome in {"voice_below_threshold", "voice_unavailable"}:
+                    return False, outcome
+            return False, reason
+        except Exception:  # noqa: BLE001 - private exceptions may contain words
+            return False, "voice_unavailable"
+        finally:
+            self._clear_exit_audio()
+
+    def _binding_exit_check(self, turn, inferred):
+        """The existing binding decision, with a fixed, content-free refusal token.
 
         Diagnostic lookups happen only after refusal and cannot grant an exit.
         """
@@ -2786,6 +2823,7 @@ class SpeechEvents:
             self._withdrawn.clear()
             self._private_seen.clear()
             self._private_name_end = None
+            self._clear_exit_audio()
             self._active = False
             self._terminal = True
             self._emit(
