@@ -1193,6 +1193,11 @@ class SpeechEvents:
             return "unknown"
         return role
 
+    def _named(self, turn):
+        return mentions_name(self._addressing, turn.text) or _starts_named(
+            turn.text, self._addressing
+        )
+
     def _named_owner(self, turn, role):
         """A direct named address by the voiceprint-bound owner (#735), never a configured
         owner label. Inferred words are allowed, as for ordinary attend requests.
@@ -1301,7 +1306,7 @@ class SpeechEvents:
         return (
             active
             and decision.confidence < self._dismissal.cooldown_min_confidence
-            and not mentions_name(self._addressing, turn.text)
+            and not self._named(turn)
         )
 
     def _engaged_with(self, turn):
@@ -1613,7 +1618,7 @@ class SpeechEvents:
 
     def _media_attends(self, turn, authority):
         """Whether an attend turn passes media mode's bar (see `media`)."""
-        named = mentions_name(self._addressing, turn.text)
+        named = self._named(turn)
         return named and (self._priority is None or authority == "owner")
 
     def _media_blocks(self, turn, authority):
@@ -2622,9 +2627,7 @@ class SpeechEvents:
             return {}, None
         follow_up = evidence.get("follow_up") is True
         score = decision.probabilities["attend"] if follow_up else decision.confidence
-        named = mentions_name(self._addressing, turn.text) or _starts_named(
-            turn.text, self._addressing
-        )
+        named = self._named(turn)
         bar = gate.min_confidence
         if follow_up and gate.follow_up_min_confidence is not None:
             # A follow-up's own, usually stricter, bar (#199).

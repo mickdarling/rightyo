@@ -7,10 +7,11 @@ acknowledgement and re-engagement, not attention-model or live voiceprint qualit
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 
 from test_conversation import MODE, SESSION, decided, turn
 
-from rightyo.contracts import Acknowledgement, Addressing, SpeakerPriority
+from rightyo.contracts import Acknowledgement, Addressing, Dismissal, SpeakerPriority
 from rightyo.live_speaker_id import EnrolledRoles
 from rightyo.providers import ConfiguredPriorityProvider
 from rightyo.tool_events import SpeechEvents
@@ -40,7 +41,7 @@ def heard(name, start, text):
 
 
 class NamedOwnerTests(unittest.TestCase):
-    def start(self, priority=None, *, addressing=OURS):
+    def start(self, priority=None, *, addressing=OURS, dismissal=None):
         self.notes = []
         self.events = SpeechEvents(report=self.notes.append)
         self.events.start(
@@ -50,6 +51,7 @@ class NamedOwnerTests(unittest.TestCase):
             priority=enrolled() if priority is None else priority,
             conversation=MODE,
             acknowledgement=Acknowledgement(min_confidence=0.95, dedup_window_ms=0),
+            dismissal=dismissal,
             duck=True,
         )
         self.events.drain()
@@ -195,6 +197,72 @@ class NamedOwnerTests(unittest.TestCase):
         self.assertEqual(request["decision"]["label"], "attend")
         self.assertNotIn("media", request["decision"])
         self.assertEqual(self.notes.count(PROMOTED), 1)
+
+    def test_media_allows_both_named_owner_spellings_at_low_confidence(self):
+        for text in ("RightyO, help", "Righty O, help"):
+            with self.subTest(text=text):
+                self.start(addressing=Addressing(names=("RightyO",)))
+                self.events.media(True)
+                events = self.say(heard("t3", 4000, text), "uncertain", confidence=0.55)
+                requests = [e for e in events if e["type"] == "request"]
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(requests[0]["decision"]["label"], "attend")
+                self.assertEqual(requests[0]["decision"]["confidence"], 0.55)
+                self.assertNotIn("media", requests[0]["decision"])
+                self.assertIs(requests[0]["acknowledge"], True)
+                self.assertEqual(self.notes.count(PROMOTED), 1)
+
+    def test_cooldown_allows_both_named_owner_spellings_at_low_confidence(self):
+        for text in ("RightyO, help", "Righty O, help"):
+            for media in (False, True):
+                with self.subTest(text=text, media=media):
+                    self.start(
+                        addressing=Addressing(names=("RightyO",)),
+                        dismissal=Dismissal(cooldown_ms=20000, cooldown_min_confidence=0.9),
+                    )
+                    away = heard("t3", 4000, "End this exchange.")
+                    event = decided(away, "ignore")
+                    event = replace(
+                        event,
+                        decision=replace(
+                            event.decision,
+                            dismissal="disengage",
+                            dismissal_choice="disengage",
+                            dismissal_confidence=0.99,
+                        ),
+                    )
+                    self.events.transcript(away, away.end_ms)
+                    self.events.decision(event, away.end_ms + 100)
+                    dismissed = self.events.drain()
+                    dismiss = next(e for e in dismissed if e["type"] == "dismiss")
+                    current = heard("t4", 6000, text)
+                    self.assertGreater(dismiss["cooldown_until_ms"], current.start_ms)
+                    self.events.media(media)
+                    events = self.say(current, "uncertain", confidence=0.55)
+                    requests = [e for e in events if e["type"] == "request"]
+                    self.assertEqual(len(requests), 1)
+                    self.assertEqual(requests[0]["decision"]["label"], "attend")
+                    self.assertEqual(requests[0]["decision"]["confidence"], 0.55)
+                    self.assertNotIn("cooldown", requests[0]["decision"])
+                    self.assertNotIn("media", requests[0]["decision"])
+                    self.assertIs(requests[0]["acknowledge"], True)
+                    self.assertEqual(self.notes.count(PROMOTED), 1)
+
+    def test_media_blocks_both_spellings_without_owner_authority(self):
+        for text in ("RightyO, help", "Righty O, help"):
+            for role, inferred, label in (
+                ("owner", True, "attend"),
+                ("owner", True, "uncertain"),
+                ("guest", False, "attend"),
+            ):
+                with self.subTest(text=text, role=role, inferred=inferred, label=label):
+                    self.start(enrolled(("bound", role)), addressing=Addressing(names=("RightyO",)))
+                    self.events.media(True)
+                    events = self.say(
+                        heard("t3", 4000, text), label, inferred=inferred, confidence=0.55
+                    )
+                    self.assert_unpromoted(events, "ignore")
+                    self.assertIs(events[1]["decision"]["media"], True)
 
     def test_unbound_label_is_not_promoted(self):
         self.start(enrolled(None))
