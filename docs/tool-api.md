@@ -1296,8 +1296,10 @@ whose label is partly inferred (edge attribution, tail join, or a lone wake word
 to the next piece), nor one heard while the host reported its own playback (a `reply`
 from `started` to `ended`, with 300 ms either side), so the echo of a clip such as
 "Privacy off, I'm back" never counts. A named exit refused for any of these reasons is
-counted as `exit_refused` and emits nothing. Without enrollment, roles or names, the
-host must offer another way out.
+counted as `exit_refused` plus its content-free reason counter (below) and emits nothing.
+A refused name-only fragment also increments `exit_name_refused` and the refusal counters;
+an exit phrase without a recent accepted name fragment increments `exit_unnamed`.
+Without enrollment, roles or names, the host must offer another way out.
 
 **Privacy keeps no speakers either.** When the host turns privacy off, rightyo forgets every
 speaker: the diarizer starts afresh (once no utterance is open, so a turn under way keeps its
@@ -1405,7 +1407,28 @@ is ever put in the shared temporary root. Its stdout is read in chunks and the r
 is stopped as soon as it passes 2 MiB ("Local recognizer failed"); its stderr goes to the
 null device. There is no debug dump. Logs carry
 counts only: when privacy goes off, one stderr note
-`privacy off: discarded=N exit=N exit_refused=N status=N failed=N`.
+`privacy off: discarded=N exit=N exit_refused=N status=N failed=N exit_unnamed=N exit_name_refused=N exit_refused_inferred=N exit_refused_no_owner_check=N exit_refused_playback=N exit_refused_unlabelled=N exit_refused_unbound=N exit_refused_not_owner=N exit_refused_error=N`.
+
+All keys, including zero counts, are printed in that fixed order, with the existing five
+keys first. Counts reset when privacy goes off. `exit_refused` remains the total refused
+named exits, now including refused name-only fragments. Each refusal increments exactly
+one reason counter, in check order:
+
+- `inferred`: the turn has inferred-label words.
+- `no_owner_check`: no per-turn identification or no callable `enrolled_owner` check.
+- `playback`: the turn overlaps reported host playback, including the 300 ms margin.
+- `unlabelled`: no diarizer label or overlapping speech (including missing diarizer provenance).
+- `unbound`: a label exists but has no bound owner identity, including tentative/unknown bindings.
+- `not_owner`: bound to someone else, or another false check result.
+- `error`: the owner check or its diagnostic lookup raised; no exception text is logged.
+
+`exit_unnamed` counts an exit-phrase remainder without an accepted name fragment within
+the split window, including a missing, expired or previously refused name fragment. It
+does not increment `exit_refused`: no owner check was attempted for that remainder.
+`exit_name_refused` is a subset of `exit_refused`. These diagnostics
+([hailing-station #946](https://github.com/mickdarling/hailing-station/issues/946), step 0)
+do not change who may exit. The note contains only fixed tokens and numbers, never words,
+speaker labels, identities, turn IDs, timestamps or exception text.
 
 ### Starting private
 
@@ -1417,7 +1440,10 @@ session's privacy span starts at 0 on the audio clock. `started` reports it:
 starts private). That `started` is the proof the session is private: the start-private duck
 is never acked. Only the host's `{"duck": false}` (with `--control-fd`) leaves privacy;
 the option is never a way out, and without a control descriptor the whole session stays
-private. A session that would not advertise version 3 refuses the option and exits with
+private. The local matcher can catch an exit phrase, but a start-private session cannot
+establish the enrolled owner binding needed to authorize it: identification requires
+public speech, and private speech builds no owner evidence. A session that would not
+advertise version 3 refuses the option and exits with
 an error rather than starting un-private: `--coaching`, and a hosted transcriber or
 diarizer.
 

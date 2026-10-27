@@ -18,6 +18,7 @@ import threading
 import time
 import traceback
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -143,7 +144,7 @@ class PrivacyEventsTests(unittest.TestCase):
         self.events.start(
             SESSION,
             now_ms=0,
-            addressing=OURS,
+            addressing=options.pop("addressing", OURS),
             conversation=MODE,
             priority=provider,
             duck=True,
@@ -241,8 +242,183 @@ class PrivacyEventsTests(unittest.TestCase):
 
     def note(self, **counts):
         """The privacy-off note with these counts and zeros elsewhere."""
-        keys = ("discarded", "exit", "exit_refused", "status", "failed")
+        keys = (
+            "discarded",
+            "exit",
+            "exit_refused",
+            "status",
+            "failed",
+            "exit_unnamed",
+            "exit_name_refused",
+            "exit_refused_inferred",
+            "exit_refused_no_owner_check",
+            "exit_refused_playback",
+            "exit_refused_unlabelled",
+            "exit_refused_unbound",
+            "exit_refused_not_owner",
+            "exit_refused_error",
+        )
         return "privacy off: " + " ".join(f"{key}={counts.get(key, 0)}" for key in keys)
+
+    @staticmethod
+    def exit_cases():
+        """Synthetic owner checks, including precedence and strict `is True` cases."""
+        for case, reason, options in (
+            ("owner", None, {}),
+            ("inferred", "inferred", {"inferred": True}),
+            (
+                "inferred_first",
+                "inferred",
+                {"inferred": True, "per_turn": False, "playbacks": [(0, None)]},
+            ),
+            ("no_per_turn", "no_owner_check", {"per_turn": False, "playbacks": [(0, None)]}),
+            ("no_callable", "no_owner_check", {"check": None}),
+            ("playback_open", "playback", {"playbacks": [(900, None)]}),
+            ("playback_before_label", "playback", {"speaker_id": None, "playbacks": [(0, None)]}),
+            ("playback_before_margin", "playback", {"playbacks": [(1200, 1500)]}),
+            ("playback_after_margin", "playback", {"playbacks": [(0, 0)]}),
+            ("outside_margin", None, {"playbacks": [(1201, None)]}),
+            ("no_label", "unlabelled", {"speaker_id": None}),
+            ("overlap", "unlabelled", {"overlap": True}),
+            ("no_timeline", "unlabelled", {"speaker_provenance": "unknown"}),
+            ("no_binding", "unbound", {"binding": None}),
+            ("tentative", "unbound", {"binding": ("tentative", None)}),
+            ("unknown", "unbound", {"binding": ("unknown", None)}),
+            ("guest", "not_owner", {"binding": ("bound", "guest-0")}),
+            ("false", "not_owner", {"result": False}),
+            ("truthy", "not_owner", {"result": 1}),
+            ("none_label", "unlabelled", {"result": None, "speaker_id": None}),
+            ("none_overlap", "unlabelled", {"result": None, "overlap": True}),
+            ("none_unbound", "unbound", {"result": None}),
+            ("none_live", "unbound", {"result": None, "binding": None, "explain": True}),
+            (
+                "none_live_label",
+                "unlabelled",
+                {"result": None, "speaker_id": None, "explain": True},
+            ),
+            ("none_live_overlap", "unlabelled", {"result": None, "overlap": True, "explain": True}),
+            ("error", "error", {"raises": True}),
+            ("diagnostic_error", "error", {"result": False, "diagnostic_raises": True}),
+            ("unsafe_reason", "not_owner", {"result": False, "unsafe_reason": True}),
+        ):
+            roles = EnrolledRoles(SpeakerPriority(owners=("owner-0",)))
+            roles.source = Bindings({"Speaker A": options.get("binding", ("bound", "owner-0"))})
+            if "result" in options or options.get("raises"):
+                roles.enrolled_owner = mock.Mock(
+                    return_value=options.get("result"),
+                    side_effect=RuntimeError(MONOLOGUE[0]) if options.get("raises") else None,
+                )
+                if not options.get("explain"):
+                    roles.enrolled_owner_refusal_reason = None
+            if options.get("unsafe_reason"):
+                roles.enrolled_owner_refusal_reason = lambda _turn: MONOLOGUE[0]
+            if options.get("diagnostic_raises"):
+                roles.enrolled_owner_refusal_reason = mock.Mock(
+                    side_effect=RuntimeError(MONOLOGUE[0])
+                )
+            if "check" in options:
+                roles.enrolled_owner = options["check"]
+            current = replace(
+                heard("synthetic-0", 300, 900, "Testbot, privacy off"),
+                **{
+                    key: options[key]
+                    for key in ("speaker_id", "overlap", "speaker_provenance")
+                    if key in options
+                },
+            )
+            yield case, reason, roles, current, options
+
+    def test_exit_decisions_match_the_original_boolean_for_every_reason(self):
+        def original(events, current, inferred):
+            # Frozen pre-#946 decision, including strict True and playback boundaries.
+            check = getattr(events._priority, "enrolled_owner", None)
+            if inferred or not events._per_turn or not callable(check):
+                return False
+            if any(
+                start - tool_events.PLAYBACK_MARGIN_MS <= current.end_ms
+                and (end is None or current.start_ms <= end + tool_events.PLAYBACK_MARGIN_MS)
+                for start, end in events._playbacks
+            ):
+                return False
+            try:
+                return check(current) is True
+            except Exception:
+                return False
+
+        for case, reason, roles, current, options in self.exit_cases():
+            with self.subTest(case=case):
+                self.start(provider=roles)
+                self.events._per_turn = options.get("per_turn", True)
+                self.events._playbacks = options.get("playbacks", [])
+                inferred = options.get("inferred", False)
+                expected = original(self.events, current, inferred)
+                self.assertIs(expected, reason is None)
+                self.assertIs(self.events._may_exit(current, inferred), expected)
+                self.assertEqual(self.events._exit_check(current, inferred), (expected, reason))
+
+    def test_exit_and_split_name_refusals_have_content_free_reason_counts(self):
+        for case, reason, roles, current, options in self.exit_cases():
+            for name_only in (False, True):
+                with self.subTest(case=case, name_only=name_only):
+                    self.start(provider=roles, addressing=Addressing(names=("Testbot",)))
+                    self.events.duck(True, now_ms=0)
+                    self.events._per_turn = options.get("per_turn", True)
+                    self.events._playbacks = options.get("playbacks", [])
+                    if name_only:
+                        current = replace(current, text="Testbot")
+                    self.events.transcript(
+                        current, current.end_ms, inferred=options.get("inferred", False)
+                    )
+                    events = self.events.drain()
+                    expected = {"discarded": 1}
+                    if reason is not None:
+                        expected.update(exit_refused=1, **{f"exit_refused_{reason}": 1})
+                        if name_only:
+                            expected["exit_name_refused"] = 1
+                        self.assertEqual(events, [])
+                        self.assertIsNone(self.events._private_name_end)
+                    elif name_only:
+                        self.assertEqual(events, [])
+                        self.assertEqual(self.events._private_name_end, current.end_ms)
+                    else:
+                        expected["exit"] = 1
+                        self.assertEqual([event.get("action") for event in events], ["exit"])
+                    self.events.duck(False, now_ms=2000)
+                    self.assertEqual(self.notes, [self.note(**expected)])
+                    self.assertEqual(leaks(" ".join(self.notes)), [])
+                    # A second period has no old counts or fragment.
+                    self.events.duck(True, now_ms=2100)
+                    self.events.duck(False, now_ms=2200)
+                    self.assertEqual(self.notes[-1], self.note())
+
+    def test_unnamed_exits_need_a_recent_accepted_name_fragment(self):
+        roles = EnrolledRoles(SpeakerPriority(owners=("owner-0",)))
+        roles.source = Bindings({"Speaker A": ("bound", "owner-0")})
+        self.start(provider=roles, addressing=Addressing(names=("Testbot",)))
+        self.events.duck(True, now_ms=0)
+        self.assertEqual(self.hear("privacy off"), [])
+        self.assertEqual(self.hear("Testbot", start=2000), [])
+        self.assertEqual(self.hear("privacy off", start=10_000), [])
+        self.assertEqual(self.hear("Testbot", speaker="Speaker B", start=12_000), [])
+        self.assertEqual(self.hear("privacy off", start=13_000), [])
+        self.assertEqual(self.hear("Testbot", start=15_000), [])
+        self.assertEqual(
+            [event.get("action") for event in self.hear("privacy off", start=16_000)], ["exit"]
+        )
+        self.events.duck(False, now_ms=20_000)
+        self.assertEqual(
+            self.notes,
+            [
+                self.note(
+                    discarded=7,
+                    exit=1,
+                    exit_unnamed=3,
+                    exit_name_refused=1,
+                    exit_refused=1,
+                    exit_refused_unbound=1,
+                )
+            ],
+        )
 
     def test_started_advertises_version_3(self):
         (started,) = self.start()
@@ -332,7 +508,11 @@ class PrivacyEventsTests(unittest.TestCase):
                 self.events.duck(True, now_ms=0)
                 self.assertEqual(self.hear("Jarvis, I'm back."), [])
                 self.events.duck(False, now_ms=5000)
-                self.assertEqual(self.notes, [self.note(discarded=1, exit_refused=1)])
+                reason = "unbound" if isinstance(provider, EnrolledRoles) else "no_owner_check"
+                self.assertEqual(
+                    self.notes,
+                    [self.note(discarded=1, exit_refused=1, **{f"exit_refused_{reason}": 1})],
+                )
 
     def test_a_guest_or_unnamed_exit_is_ignored(self):
         self.start()
@@ -343,7 +523,18 @@ class PrivacyEventsTests(unittest.TestCase):
         self.assertEqual(self.hear("I'm back.", start=15_000), [])
         self.assertEqual(self.hear("Start listening.", start=20_000), [])
         self.events.duck(False, now_ms=30_000)
-        self.assertEqual(self.notes, [self.note(discarded=5, exit_refused=3)])
+        self.assertEqual(
+            self.notes,
+            [
+                self.note(
+                    discarded=5,
+                    exit_refused=3,
+                    exit_unnamed=2,
+                    exit_refused_unbound=2,
+                    exit_refused_unlabelled=1,
+                )
+            ],
+        )
 
     def test_without_roles_nobody_can_exit(self):
         self.start(provider=None)
