@@ -875,6 +875,27 @@ class EnrolledRoles(ConfiguredPriorityProvider):
             return False
         return role == "owner" and binding is not None and binding[0] == "bound"
 
+    def enrolled_owner_refusal_reason(self, turn) -> str:
+        """Explain a refused owner check with a fixed token, without changing its result.
+
+        Read-only diagnostics for privacy exit counts (hailing-station #946 step 0).
+        No label, overlapping speech or no diarizer provenance means unlabelled; a label
+        without a bound identity means unbound. This method grants no authority.
+        """
+        try:
+            if (
+                turn.speaker_id is None
+                or turn.overlap
+                or turn.speaker_provenance != "diarization-timeline"
+            ):
+                return "unlabelled"
+            _role, binding = self._lookup(turn)
+            if binding is None or binding[0] != "bound" or binding[1] is None:
+                return "unbound"
+            return "not_owner"
+        except Exception:  # noqa: BLE001 - diagnostics never fail the session
+            return "error"
+
     def _lookup(self, turn) -> tuple[str, tuple | None]:
         """A turn's role and the binding it came from (None when no binding was used)."""
         label = turn.speaker_id

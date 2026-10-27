@@ -36,6 +36,16 @@ MAX_EVENT_BYTES = 1200000
 # is privacy mode, which keeps nothing; version 3 (S-8) also acks every `{"duck": true}`
 # line it applies with a `privacy` `on` event, and a host enters privacy only for 3+.
 DUCK_VERSION = 3
+# Diagnostic precedence and summary order (hailing-station #946 step 0).
+EXIT_REFUSAL_REASONS = (
+    "inferred",
+    "no_owner_check",
+    "playback",
+    "unlabelled",
+    "unbound",
+    "not_owner",
+    "error",
+)
 # Privacy mode's local phrases (hailing-station #735 S-1), as filler-free word tuples. The
 # exit needs a configured name and the owner; the status works for anyone, named or not;
 # the entry is the host's (S-2) and is only released as a whole turn here.
@@ -524,7 +534,17 @@ class SpeechEvents:
         self._duck_acks = False
         # Counts only, reported when privacy goes off.
         self._private_counts = dict.fromkeys(
-            ("discarded", "exit", "exit_refused", "status", "failed"), 0
+            (
+                "discarded",
+                "exit",
+                "exit_refused",
+                "status",
+                "failed",
+                "exit_unnamed",
+                "exit_name_refused",
+                *(f"exit_refused_{reason}" for reason in EXIT_REFUSAL_REASONS),
+            ),
+            0,
         )
         # This session's duck-mode spans, [on_ms, off_ms or None] in stream time, bounded by
         # MAX_DUCK_SPANS: a turn overlapping one was heard in duck mode (`heard_ducked`).
@@ -1477,8 +1497,12 @@ class SpeechEvents:
         # period and released late can never end this one, answer its status or be counted.
         if "name" in kinds:
             # Only the enrolled owner's own name fragment can begin a split exit.
-            if self._may_exit(turn, inferred):
+            allowed, reason = self._exit_check(turn, inferred)
+            if allowed:
                 self._private_name_end = turn.end_ms
+            else:
+                self._private_counts["exit_name_refused"] += 1
+                self._count_exit_refused(reason)
             return
         named = "exit" in kinds or (
             "rest" in kinds
@@ -1486,11 +1510,14 @@ class SpeechEvents:
             and 0 <= turn.start_ms - split <= PRIVACY_SPLIT_NAME_MS
         )
         if named:
-            if self._may_exit(turn, inferred):
+            allowed, reason = self._exit_check(turn, inferred)
+            if allowed:
                 self._private_counts["exit"] += 1
                 self._emit("privacy", action="exit")
                 return
-            self._private_counts["exit_refused"] += 1
+            self._count_exit_refused(reason)
+        elif "rest" in kinds:
+            self._private_counts["exit_unnamed"] += 1
         if "status" in kinds:
             self._private_counts["status"] += 1
             self._emit("privacy", action="status")
@@ -1505,19 +1532,42 @@ class SpeechEvents:
         identification (a label configured as the owner never is, so a TV in the owner's
         diarizer slot cannot), with no inferred-label words, and not heard while the host
         reported its own playback (an echo of a clip). Never raises."""
+        return self._exit_check(turn, inferred)[0]
+
+    def _count_exit_refused(self, reason):
+        self._private_counts["exit_refused"] += 1
+        self._private_counts[f"exit_refused_{reason}"] += 1
+
+    def _exit_check(self, turn, inferred):
+        """The unchanged exit decision, with a fixed, content-free refusal token.
+
+        Diagnostic lookups happen only after refusal and cannot grant an exit.
+        """
         check = getattr(self._priority, "enrolled_owner", None)
-        if inferred or not self._per_turn or not callable(check):
-            return False
+        if inferred:
+            return False, "inferred"
+        if not self._per_turn or not callable(check):
+            return False, "no_owner_check"
         if any(
             start - PLAYBACK_MARGIN_MS <= turn.end_ms
             and (end is None or turn.start_ms <= end + PLAYBACK_MARGIN_MS)
             for start, end in self._playbacks
         ):
-            return False
+            return False, "playback"
         try:
-            return check(turn) is True
+            result = check(turn)
+            if result is True:
+                return True, None
+            explain = getattr(self._priority, "enrolled_owner_refusal_reason", None)
+            if callable(explain):
+                reason = explain(turn)
+                if reason in EXIT_REFUSAL_REASONS:
+                    return False, reason
+            if result is None:
+                return False, "unlabelled" if turn.speaker_id is None or turn.overlap else "unbound"
+            return False, "not_owner"
         except Exception:  # noqa: BLE001 - identification never fails the session
-            return False
+            return False, "error"
 
     def heard_ducked(self, turn):
         """Whether `turn` was heard in duck mode: it is on now (a turn accepted while it is
