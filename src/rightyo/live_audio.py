@@ -225,6 +225,10 @@ class LiveConfig:
     # with it the per-response segment bound (`timeline_segment_limit`). Memory only; set at
     # session start and never changed during it. The native worker receives it at launch.
     timeline_window_ms: int = TIMELINE_WINDOW_MS
+    # Local privacy-exit plumbing only. Borrowed view of a finalized turn's exact PCM
+    # from the existing ASR assembly; never a ring or speaker-evidence input. Private
+    # turns bypass continuation holds so only the current sentence needs retaining.
+    on_private_turn_audio: Callable[[Turn, memoryview], None] | None = None
 
     def __post_init__(self) -> None:
         identifier(self.session_id, "session_id")
@@ -1703,9 +1707,19 @@ class LiveProcessor:
                 )
             # Only the speaker who just paused was judged finished; earlier groups in the
             # utterance were followed by other speech already.
-            self._merger.offer(group, complete=complete and index == len(kept) - 1)
+            if self.config.on_private_turn_audio is not None and self._heard_private(
+                group["start_ms"], group["end_ms"]
+            ):
+                # Nothing private needs a continuation context. Release any older held
+                # public piece on its own; it cannot absorb a private sentence.
+                self._merger.flush()
+                start = (group["start_ms"] - offset) * BYTES_PER_MS
+                end = (group["end_ms"] - offset) * BYTES_PER_MS
+                self._emit(group, memoryview(pcm)[start:end])
+            else:
+                self._merger.offer(group, complete=complete and index == len(kept) - 1)
 
-    def _emit(self, group: dict[str, Any]) -> None:
+    def _emit(self, group: dict[str, Any], private_pcm: memoryview | None = None) -> None:
         """Number and emit one finalized (possibly joined) turn; ids follow emission order."""
         self._counter += 1
         gap = group.pop("post_turn_gap", None)
@@ -1735,6 +1749,8 @@ class LiveProcessor:
             self.config.on_inferred(turn.utterance_id)
         if spans is not None and self.config.on_labelled_spans is not None:
             self.config.on_labelled_spans(turn.utterance_id, tuple(spans))
+        if private_pcm is not None:
+            self.config.on_private_turn_audio(turn, private_pcm)
         self.on_turn(turn)
 
     def finish(self) -> None:

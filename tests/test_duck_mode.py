@@ -40,7 +40,7 @@ from rightyo.live_audio import (
     _transcribe,
     recognizer_dir,
 )
-from rightyo.live_speaker_id import EnrolledRoles, EntryScore, PcmRing
+from rightyo.live_speaker_id import EnrolledRoles, EntryScore, PcmRing, PrivateTurnAudio
 from rightyo.memory import TranscriptMemory
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
 from rightyo.providers import ConfiguredPriorityProvider
@@ -257,6 +257,8 @@ class PrivacyEventsTests(unittest.TestCase):
             "exit_refused_unbound",
             "exit_refused_not_owner",
             "exit_refused_error",
+            "exit_refused_voice_below_threshold",
+            "exit_refused_voice_unavailable",
         )
         return "privacy off: " + " ".join(f"{key}={counts.get(key, 0)}" for key in keys)
 
@@ -1809,6 +1811,7 @@ class DuckControllerTests(unittest.TestCase):
         controller = SimpleNamespace(
             _lock=threading.RLock(),
             _events=events,
+            _private_sentence=PrivateTurnAudio(),
             _received_ms=7,
             _received_bytes=224,
             config=local,

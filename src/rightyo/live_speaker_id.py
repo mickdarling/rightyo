@@ -26,11 +26,17 @@ is reported once and switches shadow identification off for the rest of the sess
 live session itself never stalls or fails because of it. Audio is never written: the ring
 holds at most `RING_MS` of PCM in memory by default (`audio_retention.speaker_ring_seconds`
 sets it, #226) and is cleared when the session ends.
+
+Private turns never enter that queue, ring or accumulated evidence. An enrolled-owner
+exit candidate may borrow one mutable sentence for an isolated check (#946 step 1),
+including from startup in privacy. It uses the entry threshold/minimum and always
+wipes the borrowed PCM before returning. Only the score number may be reported.
 """
 
 from __future__ import annotations
 
 import contextlib
+import math
 import queue
 import sys
 import threading
@@ -65,6 +71,62 @@ QUEUE_SIZE = 4
 # a check not done by then refuses, the safe failure. At most this many wait at once.
 ENTRY_CHECK_TIMEOUT_S = 2.0
 ENTRY_CHECKS = 4
+PRIVATE_TURN_MAX_BYTES = 10 * SAMPLE_RATE * 2
+
+
+def wipe(buffer) -> None:
+    """Overwrite a mutable buffer before releasing it; no copy of its contents."""
+    view = memoryview(buffer).cast("B")
+    view[:] = b"\0" * len(view)
+
+
+class PrivateTurnAudio:
+    """Exactly one finalized private turn, RAM only, never speaker evidence.
+
+    Oversized or incomplete turns retain nothing: authenticating a clipped sentence
+    could discard another voice's words. The ASR's existing current-utterance assembly
+    is the only source; this is not another streaming ring.
+    """
+
+    def __init__(self):
+        self.pcm = bytearray()
+        self.key = None
+
+    @staticmethod
+    def _key(turn):
+        return (turn.session_id, turn.utterance_id, turn.start_ms, turn.end_ms)
+
+    def replace(self, turn, pcm) -> None:
+        self.clear()
+        self.key = self._key(turn)
+        expected = (turn.end_ms - turn.start_ms) * BYTES_PER_MS
+        if len(pcm) == expected and 0 < expected <= PRIVATE_TURN_MAX_BYTES:
+            self.pcm.extend(memoryview(pcm))
+
+    def for_turn(self, turn):
+        return self.pcm if self.key == self._key(turn) else None
+
+    def clear(self) -> None:
+        wipe(self.pcm)
+        self.pcm = bytearray()
+        self.key = None
+
+
+class _ExitCheck:
+    """Borrowed mutable PCM. Cancellation and worker use are mutually exclusive.
+
+    A timed-out queued check cannot read audio later. If already running, teardown
+    waits for its synchronous local embed (which has its own timeout) and its wipes.
+    No private PCM is copied into the ordinary speaker queue.
+    """
+
+    def __init__(self, pcm, owners):
+        self.pcm = pcm
+        self.owners = tuple(owners)
+        self.lock = threading.Lock()
+        self.cancelled = False
+        self.done = threading.Event()
+        self.result = EntryScore(None, None, 0, "unavailable")
 
 
 class _EntryCheck:
@@ -319,7 +381,7 @@ class ShadowSpeakerId:
         self._entries = entries
         self._queue: queue.Queue[tuple[str, int, int, bytes]] = queue.Queue(maxsize=queue_size)
         # Privacy-entry voice checks (#735), taken before queued turns: a caller waits on one.
-        self._checks: queue.Queue[_EntryCheck] = queue.Queue(maxsize=ENTRY_CHECKS)
+        self._checks: queue.Queue[_EntryCheck | _ExitCheck] = queue.Queue(maxsize=ENTRY_CHECKS)
         self._ring = PcmRing(ring_ms)
         self._labels: dict[str, LabelState] = {}
         # Enrolled display names by identifier (hailing-station #434), for the voiceprints
@@ -513,7 +575,10 @@ class ShadowSpeakerId:
                 except queue.Empty:
                     pass
                 else:
-                    self._check(embedder, prints, check)
+                    if isinstance(check, _ExitCheck):
+                        self._exit_check(embedder, prints, check)
+                    else:
+                        self._check(embedder, prints, check)
                     continue
                 try:
                     item = self._queue.get(timeout=0.05)
@@ -635,6 +700,86 @@ class ShadowSpeakerId:
             return check.result
         except Exception:  # noqa: BLE001 - a check that fails refuses, never raises
             return EntryScore(None, None, 0, "unavailable")
+
+    def exit_score(self, pcm: bytearray, owners) -> EntryScore:
+        """Score only an exit candidate, without binding, accumulation or immutable PCM.
+
+        Always wipes the borrowed buffer, including unavailable/busy/timeout/error.
+        Queued checks wait at most ENTRY_CHECK_TIMEOUT_S; an in-flight embed must finish
+        (or hit the local embedder's timeout) before releasing its borrowed audio.
+        """
+        check = _ExitCheck(pcm, owners)
+        try:
+            if not self.active or not pcm or len(pcm) > PRIVATE_TURN_MAX_BYTES:
+                return check.result
+            try:
+                self._checks.put_nowait(check)
+            except queue.Full:
+                return check.result
+            if not check.done.wait(ENTRY_CHECK_TIMEOUT_S):
+                return EntryScore(None, None, 0, "timeout")
+            return check.result
+        except Exception:  # noqa: BLE001 - no exception content crosses the privacy boundary
+            return EntryScore(None, None, 0, "unavailable")
+        finally:
+            # Let an in-flight check stop before its next window; wait for its current
+            # local embed and wipes before releasing the borrowed PCM.
+            check.cancelled = True
+            with check.lock:
+                wipe(pcm)
+
+    def _exit_check(self, embedder, prints, check: _ExitCheck) -> None:
+        with check.lock:
+            if check.cancelled:
+                check.done.set()
+                return
+            raw, samples, parts, vectors = array("h"), array("h"), [], []
+            try:
+                raw.frombytes(memoryview(check.pcm))
+                if sys.byteorder != "little":
+                    raw.byteswap()
+                samples = speech(raw)
+                wipe(raw)
+                if len(samples) / SAMPLE_RATE < self.settings.entry_min_seconds:
+                    check.result = EntryScore(None, None, 0, "short")
+                    return
+                # Same silence gate, windows, normalisation and owner cosine as entry;
+                # mutable windows avoid voiceprint()'s immutable .tobytes() copies.
+                parts = windows(samples)
+                embed = getattr(embedder, "embed_private", embedder.embed)
+                for part in parts:
+                    if check.cancelled:
+                        return
+                    if sys.byteorder != "little":
+                        part.byteswap()
+                    vector = embed(memoryview(part).cast("B"))
+                    try:
+                        vectors.append(normalize(vector))
+                    finally:
+                        vector[:] = [0.0] * len(vector)
+                        wipe(part)
+                if len({len(vector) for vector in vectors}) != 1:
+                    return
+                mean = normalize([sum(column) / len(vectors) for column in zip(*vectors)])
+                try:
+                    scores = [
+                        cosine(mean, prints[owner])
+                        for owner in check.owners
+                        if owner in prints and len(prints[owner]) == len(mean)
+                    ]
+                    if scores:
+                        check.result = EntryScore(max(scores), None, 0, "scored")
+                finally:
+                    mean[:] = [0.0] * len(mean)
+            except Exception:  # noqa: BLE001 - failures reveal no content and never bind
+                check.result = EntryScore(None, None, 0, "unavailable")
+            finally:
+                for part in (raw, samples, *parts):
+                    wipe(part)
+                for vector in vectors:
+                    vector[:] = [0.0] * len(vector)
+                wipe(check.pcm)
+                check.done.set()
 
     def _check(self, embedder, prints: dict[str, list[float]], check: _EntryCheck) -> None:
         """Scores one entry check on the worker; any failure is its outcome, never the
@@ -786,6 +931,37 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         self._resolved = None
         # The latest turn's own-label pieces, as (utterance id, spans), for `entry_voice`.
         self._spans = None
+        self.exit_audio: PrivateTurnAudio | None = None
+
+    def clear_exit_audio(self) -> None:
+        if self.exit_audio is not None:
+            self.exit_audio.clear()
+
+    def exit_voice(self, turn) -> str | None:
+        """Fixed outcome for this turn's isolated exit check; None for legacy callers.
+
+        Uses entry_threshold and entry_min_seconds, never a label or accumulated voice.
+        The caller also clears on binding passes and prechecks that refuse before here.
+        """
+        if self.exit_audio is None:
+            return None
+        try:
+            pcm = self.exit_audio.for_turn(turn)
+            source = self.source
+            check = getattr(source, "exit_score", None)
+            if not callable(check) or not pcm or turn.overlap:
+                return "voice_unavailable"
+            result = check(pcm, self.priority.owners)
+            score = result.labelled
+            if result.outcome != "scored" or type(score) is not float or not math.isfinite(score):
+                return "voice_unavailable"
+            passed = score >= source.settings.entry_threshold
+            source._report(f"speaker_id exit_check score={score:.3f}")
+            return "pass" if passed else "voice_below_threshold"
+        except Exception:  # noqa: BLE001 - private failures never reach logs
+            return "voice_unavailable"
+        finally:
+            self.clear_exit_audio()
 
     def role_for(self, turn) -> str:
         self._resolved = None
