@@ -7,6 +7,7 @@ import json
 import tempfile
 import threading
 import unittest
+from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -300,12 +301,13 @@ class MeetingModeTests(unittest.TestCase):
     def test_named_owner_promotion_never_bypasses_the_meeting_bar(self):
         # #251 promotes a start-named abstention by the live voiceprint-bound owner, even
         # with inferred words or a split name. With meeting on, the promotion re-checks
-        # meeting's bar, so none of these turns attends.
+        # meeting's bar, so none of these turns attends. (A split name from the owner with
+        # no inferred words passes the bar since #251's `_named`; see the test below.)
         split = Addressing(names=("RightyO",))
         cases = (
             # (case, text, speaker, inferred, addressing, roles, promoted with meeting off)
             ("inferred owner", "Jarvis, what do you think?", "Speaker A", True, OURS, True, True),
-            ("split name", "Righty O, what do you think?", "Speaker A", False, split, True, True),
+            ("inferred split", "Righty O, what now?", "Speaker A", True, split, True, True),
             ("guest", "Jarvis, what do you think?", "Speaker B", False, OURS, True, False),
             ("unlabelled", "Jarvis, what do you think?", None, False, OURS, True, False),
             ("no roles", "Jarvis, what do you think?", "Speaker A", False, OURS, False, False),
@@ -360,11 +362,19 @@ class MeetingModeTests(unittest.TestCase):
         # attends the bound owner's named abstention under meeting, with or without media.
         roles = EnrolledRoles(SpeakerPriority(owners=("owner",)))
         roles.source = SimpleNamespace(binding=lambda label: ("bound", "owner"))
-        for media in (False, True):
-            with self.subTest(media=media):
-                self.start(priority=roles, duck=True, meeting_ask_anywhere=False)
+        split = Addressing(names=("RightyO",))
+        spellings = (
+            ("name", OURS, "Jarvis, what do you think?"),
+            # #251's `_named`: meeting and media recognise the owner's split name alike.
+            ("split name", split, "Righty O, what do you think?"),
+        )
+        for (case, addressing, text), media in product(spellings, (False, True)):
+            with self.subTest(case=case, media=media):
+                self.start(
+                    priority=roles, addressing=addressing, duck=True, meeting_ask_anywhere=False
+                )
                 self.events.media(media)
-                events = self.say("Jarvis, what do you think?", provenance="diarization-timeline")
+                events = self.say(text, provenance="diarization-timeline")
                 request = next(e for e in events if e["type"] == "request")
                 self.assertEqual(request["decision"]["label"], "attend")
                 self.assertNotIn("meeting", request["decision"])
