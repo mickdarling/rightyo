@@ -286,6 +286,57 @@ class PrivateExitTests(unittest.TestCase):
         self.hear(controller, start=1000)
         self.assertEqual([e.get("action") for e in events.drain()], ["exit"])
 
+    def test_privacy_on_never_publishes_a_held_public_continuation(self):
+        from test_turn_merge import SILENCE, VOICE, ScriptedDiarizer, ScriptedTranscriber, audio
+
+        harness = self.harness()
+        controller, events, _roles = self.controller(harness)
+        controller.duck(False)
+        events.drain()
+        generation = controller._generation
+        work, memory, retained, turns = queue.Queue(), TranscriptMemory(), [], []
+
+        def private_audio(current, pcm):
+            controller._private_turn_audio(generation, current, pcm)
+            retained.append(bytes(controller._private_sentence.pcm))
+
+        def accept(current):
+            turns.append(current)
+            controller._turn(generation, work, memory, harness.shadow, current)
+
+        processor = LiveProcessor(
+            LiveConfig(
+                "shadow-test",
+                provenance="causal-replay",
+                transcriber=ScriptedTranscriber(("Synthetic public prefix", "synthetic tail")),
+                diarizer=ScriptedDiarizer(),
+                private=controller._heard_private_span,
+                on_private_turn_audio=private_audio,
+                turn_merge_gap_ms=2000,
+            ),
+            accept,
+        )
+        self.addCleanup(processor.close)
+
+        def feed(pcm):
+            for at in range(0, len(pcm), 6400):
+                controller._feed(generation, processor, pcm[at : at + 6400], "stdin")
+
+        feed(audio((VOICE, 200), (SILENCE, 1500)))
+        self.assertTrue(processor._merger.holding)
+        self.assertEqual(turns, [])
+        controller.duck(True)
+        events.drain()
+        feed(audio((VOICE, 200), (SILENCE, 1500)))
+        processor.finish()
+        # Main (efbbef9) joins these same-speaker pieces and suppresses the whole turn.
+        # Discarding the prefix preserves that public outcome and isolates the exit PCM.
+        self.assertEqual([current.text for current in turns], ["synthetic tail"])
+        self.assertEqual(events.drain(), [])
+        self.assertEqual(memory.snapshot(10_000)["turns"], [])
+        self.assertEqual(work.qsize(), 0)
+        self.assertEqual(retained, [audio((VOICE, 200))])
+
     def test_bare_jarvis_uses_only_binding_and_zeroes_audio_without_a_score_or_log(self):
         for identity in (None, "guest", "owner"):
             with self.subTest(binding=identity):

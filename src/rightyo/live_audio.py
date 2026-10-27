@@ -1710,9 +1710,9 @@ class LiveProcessor:
             if self.config.on_private_turn_audio is not None and self._heard_private(
                 group["start_ms"], group["end_ms"]
             ):
-                # Nothing private needs a continuation context. Release any older held
-                # public piece on its own; it cannot absorb a private sentence.
-                self._merger.flush()
+                # Privacy wins a continuation tie: discard the held public prefix without
+                # publishing it, while keeping only this private sentence's PCM for exit.
+                self._merger.discard()
                 start = (group["start_ms"] - offset) * BYTES_PER_MS
                 end = (group["end_ms"] - offset) * BYTES_PER_MS
                 self._emit(group, memoryview(pcm)[start:end])

@@ -1430,15 +1430,17 @@ can be wiped and the check returned. There is no asynchronous private-audio back
 The local embedding process receives mutable PCM through its local pipe, without
 base64/JSON audio copies, and wipes its mutable input after inference; this is local
 computation, with no network destination. No private audio is ever used for binding or
-accumulation, written to disk, logged, or sent to hosted speech. Managed PCM buffers
-are explicitly wiped; this is not a claim to erase OS/runtime/model internal allocations.
+accumulation, written to disk, logged, or sent to hosted speech. The retained sentence
+buffer and some owned scratch copies are explicitly wiped; this is not a claim to erase
+OS/runtime/model internal allocations.
 
 Retained while private: the single rolling buffer holding the most recent finalized
 private turn, in RAM, zeroed on overwrite, after any exit check and at privacy-off or
-stop. Transient computation copies made during an exit check (speech filtering, NumPy
-feature extraction, ONNX Runtime internals) exist only for the check's duration and are
-freed, not zeroed, when it returns. They never reach disk, logs or the network. Python
-cannot guarantee that freed memory is overwritten.
+stop. Some owned scratch copies (the scorer input, returned samples, worker PCM and
+features) are zeroed; transient library copies (speech filtering, NumPy feature
+extraction, ONNX Runtime internals) are freed, not zeroed, when the check returns.
+These transient copies exist only for the check's duration. They never reach disk, logs
+or the network. Python cannot guarantee that freed memory is overwritten.
 
 The local recognizer, diarizer and end-of-turn model still hear the audio in memory, in
 order to run (the open utterance's PCM). Nothing is written to disk, even briefly: the

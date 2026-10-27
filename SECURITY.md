@@ -18,10 +18,11 @@ utterance in bounded memory. See [the exact retention contract](docs/tool-api.md
 
 Retained while private: the single rolling buffer holding the most recent finalized
 private turn, in RAM, zeroed on overwrite, after any exit check and at privacy-off or
-stop. Transient computation copies made during an exit check (speech filtering, NumPy
-feature extraction, ONNX Runtime internals) exist only for the check's duration and are
-freed, not zeroed, when it returns. They never reach disk, logs or the network. Python
-cannot guarantee that freed memory is overwritten.
+stop. Some owned scratch copies (the scorer input, returned samples, worker PCM and
+features) are zeroed; transient library copies (speech filtering, NumPy feature
+extraction, ONNX Runtime internals) are freed, not zeroed, when the check returns.
+These transient copies exist only for the check's duration. They never reach disk, logs
+or the network. Python cannot guarantee that freed memory is overwritten.
 
 Attention and transcript events are untrusted input, never authorization to execute privileged commands. Playback/echo must not fabricate user authority. Validate all event fields, lengths, timestamps, IDs, and bounds. Fail closed on malformed input.
 
