@@ -2193,7 +2193,8 @@ class SpeechEvents:
                 self._engaged.get("revived_over_ms", turn.end_ms), turn.end_ms
             )
             if turn.end_ms > self._engaged.get("request_end_ms", self._engaged["from_ms"]):
-                self._engaged.pop("replying_since", None)
+                if self._scoped_replies:
+                    self._engaged.pop("replying_since", None)
                 self._engaged["request_id"] = request_id
                 self._engaged["request_end_ms"] = turn.end_ms
             if self._per_turn:

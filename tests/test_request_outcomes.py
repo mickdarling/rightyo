@@ -186,6 +186,13 @@ class RequestOutcomeTests(unittest.TestCase):
         self.events.end(now_ms=self.events.retention_ms + 3000)
         self.assertEqual(self.events._request_outcome_ends, {})
 
+    def test_legacy_host_keeps_playing_reply_hold_across_new_request(self):
+        self.say("a")
+        self.events.reply("started", 1100)
+        self.say("b", at=2000)
+        self.assertEqual(self.events._engaged["replying_since"], 1100)
+        self.assertGreater(self.events._window_end(self.events._engaged), 12900)
+
     def test_newer_request_does_not_inherit_old_playback_hold(self):
         self.say("a")
         self.apply()
