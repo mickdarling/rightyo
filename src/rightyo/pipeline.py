@@ -143,6 +143,7 @@ class ReplayRunner:
         # its turn still sees what was true when the turn began.
         self._replies: deque[list[int | None]] = deque(maxlen=MAX_REPLY_INTERVALS)
         self._reply_scopes: dict[str, list[int | None]] = {}
+        self._legacy_reply_span: list[int | None] | None = None
         self.skipped = 0
         self.partial_turns = 0
 
@@ -161,6 +162,7 @@ class ReplayRunner:
         self._last_end_ms = 0
         self._replies.clear()
         self._reply_scopes.clear()
+        self._legacy_reply_span = None
         self._last_request = None
         self._labels_until_ms = None
 
@@ -270,15 +272,25 @@ class ReplayRunner:
                 else:
                     self._replies.append([now_ms, now_ms])
             return
-        playing = bool(self._replies) and self._replies[-1][1] is None
+        span = self._legacy_reply_span
+        playing = span is not None and span[1] is None
         if phase == "started" and not playing:
-            self._replies.append([now_ms, None])
+            self._legacy_reply_span = [now_ms, None]
+            self._replies.append(self._legacy_reply_span)
         elif phase == "ended":
             if playing:
-                self._replies[-1][1] = now_ms
+                span[1] = now_ms
             else:
                 # An end with no start seen: the reply had begun before this session knew.
-                self._replies.append([now_ms, now_ms])
+                self._legacy_reply_span = [now_ms, now_ms]
+                self._replies.append(self._legacy_reply_span)
+
+    @_locked
+    def close_legacy_reply(self, now_ms: int) -> None:
+        """Close only a known pre-opt-in physical span; create no reply authority."""
+        span = self._legacy_reply_span
+        if span is not None and span[1] is None:
+            span[1] = now_ms
 
     def note_request(self, request: tuple[int, str, str, str | None] | None) -> None:
         """Record the latest request formed, (end_ms, text, utterance_id, speaker_id), or

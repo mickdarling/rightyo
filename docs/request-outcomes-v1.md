@@ -36,6 +36,10 @@ forget, explicit withdrawal/override and session retirement revoke old identitie
 The existing transcript retention cutoff also retires their control authority. The bounded map retains at most
 128 request identities; an evicted identity has no authority. No transcript is added.
 
+On the first valid lifecycle control, old unscoped semantic reply/asked/hold authority
+is retired. Known pre-opt-in physical spans can still close at their actual end without
+closing a competing scoped reply or creating new reply authority.
+
 After accepting scoped controls, unscoped playback reports still record echo spans,
 but cannot answer, extend or revive a conversation. An acknowledgement clip is not an
 answer. Negotiating hosts must use scoped reply states for actual answer playback;

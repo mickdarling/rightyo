@@ -20,8 +20,9 @@ from rightyo.contracts import (
     Dismissal,
     SpeakerPriority,
 )
+from rightyo.pipeline import ReplayRunner
 from rightyo.prototype import PrototypeConfig, PrototypeController
-from rightyo.providers import ConfiguredPriorityProvider
+from rightyo.providers import ConfiguredPriorityProvider, MockProvider
 from rightyo.request_outcomes import validate
 from rightyo.tool import _apply_control, _read_control
 from rightyo.tool_events import SpeechEvents
@@ -247,7 +248,9 @@ class RequestOutcomeTests(unittest.TestCase):
         config = PrototypeConfig(None, None, None, None, None)
         controller = PrototypeController(config, event_publisher=self.events)
         self.addCleanup(controller.close)
-        runner = SimpleNamespace(request_context=True, note_request=Mock(), note_reply=Mock())
+        runner = SimpleNamespace(
+            request_context=True, note_request=Mock(), note_reply=Mock(), close_legacy_reply=Mock()
+        )
         controller._runner = runner
         controller._event_terminal = False
         controller._phase = "replaying"
@@ -268,6 +271,44 @@ class RequestOutcomeTests(unittest.TestCase):
             self.assertEqual(runner.note_reply.call_count, 2)
             runner.note_reply.assert_called_with("ended", 4000, request_id=SESSION + ":a")
             self.assertEqual(self.events._engaged["request_id"], SESSION + ":b")
+        finally:
+            controller._runner = None
+            controller._phase = "idle"
+
+    def test_pre_opt_in_ack_end_closes_runner_span_without_ending_scoped_reply(self):
+        self.say("a")
+        config = PrototypeConfig(None, None, None, None, None)
+        controller = PrototypeController(config, event_publisher=self.events)
+        self.addCleanup(controller.close)
+        runner = ReplayRunner(MockProvider())
+        runner.restart(SESSION)
+        controller._runner = runner
+        controller._event_terminal = False
+        controller._phase = "replaying"
+        clock = [1100]
+        controller._now_ms = lambda: clock[0]
+        try:
+            controller.reply("started")
+            self.assertEqual(self.events._engaged["replying_since"], 1100)
+            clock[0] = 1200
+            controller.request_outcome(outcome())
+            self.assertNotIn("replying_since", self.events._engaged)
+            self.assertIsNone(self.events._replied_at)
+            clock[0] = 1300
+            controller.request_outcome(outcome(state="reply_started"))
+            clock[0] = 1400
+            controller.reply("ended")
+            self.assertIsNotNone(self.events._engaged.get("replying_since"))
+            self.assertEqual(
+                runner._reply_state(turn("probe", 1500, 1600, "Stop?")), {"playing": True}
+            )
+            clock[0] = 1700
+            controller.request_outcome(outcome(state="reply_ended"))
+            self.assertEqual(
+                runner._reply_state(turn("later", 2000, 2100, "Thanks?")),
+                {"playing": False, "ended_ms_before": 300},
+            )
+            self.assertEqual(list(runner._replies), [[1100, 1400], [1300, 1700]])
         finally:
             controller._runner = None
             controller._phase = "idle"

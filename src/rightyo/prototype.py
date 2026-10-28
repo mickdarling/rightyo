@@ -1876,9 +1876,13 @@ class PrototypeController:
             ):
                 return
             self._publish("reply", phase, **({"asked": True} if asked else {}))
-            if self._runner is not None and not getattr(self._events, "scoped_replies", False):
-                # The decision context sees the reply too (rightyo#153), on the same clock.
-                self._runner.note_reply(phase, self._now_ms())
+            if self._runner is not None:
+                if not getattr(self._events, "scoped_replies", False):
+                    self._runner.note_reply(phase, self._now_ms())
+                elif phase == "ended":
+                    # A legacy ack may have started before the first lifecycle control.
+                    # Only close an already-known physical span; never open or renew one.
+                    self._runner.close_legacy_reply(self._now_ms())
 
     def request_outcome(self, value) -> None:
         """Trusted control-FD lifecycle report, scoped to this producer session (#262)."""

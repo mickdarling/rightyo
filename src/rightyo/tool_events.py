@@ -1855,6 +1855,14 @@ class SpeechEvents:
             if state.startswith("reply_") and previous not in {"accepted", "reply_started", state}:
                 return False
             self._now = max(self._now, now_ms)
+            if not self._scoped_replies:
+                # Negotiation retires legacy semantic authority (an ack may already play).
+                # Its physical spans remain until their own actual end is reported.
+                self._asked_at = self._replied_at = None
+                if self._engaged is not None:
+                    self._engaged.pop("replying_since", None)
+                if self._dormant is not None:
+                    self._dormant["engaged"].pop("replying_since", None)
             self._scoped_replies = True
             result = OutcomeApplied(True)
             if state != previous:
@@ -2922,8 +2930,7 @@ class SpeechEvents:
                 if self.request_control:
                     if len(self._request_outcomes) >= 128:
                         old = next(iter(self._request_outcomes))
-                        del self._request_outcomes[old]
-                        self._request_outcome_ends.pop(old, None)
+                        self._retire_request_outcome(old)
                     self._request_outcomes[request_id] = "pending"
                     self._request_outcome_ends[request_id] = turn.end_ms
                 if ack.get("acknowledge") is True:
