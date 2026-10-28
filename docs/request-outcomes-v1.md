@@ -15,9 +15,9 @@ The request ID is exactly `session_id:utterance_id`, from a request this produce
 {"request_outcome":{"version":1,"session_id":"authored-session","request_id":"authored-session:turn-1","state":"accepted"}}
 ```
 
-States are `accepted`, `failed`, `timed_out`, `cancelled`, `reply_started`, `reply_ended`.
+States are `accepted`, `failed`, `timed_out`, `cancelled`, `reply_started`, `reply_ended`, `reply_published`.
 An issued request begins pending; a real scoped reply requires prior `accepted`.
-Only `reply_ended` may include optional boolean `asked`. A terminal failure/cancellation
+Only `reply_ended` and `reply_published` may include optional boolean `asked`. A terminal failure/cancellation
 may end pending, accepted or playing work. `reply_ended` ends reply reporting; terminal
 outcomes cannot be reopened. An identical duplicate is acknowledged without extending
 windows. Backwards, unknown, foreign, retired and expired identities emit no ack.
@@ -54,3 +54,15 @@ and tests are authored; there is no live-device or speech-quality proof here.
 
 Run `PYTHONPATH=src:tests python3 -m unittest tests/test_request_outcomes.py` and the
 normal `scripts/verify.py`. The control-FD test uses a real pipe with authored records.
+
+`reply_published` is a terminal answer outcome for existing clients that cannot report
+request-specific playback. It requires prior `accepted`, and the host must have
+confirmed the exact request's complete reply publication (final audio frame, or final
+text for a text-only reply). Provider completion, generated text and queue admission
+are insufficient. It clears only matching pending state and renews that request's
+conversation window from publication time; explicit dismissal/privacy/retirement still
+refuse revival. It creates no physical playback/echo span and sends no runner playback
+edge. Duplicates cannot renew the window. Hearing remains unproven. Host audio pacing
+and physical reports are separate; an unrelated or late request cannot renew another
+conversation. This additive v1 state is emitted only in response to a matching host
+control; old hosts never send it and keep their existing supported state vocabulary.

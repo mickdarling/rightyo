@@ -1899,6 +1899,8 @@ class SpeechEvents:
                         self.last_request = None
                     self._open.pop(request, None)
                     self._delivered.pop(request, None)
+                elif state == "reply_published":
+                    self._published(request, now_ms, value.get("asked", False))
                 else:
                     # Scoped real reply reports are different from acknowledgement clips.
                     if (
@@ -1915,6 +1917,25 @@ class SpeechEvents:
                     )
             self._emit("request_outcome", request_id=request, state=state, version=1)
             return result
+
+    def _published(self, request, now_ms, asked):
+        """Exact host reply publication is answer completion, never physical playback."""
+        if self._pending_ack is not None and self._pending_ack.get("request_id") == request:
+            self._pending_ack = None
+        self._open.pop(request, None)
+        self._delivered.pop(request, None)
+        current = self._engaged or (self._dormant or {}).get("engaged")
+        if self._duck or current is None or current.get("request_id") != request:
+            return
+        self._lapse(now_ms)
+        current = self._engaged or self._revive(now_ms)
+        if current is not None:
+            # Timed from confirmed publication, not claimed hearing. Pacing and physical
+            # playback remain the host/client's responsibility, and create no echo span here.
+            current.pop("replying_since", None)
+            current["until_ms"] = max(current["until_ms"], now_ms + self._conversation.window_ms)
+            self._asked_at = now_ms if asked else None
+            self._replied_at = now_ms
 
     @property
     def scoped_replies(self):

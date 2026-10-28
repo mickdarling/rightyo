@@ -351,6 +351,36 @@ class RequestOutcomeTests(unittest.TestCase):
         self.apply("c", "failed", at=3300)
         self.assertEqual(self.events._engaged["request_id"], SESSION + ":b")
 
+    def test_confirmed_publication_completes_without_fabricating_playback(self):
+        self.say("a")
+        self.apply()
+        result = self.events.request_outcome(outcome(state="reply_published", asked=True), 20000)
+        self.assertTrue(result)
+        self.assertIsNone(result.playback)
+        self.assertIsNone(self.events._pending_ack)
+        self.assertEqual(list(self.events._playbacks), [])
+        self.assertEqual(self.events._engaged["request_id"], SESSION + ":a")
+        self.assertEqual(self.events._engaged["until_ms"], 30000)
+        self.assertEqual(self.events._asked_at, 20000)
+        before = copy.deepcopy(self.events._engaged)
+        self.apply(state="reply_published", at=25000)
+        self.assertEqual(self.events._engaged, before)
+
+    def test_old_publication_does_not_complete_or_renew_new_request(self):
+        self.say("a")
+        self.apply()
+        self.apply(state="reply_started", at=1100)
+        self.say("b", at=2000)
+        self.apply("b", at=3100)
+        before = copy.deepcopy(self.events._engaged)
+        pending = copy.deepcopy(self.events._pending_ack)
+        self.apply("a", "reply_published", at=4000)
+        self.assertEqual(self.events._engaged, before)
+        self.assertEqual(self.events._pending_ack, pending)
+        self.apply("b", "reply_published", at=5000)
+        self.assertIsNone(self.events._pending_ack)
+        self.assertEqual(self.events._engaged["until_ms"], 15000)
+
     def test_malformed_envelopes_refuse_without_mutation(self):
         self.say("a")
         for value in [

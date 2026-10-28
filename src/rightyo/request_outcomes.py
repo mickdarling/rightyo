@@ -4,8 +4,18 @@ from dataclasses import dataclass
 
 from rightyo.contracts import ContractError, identifier
 
-STATES = frozenset({"accepted", "failed", "timed_out", "cancelled", "reply_started", "reply_ended"})
-TERMINAL = frozenset({"failed", "timed_out", "cancelled", "reply_ended"})
+STATES = frozenset(
+    {
+        "accepted",
+        "failed",
+        "timed_out",
+        "cancelled",
+        "reply_started",
+        "reply_ended",
+        "reply_published",
+    }
+)
+TERMINAL = frozenset({"failed", "timed_out", "cancelled", "reply_ended", "reply_published"})
 
 
 @dataclass(frozen=True)
@@ -36,6 +46,8 @@ def validate(value):
     state = value["state"]
     if not isinstance(state, str) or state not in STATES:
         raise ContractError("invalid request outcome")
-    if "asked" in value and (state != "reply_ended" or type(value["asked"]) is not bool):
+    if "asked" in value and (
+        state not in {"reply_ended", "reply_published"} or type(value["asked"]) is not bool
+    ):
         raise ContractError("invalid request outcome")
     return value
