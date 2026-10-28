@@ -8,10 +8,20 @@ import threading
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from test_conversation import SESSION, decided, turn
 
-from rightyo.contracts import Acknowledgement, ContractError, Conversation
+from rightyo.contracts import (
+    Acknowledgement,
+    ContractError,
+    Conversation,
+    Dismissal,
+    SpeakerPriority,
+)
+from rightyo.prototype import PrototypeConfig, PrototypeController
+from rightyo.providers import ConfiguredPriorityProvider
 from rightyo.request_outcomes import validate
 from rightyo.tool import _apply_control, _read_control
 from rightyo.tool_events import SpeechEvents
@@ -127,6 +137,108 @@ class RequestOutcomeTests(unittest.TestCase):
         self.events.forget_speakers(now_ms=4000)
         self.assertFalse(self.apply("b", "reply_started", 5000))
         self.assertIsNone(self.events._engaged)
+
+    def test_terminal_from_pending_also_revokes_unscoped_late_reply_authority(self):
+        self.say("a")
+        self.assertTrue(self.apply(state="timed_out"))
+        self.say("b", at=2000)
+        before = copy.deepcopy(self.events._engaged)
+        pending = copy.deepcopy(self.events._pending_ack)
+        self.events.reply("started", 4000)
+        self.events.reply("ended", 5000, asked=True)
+        self.assertEqual(self.events._engaged, before)
+        self.assertEqual(self.events._pending_ack, pending)
+        self.assertIsNone(self.events._asked_at)
+
+    def test_old_scoped_reply_end_closes_only_its_echo_span(self):
+        self.say("a")
+        self.apply()
+        self.apply(state="reply_started", at=1100)
+        span_a = self.events._playback_scopes[SESSION + ":a"]
+        self.say("b", at=2000)
+        self.apply("b", at=3000)
+        self.apply("b", "reply_started", at=3100)
+        span_b = self.events._playback_scopes[SESSION + ":b"]
+        before = copy.deepcopy(self.events._engaged)
+        self.assertTrue(self.apply(state="reply_ended", at=4000))
+        self.assertEqual(span_a, [1100, 4000])
+        self.assertEqual(span_b, [3100, None])
+        self.assertEqual(self.events._engaged, before)
+
+    def test_old_decision_never_replaces_newer_request_identity(self):
+        self.say("a")
+        middle = turn("c", 1000, 1900, "Jarvis, another question?")
+        newest = turn("b", 2000, 2900, "Jarvis, the newest question?")
+        self.events.transcript(middle, 1900)
+        self.events.transcript(newest, 2900)
+        self.events.decision(decided(newest, "attend"), 3000)
+        self.events.decision(decided(middle, "attend"), 3100)
+        before = copy.deepcopy(self.events._engaged)
+        self.assertEqual(before["request_id"], SESSION + ":b")
+        self.assertTrue(self.apply("c", "failed", at=3200))
+        self.assertEqual(self.events._engaged, before)
+
+    def test_expired_and_ended_sessions_release_request_control_state(self):
+        self.say("a")
+        self.events.expire(self.events.retention_ms + 2000)
+        self.assertFalse(self.apply(state="reply_started"))
+        self.assertEqual(self.events._request_outcomes, {})
+        self.events.end(now_ms=self.events.retention_ms + 3000)
+        self.assertEqual(self.events._request_outcome_ends, {})
+
+    def test_spoken_dismissal_retires_original_control_identity(self):
+        self.events = SpeechEvents(request_control=True)
+        self.events.start(
+            SESSION, now_ms=0, conversation=Conversation(window_ms=10000), dismissal=Dismissal()
+        )
+        self.events.drain()
+        self.say("a")
+        self.apply()
+        closing = turn("stop", 2000, 2900, "Never mind.")
+        self.events.transcript(closing, 2900)
+        events = self.events.drain()
+        self.assertIn("dismiss", [event["type"] for event in events])
+        self.assertFalse(self.apply(state="reply_started", at=3000))
+        self.assertFalse(self.apply(state="cancelled", at=3100))
+
+    def test_owner_override_retires_superseded_request_controls(self):
+        self.events = SpeechEvents(request_control=True)
+        self.events.start(
+            SESSION, priority=ConfiguredPriorityProvider(SpeakerPriority(owners=("Speaker A",)))
+        )
+        self.events.drain()
+        self.say("guest", speaker="Speaker B")
+        self.assertTrue(self.apply("guest"))
+        self.say("owner", at=2000)
+        self.assertFalse(self.apply("guest", "reply_started", 3000))
+        self.assertTrue(self.apply("owner", at=3000))
+
+    def test_controller_forwards_only_new_scoped_answer_to_runner(self):
+        self.say("a")
+        config = PrototypeConfig(None, None, None, None, None)
+        controller = PrototypeController(config, event_publisher=self.events)
+        self.addCleanup(controller.close)
+        runner = SimpleNamespace(request_context=True, note_request=Mock(), note_reply=Mock())
+        controller._runner = runner
+        controller._event_terminal = False
+        controller._phase = "replaying"
+        controller._now_ms = lambda: 2000
+        try:
+            controller.request_outcome(outcome())
+            controller.reply("started")
+            controller.reply("ended")
+            runner.note_reply.assert_not_called()
+            controller.request_outcome(outcome(state="reply_started"))
+            runner.note_reply.assert_called_once_with("started", 2000)
+            controller.request_outcome(outcome(state="reply_started"))
+            controller.request_outcome(outcome("foreign", state="reply_ended"))
+            self.assertEqual(runner.note_reply.call_count, 1)
+            controller.request_outcome(outcome(state="reply_ended"))
+            self.assertEqual(runner.note_reply.call_count, 2)
+            self.assertIsNotNone(self.events._engaged)
+        finally:
+            controller._runner = None
+            controller._phase = "idle"
 
     def test_malformed_envelopes_refuse_without_mutation(self):
         self.say("a")

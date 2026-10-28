@@ -1876,7 +1876,7 @@ class PrototypeController:
             ):
                 return
             self._publish("reply", phase, **({"asked": True} if asked else {}))
-            if self._runner is not None:
+            if self._runner is not None and not getattr(self._events, "scoped_replies", False):
                 # The decision context sees the reply too (rightyo#153), on the same clock.
                 self._runner.note_reply(phase, self._now_ms())
 
@@ -1893,7 +1893,9 @@ class PrototypeController:
                 or self._phase not in {"listening", "replaying", "finishing"}
             ):
                 return
-            self._publish("request_outcome", value)
+            result = self._publish("request_outcome", value)
+            if result == "reply" and self._runner is not None:
+                self._runner.note_reply(value["state"].removeprefix("reply_"), self._now_ms())
 
     def media(self, on: bool) -> None:
         """Forward the host's media mode (hailing-station #551) to the event publisher.
@@ -2030,11 +2032,12 @@ class PrototypeController:
                 if method == "transcript"
                 else fields
             )
-            getattr(self._events, method)(value, now_ms=self._now_ms(), **options)
+            result = getattr(self._events, method)(value, now_ms=self._now_ms(), **options)
             runner = self._runner
             if runner is not None and runner.request_context:
                 # What the assistant last acted on, or None once dismissed (#199).
                 runner.note_request(getattr(self._events, "last_request", None))
+            return result
         except Exception:
             self._event_delivery_failed()
             raise PrototypeError("Tool event delivery failed") from None

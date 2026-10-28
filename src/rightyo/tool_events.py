@@ -451,6 +451,7 @@ class SpeechEvents:
             raise ContractError("invalid request control setting")
         self.request_control = request_control
         self._request_outcomes = {}
+        self._request_outcome_ends = {}
         self._scoped_replies = False
         self._retain_transcripts = retain_transcripts
         # At least five: one open request plus the owner's transcript, attention and
@@ -505,6 +506,7 @@ class SpeechEvents:
         # Recent [start, end] stream times of the assistant's own playback (end None while
         # it plays), as the host reports them (#124); bounded.
         self._playbacks = deque(maxlen=MAX_PLAYBACKS)
+        self._playback_scopes = {}
         # Stream time the latest reply ended with a question to the owner (#199), or None;
         # cleared when the next reply starts.
         self._asked_at = None
@@ -710,12 +712,14 @@ class SpeechEvents:
         self._appendix_from.clear()
         self.last_request = None
         self._playbacks.clear()
+        self._playback_scopes.clear()
         self._asked_at = None
         self._replied_at = None
         self._delivered.clear()
         self._withdrawn.clear()
         self._formed.clear()
         self._request_outcomes.clear()
+        self._request_outcome_ends.clear()
         self._scoped_replies = False
 
     def start(
@@ -922,6 +926,9 @@ class SpeechEvents:
                 size = len(encode_json(context))
                 self._pending[key] = (turn, context, size, role)
                 self._pending_bytes += size
+            for request_id, end_ms in list(self._request_outcome_ends.items()):
+                if end_ms <= cutoff:
+                    self._retire_request_outcome(request_id)
             for request_id, end_ms in list(self._open.items()):
                 if end_ms <= cutoff:
                     del self._open[request_id]
@@ -1328,6 +1335,7 @@ class SpeechEvents:
         for request_id in fields["withdrawn_request_ids"]:
             del self._delivered[request_id]
             self._open.pop(request_id, None)
+            self._retire_request_outcome(request_id)
         for key in plan["pending"]:
             # Its decision is still to come: if it would form a request, it is withdrawn.
             self._withdrawn[key] = {
@@ -1484,6 +1492,7 @@ class SpeechEvents:
             self._private_name_end = None
             if on and not self._duck:
                 self._request_outcomes.clear()
+                self._request_outcome_ends.clear()
                 self._pending_ack = None
                 # Privacy ends the conversation (rightyo#244), said at the entry itself, the
                 # moment the host already knows of, so the host never thinks it engaged: no
@@ -1700,6 +1709,7 @@ class SpeechEvents:
             )
             self._roles.clear()
             self._request_outcomes.clear()
+            self._request_outcome_ends.clear()
             self._pending_ack = None
             self._engaged = None
             self._dormant = None
@@ -1808,6 +1818,12 @@ class SpeechEvents:
             # Optional evidence, like `media`; strict hosts ignore unknown keys.
             evidence["meeting"] = "ask_anywhere"
 
+    def _retire_request_outcome(self, request):
+        self._request_outcomes.pop(request, None)
+        self._request_outcome_ends.pop(request, None)
+        if self._pending_ack is not None and self._pending_ack.get("request_id") == request:
+            self._pending_ack = None
+
     def request_outcome(self, value, now_ms):
         """Apply only a known request's monotonic lifecycle; acknowledge after application.
 
@@ -1822,6 +1838,11 @@ class SpeechEvents:
                 return False
             request, state = value["request_id"], value["state"]
             previous = self._request_outcomes.get(request)
+            if state == "reply_ended" and (previous is None or previous in TERMINAL):
+                # A late actual end may close only its own echo span, never revive a request.
+                span = self._playback_scopes.pop(request, None)
+                if span is not None:
+                    span[1] = now_ms
             if previous is None or (previous in TERMINAL and state != previous):
                 return False
             if state == "accepted" and previous not in {"pending", "accepted"}:
@@ -1829,10 +1850,13 @@ class SpeechEvents:
             if state.startswith("reply_") and previous not in {"accepted", "reply_started", state}:
                 return False
             self._now = max(self._now, now_ms)
+            self._scoped_replies = True
+            result = "duplicate"
             if state != previous:
+                result = "applied"
                 self._request_outcomes[request] = state
                 if state == "accepted":
-                    self._scoped_replies = True
+                    pass
                 elif state in {"failed", "timed_out", "cancelled"}:
                     if (
                         self._pending_ack is not None
@@ -1872,14 +1896,20 @@ class SpeechEvents:
                         self._pending_ack = None
                     current = self._engaged or (self._dormant or {}).get("engaged")
                     if current is not None and current.get("request_id") == request:
-                        self.reply(
-                            state.removeprefix("reply_"),
-                            now_ms,
-                            asked=value.get("asked", False),
-                            request_id=request,
-                        )
+                        result = "reply"
+                    self.reply(
+                        state.removeprefix("reply_"),
+                        now_ms,
+                        asked=value.get("asked", False),
+                        request_id=request,
+                    )
             self._emit("request_outcome", request_id=request, state=state, version=1)
-            return True
+            return result
+
+    @property
+    def scoped_replies(self):
+        with self._lock:
+            return self._scoped_replies
 
     def reply(self, phase, now_ms, asked=False, *, request_id=None):
         """The host's report that the assistant's spoken reply `started` or `ended` (#124).
@@ -1903,7 +1933,10 @@ class SpeechEvents:
             integer(now_ms, "now_ms")
             # Once a host opts into request identity, unscoped playback (ack clips included)
             # cannot revive, answer or extend any request. Echo spans remain recorded below.
-            unscoped = self._scoped_replies and request_id is None
+            current = self._engaged or (self._dormant or {}).get("engaged")
+            unscoped = self._scoped_replies and (
+                request_id is None or current is None or current.get("request_id") != request_id
+            )
             if self._active and not unscoped:
                 self._asked_at = now_ms if asked else None
                 if self._replied_at is None:
@@ -1912,14 +1945,20 @@ class SpeechEvents:
                     self._replied_at = now_ms
             if self._active:
                 # The assistant's own audio, so its echo is never taken for a person's answer.
+                scope = request_id or "legacy"
                 if phase == "started":
-                    if self._playbacks and self._playbacks[-1][1] is None:
-                        # A host may forward only the last phase of a burst: an unclosed
-                        # span ends where the next begins, so it never covers all time.
-                        self._playbacks[-1][1] = now_ms
-                    self._playbacks.append([now_ms, None])
-                elif self._playbacks and self._playbacks[-1][1] is None:
-                    self._playbacks[-1][1] = now_ms
+                    old = self._playback_scopes.pop(scope, None)
+                    if old is not None:
+                        old[1] = now_ms
+                    if len(self._playback_scopes) >= MAX_PLAYBACKS:
+                        del self._playback_scopes[next(iter(self._playback_scopes))]
+                    span = [now_ms, None]
+                    self._playbacks.append(span)
+                    self._playback_scopes[scope] = span
+                else:
+                    span = self._playback_scopes.pop(scope, None)
+                    if span is not None:
+                        span[1] = now_ms
             if unscoped:
                 return
             if self._active and self._pending_ack is not None:
@@ -2135,7 +2174,9 @@ class SpeechEvents:
             # first (#167): the request is still delivered, but does not re-open it.
             return
         until = turn.end_ms + self._conversation.window_ms
-        if self._engaged is not None and turn.end_ms < self._engaged["from_ms"]:
+        if self._engaged is not None and turn.end_ms < self._engaged.get(
+            "request_end_ms", self._engaged["from_ms"]
+        ):
             # Decided out of order: an older request never takes the engagement from a
             # newer one (or shortens it).
             return
@@ -2149,7 +2190,9 @@ class SpeechEvents:
             self._engaged["revived_over_ms"] = max(
                 self._engaged.get("revived_over_ms", turn.end_ms), turn.end_ms
             )
-            self._engaged["request_id"] = request_id
+            if turn.end_ms > self._engaged.get("request_end_ms", self._engaged["from_ms"]):
+                self._engaged["request_id"] = request_id
+                self._engaged["request_end_ms"] = turn.end_ms
             if self._per_turn:
                 self._engaged["role"] = role
             return
@@ -2164,6 +2207,7 @@ class SpeechEvents:
         self._dormant = None
         self._engaged = {
             "request_id": request_id,
+            "request_end_ms": turn.end_ms,
             "key": key,
             "speaker_id": turn.speaker_id,
             "from_ms": turn.end_ms,
@@ -2755,6 +2799,7 @@ class SpeechEvents:
                     )
                     del self._open[superseded]
                     self._delivered.pop(superseded, None)
+                    self._retire_request_outcome(superseded)
                 for other, (earlier, _context, _size, other_role) in self._pending.items():
                     if (
                         # #242 round 24: a turn pending across a forget has no owner's
@@ -2872,8 +2917,11 @@ class SpeechEvents:
                     self._engage(turn, request_id, decided)
                 if self.request_control:
                     if len(self._request_outcomes) >= 128:
-                        del self._request_outcomes[next(iter(self._request_outcomes))]
+                        old = next(iter(self._request_outcomes))
+                        del self._request_outcomes[old]
+                        self._request_outcome_ends.pop(old, None)
                     self._request_outcomes[request_id] = "pending"
+                    self._request_outcome_ends[request_id] = turn.end_ms
                 if ack.get("acknowledge") is True:
                     self._hold_ack(turn, request_id)
                 if ack_note is not None and self._report is not None:
@@ -3022,6 +3070,9 @@ class SpeechEvents:
             self._private_seen.clear()
             self._private_name_end = None
             self._clear_exit_audio()
+            self._request_outcomes.clear()
+            self._request_outcome_ends.clear()
+            self._playback_scopes.clear()
             self._active = False
             self._terminal = True
             self._emit(

@@ -32,7 +32,8 @@ Terminal failures clear only matching pending acknowledgement, open-request and
 engagement state, and cannot revive dormant engagement. If that request held the
 engagement, a `conversation` event returns to `ambient`, reason `request_ended`.
 A newer request's engagement or acknowledgement is preserved. Privacy entry, speaker
-forget and session retirement revoke old identities. The bounded map retains at most
+forget, explicit withdrawal/override and session retirement revoke old identities.
+The existing transcript retention cutoff also retires their control authority. The bounded map retains at most
 128 request identities; an evicted identity has no authority. No transcript is added.
 
 After accepting scoped controls, unscoped playback reports still record echo spans,
