@@ -352,6 +352,9 @@ class PrototypeConfig:
     # acknowledgement on confidence or a name. Absent means off (every request is
     # acknowledged, as before); `{}` turns it on with the default threshold.
     acknowledgement: Acknowledgement | None = None
+    # hailing-station#735 meeting mode (#227): named owner abstentions may attend,
+    # anywhere in a turn, only while the host's meeting control is on.
+    meeting_ask_anywhere: bool = True
     # The optional `speaker_id` section (#137 step 3): the local speaker-embedding model
     # and enrollment store used by `rightyo enroll`. Absent or `"enabled": false` means
     # off. With `"live": true`, live sessions also run shadow identification (step 4a):
@@ -443,6 +446,7 @@ class PrototypeConfig:
                 "end_of_turn",
                 "conversation",
                 "acknowledgement",
+                "meeting",
                 "speaker_id",
                 "other_agents",
                 "audio_retention",
@@ -474,6 +478,12 @@ class PrototypeConfig:
             acknowledgement = raw.pop("acknowledgement", None)
             if acknowledgement is not None:
                 acknowledgement = Acknowledgement.from_dict(acknowledgement)
+            meeting = raw.pop("meeting", {})
+            if not isinstance(meeting, dict) or set(meeting) - {"ask_anywhere"}:
+                raise ValueError
+            ask_anywhere = meeting.get("ask_anywhere", True)
+            if type(ask_anywhere) is not bool:
+                raise ValueError
             end_of_turn = raw.pop("end_of_turn", None)
             if end_of_turn is not None:
                 end_of_turn = EndOfTurn.from_dict(end_of_turn)
@@ -558,6 +568,7 @@ class PrototypeConfig:
                 end_of_turn=end_of_turn,
                 conversation=conversation,
                 acknowledgement=acknowledgement,
+                meeting_ask_anywhere=ask_anywhere,
                 speaker_id=speaker_id,
                 speaker_ring_ms=ring_ms,
                 timeline_window_ms=window_ms,
@@ -1010,6 +1021,7 @@ class PrototypeController:
                     dismissal=self.config.dismissal,
                     conversation=self.config.conversation,
                     acknowledgement=self.config.acknowledgement,
+                    meeting_ask_anywhere=self.config.meeting_ask_anywhere,
                     other_agents=self.config.other_agents,
                     **({} if self.owner_voice is None else {"owner_voice": self.owner_voice}),
                     # Privacy mode (internally duck, hailing-station #735): the live
@@ -1022,6 +1034,14 @@ class PrototypeController:
                         if getattr(self._events, "duck_control", False) is True
                         and callable(getattr(self._events, "duck", None))
                         and not self.config.hosted_speech
+                        else {}
+                    ),
+                    # Meeting uses ordinary host controls, including with hosted speech.
+                    # Coaching's descriptor carries only its separate record protocol.
+                    **(
+                        {"meeting": True}
+                        if getattr(self._events, "meeting_control", False) is True
+                        and callable(getattr(self._events, "meeting", None))
                         else {}
                     ),
                 )
@@ -1872,6 +1892,14 @@ class PrototypeController:
         with self._lock:
             if self._events is not None:
                 self._events.media(on)
+
+    def meeting(self, on: bool) -> None:
+        """hailing-station#735 meeting mode (#227), held across sessions; emits nothing."""
+        if type(on) is not bool:
+            raise PrototypeError("invalid meeting mode")
+        with self._lock:
+            if self._events is not None:
+                self._events.meeting(on)
 
     def duck(self, on: bool) -> None:
         """Forward the host's duck mode (hailing-station #735) to the event publisher.

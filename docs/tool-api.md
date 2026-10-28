@@ -1195,6 +1195,44 @@ to another person). Without the question (the #96 request), 9 of the 20 dismissa
 attended and would have been delivered as requests. These are authored
 lines, not recordings; the PR records the tables.
 
+## Meeting mode
+
+For hailing-station#735 meeting mode (#227), a host sends `{"meeting": true}` or
+`{"meeting": false}` over `listen --mode stdin --control-fd N` only to a child whose
+`started` advertises `"meeting": {"version": 1}`. This optional top-level object is
+advertised whenever the live controller's host channel accepts ordinary controls, as
+for media, including with an explicitly consented hosted speech backend. It is absent
+for replay and coaching listeners, whose descriptor carries only coaching records.
+Older Swift `Decodable` hosts ignore unknown top-level and decision-evidence keys,
+as with `media` evidence.
+Only that exact key set and a boolean are accepted; malformed lines are skipped with
+the content-free `invalid control line; skipped` stderr note. Changes emit nothing,
+persist across sessions, and apply to turns accepted afterward, never pending decisions.
+
+While on, attends require both the assistant's configured name (a split spelling such as
+"Righty O" counts, as it does for media) and owner authority;
+without speaker roles, nothing attends (fail closed). Inferred or unlabelled turns
+never pass. A model `attend` that fails this bar is published as `ignore` with the
+optional evidence key `"meeting": true`, as media mode marks its refusals with
+`"media": true`. Like media, a model `uncertain` otherwise stays `uncertain`: an
+unavailable decision keeps its documented `uncertain` evidence, and an abstention does
+not end a conversation that normal mode would keep. The one exception is the
+voiceprint-bound owner's start-of-turn named promotion (hailing-station #735), which
+faces the same bar: one that fails it, such as a turn with inferred-label words, is
+published as `ignore` with `"meeting": true` and, exactly as under media,
+ends an engaged conversation when the model's recipient is another person. Every
+follow-up is refused (`meeting`).
+By default
+`"meeting": {"ask_anywhere": true}` in the prototype config also promotes an
+owner-authority turn naming the assistant anywhere from model `uncertain` to `attend`,
+with recipient `system` and optional evidence `"meeting": "ask_anywhere"`. It never
+promotes `ignore`, inferred owner labels, unavailable decisions or turns to another
+configured agent, nor a turn the model marks as a dismissal or an owner stop phrase.
+False disables this promotion. Media and meeting may both be on: meeting's bar is
+media's bar plus owner authority, so turns are decided exactly as under meeting alone.
+Normal/media-only behavior is unchanged.
+Transcripts, retention and context continue normally; this is separate from privacy mode.
+
 ## Privacy mode (internally `duck`, v3)
 
 Privacy mode ([hailing-station #735](https://github.com/mickdarling/hailing-station/issues/735))
