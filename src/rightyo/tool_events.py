@@ -2175,6 +2175,10 @@ class SpeechEvents:
         does not move the engagement to them.
         """
         key = self._cooldown_key(self._facts(turn))
+        # Equal timestamps are legal. Preserve causal transcript order for distinct turns,
+        # even when their decisions complete in the opposite order (native review #263).
+        ordinal = next((i for i, name in enumerate(self._seen) if name == turn.utterance_id), -1)
+        order = (turn.end_ms, turn.start_ms, ordinal)
         if self._conversation is None or key is None or self._duck:
             # A public request decided while private is still delivered, but opens no
             # conversation, whose events would be timed by the private window (rightyo#244).
@@ -2200,11 +2204,11 @@ class SpeechEvents:
             self._engaged["revived_over_ms"] = max(
                 self._engaged.get("revived_over_ms", turn.end_ms), turn.end_ms
             )
-            if turn.end_ms > self._engaged.get("request_end_ms", self._engaged["from_ms"]):
+            if order > self._engaged.get("request_order", (self._engaged["from_ms"], -1, -1)):
                 if self._scoped_replies:
                     self._engaged.pop("replying_since", None)
                 self._engaged["request_id"] = request_id
-                self._engaged["request_end_ms"] = turn.end_ms
+                self._engaged["request_order"] = order
             if self._per_turn:
                 self._engaged["role"] = role
             return
@@ -2219,7 +2223,7 @@ class SpeechEvents:
         self._dormant = None
         self._engaged = {
             "request_id": request_id,
-            "request_end_ms": turn.end_ms,
+            "request_order": order,
             "key": key,
             "speaker_id": turn.speaker_id,
             "from_ms": turn.end_ms,

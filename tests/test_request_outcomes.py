@@ -313,6 +313,32 @@ class RequestOutcomeTests(unittest.TestCase):
             controller._runner = None
             controller._phase = "idle"
 
+    def test_equal_timestamp_new_request_owns_playback_and_survives_old_failure(self):
+        self.say("a")
+        self.apply()
+        second = turn("b", 0, 900, "Jarvis, this is the new request.")
+        self.events.transcript(second, 1100)
+        self.events.decision(decided(second, "attend"), 1200)
+        self.apply("b", at=1300)
+        self.assertTrue(self.apply("b", "reply_started", at=1400))
+        self.assertEqual(self.events._engaged["request_id"], SESSION + ":b")
+        self.assertEqual(self.events._engaged["replying_since"], 1400)
+        before = copy.deepcopy(self.events._engaged)
+        self.apply("a", "failed", at=1500)
+        self.assertEqual(self.events._engaged, before)
+
+    def test_equal_timestamp_older_decision_does_not_take_newer_identity(self):
+        self.say("a")
+        earlier = turn("c", 1000, 1900, "Jarvis, earlier request.")
+        newer = turn("b", 1000, 1900, "Jarvis, newer request.")
+        self.events.transcript(earlier, 2000)
+        self.events.transcript(newer, 2100)
+        self.events.decision(decided(newer, "attend"), 2200)
+        self.events.decision(decided(earlier, "attend"), 2300)
+        self.assertEqual(self.events._engaged["request_id"], SESSION + ":b")
+        self.apply("c", "failed", at=2400)
+        self.assertEqual(self.events._engaged["request_id"], SESSION + ":b")
+
     def test_malformed_envelopes_refuse_without_mutation(self):
         self.say("a")
         for value in [
