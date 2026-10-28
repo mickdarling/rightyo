@@ -1877,8 +1877,30 @@ class PrototypeController:
                 return
             self._publish("reply", phase, **({"asked": True} if asked else {}))
             if self._runner is not None:
-                # The decision context sees the reply too (rightyo#153), on the same clock.
-                self._runner.note_reply(phase, self._now_ms())
+                if not getattr(self._events, "scoped_replies", False):
+                    self._runner.note_reply(phase, self._now_ms())
+                elif phase == "ended":
+                    # A legacy ack may have started before the first lifecycle control.
+                    # Only close an already-known physical span; never open or renew one.
+                    self._runner.close_legacy_reply(self._now_ms())
+
+    def request_outcome(self, value) -> None:
+        """Trusted control-FD lifecycle report, scoped to this producer session (#262)."""
+        from rightyo.request_outcomes import validate
+
+        validate(value)
+        with self._lock:
+            if (
+                self._events is None
+                or self._event_terminal
+                or self._stop.is_set()
+                or self._phase not in {"listening", "replaying", "finishing"}
+            ):
+                return
+            result = self._publish("request_outcome", value)
+            phase = getattr(result, "playback", None)
+            if phase is not None and self._runner is not None:
+                self._runner.note_reply(phase, self._now_ms(), request_id=value["request_id"])
 
     def media(self, on: bool) -> None:
         """Forward the host's media mode (hailing-station #551) to the event publisher.
@@ -2015,11 +2037,12 @@ class PrototypeController:
                 if method == "transcript"
                 else fields
             )
-            getattr(self._events, method)(value, now_ms=self._now_ms(), **options)
+            result = getattr(self._events, method)(value, now_ms=self._now_ms(), **options)
             runner = self._runner
             if runner is not None and runner.request_context:
                 # What the assistant last acted on, or None once dismissed (#199).
                 runner.note_request(getattr(self._events, "last_request", None))
+            return result
         except Exception:
             self._event_delivery_failed()
             raise PrototypeError("Tool event delivery failed") from None

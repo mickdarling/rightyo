@@ -30,6 +30,8 @@ from rightyo.contracts import (
 )
 from rightyo.memory import TranscriptMemory
 from rightyo.providers import ConfiguredPriorityProvider, ProviderError
+from rightyo.request_outcomes import TERMINAL, OutcomeApplied
+from rightyo.request_outcomes import validate as validate_request_outcome
 
 MAX_EVENT_BYTES = 1200000
 # The duck-mode control version advertised on `started` (hailing-station #735). Version 2
@@ -431,6 +433,7 @@ class SpeechEvents:
         retain_transcripts=True,
         duck_control=True,
         meeting_control=True,
+        request_control=False,
     ):
         if type(retain_transcripts) is not bool:
             raise ContractError("invalid transcript retention setting")
@@ -444,6 +447,12 @@ class SpeechEvents:
         self.duck_control = duck_control
         # Ordinary meeting controls are independent of privacy's speech-backend limits.
         self.meeting_control = meeting_control
+        if type(request_control) is not bool:
+            raise ContractError("invalid request control setting")
+        self.request_control = request_control
+        self._request_outcomes = {}
+        self._request_outcome_ends = {}
+        self._scoped_replies = False
         self._retain_transcripts = retain_transcripts
         # At least five: one open request plus the owner's transcript, attention and
         # request, with a terminal slot, so the static and dynamic override bounds agree.
@@ -497,6 +506,7 @@ class SpeechEvents:
         # Recent [start, end] stream times of the assistant's own playback (end None while
         # it plays), as the host reports them (#124); bounded.
         self._playbacks = deque(maxlen=MAX_PLAYBACKS)
+        self._playback_scopes = {}
         # Stream time the latest reply ended with a question to the owner (#199), or None;
         # cleared when the next reply starts.
         self._asked_at = None
@@ -702,11 +712,15 @@ class SpeechEvents:
         self._appendix_from.clear()
         self.last_request = None
         self._playbacks.clear()
+        self._playback_scopes.clear()
         self._asked_at = None
         self._replied_at = None
         self._delivered.clear()
         self._withdrawn.clear()
         self._formed.clear()
+        self._request_outcomes.clear()
+        self._request_outcome_ends.clear()
+        self._scoped_replies = False
 
     def start(
         self,
@@ -892,6 +906,7 @@ class SpeechEvents:
                 # Ordinary host control, including hosted speech; older Decodable hosts
                 # ignore this optional top-level key (hailing-station#735, #227).
                 **({"meeting": {"version": 1}} if meeting else {}),
+                **({"request_outcomes": {"version": 1}} if self.request_control else {}),
             )
 
     def expire(self, now_ms):
@@ -911,6 +926,9 @@ class SpeechEvents:
                 size = len(encode_json(context))
                 self._pending[key] = (turn, context, size, role)
                 self._pending_bytes += size
+            for request_id, end_ms in list(self._request_outcome_ends.items()):
+                if end_ms <= cutoff:
+                    self._retire_request_outcome(request_id)
             for request_id, end_ms in list(self._open.items()):
                 if end_ms <= cutoff:
                     del self._open[request_id]
@@ -1317,6 +1335,7 @@ class SpeechEvents:
         for request_id in fields["withdrawn_request_ids"]:
             del self._delivered[request_id]
             self._open.pop(request_id, None)
+            self._retire_request_outcome(request_id)
         for key in plan["pending"]:
             # Its decision is still to come: if it would form a request, it is withdrawn.
             self._withdrawn[key] = {
@@ -1472,6 +1491,9 @@ class SpeechEvents:
             # A change of mode always ends a split exit.
             self._private_name_end = None
             if on and not self._duck:
+                self._request_outcomes.clear()
+                self._request_outcome_ends.clear()
+                self._pending_ack = None
                 # Privacy ends the conversation (rightyo#244), said at the entry itself, the
                 # moment the host already knows of, so the host never thinks it engaged: no
                 # timeout can fall due while private, and none is owed at the exit. Said once
@@ -1686,6 +1708,9 @@ class SpeechEvents:
                 self._engaged["speaker_id"] if self._engaged is not None and self._active else None
             )
             self._roles.clear()
+            self._request_outcomes.clear()
+            self._request_outcome_ends.clear()
+            self._pending_ack = None
             self._engaged = None
             self._dormant = None
             self._cooldowns.clear()
@@ -1793,7 +1818,131 @@ class SpeechEvents:
             # Optional evidence, like `media`; strict hosts ignore unknown keys.
             evidence["meeting"] = "ask_anywhere"
 
-    def reply(self, phase, now_ms, asked=False):
+    def _retire_request_outcome(self, request):
+        self._request_outcomes.pop(request, None)
+        self._request_outcome_ends.pop(request, None)
+        if self._pending_ack is not None and self._pending_ack.get("request_id") == request:
+            self._pending_ack = None
+
+    def request_outcome(self, value, now_ms):
+        """Apply only a known request's monotonic lifecycle; acknowledge after application.
+
+        A terminal outcome clears matching pending state, never playback or a newer request.
+        Duplicate identical states are acknowledged without extending any window. Unknown,
+        foreign, retired and backwards transitions have no effect and no acknowledgement.
+        """
+        value = validate_request_outcome(value)
+        integer(now_ms, "now_ms")
+        with self._lock:
+            if not self.request_control or not self._active or value["session_id"] != self._session:
+                return False
+            self.expire(now_ms)
+            if not self._active:
+                return False
+            request, state = value["request_id"], value["state"]
+            previous = self._request_outcomes.get(request)
+            playback = None
+            if state == "reply_ended" and (previous is None or previous in TERMINAL):
+                # A late actual end may close only its own echo span, never revive a request.
+                span = self._playback_scopes.pop(request, None)
+                if span is not None:
+                    span[1] = now_ms
+                    playback = "ended"
+            if previous is None or (previous in TERMINAL and state != previous):
+                return OutcomeApplied(False, playback)
+            if state == "accepted" and previous not in {"pending", "accepted"}:
+                return False
+            if state.startswith("reply_") and previous not in {"accepted", "reply_started", state}:
+                return False
+            self._now = max(self._now, now_ms)
+            if not self._scoped_replies:
+                # Negotiation retires legacy semantic authority (an ack may already play).
+                # Its physical spans remain until their own actual end is reported.
+                self._asked_at = self._replied_at = None
+                if self._engaged is not None:
+                    self._engaged.pop("replying_since", None)
+                if self._dormant is not None:
+                    self._dormant["engaged"].pop("replying_since", None)
+            self._scoped_replies = True
+            result = OutcomeApplied(True)
+            if state != previous:
+                self._request_outcomes[request] = state
+                if state == "accepted":
+                    pass
+                elif state in {"failed", "timed_out", "cancelled"}:
+                    if (
+                        self._pending_ack is not None
+                        and self._pending_ack.get("request_id") == request
+                    ):
+                        self._pending_ack = None
+                    if self._engaged is not None and self._engaged.get("request_id") == request:
+                        # A failure is not a completed answer and cannot later revive engagement.
+                        ended = self._engaged["speaker_id"]
+                        self._engaged = None
+                        self._asked_at = self._replied_at = None
+                        self._emit(
+                            "conversation",
+                            state="ambient",
+                            reason="request_ended",
+                            speaker_id=ended,
+                            at_ms=self._now,
+                        )
+                    if (
+                        self._dormant is not None
+                        and self._dormant["engaged"].get("request_id") == request
+                    ):
+                        self._dormant = None
+                    if (
+                        self.last_request is not None
+                        and request == self._session + ":" + self.last_request[2]
+                    ):
+                        self.last_request = None
+                    self._open.pop(request, None)
+                    self._delivered.pop(request, None)
+                elif state == "reply_published":
+                    self._published(request, now_ms, value.get("asked", False))
+                else:
+                    # Scoped real reply reports are different from acknowledgement clips.
+                    if (
+                        self._pending_ack is not None
+                        and self._pending_ack.get("request_id") == request
+                    ):
+                        self._pending_ack = None
+                    result = OutcomeApplied(True, state.removeprefix("reply_"))
+                    self.reply(
+                        state.removeprefix("reply_"),
+                        now_ms,
+                        asked=value.get("asked", False),
+                        request_id=request,
+                    )
+            self._emit("request_outcome", request_id=request, state=state, version=1)
+            return result
+
+    def _published(self, request, now_ms, asked):
+        """Exact host reply publication is answer completion, never physical playback."""
+        if self._pending_ack is not None and self._pending_ack.get("request_id") == request:
+            self._pending_ack = None
+        self._open.pop(request, None)
+        self._delivered.pop(request, None)
+        current = self._engaged or (self._dormant or {}).get("engaged")
+        if self._duck or current is None or current.get("request_id") != request:
+            return
+        self._lapse(now_ms)
+        current = self._engaged or self._revive(now_ms)
+        if current is not None:
+            # Timed from confirmed publication, not claimed hearing. Pacing and physical
+            # playback remain the host/client's responsibility, and create no echo span here.
+            current.pop("replying_since", None)
+            current["until_ms"] = max(current["until_ms"], now_ms + self._conversation.window_ms)
+            self._asked_at = now_ms if asked else None
+            self._replied_at = now_ms
+
+    @property
+    def scoped_replies(self):
+        with self._lock:
+            return self._scoped_replies
+
+    def reply(self, phase, now_ms, asked=False, *, request_id=None):
         """The host's report that the assistant's spoken reply `started` or `ended` (#124).
 
         While engaged, a playing reply holds the window open, and its end restarts the
@@ -1813,7 +1962,13 @@ class SpeechEvents:
             if asked and phase != "ended":
                 raise ContractError("invalid reply phase")
             integer(now_ms, "now_ms")
-            if self._active:
+            # Once a host opts into request identity, unscoped playback (ack clips included)
+            # cannot revive, answer or extend any request. Echo spans remain recorded below.
+            current = self._engaged or (self._dormant or {}).get("engaged")
+            unscoped = self._scoped_replies and (
+                request_id is None or current is None or current.get("request_id") != request_id
+            )
+            if self._active and not unscoped:
                 self._asked_at = now_ms if asked else None
                 if self._replied_at is None:
                     # The first phase reported since the request: a host may forward only
@@ -1821,14 +1976,22 @@ class SpeechEvents:
                     self._replied_at = now_ms
             if self._active:
                 # The assistant's own audio, so its echo is never taken for a person's answer.
+                scope = request_id or "legacy"
                 if phase == "started":
-                    if self._playbacks and self._playbacks[-1][1] is None:
-                        # A host may forward only the last phase of a burst: an unclosed
-                        # span ends where the next begins, so it never covers all time.
-                        self._playbacks[-1][1] = now_ms
-                    self._playbacks.append([now_ms, None])
-                elif self._playbacks and self._playbacks[-1][1] is None:
-                    self._playbacks[-1][1] = now_ms
+                    old = self._playback_scopes.pop(scope, None)
+                    if old is not None:
+                        old[1] = now_ms
+                    if len(self._playback_scopes) >= MAX_PLAYBACKS:
+                        del self._playback_scopes[next(iter(self._playback_scopes))]
+                    span = [now_ms, None]
+                    self._playbacks.append(span)
+                    self._playback_scopes[scope] = span
+                else:
+                    span = self._playback_scopes.pop(scope, None)
+                    if span is not None:
+                        span[1] = now_ms
+            if unscoped:
+                return
             if self._active and self._pending_ack is not None:
                 self._answer_ack(phase)
             engaged = self._engaged
@@ -1943,13 +2106,17 @@ class SpeechEvents:
         elif self._pending_ack["heard_end"]:
             self._pending_ack = None
 
-    def _hold_ack(self, turn):
+    def _hold_ack(self, turn, request_id):
         """Hold an emitted acknowledgement as pending until answered or the window ends."""
         window = self._acknowledgement.dedup_window_ms
         if window > 0:
             # Only reached with nothing pending or a lapsed hold (an acknowledged turn
             # never starts inside a pending window), so this never shortens a hold.
-            self._pending_ack = {"until_ms": turn.end_ms + window, "heard_end": False}
+            self._pending_ack = {
+                "until_ms": turn.end_ms + window,
+                "heard_end": False,
+                "request_id": request_id,
+            }
 
     def _lapse(self, now_ms):
         """Return to ambient once stream time passes the engagement window (#82)."""
@@ -2029,6 +2196,10 @@ class SpeechEvents:
         does not move the engagement to them.
         """
         key = self._cooldown_key(self._facts(turn))
+        # Equal timestamps are legal. Preserve causal transcript order for distinct turns,
+        # even when their decisions complete in the opposite order (native review #263).
+        ordinal = next((i for i, name in enumerate(self._seen) if name == turn.utterance_id), -1)
+        order = (turn.end_ms, turn.start_ms, ordinal)
         if self._conversation is None or key is None or self._duck:
             # A public request decided while private is still delivered, but opens no
             # conversation, whose events would be timed by the private window (rightyo#244).
@@ -2038,7 +2209,9 @@ class SpeechEvents:
             # first (#167): the request is still delivered, but does not re-open it.
             return
         until = turn.end_ms + self._conversation.window_ms
-        if self._engaged is not None and turn.end_ms < self._engaged["from_ms"]:
+        if self._engaged is not None and order < self._engaged.get(
+            "request_order", (self._engaged["from_ms"], -1, -1)
+        ):
             # Decided out of order: an older request never takes the engagement from a
             # newer one (or shortens it).
             return
@@ -2052,6 +2225,11 @@ class SpeechEvents:
             self._engaged["revived_over_ms"] = max(
                 self._engaged.get("revived_over_ms", turn.end_ms), turn.end_ms
             )
+            if order > self._engaged.get("request_order", (self._engaged["from_ms"], -1, -1)):
+                if self._scoped_replies:
+                    self._engaged.pop("replying_since", None)
+                self._engaged["request_id"] = request_id
+                self._engaged["request_order"] = order
             if self._per_turn:
                 self._engaged["role"] = role
             return
@@ -2065,6 +2243,8 @@ class SpeechEvents:
             return
         self._dormant = None
         self._engaged = {
+            "request_id": request_id,
+            "request_order": order,
             "key": key,
             "speaker_id": turn.speaker_id,
             "from_ms": turn.end_ms,
@@ -2656,6 +2836,7 @@ class SpeechEvents:
                     )
                     del self._open[superseded]
                     self._delivered.pop(superseded, None)
+                    self._retire_request_outcome(superseded)
                 for other, (earlier, _context, _size, other_role) in self._pending.items():
                     if (
                         # #242 round 24: a turn pending across a forget has no owner's
@@ -2771,8 +2952,14 @@ class SpeechEvents:
                     self._open[request_id] = turn.end_ms
                 if self._conversation is not None and not self._conversation.is_closing(turn.text):
                     self._engage(turn, request_id, decided)
+                if self.request_control:
+                    if len(self._request_outcomes) >= 128:
+                        old = next(iter(self._request_outcomes))
+                        self._retire_request_outcome(old)
+                    self._request_outcomes[request_id] = "pending"
+                    self._request_outcome_ends[request_id] = turn.end_ms
                 if ack.get("acknowledge") is True:
-                    self._hold_ack(turn)
+                    self._hold_ack(turn, request_id)
                 if ack_note is not None and self._report is not None:
                     # Best-effort and last: a failed diagnostic write (a closed stderr)
                     # must never undo or skip the request's state transitions above.
@@ -2919,6 +3106,9 @@ class SpeechEvents:
             self._private_seen.clear()
             self._private_name_end = None
             self._clear_exit_audio()
+            self._request_outcomes.clear()
+            self._request_outcome_ends.clear()
+            self._playback_scopes.clear()
             self._active = False
             self._terminal = True
             self._emit(
