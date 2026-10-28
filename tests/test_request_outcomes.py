@@ -339,6 +339,18 @@ class RequestOutcomeTests(unittest.TestCase):
         self.apply("c", "failed", at=2400)
         self.assertEqual(self.events._engaged["request_id"], SESSION + ":b")
 
+    def test_older_different_speaker_cannot_replace_newer_engagement(self):
+        self.say("a")
+        older = turn("c", 1000, 1900, "Jarvis, an older question.", speaker="Speaker B")
+        newest = turn("b", 2000, 2900, "Jarvis, the newest question.")
+        self.events.transcript(older, 2000)
+        self.events.transcript(newest, 3000)
+        self.events.decision(decided(newest, "attend"), 3100)
+        self.events.decision(decided(older, "attend"), 3200)
+        self.assertEqual(self.events._engaged["request_id"], SESSION + ":b")
+        self.apply("c", "failed", at=3300)
+        self.assertEqual(self.events._engaged["request_id"], SESSION + ":b")
+
     def test_malformed_envelopes_refuse_without_mutation(self):
         self.say("a")
         for value in [

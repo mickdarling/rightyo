@@ -2188,8 +2188,8 @@ class SpeechEvents:
             # first (#167): the request is still delivered, but does not re-open it.
             return
         until = turn.end_ms + self._conversation.window_ms
-        if self._engaged is not None and turn.end_ms < self._engaged.get(
-            "request_end_ms", self._engaged["from_ms"]
+        if self._engaged is not None and order < self._engaged.get(
+            "request_order", (self._engaged["from_ms"], -1, -1)
         ):
             # Decided out of order: an older request never takes the engagement from a
             # newer one (or shortens it).
