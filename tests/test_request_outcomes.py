@@ -186,6 +186,16 @@ class RequestOutcomeTests(unittest.TestCase):
         self.events.end(now_ms=self.events.retention_ms + 3000)
         self.assertEqual(self.events._request_outcome_ends, {})
 
+    def test_newer_request_does_not_inherit_old_playback_hold(self):
+        self.say("a")
+        self.apply()
+        self.apply(state="reply_started", at=1100)
+        self.say("b", at=2000)
+        self.assertNotIn("replying_since", self.events._engaged)
+        self.assertEqual(self.events._window_end(self.events._engaged), 12900)
+        self.assertTrue(self.apply(state="reply_ended", at=4000))
+        self.assertNotIn("replying_since", self.events._engaged)
+
     def test_control_enforces_retention_without_a_prior_timer_tick(self):
         self.say("a")
         self.apply()
@@ -241,13 +251,16 @@ class RequestOutcomeTests(unittest.TestCase):
             controller.reply("ended")
             runner.note_reply.assert_not_called()
             controller.request_outcome(outcome(state="reply_started"))
-            runner.note_reply.assert_called_once_with("started", 2000)
+            runner.note_reply.assert_called_once_with("started", 2000, request_id=SESSION + ":a")
             controller.request_outcome(outcome(state="reply_started"))
             controller.request_outcome(outcome("foreign", state="reply_ended"))
             self.assertEqual(runner.note_reply.call_count, 1)
+            self.say("b", at=2500)
+            controller._now_ms = lambda: 4000
             controller.request_outcome(outcome(state="reply_ended"))
             self.assertEqual(runner.note_reply.call_count, 2)
-            self.assertIsNotNone(self.events._engaged)
+            runner.note_reply.assert_called_with("ended", 4000, request_id=SESSION + ":a")
+            self.assertEqual(self.events._engaged["request_id"], SESSION + ":b")
         finally:
             controller._runner = None
             controller._phase = "idle"

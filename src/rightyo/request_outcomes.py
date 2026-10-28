@@ -1,9 +1,22 @@
 """Strict provider-neutral host request control, version 1 (#262)."""
 
+from dataclasses import dataclass
+
 from rightyo.contracts import ContractError, identifier
 
 STATES = frozenset({"accepted", "failed", "timed_out", "cancelled", "reply_started", "reply_ended"})
 TERMINAL = frozenset({"failed", "timed_out", "cancelled", "reply_ended"})
+
+
+@dataclass(frozen=True)
+class OutcomeApplied:
+    """Keep lifecycle acknowledgement separate from an actual physical playback edge."""
+
+    acknowledged: bool
+    playback: str | None = None
+
+    def __bool__(self):
+        return self.acknowledged
 
 
 def validate(value):

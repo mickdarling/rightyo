@@ -30,7 +30,7 @@ from rightyo.contracts import (
 )
 from rightyo.memory import TranscriptMemory
 from rightyo.providers import ConfiguredPriorityProvider, ProviderError
-from rightyo.request_outcomes import TERMINAL
+from rightyo.request_outcomes import TERMINAL, OutcomeApplied
 from rightyo.request_outcomes import validate as validate_request_outcome
 
 MAX_EVENT_BYTES = 1200000
@@ -1841,22 +1841,23 @@ class SpeechEvents:
                 return False
             request, state = value["request_id"], value["state"]
             previous = self._request_outcomes.get(request)
+            playback = None
             if state == "reply_ended" and (previous is None or previous in TERMINAL):
                 # A late actual end may close only its own echo span, never revive a request.
                 span = self._playback_scopes.pop(request, None)
                 if span is not None:
                     span[1] = now_ms
+                    playback = "ended"
             if previous is None or (previous in TERMINAL and state != previous):
-                return False
+                return OutcomeApplied(False, playback)
             if state == "accepted" and previous not in {"pending", "accepted"}:
                 return False
             if state.startswith("reply_") and previous not in {"accepted", "reply_started", state}:
                 return False
             self._now = max(self._now, now_ms)
             self._scoped_replies = True
-            result = "duplicate"
+            result = OutcomeApplied(True)
             if state != previous:
-                result = "applied"
                 self._request_outcomes[request] = state
                 if state == "accepted":
                     pass
@@ -1897,9 +1898,7 @@ class SpeechEvents:
                         and self._pending_ack.get("request_id") == request
                     ):
                         self._pending_ack = None
-                    current = self._engaged or (self._dormant or {}).get("engaged")
-                    if current is not None and current.get("request_id") == request:
-                        result = "reply"
+                    result = OutcomeApplied(True, state.removeprefix("reply_"))
                     self.reply(
                         state.removeprefix("reply_"),
                         now_ms,
@@ -2194,6 +2193,7 @@ class SpeechEvents:
                 self._engaged.get("revived_over_ms", turn.end_ms), turn.end_ms
             )
             if turn.end_ms > self._engaged.get("request_end_ms", self._engaged["from_ms"]):
+                self._engaged.pop("replying_since", None)
                 self._engaged["request_id"] = request_id
                 self._engaged["request_end_ms"] = turn.end_ms
             if self._per_turn:

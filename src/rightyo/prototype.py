@@ -1894,8 +1894,9 @@ class PrototypeController:
             ):
                 return
             result = self._publish("request_outcome", value)
-            if result == "reply" and self._runner is not None:
-                self._runner.note_reply(value["state"].removeprefix("reply_"), self._now_ms())
+            phase = getattr(result, "playback", None)
+            if phase is not None and self._runner is not None:
+                self._runner.note_reply(phase, self._now_ms(), request_id=value["request_id"])
 
     def media(self, on: bool) -> None:
         """Forward the host's media mode (hailing-station #551) to the event publisher.
