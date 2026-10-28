@@ -186,6 +186,18 @@ class RequestOutcomeTests(unittest.TestCase):
         self.events.end(now_ms=self.events.retention_ms + 3000)
         self.assertEqual(self.events._request_outcome_ends, {})
 
+    def test_control_enforces_retention_without_a_prior_timer_tick(self):
+        self.say("a")
+        self.apply()
+        self.assertFalse(self.apply(state="reply_started", at=self.events.retention_ms + 2000))
+        self.assertEqual(self.events._request_outcomes, {})
+        self.assertFalse(
+            any(
+                event["type"] == "request_outcome" and event["state"] == "reply_started"
+                for event in self.events.drain()
+            )
+        )
+
     def test_spoken_dismissal_retires_original_control_identity(self):
         self.events = SpeechEvents(request_control=True)
         self.events.start(

@@ -1836,6 +1836,9 @@ class SpeechEvents:
         with self._lock:
             if not self.request_control or not self._active or value["session_id"] != self._session:
                 return False
+            self.expire(now_ms)
+            if not self._active:
+                return False
             request, state = value["request_id"], value["state"]
             previous = self._request_outcomes.get(request)
             if state == "reply_ended" and (previous is None or previous in TERMINAL):
