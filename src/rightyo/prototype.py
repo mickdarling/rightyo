@@ -1880,6 +1880,21 @@ class PrototypeController:
                 # The decision context sees the reply too (rightyo#153), on the same clock.
                 self._runner.note_reply(phase, self._now_ms())
 
+    def request_outcome(self, value) -> None:
+        """Trusted control-FD lifecycle report, scoped to this producer session (#262)."""
+        from rightyo.request_outcomes import validate
+
+        validate(value)
+        with self._lock:
+            if (
+                self._events is None
+                or self._event_terminal
+                or self._stop.is_set()
+                or self._phase not in {"listening", "replaying", "finishing"}
+            ):
+                return
+            self._publish("request_outcome", value)
+
     def media(self, on: bool) -> None:
         """Forward the host's media mode (hailing-station #551) to the event publisher.
 
