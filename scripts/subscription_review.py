@@ -59,6 +59,20 @@ class GateError(ValueError):
     """Only public-safe categories are emitted; never response bodies or tokens."""
 
 
+def marker_count(body, name):
+    return len(re.findall(r"<!--\s*" + re.escape(name), body, re.I))
+
+
+def completion_match(body):
+    match = COMPLETION.match(body)
+    count = marker_count(body, "codex-review-receipt")
+    if count and (
+        count != 1 or not body.startswith("<!-- codex-review-receipt:v1 -->\n\n") or match is None
+    ):
+        raise GateError("Native completion receipt is unsupported")
+    return match
+
+
 def unique_fields(pairs):
     fields = dict(pairs)
     if len(fields) != len(pairs):
@@ -70,10 +84,20 @@ def summary_state(body):
     """Recognize bounded envelopes without changing the body used for provenance."""
     marker = "<!-- codex-pull-request-review-summary -->\n"
     heading = "\n## Codex Review Summary\n"
+    summaries = marker_count(body, "codex-pull-request-review-summary")
+    states = marker_count(body, "codex-review-state")
     if not body.startswith(marker):
+        if summaries or states:
+            raise GateError("Native summary envelope is unsupported")
         return None
+    if summaries != 1:
+        raise GateError("Native summary envelope is repeated")
     if body.startswith(marker + heading):
+        if states:
+            raise GateError("Legacy summary carries unexpected state metadata")
         return {}  # Supported legacy envelope; its markdown remains authoritative.
+    if states != 1:
+        raise GateError("Native summary state marker is missing or repeated")
     line, _, rest = body[len(marker) :].partition("\n")
     match = re.fullmatch(r"<!-- codex-review-state:v1 ([^\n]{1,4096}) -->", line)
     if not match or not rest.startswith(heading):
@@ -118,10 +142,27 @@ def validate_summary_state(state, head, completed):
             review["has_any_findings"] is True or review["has_unresolved_findings"] is True
         ):
             raise GateError("Native summary reports findings")
-    if completed and any(
-        code[key] is not False for key in ["has_any_findings", "has_unresolved_findings"]
+    if completed:
+        for review in state.values():
+            if review["commit_sha"] == head and (
+                review["status"] != "completed"
+                or any(
+                    review[key] is not False
+                    for key in ["has_any_findings", "has_unresolved_findings"]
+                )
+            ):
+                raise GateError("Native summary completion is inconclusive")
+
+
+def validate_security_state(state, head):
+    """Security authority belongs to its own commit, independently of the code row."""
+    if not state or state["security_review"]["commit_sha"] != head:
+        return
+    review = state["security_review"]
+    if review["status"] != "completed" or any(
+        review[key] is not False for key in ["has_any_findings", "has_unresolved_findings"]
     ):
-        raise GateError("Native summary completion is inconclusive")
+        raise GateError("Current native security review is incomplete or reports findings")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -335,13 +376,17 @@ def freshness_barrier(comments, head, resolve, attest, authorize, persisted=None
             continue
         if not attest(comment, True):
             raise GateError("Native comment edit provenance is invalid")
+        completion_match(body)  # Unsupported receipts must not fall back to older evidence.
         state = summary_state(body)
         if state is None:
             continue
+        validate_security_state(state, head)
         row = re.findall(r"(?m)^\|[^\n]*\*\*Code Review\*\*[^\n]*\| `([0-9a-f]{7,40})` \|", body)
         if len(row) != 1:
             raise GateError("Native review activity summary is ambiguous or unsupported")
         if not head.startswith(row[0]) or resolve(row[0]) != head:
+            if state and state["code_review"]["commit_sha"] == head:
+                raise GateError("Current native code state conflicts with its markdown revision")
             continue
         updated = timestamp(comment.get("updated_at"))
         completed = SUMMARY.findall(body)
@@ -404,7 +449,7 @@ def review_candidates(
         if not native(comment, require_app=True):
             continue
         body = comment.get("body") or ""
-        match = COMPLETION.match(body)
+        match = completion_match(body)
         summary = False
         if not match:
             if summary_state(body) is None:
