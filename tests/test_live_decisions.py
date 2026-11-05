@@ -51,16 +51,40 @@ def malformed():
 
 
 class Paced:
-    """One PCM chunk per read, each released only after the previous turn's decision."""
+    """One PCM chunk per read, including EOF only after previous event publication."""
 
-    def __init__(self, count, decided):
-        self.remaining, self.decided = count, decided
+    def __init__(self, count, decided, finished):
+        self.remaining, self.decided, self.finished = count, decided, finished
 
     def read(self, _limit):
-        if self.remaining == 0 or not self.decided.acquire(timeout=5):
+        if self.finished.is_set() or not self.decided.acquire(timeout=5):
+            return b""
+        if self.finished.is_set() or self.remaining == 0:
             return b""
         self.remaining -= 1
         return bytes(PCM_CHUNK_BYTES)
+
+
+class PublishedOutput(io.StringIO):
+    """Acknowledge serialized output, after it is observable to the test consumer."""
+
+    def __init__(self, decided, finished):
+        super().__init__()
+        self.decided, self.finished = decided, finished
+
+    def write(self, text):
+        result = super().write(text)
+        event = json.loads(text)  # listen's _emit writes exactly one complete JSON line.
+        terminal = event["type"] == "session" and event.get("phase") in {
+            "stopped",
+            "cancelled",
+            "error",
+        }
+        if terminal:
+            self.finished.set()
+        if terminal or event["type"] == "attention":
+            self.decided.release()
+        return result
 
 
 class TurnPerChunk:
@@ -102,23 +126,48 @@ class TurnPerChunk:
 class ScriptedJev:
     """Answers like the fixture rule, or raises the scripted failure for that call."""
 
-    def __init__(self, script, decided, built, **options):
-        self.script, self.decided, self.options = script, decided, options
+    def __init__(self, script, built, **options):
+        self.script, self.options = script, options
         self.max_requests = options["max_requests"]
         self.requests = 0
         built.append(self)
 
     def decide(self, state):
-        try:
-            if self.max_requests is not None and self.requests >= self.max_requests:
-                raise ProviderError("Jev request budget exhausted")
-            outcome = self.script[self.requests] if self.requests < len(self.script) else OK
-            self.requests += 1
-            if outcome is not OK:
-                raise outcome
-            return MockProvider().decide(state)
-        finally:
-            self.decided.release()
+        if self.max_requests is not None and self.requests >= self.max_requests:
+            raise ProviderError("Jev request budget exhausted")
+        outcome = self.script[self.requests] if self.requests < len(self.script) else OK
+        self.requests += 1
+        if outcome is not OK:
+            raise outcome
+        return MockProvider().decide(state)
+
+
+class PublicationPacingTests(unittest.TestCase):
+    def test_decision_and_terminal_release_only_after_output_is_observable(self):
+        for event in [{"type": "attention"}, {"type": "session", "phase": "error"}]:
+            gate, finished = MagicMock(), threading.Event()
+            output = PublishedOutput(gate, finished)
+            text = json.dumps(event) + "\n"
+            gate.release.side_effect = lambda: self.assertEqual(output.getvalue(), text)
+            self.assertEqual(output.write(text), len(text))
+            gate.release.assert_called_once_with()
+            self.assertEqual(finished.is_set(), event["type"] == "session")
+
+    def test_eof_waits_for_last_publication_and_other_events_are_transparent(self):
+        gate = MagicMock()
+        gate.acquire.return_value = True
+        finished = threading.Event()
+        self.assertEqual(Paced(0, gate, finished).read(1), b"")
+        gate.acquire.assert_called_once_with(timeout=5)
+        gate.reset_mock()
+        output = PublishedOutput(gate, finished)
+        text = json.dumps({"type": "transcript"}) + "\n"
+        self.assertEqual(output.write(text), len(text))
+        self.assertEqual(output.getvalue(), text)
+        gate.release.assert_not_called()
+        finished.set()
+        self.assertEqual(Paced(5, gate, finished).read(1), b"")
+        gate.acquire.assert_not_called()
 
 
 class LiveDecisionTests(unittest.TestCase):
@@ -148,6 +197,7 @@ class LiveDecisionTests(unittest.TestCase):
         """Run `listen --mode stdin --use-jev --allow-hosted` over synthetic paced turns."""
         TurnPerChunk.texts = list(texts)
         decided = threading.Semaphore(1)
+        finished = threading.Event()
         built = []
 
         def factory(config, *, event_publisher, audio_input, audio_provenance, report):
@@ -155,9 +205,7 @@ class LiveDecisionTests(unittest.TestCase):
                 config,
                 event_publisher=event_publisher,
                 processor_factory=TurnPerChunk,
-                provider_factory=lambda **options: ScriptedJev(
-                    list(script), decided, built, **options
-                ),
+                provider_factory=lambda **options: ScriptedJev(list(script), built, **options),
                 audio_input=audio_input,
                 audio_provenance=audio_provenance,
                 report=report,
@@ -171,13 +219,13 @@ class LiveDecisionTests(unittest.TestCase):
             use_jev=True,
             allow_hosted=True,
         )
-        output = io.StringIO()
+        output = PublishedOutput(decided, finished)
         with contextlib.redirect_stderr(io.StringIO()):
             code = listen(
                 args,
                 output=output,
                 controller_factory=factory,
-                audio_input=Paced(turns, decided),
+                audio_input=Paced(turns, decided, finished),
             )
         events = [json.loads(line) for line in output.getvalue().splitlines()]
         return code, events, built
@@ -199,7 +247,19 @@ class LiveDecisionTests(unittest.TestCase):
         code, events, built = self.run_listen(5)
         self.assertEqual(code, 2)
         self.assertEqual(built[0].options["max_requests"], 3)
-        self.assertEqual(len(self.of(events, "attention")), 3)
+        self.assertEqual(
+            len(self.of(events, "attention")),
+            3,
+            [
+                (
+                    e["type"],
+                    e.get("utterance_id"),
+                    e.get("turn", {}).get("utterance_id"),
+                    e.get("reason"),
+                )
+                for e in events
+            ],
+        )
         self.assertEqual(
             (events[-1]["phase"], events[-1]["reason"]), ("error", "attention-budget-exhausted")
         )
