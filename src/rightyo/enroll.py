@@ -85,19 +85,28 @@ def read_wav(path: Path) -> array:
     return samples
 
 
-def speech(samples: array) -> array:
-    """Speech only: leading and trailing silence removed, pauses cut to 0.25 s.
-
-    A 10 ms frame counts as speech when its energy is within 35 dB of the loudest frame
-    and above -60 dBFS. This is a level gate, not a voice detector: steady noise or
-    music counts as "speech", so enroll from a quiet recording of one person talking.
-    """
+def frame_energies(samples: array) -> list[float]:
+    """Each whole 10 ms frame's mean square energy."""
     count = len(samples) // FRAME
     energies = []
     for index in range(count):
         frame = samples[index * FRAME : (index + 1) * FRAME]
         energies.append(sum(map(operator.mul, frame, frame)) / FRAME)
-    floor = max(max(energies, default=0.0) * RELATIVE_FLOOR, ABSOLUTE_FLOOR)
+    return energies
+
+
+def speech(samples: array, *, peak: float = 0.0) -> array:
+    """Speech only: leading and trailing silence removed, pauses cut to 0.25 s.
+
+    A 10 ms frame counts as speech when its energy is within 35 dB of the loudest frame
+    and above -60 dBFS. This is a level gate, not a voice detector: steady noise or
+    music counts as "speech", so enroll from a quiet recording of one person talking.
+    `peak` (a frame energy) raises the loudest frame the 35 dB are measured from, so a
+    piece judged beside louder speech (hailing-station #735's entry gaps, beside the
+    owner's own words) keeps only what is within 35 dB of that speech.
+    """
+    energies = frame_energies(samples)
+    floor = max(max(max(energies, default=0.0), peak) * RELATIVE_FLOOR, ABSOLUTE_FLOOR)
     voiced = [energy > floor for energy in energies]
     kept = array("h")
     pending: list[int] = []

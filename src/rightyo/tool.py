@@ -11,6 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TextIO
 
+from rightyo.addressedness import SCENES
 from rightyo.cli import (
     addressing_from_args,
     dismissal_from_args,
@@ -169,13 +170,17 @@ def _stderr(message: str) -> None:
     print(f"rightyo: {message}", file=sys.stderr, flush=True)
 
 
-MAX_CONTROL_LINE = 256
+MAX_CONTROL_LINE = 512
 
 
 def _read_control(fd: int, controller) -> None:
     """Forward the host's reply reports to the session until EOF (#124).
 
-    Bounded lines of `{"reply": "started"}` or `{"reply": "ended"}`; anything else is
+    Bounded lines of `{"reply": "started"}` or `{"reply": "ended"}` (an ended reply may add
+    `"asked": true` when it ended with a question, #199), and the host's media mode
+    `{"media": true}` or `{"media": false}` (hailing-station #551), and its duck mode
+    `{"duck": true}` or `{"duck": false}` (hailing-station #735), and meeting mode
+    `{"meeting": true|false}` (hailing-station#735 meeting mode (#227)); anything else is
     reported on stderr (content-free) and skipped. The reader never ends the session.
     """
     try:
@@ -191,6 +196,8 @@ def _read_control(fd: int, controller) -> None:
                     if discarding:
                         # The rest of an overlong line is never read as a line of its own.
                         discarding = False
+                    elif len(line) > MAX_CONTROL_LINE:
+                        _stderr("control line too long; skipped")
                     elif line.strip():
                         _apply_control(line, controller)
                 if len(pending) > MAX_CONTROL_LINE:
@@ -201,12 +208,47 @@ def _read_control(fd: int, controller) -> None:
         _stderr("control input unavailable; reply timing off")
 
 
+def _unique_control_keys(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate control key")
+        value[key] = item
+    return value
+
+
 def _apply_control(line: bytes, controller) -> None:
     try:
-        message = json.loads(line)
-        if not isinstance(message, dict) or set(message) != {"reply"}:
+        message = json.loads(line, object_pairs_hook=_unique_control_keys)
+        if not isinstance(message, dict) or set(message) not in (
+            {"reply"},
+            {"reply", "asked"},
+            {"media"},
+            {"duck"},
+            {"meeting"},
+            {"request_outcome"},
+        ):
             raise ValueError
-        controller.reply(message["reply"])
+        if "request_outcome" in message:
+            controller.request_outcome(message["request_outcome"])
+        elif "media" in message:
+            controller.media(message["media"])
+        elif "duck" in message:
+            controller.duck(message["duck"])
+        elif "meeting" in message:
+            controller.meeting(message["meeting"])
+        elif "asked" in message:
+            if message["reply"] != "ended" or type(message["asked"]) is not bool:
+                raise ValueError
+            controller.reply("ended", asked=message["asked"])
+        else:
+            controller.reply(message["reply"])
+    except ContractError:
+        # The session failed while applying a valid line (#735 S-8: a `privacy` ack that
+        # overran the event backlog, after the duck itself was applied). The reader lives
+        # on, so later lines (an off included) still apply; the host's ack deadline fails
+        # closed on the missing ack.
+        _stderr("control line not acknowledged; session failed")
     except (ValueError, TypeError, AttributeError, PrototypeError):
         _stderr("invalid control line; skipped")
 
@@ -246,6 +288,13 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
     if budget is not None:
         # The command line's budget likewise replaces the configuration file's.
         config = replace(config, session_budget_seconds=validate_session_budget(budget))
+    scene = getattr(args, "scene", None)
+    if scene is not None and not use_jev:
+        # Only Jev reads the scene; refused rather than silently doing nothing.
+        raise PrototypeError("--scene requires Jev decisions")
+    if scene is not None:
+        # A built-in scene for this session replaces the configuration file's, like --name.
+        config = replace(config, decision_scene=SCENES[scene])
     forming = forming_from_args(args)
     if forming is not None:
         # The command-line former replaces the configuration file's, like --name.
@@ -255,7 +304,27 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
         # file's `dismissal` section keeps its own values.
         config = replace(config, dismissal=dismissal_from_args(args))
     # Stdout carries the events; acknowledgement-gating notes (#132) go to stderr.
-    events = SpeechEvents(report=_stderr)
+    coaching = getattr(args, "coaching", False)
+    # Starting private (hailing-station #735 S-2b) is honoured only where privacy mode v3 is
+    # advertised; anywhere else it is refused rather than starting un-private.
+    start_private = getattr(args, "start_private", False) is True
+    if start_private and coaching:
+        raise PrototypeError("--start-private is refused with --coaching")
+    if start_private and config.hosted_speech:
+        raise PrototypeError("--start-private is refused with a hosted speech backend")
+    # A coaching listener's control descriptor carries only coaching records (it refuses a
+    # duck or meeting line), so it advertises neither mode (hailing-station #735).
+    events = SpeechEvents(
+        report=None if coaching else _stderr,
+        retain_transcripts=not coaching,
+        duck_control=not coaching,
+        meeting_control=not coaching,
+        request_control=not coaching,
+    )
+    if start_private:
+        # Exactly as if `{"duck": true}` arrived at stream time 0, before any audio: the
+        # session's privacy span starts at 0 and `started` reports `"private": true`.
+        events.duck(True, now_ms=0)
     consent = {"allow_hosted_speech": True} if config.hosted_speech else {}
     # Content-free session notes (end-of-turn scores, capture, shadow speaker
     # identification) go to stderr in every mode.
@@ -265,6 +334,26 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
         consent["audio_provenance"] = provenance
     # Host opt-ins from the environment (rightyo#164); absent, nothing changes.
     consent.update(host_options())
+    if getattr(args, "coaching", False):
+        from rightyo.coaching_listen import run
+
+        return run(
+            args,
+            config=config,
+            events=events,
+            consent=consent,
+            controller_factory=controller_factory,
+            output=output,
+            use_jev=use_jev,
+        )
+    if (
+        getattr(args, "coaching_mock_suggestions", None) is not None
+        or getattr(args, "coaching_provider", "mock") != "mock"
+        or getattr(args, "coaching_allow_hosted_text", False)
+        or getattr(args, "coaching_max_requests", None) is not None
+        or getattr(args, "coaching_advice_catalog", None) is not None
+    ):
+        raise PrototypeError("coaching provider options require --coaching")
     controller = controller_factory(config, event_publisher=events, **consent)
     # Signal handlers are installed only by this explicit foreground operation.
     previous = None

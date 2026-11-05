@@ -255,6 +255,90 @@ class ShadowTests(unittest.TestCase):
         )
         self.assertTrue(embedder.closed)
 
+    def test_forget_drops_every_binding_and_the_owner_binds_again(self):
+        # Codex P1 on #242: no speaker state outlives privacy; the owner rebinds from public
+        # speech after `bind_min_seconds`.
+        embedder = ScriptedEmbedder(
+            [unit(1, 0.2, 0), unit(1, 0.1, 0), unit(1, 0.2, 0), unit(1, 0.1, 0)]
+        )
+        harness = Harness(embedder)
+        harness.shadow.start()
+        harness.speak(2.0)
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
+        harness.shadow.forget()
+        self.assertIsNone(harness.shadow.binding("Speaker A"))
+        self.assertEqual(harness.shadow._bound_ids, set())
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.scored == 3)
+        self.assertNotEqual(harness.shadow.binding("Speaker A"), ("bound", "owner"))
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
+        harness.shadow.close(drain=True)
+
+    def test_forget_restarts_the_owner_voice_evidence(self):
+        # #242 round 18: seconds scored before the forget, kept without the owner binding
+        # they produced, would soon report the recognised owner as unrecognised.
+        embedder = ScriptedEmbedder([unit(1, 0.2, 0), unit(1, 0.1, 0)])
+        harness = Harness(embedder)
+        harness.shadow.start()
+        harness.speak(2.0)
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
+        self.assertEqual(harness.shadow.owner_evidence(("owner",)), (True, True, 4.0))
+        harness.shadow.forget()
+        self.assertEqual(harness.shadow.owner_evidence(("owner",)), (True, False, 0.0))
+        harness.shadow.close(drain=True)
+
+    def test_owner_evidence_reads_seconds_and_bindings_together(self):
+        # #242 round 19: read under the epoch lock, so a `forget` landing between the two reads
+        # never pairs the old seconds with the emptied bindings.
+        embedder = ScriptedEmbedder([unit(1, 0.2, 0), unit(1, 0.1, 0)])
+        harness = Harness(embedder)
+        harness.shadow.start()
+        harness.speak(2.0)
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
+        results = []
+        with harness.shadow._epoch_lock:
+            reader = threading.Thread(
+                target=lambda: results.append(harness.shadow.owner_evidence(("owner",)))
+            )
+            reader.start()
+            reader.join(0.2)
+            self.assertTrue(reader.is_alive())
+            # What `forget` writes under the same lock.
+            harness.shadow._bound_ids = set()
+            harness.shadow.scored_seconds = 0.0
+        reader.join(5)
+        self.assertEqual(results, [(True, False, 0.0)])
+        harness.shadow.close(drain=True)
+
+    def test_a_binding_made_while_the_renewal_waited_is_gone_after_it(self):
+        # #242 round 14 keys: the off edge forgets; a public turn finalized before the diarizer
+        # renews binds the old "Speaker A"; the renewal forgets again, so a new voice given that
+        # label never inherits the owner.
+        embedder = ScriptedEmbedder([unit(1, 0.2, 0), unit(1, 0.1, 0)])
+        harness = Harness(embedder)
+        harness.shadow.start()
+        harness.shadow.forget()  # the off edge
+        harness.speak(2.0)
+        harness.speak(2.0)
+        wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
+        harness.shadow.forget()  # the fresh diarizer takes over
+        self.assertIsNone(harness.shadow.binding("Speaker A"))
+        harness.shadow.close(drain=True)
+
+    def test_a_turn_queued_before_forget_never_commits(self):
+        embedder = ScriptedEmbedder([unit(1, 0.2, 0)])
+        harness = Harness(embedder)
+        harness.speak(2.0)  # queued (epoch 0); the worker is not started yet
+        harness.shadow.forget()
+        harness.shadow.start()
+        harness.shadow.close(drain=True)
+        self.assertIsNone(harness.shadow.binding("Speaker A"))
+        self.assertEqual(harness.shadow.scored, 0)
+
     def test_short_overlapping_and_unlabelled_turns_are_not_scored(self):
         embedder = ScriptedEmbedder()
         harness = Harness(embedder)
@@ -447,6 +531,248 @@ class ToneEmbedder:
 
     def close(self):
         self.closed = True
+
+
+class OwnerRefusalReasonTests(unittest.TestCase):
+    def test_reasons_are_read_only_and_enrolled_owner_stays_boolean(self):
+        roles = EnrolledRoles(SpeakerPriority(owners=("owner-0",)))
+        for binding, current, allowed, reason in (
+            (("bound", "owner-0"), turn(0, 1), True, "not_owner"),
+            (("bound", "guest-0"), turn(0, 1), False, "not_owner"),
+            (None, turn(0, 1), False, "unbound"),
+            (("tentative", "owner-0"), turn(0, 1), False, "unbound"),
+            (("unknown", None), turn(0, 1), False, "unbound"),
+            (("bound", "owner-0"), turn(0, 1, None), False, "unlabelled"),
+            (("bound", "owner-0"), turn(0, 1, overlap=True), False, "unlabelled"),
+            (("bound", "owner-0"), turn(0, 1, provenance="unknown"), False, "unlabelled"),
+        ):
+            with self.subTest(binding=binding, speaker=current.speaker_id, reason=reason):
+                source = MagicMock()
+                source.binding.return_value = binding
+                roles.source = source
+                before = roles._resolved, roles._spans
+                self.assertIs(roles.enrolled_owner(current), allowed)
+                self.assertEqual(roles.enrolled_owner_refusal_reason(current), reason)
+                self.assertIs(roles.enrolled_owner(current), allowed)
+                self.assertEqual((roles._resolved, roles._spans), before)
+                self.assertEqual(source.binding.return_value, binding)
+        # A configured session label is never a bound owner identity.
+        roles = EnrolledRoles(SpeakerPriority(owners=("Speaker A",)))
+        self.assertIs(roles.enrolled_owner(turn(0, 1)), False)
+        self.assertEqual(roles.enrolled_owner_refusal_reason(turn(0, 1)), "unbound")
+        # A diagnostic failure remains content free and cannot change the boolean.
+        with patch.object(roles, "_lookup", side_effect=RuntimeError(PRIVATE_TEXT)):
+            self.assertIs(roles.enrolled_owner(turn(0, 1)), False)
+            self.assertEqual(roles.enrolled_owner_refusal_reason(turn(0, 1)), "error")
+
+
+class EntryCheckTests(unittest.TestCase):
+    """The privacy-entry voice check (hailing-station #735, rightyo#250): a turn's own-label
+    pieces and its inferred remainder, each scored on its own against the owner's voiceprint;
+    any failure refuses."""
+
+    def shadow(self, **overrides):
+        lines: list[str] = []
+        ring_ms = overrides.pop("ring_ms", 60000)
+        shadow = ShadowSpeakerId(
+            settings(**overrides),
+            report=lines.append,
+            embedder_factory=lambda _settings: ToneEmbedder(),
+            entries=lambda _settings: [dict(entry) for entry in ENTRIES],
+            ring_ms=ring_ms,
+        )
+        shadow.start()
+        self.addCleanup(shadow.close)
+        return shadow, lines
+
+    def roles(self, shadow):
+        roles = EnrolledRoles(SpeakerPriority.from_dict({"owner": ["owner"]}))
+        roles.source = shadow
+        return roles
+
+    def entry(self, roles, start, end, spans):
+        current = turn(start, end)
+        roles.note_spans(current.utterance_id, spans)
+        return roles.entry_voice(current)
+
+    def test_the_owners_own_pieces_pass_and_a_guests_do_not(self):
+        shadow, _lines = self.shadow()
+        shadow.audio(tone(1.0, OWNER_F0) + tone(1.0, GUEST_F0))
+        owner = shadow.entry_score(0, 1000, ((0, 1000),), ["owner"])
+        self.assertEqual((owner.outcome, owner.remainder, owner.remainder_ms), ("scored", None, 0))
+        self.assertGreater(owner.labelled, 0.99)
+        self.assertLess(shadow.entry_score(1000, 2000, ((1000, 2000),), ["owner"]).labelled, 0.1)
+
+    def test_an_even_owner_and_guest_mix_refuses(self):
+        # Codex P1 on #250: the owner says "stop", a guest's "recording" is inferred under his
+        # label. Scored whole, the mix would pass; scored apart, the guest's part refuses.
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.6, GUEST_F0))
+        roles = self.roles(shadow)
+        self.assertFalse(self.entry(roles, 0, 1200, ((0, 600),)))
+        (line,) = [line for line in lines if "entry_check" in line]
+        self.assertRegex(
+            line,
+            r"^speaker_id entry_check outcome=refuse reason=scored score=1\.000 threshold=0\.35"
+            r" remainder_ms=600 remainder_gap_ms=600 remainder_score=0\.\d{3}"
+            r" remainder_threshold=0\.35 gap_max_ms=600$",
+        )
+        self.assertNotIn(PRIVATE_TEXT, " ".join(lines))
+
+    def test_a_short_guest_word_refuses_and_the_owners_own_words_pass(self):
+        # Codex P1 on #250 (2b90c8c): a guest's 0.2 s "go" before the owner's "private" is
+        # judged, however short, and refuses; the owner's own short edge and his own 0.5 s
+        # inferred word pass.
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.2, GUEST_F0) + tone(0.6, OWNER_F0))
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.2, OWNER_F0))
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.5, OWNER_F0))
+        roles = self.roles(shadow)
+        self.assertFalse(self.entry(roles, 0, 800, ((200, 800),)))
+        self.assertTrue(self.entry(roles, 800, 1600, ((800, 1400),)))
+        self.assertTrue(self.entry(roles, 1600, 2700, ((1600, 2200),)))
+        checks = [line for line in lines if "entry_check" in line]
+        self.assertRegex(
+            checks[0],
+            r"outcome=refuse .* remainder_ms=200 remainder_gap_ms=200 remainder_score=0\.\d{3} ",
+        )
+        self.assertIn("remainder_ms=200 remainder_gap_ms=200 remainder_score=1.000", checks[1])
+        self.assertIn("remainder_ms=500 remainder_gap_ms=500 remainder_score=1.000", checks[2])
+
+    def test_each_inferred_gap_is_judged_alone(self):
+        # Codex P1 on #250 (0f40847): the owner's inferred "please", his own labelled "stop",
+        # then a guest's inferred "recording". Joined, the two gaps would average past the
+        # threshold; scored apart, the guest's gap refuses. Two gaps of his own pass.
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.4, OWNER_F0) + tone(0.6, OWNER_F0) + tone(0.4, GUEST_F0))
+        shadow.audio(tone(0.4, OWNER_F0) + tone(0.6, OWNER_F0) + tone(0.4, OWNER_F0))
+        roles = self.roles(shadow)
+        self.assertFalse(self.entry(roles, 0, 1400, ((400, 1000),)))
+        self.assertTrue(self.entry(roles, 1400, 2800, ((1800, 2400),)))
+        checks = [line for line in lines if "entry_check" in line]
+        self.assertRegex(
+            checks[0],
+            r"outcome=refuse .* remainder_ms=800 remainder_gap_ms=400 remainder_score=0\.\d{3} ",
+        )
+        self.assertIn("outcome=pass", checks[1])
+
+    def test_a_gap_long_enough_to_hold_two_words_refuses(self):
+        # Codex P1 on #250 (c9b3907): one gap holding the owner's "stop" and a guest's
+        # "recording" is one embedding; a voiced gap over `entry_gap_max_seconds` refuses,
+        # and the bound comes from the config.
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.6, OWNER_F0) + tone(0.6, GUEST_F0))
+        roles = self.roles(shadow)
+        self.assertFalse(self.entry(roles, 0, 1800, ((0, 600),)))
+        self.assertIn("outcome=refuse reason=scored", lines[-1])
+        self.assertIn("remainder_gap_ms=1200", lines[-1])
+        self.assertIn("gap_max_ms=600", lines[-1])
+        loose, loose_lines = self.shadow(entry_gap_max_seconds=1.5, entry_remainder_threshold=0.5)
+        loose.audio(tone(0.6, OWNER_F0) + tone(1.2, OWNER_F0))
+        self.assertTrue(self.entry(self.roles(loose), 0, 1800, ((0, 600),)))
+        self.assertIn("gap_max_ms=1500", loose_lines[-1])
+
+    def test_room_noise_under_his_voice_is_not_a_word_but_a_guest_word_is(self):
+        # #250 round 6: a pause gap of room noise 40 dB under his speech is not voiced, so
+        # neither the gap bound nor the remainder score refuses him for it; a guest's word
+        # at speaking level in a gap is still judged, and refuses.
+        quiet = array(
+            "h",
+            (int(90 * math.sin(2 * math.pi * GUEST_F0 * n / RATE)) for n in range(int(0.9 * RATE))),
+        )
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.6, OWNER_F0) + quiet.tobytes() + tone(0.6, OWNER_F0))
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.4, GUEST_F0))
+        roles = self.roles(shadow)
+        self.assertTrue(self.entry(roles, 0, 2100, ((0, 600), (1500, 2100))))
+        self.assertIn("remainder_ms=0 remainder_gap_ms=0 remainder_score=-", lines[-1])
+        self.assertFalse(self.entry(roles, 2100, 3100, ((2100, 2700),)))
+        self.assertIn("remainder_gap_ms=400", lines[-1])
+
+    def test_a_gap_mixing_his_word_and_a_guests_refuses_window_by_window(self):
+        # Codex P1 on #250 (caff9c4): 300 ms of the owner then 300 ms of a guest in ONE gap
+        # fits the gap bound, but its windows over the guest's part score as the guest.
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.3, OWNER_F0) + tone(0.3, GUEST_F0))
+        roles = self.roles(shadow)
+        self.assertFalse(self.entry(roles, 0, 1200, ((0, 600),)))
+        self.assertIn("remainder_gap_ms=600", lines[-1])
+        self.assertRegex(lines[-1], r"remainder_score=0\.[0-2]\d\d ")
+        # 600 ms + 600 ms (Codex P1 at c9b3907) refuses too, with the bound lifted out of the way.
+        wide, wide_lines = self.shadow(entry_gap_max_seconds=2.0)
+        wide.audio(tone(0.6, OWNER_F0) + tone(0.6, OWNER_F0) + tone(0.6, GUEST_F0))
+        self.assertFalse(self.entry(self.roles(wide), 0, 1800, ((0, 600),)))
+        self.assertIn("remainder_gap_ms=1200", wide_lines[-1])
+
+    def test_his_own_inferred_word_passes_window_by_window(self):
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.6, OWNER_F0))
+        self.assertTrue(self.entry(self.roles(shadow), 0, 1200, ((0, 600),)))
+        self.assertIn("remainder_gap_ms=600 remainder_score=1.000", lines[-1])
+
+    def test_a_clipped_span_refuses(self):
+        # Codex P2 on #250: never score what is left of a span the ring no longer holds.
+        shadow, _lines = self.shadow(ring_ms=1000)
+        shadow.audio(tone(2.0, OWNER_F0))
+        self.assertEqual(shadow.entry_score(0, 2000, ((0, 2000),), ["owner"]).outcome, "clipped")
+        self.assertFalse(self.entry(self.roles(shadow), 0, 2000, ((0, 2000),)))
+
+    def test_too_little_own_speech_or_no_spans_or_identifier_refuses(self):
+        shadow, lines = self.shadow()
+        shadow.audio(tone(0.3, OWNER_F0) + tone(0.9, OWNER_F0))
+        roles = self.roles(shadow)
+        self.assertEqual(shadow.entry_score(0, 1200, ((0, 300),), ["owner"]).outcome, "short")
+        self.assertFalse(self.entry(roles, 0, 1200, ((0, 300),)))
+        self.assertIn("outcome=refuse reason=short score=-", lines[-1])
+        # No pieces noted for this turn: nothing is the label's own.
+        self.assertFalse(roles.entry_voice(turn(0, 1200)))
+        self.assertEqual(
+            shadow.entry_score(0, 1200, ((0, 1200),), ["nobody"]).outcome, "unavailable"
+        )
+        shadow.close()
+        self.assertEqual(
+            shadow.entry_score(0, 1200, ((0, 1200),), ["owner"]).outcome, "unavailable"
+        )
+        orphan = EnrolledRoles(SpeakerPriority.from_dict({"owner": ["owner"]}))
+        self.assertFalse(self.entry(orphan, 0, 1200, ((0, 1200),)))
+
+    def test_the_thresholds_and_lengths_come_from_the_config(self):
+        shadow, lines = self.shadow(entry_threshold=0.2, entry_remainder_threshold=0.0)
+        shadow.audio(tone(0.6, OWNER_F0) + tone(0.6, GUEST_F0))
+        self.assertTrue(self.entry(self.roles(shadow), 0, 1200, ((0, 600),)))
+        self.assertIn("threshold=0.20 remainder_ms=600", lines[-1])
+
+    def test_the_entry_keys_are_validated(self):
+        base = {"python": "/synthetic/python", "model": "/synthetic/model.onnx", "live": True}
+        config = SpeakerIdConfig.from_dict(base)
+        self.assertEqual(
+            (
+                config.entry_threshold,
+                config.entry_min_seconds,
+                config.entry_remainder_threshold,
+                config.entry_gap_max_seconds,
+                config.entry_window_seconds,
+            ),
+            (0.35, 0.5, 0.35, 0.6, 0.25),
+        )
+        tuned = SpeakerIdConfig.from_dict(base | {"entry_remainder_threshold": 0.2})
+        self.assertEqual(tuned.entry_remainder_threshold, 0.2)
+        for bad in (
+            {"entry_threshold": 1.5},
+            {"entry_threshold": "0.4"},
+            {"entry_threshold": True},
+            {"entry_min_seconds": 0.1},
+            {"entry_min_seconds": 11},
+            {"entry_remainder_threshold": -0.1},
+            {"entry_gap_max_seconds": 0.05},
+            {"entry_gap_max_seconds": 11},
+            {"entry_window_seconds": 0.05},
+            {"entry_window_seconds": 6},
+            # No length below which a remainder goes unjudged (Codex P1 on #250).
+            {"entry_word_seconds": 0.3},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                SpeakerIdConfig.from_dict(base | bad)
 
 
 class SegmentScoringTests(unittest.TestCase):
