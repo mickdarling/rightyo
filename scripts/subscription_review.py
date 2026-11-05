@@ -38,7 +38,8 @@ AUDITED_RECHECK_PAIRS = {
 REQUEST_MARKER = re.compile(r"v1 comment:([1-9][0-9]*) requested:(.+)\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 COMPLETION = re.compile(
-    r"\ACodex Review: Didn't find any major issues\.[^\n]*\s+"
+    r"\A(?:<!-- codex-review-receipt:v1 -->\n\n)?"
+    r"Codex Review: Didn't find any major issues\.[^\n]*\s+"
     r"\*\*Reviewed commit:\*\* `([0-9a-f]{10,40})`(?:\s|\Z)"
 )
 
@@ -56,6 +57,71 @@ COMMENT_QUERY = (
 
 class GateError(ValueError):
     """Only public-safe categories are emitted; never response bodies or tokens."""
+
+
+def unique_fields(pairs):
+    fields = dict(pairs)
+    if len(fields) != len(pairs):
+        raise GateError("Native summary state has duplicate fields")
+    return fields
+
+
+def summary_state(body):
+    """Recognize bounded envelopes without changing the body used for provenance."""
+    marker = "<!-- codex-pull-request-review-summary -->\n"
+    heading = "\n## Codex Review Summary\n"
+    if not body.startswith(marker):
+        return None
+    if body.startswith(marker + heading):
+        return {}  # Supported legacy envelope; its markdown remains authoritative.
+    line, _, rest = body[len(marker) :].partition("\n")
+    match = re.fullmatch(r"<!-- codex-review-state:v1 ([^\n]{1,4096}) -->", line)
+    if not match or not rest.startswith(heading):
+        raise GateError("Native summary envelope is unsupported")
+    try:
+        state = json.loads(match[1], object_pairs_hook=unique_fields)
+    except (ValueError, RecursionError) as error:
+        raise GateError("Native summary state is malformed") from error
+    keys = {"commit_sha", "has_any_findings", "has_unresolved_findings", "status"}
+    if not isinstance(state, dict) or set(state) != {"code_review", "security_review"}:
+        raise GateError("Native summary state shape is unsupported")
+    for review in state.values():
+        if not isinstance(review, dict) or set(review) != keys:
+            raise GateError("Native summary review shape is unsupported")
+        if review["status"] is None:
+            if any(value is not None for value in review.values()):
+                raise GateError("Native summary inactive review is inconsistent")
+            continue
+        if (
+            not isinstance(review["status"], str)
+            or review["status"] not in {"queued", "running", "completed"}
+            or not isinstance(review["commit_sha"], str)
+            or not SHA.fullmatch(review["commit_sha"])
+            or any(
+                value is not None and type(value) is not bool
+                for key, value in review.items()
+                if key.startswith("has_")
+            )
+        ):
+            raise GateError("Native summary review state is unsupported")
+    return state
+
+
+def validate_summary_state(state, head, completed):
+    if not state:
+        return
+    code = state["code_review"]
+    if code["commit_sha"] != head or (code["status"] == "completed") != completed:
+        raise GateError("Native summary state conflicts with its markdown")
+    for review in state.values():
+        if review["commit_sha"] == head and (
+            review["has_any_findings"] is True or review["has_unresolved_findings"] is True
+        ):
+            raise GateError("Native summary reports findings")
+    if completed and any(
+        code[key] is not False for key in ["has_any_findings", "has_unresolved_findings"]
+    ):
+        raise GateError("Native summary completion is inconclusive")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -269,9 +335,8 @@ def freshness_barrier(comments, head, resolve, attest, authorize, persisted=None
             continue
         if not attest(comment, True):
             raise GateError("Native comment edit provenance is invalid")
-        if not body.startswith(
-            "<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n"
-        ):
+        state = summary_state(body)
+        if state is None:
             continue
         row = re.findall(r"(?m)^\|[^\n]*\*\*Code Review\*\*[^\n]*\| `([0-9a-f]{7,40})` \|", body)
         if len(row) != 1:
@@ -280,6 +345,7 @@ def freshness_barrier(comments, head, resolve, attest, authorize, persisted=None
             continue
         updated = timestamp(comment.get("updated_at"))
         completed = SUMMARY.findall(body)
+        validate_summary_state(state, head, len(completed) == 1)
         if len(completed) == 1:
             summaries.append((updated, timestamp(completed[0][0]).replace(microsecond=0)))
         else:
@@ -341,9 +407,7 @@ def review_candidates(
         match = COMPLETION.match(body)
         summary = False
         if not match:
-            if not body.startswith(
-                "<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n"
-            ):
+            if summary_state(body) is None:
                 continue
             rows = SUMMARY.findall(body)
             if len(rows) != 1 or len(re.findall(r"(?m)^\|[^\n]*\*\*Code Review\*\*", body)) != 1:

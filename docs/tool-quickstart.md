@@ -148,6 +148,58 @@ is absent); `allow_hosted` is a JSON boolean. `"provider": "jev"` without
 value or an invalid `max_requests` is refused with a message naming the rule before any capture starts. `"mock"` with
 `"allow_hosted": true` is refused, as `--allow-hosted` alone is.
 
+An optional `"attend_min_probability"`, a number from 0 to 1, is a stricter bar for attend
+alone: a turn Jev would attend becomes `uncertain` unless Jev's probability for attend is at
+least this ([#199](https://github.com/mickdarling/rightyo/issues/199)). Ignore, recipient,
+dismissal and speaker-role answers keep `min_confidence` (0.7 by default). Within a
+conversation window, the engaged speaker's follow-ups are still governed by
+`conversation.follow_up_min_probability`, so a turn below the bar can still form a follow-up
+request there. Absent, attend is decided as before. In an internal evaluation on real turns
+(not published), 0.9 raised precision from 0.71 to 0.81 at the same F1 and halved false acts
+per speech hour. It is accepted only with `"provider": "jev"`.
+
+An optional `"other_answered_blocks": true` makes another person's answer decisive
+([#199](https://github.com/mickdarling/rightyo/issues/199)). A turn that names no
+assistant, and that a different speaker answers within the reply window (the post-turn
+gap's `following` is `different_speaker`), is not attended and never becomes a
+conversation follow-up. Its attention event's `decision` carries `answered_by_other: true`.
+It does not apply when:
+- the host reported the assistant's own playback (a reply or an acknowledgement clip)
+  running when that speech started, within 300 ms, since it may be its echo. This guard
+  relies on the host reporting playback promptly through `listen --control-fd`; without
+  it there is no echo guard;
+- the turn is an enrolled owner's or trusted speaker's, whose requests a guest's quick
+  word never vetoes.
+
+Two labels the diarizer gives one unenrolled person can still read as a different
+speaker. It needs the post-turn gap (`turns.reply_wait_ms` above 0, the default) and is
+refused without it. Default false.
+
+An optional `"state_log": "/absolute/path.jsonl"` keeps a local record of each decided
+live turn ([#199](https://github.com/mickdarling/rightyo/issues/199)), so live decisions
+can be compared turn by turn with offline runs. Each line holds the exact bounded state
+sent to Jev and its answer (label, choice, recipient, confidence, probabilities, model).
+**The state contains transcript text**, so the log is off unless named, and a path inside
+a Git checkout is refused. The file is created `0600`. Writing stops for good, with one
+content-free `decision_state_log stopped` note, if the file is a symlink, someone else's,
+readable by others, or hard-linked, or once it reaches 50 MB. A failed write never affects
+a decision; a disk failing mid-write can leave a short last line, so readers should skip
+a last line that does not parse. Clear and Stop do not delete the file: delete it when
+the comparison is done. Each record also carries `answered_at_ms` from
+`other_answered_blocks`. It is accepted only with `"provider": "jev"`.
+
+An optional `"request_context": true` gives each decision the latest request the assistant
+acted on ([#199](https://github.com/mickdarling/rightyo/issues/199)). The state carries
+`assistant_request`: that request's text (up to 400 characters), its `speaker_id` and
+`ms_before`, how long before the current turn began it ended. That lasts for up to 120 s,
+and never past the transcript's own retention. A dismissal, a withdrawal or an explicit
+closing of the conversation forgets it at once; talk to another person in between does
+not. It needs the tool's event stream (`listen`); without one it does nothing. Guidance
+tells Jev that a turn continuing, correcting or referring back to it is evidence that it
+is addressed to the assistant. In an internal evaluation (not published), the owner's
+follow-ups 30 to 120 s after a request were the largest group of missed requests.
+Default false.
+
 The flags keep their rules. `--use-jev` without `--allow-hosted` is still refused before the
 file is read, and the file never supplies the missing half. Both flags select Jev even when
 the file names `"mock"`; neither source can switch the other's Jev selection off. With the

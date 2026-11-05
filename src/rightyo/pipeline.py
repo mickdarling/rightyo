@@ -6,17 +6,21 @@ import hashlib
 import json
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import wraps
 from threading import RLock
 from typing import Any, Callable
 
+from rightyo.addressedness import mentions_name, scene_text
 from rightyo.addressedness import post_turn_gap as checked_gap
-from rightyo.addressedness import scene_text
-from rightyo.contracts import Addressing, ContractError, DecisionEvent, Turn, identifier
+from rightyo.contracts import Addressing, ContractError, DecisionEvent, Turn, identifier, integer
 from rightyo.memory import TranscriptMemory
 from rightyo.providers import DecisionProvider, dismissal_hints
 
+# How long after the latest request formed a turn still carries it as context (#199), and
+# how much of its text.
+REQUEST_CONTEXT_MS = 120000
+REQUEST_CONTEXT_CHARS = 400
 # How long after the assistant's spoken reply a turn still carries it as context (rightyo#153).
 REPLY_CONTEXT_MS = 60_000
 # Reply intervals kept for that, two integers each. Only this cap evicts them, never their age,
@@ -71,6 +75,9 @@ class ReplayRunner:
         scene: str | None = None,
         post_turn_gaps: bool = False,
         dismissal_phrases: tuple[str, ...] | None = None,
+        other_answered_blocks: bool = False,
+        state_log: Callable[[dict[str, Any], Any], None] | None = None,
+        request_context: bool = False,
     ) -> None:
         if not 1 <= max_context_turns <= 32 or not 4000 <= max_context_chars <= 16000:
             raise ContractError("invalid context budget")
@@ -90,6 +97,22 @@ class ReplayRunner:
         self.scene = scene_text(scene)
         # Whether decision states carry the post-turn gap (#96), observed or not.
         self.post_turn_gaps = post_turn_gaps is True
+        # With the observed gap showing a different speaker answering, an unnamed turn is
+        # theirs to answer, not the assistant's (#199): the decision records when, and the
+        # event layer withholds it.
+        self.other_answered_blocks = other_answered_blocks is True
+        if state_log is not None and not callable(state_log):
+            raise ContractError("invalid decision state log")
+        # Opt-in record of each decided turn's exact state and answer (#199).
+        self.state_log = state_log
+        # Whether a decision state carries the latest request formed (#199): what the
+        # assistant last acted on, and how long ago, for follow-ups that refer back to it.
+        self.request_context = request_context is True
+        self._last_request: tuple[int, str, str, str | None] | None = None
+        # #242 round 25 (hailing-station #735 S-1): the stream time the speakers were last
+        # forgotten this session, or None. A turn ending by then carries a label from before
+        # the forget, which may now name someone else: no decision state names it.
+        self._labels_until_ms: int | None = None
         # Configured stop phrases sent as hints with the dismissal question (#98); None
         # asks no dismissal question.
         self.dismissal_phrases = (
@@ -119,6 +142,8 @@ class ReplayRunner:
         # the stream clock, end None while playing; recent ones only, so a decision made after
         # its turn still sees what was true when the turn began.
         self._replies: deque[list[int | None]] = deque(maxlen=MAX_REPLY_INTERVALS)
+        self._reply_scopes: dict[str, list[int | None]] = {}
+        self._legacy_reply_span: list[int | None] | None = None
         self.skipped = 0
         self.partial_turns = 0
 
@@ -136,6 +161,10 @@ class ReplayRunner:
         self._history.clear()
         self._last_end_ms = 0
         self._replies.clear()
+        self._reply_scopes.clear()
+        self._legacy_reply_span = None
+        self._last_request = None
+        self._labels_until_ms = None
 
     @_locked
     def clear(self, *, clear_memory: bool = True) -> None:
@@ -151,6 +180,8 @@ class ReplayRunner:
         self.failed_decisions = 0
         if self.memory is not None and clear_memory:
             self.memory.clear()
+        self._last_request = None
+        self._labels_until_ms = None
 
     @_locked
     def expire(self, now_ms: int) -> None:
@@ -185,18 +216,35 @@ class ReplayRunner:
             self.memory.append(turn)
             self.expire(turn.end_ms)
 
+    @_locked
+    def forget_speakers(self, now_ms: int) -> None:
+        """The speakers were forgotten at stream time `now_ms` (#242 round 25, hailing-station
+        #735 S-1): every turn ending by then, held in the history, being decided or the latest
+        request, is given to later decisions with no speaker label, as the publisher does."""
+        integer(now_ms, "now_ms")
+        if self._labels_until_ms is None or now_ms > self._labels_until_ms:
+            self._labels_until_ms = now_ms
+
+    def _label(self, speaker_id: str | None, end_ms: int) -> str | None:
+        """A turn's speaker label as decision state carries it: none without speakers or
+        for a turn ending by the latest forget (#242 round 25)."""
+        until = self._labels_until_ms
+        if self.no_speakers or (until is not None and end_ms <= until):
+            return None
+        return speaker_id
+
     def _turn_state(self, turn: Turn) -> dict[str, Any]:
         # Session/source identifiers are not needed for addressee inference.
         return {
             "text": turn.text,
-            "speaker_id": None if self.no_speakers else turn.speaker_id,
+            "speaker_id": self._label(turn.speaker_id, turn.end_ms),
             "start_ms": turn.start_ms,
             "end_ms": turn.end_ms,
             "overlap": turn.overlap,
         }
 
     @_locked
-    def note_reply(self, phase: str, now_ms: int) -> None:
+    def note_reply(self, phase: str, now_ms: int, *, request_id: str | None = None) -> None:
         """The host's report that the assistant's spoken reply `started` or `ended` (rightyo#153).
 
         Later decisions then see `assistant_reply` in their state: whether a reply was
@@ -205,15 +253,82 @@ class ReplayRunner:
         """
         if phase not in {"started", "ended"}:
             raise ValueError("invalid reply phase")
-        playing = bool(self._replies) and self._replies[-1][1] is None
+        if request_id is not None:
+            # Physical playback is independent of which request currently owns engagement.
+            # An old end closes only its own span; it cannot close a newer playing reply.
+            if not isinstance(request_id, str) or not 1 <= len(request_id) <= 193:
+                raise ValueError("invalid reply request")
+            span = self._reply_scopes.get(request_id)
+            if phase == "started" and span is None:
+                if len(self._reply_scopes) >= MAX_REPLY_INTERVALS:
+                    del self._reply_scopes[next(iter(self._reply_scopes))]
+                span = [now_ms, None]
+                self._replies.append(span)
+                self._reply_scopes[request_id] = span
+            elif phase == "ended":
+                span = self._reply_scopes.pop(request_id, None)
+                if span is not None:
+                    span[1] = now_ms
+                else:
+                    self._replies.append([now_ms, now_ms])
+            return
+        span = self._legacy_reply_span
+        playing = span is not None and span[1] is None
         if phase == "started" and not playing:
-            self._replies.append([now_ms, None])
+            self._legacy_reply_span = [now_ms, None]
+            self._replies.append(self._legacy_reply_span)
         elif phase == "ended":
             if playing:
-                self._replies[-1][1] = now_ms
+                span[1] = now_ms
             else:
                 # An end with no start seen: the reply had begun before this session knew.
-                self._replies.append([now_ms, now_ms])
+                self._legacy_reply_span = [now_ms, now_ms]
+                self._replies.append(self._legacy_reply_span)
+
+    @_locked
+    def close_legacy_reply(self, now_ms: int) -> None:
+        """Close only a known pre-opt-in physical span; create no reply authority."""
+        span = self._legacy_reply_span
+        if span is not None and span[1] is None:
+            span[1] = now_ms
+
+    def note_request(self, request: tuple[int, str, str, str | None] | None) -> None:
+        """Record the latest request formed, (end_ms, text, utterance_id, speaker_id), or
+        forget it with None (#199). Only used when decisions carry it."""
+        if not self.request_context:
+            return
+        with self._lock:
+            if request is None:
+                self._last_request = None
+                return
+            end_ms, text, utterance_id, speaker_id = request
+            if type(end_ms) is not int or not isinstance(text, str):
+                raise ContractError("invalid request context")
+            if self._last_request is None or end_ms >= self._last_request[0]:
+                self._last_request = (
+                    end_ms,
+                    text[:REQUEST_CONTEXT_CHARS],
+                    utterance_id,
+                    speaker_id,
+                )
+
+    def _request_state(self, turn: Turn) -> dict[str, Any] | None:
+        last = self._last_request
+        if last is None:
+            return None
+        end_ms, text, utterance_id, speaker_id = last
+        if self.memory is not None and utterance_id not in self.memory.retained_ids:
+            # Never outlive the transcript's own retention.
+            return None
+        before = turn.start_ms - end_ms
+        if not 0 <= before <= REQUEST_CONTEXT_MS:
+            return None
+        # Bounded by REQUEST_CONTEXT_CHARS; `bounded_request` never drops it.
+        return {
+            "ms_before": before,
+            "text": text,
+            "speaker_id": self._label(speaker_id, end_ms),
+        }
 
     def _reply_state(self, turn: Turn) -> dict[str, Any] | None:
         """`assistant_reply` as it stood when `turn` began, or None when no reply bears on it.
@@ -228,7 +343,8 @@ class ReplayRunner:
             if begun <= start and (end is None or end > start):
                 return {"playing": True}
             if end is not None and end <= start:
-                ended_before = start - end
+                elapsed = start - end
+                ended_before = elapsed if ended_before is None else min(ended_before, elapsed)
         if ended_before is not None and ended_before <= REPLY_CONTEXT_MS:
             return {"playing": False, "ended_ms_before": ended_before}
         return None
@@ -243,9 +359,9 @@ class ReplayRunner:
             past.insert(0, previous)
         participants = sorted(
             {
-                item.speaker_id
+                label
                 for item in [*past, turn]
-                if item.speaker_id is not None and not self.no_speakers
+                if (label := self._label(item.speaker_id, item.end_ms)) is not None
             }
         )
         return {
@@ -260,11 +376,24 @@ class ReplayRunner:
             **({"post_turn_gap": checked_gap(gap)} if self.post_turn_gaps else {}),
             **({} if (reply := self._reply_state(turn)) is None else {"assistant_reply": reply}),
             **(
+                {} if (acted := self._request_state(turn)) is None else {"assistant_request": acted}
+            ),
+            **(
                 {}
                 if self.dismissal_phrases is None
                 else {"dismissal": {"stop_phrases": list(self.dismissal_phrases)}}
             ),
         }
+
+    def _answered_by_other(self, turn: Turn, gap: dict[str, Any] | None) -> bool:
+        """Whether another speaker answered `turn` within the reply window, unnamed (#199)."""
+        return (
+            self.other_answered_blocks
+            and gap is not None
+            and gap.get("observed") is True
+            and gap.get("following") == "different_speaker"
+            and not mentions_name(self.addressing, turn.text)
+        )
 
     def process(
         self, turn: Turn, post_turn_gap: dict[str, Any] | None = None
@@ -327,6 +456,16 @@ class ReplayRunner:
                 return None
             self._emitted.add(key)
             self._retain_final(turn, key)
-            return DecisionEvent(
+            if self._answered_by_other(turn, post_turn_gap):
+                answered = turn.end_ms + post_turn_gap["silence_ms"]
+                decision = replace(decision, answered_at_ms=answered)
+            result = DecisionEvent(
                 turn, decision, turn.revision, provider_ms, (time.perf_counter() - started) * 1000
             )
+        if self.state_log is not None:
+            # Outside the lock: a slow disk never holds up other turns.
+            try:
+                self.state_log(state, decision)
+            except Exception:  # noqa: BLE001 - the record never affects a decision
+                pass
+        return result

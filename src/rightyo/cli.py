@@ -10,6 +10,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from rightyo.addressedness import SCENES
 from rightyo.contracts import (
     PROVENANCE,
     Addressing,
@@ -404,12 +405,60 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         help=(
             "with --mode stdin: an inherited file descriptor carrying host JSON lines "
-            '{"reply": "started"} / {"reply": "ended"} (#124)'
+            '{"reply": "started"} / {"reply": "ended"} (#124), {"media": true|false} and'
+            ' {"duck": true|false}'
         ),
     )
     listen.add_argument("--use-jev", action="store_true")
     listen.add_argument("--allow-hosted", action="store_true")
+    listen.add_argument(
+        "--start-private",
+        action="store_true",
+        help=(
+            "start in privacy mode (internally duck, hailing-station #735): nothing heard is"
+            ' kept or emitted from the first frame until the host sends {"duck": false}'
+        ),
+    )
+    listen.add_argument(
+        "--coaching",
+        action="store_true",
+        help="opt-in owner-private coaching; stdin PCM plus trusted coaching controls",
+    )
+    listen.add_argument(
+        "--coaching-mock-suggestions",
+        type=Path,
+        help="with --coaching: bounded authored JSON suggestions keyed by final utterance ID",
+    )
+    listen.add_argument(
+        "--coaching-provider",
+        choices=("mock", "jev"),
+        default="mock",
+        help="with --coaching: advice provider (default mock; Jev selects authored catalog text)",
+    )
+    listen.add_argument(
+        "--coaching-allow-hosted-text",
+        action="store_true",
+        help="explicit consent for Jev to receive bounded coaching transcript/profile text",
+    )
+    listen.add_argument(
+        "--coaching-max-requests",
+        type=int,
+        help="required for Jev coaching: maximum hosted attempts in this child (1..100)",
+    )
+    listen.add_argument(
+        "--coaching-advice-catalog",
+        type=Path,
+        help="required for Jev coaching: bounded JSON object of authored advice ID/text pairs",
+    )
     _add_name_option(listen)
+    listen.add_argument(
+        "--scene",
+        choices=sorted(SCENES),
+        help=(
+            "a built-in scene for this session, replacing the configuration's: default, or "
+            "clear-requests (only clear requests to the assistant; precision first)"
+        ),
+    )
     _add_session_budget_option(listen)
     _add_request_former_option(listen)
     _add_dismissal_option(listen)
@@ -424,6 +473,10 @@ def main(argv: list[str] | None = None) -> int:
     _add_speaker_options(tool_replay)
     _add_request_former_option(tool_replay)
     _add_dismissal_option(tool_replay)
+    coach_replay = commands.add_parser(
+        "coach-replay", help="emit coaching JSONL from an authored synthetic fixture"
+    )
+    coach_replay.add_argument("--input", type=Path, required=True)
     _add_enroll_parser(commands)
     args = parser.parse_args(argv)
     if args.command == "enroll":
@@ -431,6 +484,10 @@ def main(argv: list[str] | None = None) -> int:
 
         return run(args)
     try:
+        if args.command == "coach-replay":
+            from rightyo.coach_replay import run
+
+            return run(args)
         if args.command in {"listen", "tool-replay"}:
             from rightyo.prototype import PrototypeError
             from rightyo.tool import listen, replay

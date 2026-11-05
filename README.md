@@ -44,7 +44,9 @@ and `--allow-hosted`, or the configuration file's
 transcript context to Jev and emit attention/request events. Stop with Ctrl-C; restart with a fresh session ID. The stream
 contains transcript text: pipe it to a local consumer and avoid logging real conversations.
 See [the tool guide](docs/tool-quickstart.md) for the event contract, Hailing Station handoff,
-limits, and contribution checks. Replies, acknowledgement voices, routing, and tool
+limits, and contribution checks. The configuration's optional `audio_retention` object sets
+how much audio is kept in memory for speaker identification and attribution (60 s each by
+default; see [the prototype guide](docs/prototype.md)); a change takes effect at restart. Replies, acknowledgement voices, routing, and tool
 execution belong to the consuming application.
 
 ## Enroll speakers locally
@@ -57,6 +59,31 @@ are logged on stderr, and turns, roles and events don't change. With `"roles": t
 well (opt-in), a voice bound to an enrolled identifier carries the role the `speakers`
 section gives it, the session advertises `speakers: "enrolled"`, and enrolled owners and
 trusted speakers take precedence. See [speaker enrollment](docs/speaker-enrollment.md).
+
+## Replay private coaching
+
+An explicitly enabled, owner-private coaching component can accept final tool transcripts
+under a host-qualified private output generation. It uses bounded context, a replaceable
+provider and short-lived advice tickets. It grants no command or playback authority.
+Try its authored mock fixture without a microphone, model, API key or audio output:
+
+```sh
+PYTHONPATH=src python3 -m rightyo coach-replay --input examples/coaching-replay.json
+```
+
+For continuous host composition, [the coaching listener](docs/coaching-listen.md)
+documents opt-in raw PCM input, separate trusted controls and an executable authored
+speech backend. It requires no model assets for synthetic qualification; actual
+recognition/coaching quality and private hardware behavior remain unvalidated.
+Mock advice is the default. A separately consented Jev provider can select bounded
+locally authored catalog suggestions; its credential/HTTPS path is qualified with
+fakes, and hosted usefulness/latency remain unvalidated. See the listener guide for
+the separate consent and request-budget requirements.
+
+See [the coaching guide](docs/conversation-coaching.md) for the replay and library
+adapter, and [the wire contract](docs/coaching-wire-v1.md) for the host boundary. This
+is a separate opt-in experiment; actual coaching inference and device audio wiring
+remain unvalidated.
 
 ## Try the replay MVP
 

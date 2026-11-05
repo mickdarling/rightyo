@@ -219,6 +219,22 @@ class OwnerVoiceEventTests(unittest.TestCase):
         events.expire(4000)
         self.assertEqual(events.drain(), [])
 
+    def test_not_polled_while_private(self):
+        # rightyo#244: a private turn's handling polls too, so the change would be timed
+        # by private speech; the first poll after the exit says it.
+        evidence = Evidence(seconds=0.0)
+        events, _ = self.start(owner_voice=OwnerVoice(), evidence=evidence)
+        events.duck(True, now_ms=1000)
+        evidence.seconds = 30.0
+        events.expire(2000)
+        self.assertEqual(events.drain(), [])
+        events.duck(False, now_ms=3000)
+        events.expire(3000)
+        emitted = owner_events(events.drain())
+        self.assertEqual(
+            [(e["state"], e["emitted_at_ms"]) for e in emitted], [("unrecognized", 3000)]
+        )
+
     def test_an_owner_bound_before_the_threshold_emits_nothing(self):
         evidence = Evidence(seconds=5.0, bound=True)
         events, _ = self.start(owner_voice=OwnerVoice(), evidence=evidence)
