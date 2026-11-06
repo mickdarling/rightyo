@@ -579,12 +579,17 @@ class ControllerTests(unittest.TestCase):
                         self.controller._last_browser -= 20
                     else:
                         self.controller._started -= 601
+                # Idle is published just before the audio thread exits; the next
+                # subcase must wait until start's old-runtime guard can pass too.
                 await_condition(
                     lambda: self.controller.snapshot(heartbeat=False)["phase"] == "idle"
+                    and not self.controller._audio_thread.is_alive()
                 )
                 self.assertEqual(self.controller.snapshot()["turns"], [])
 
     def test_default_has_no_session_ceiling_and_accepts_three_hours_of_audio(self):
+        final_published = threading.Event()
+
         class HourlyProcessor(FakeProcessor):
             def push_pcm16(self, pcm):
                 start = self.received_ms
@@ -608,6 +613,8 @@ class ControllerTests(unittest.TestCase):
                         "diarization-timeline",
                     )
                 )
+                if self.received_ms == THREE_HOURS_MS:
+                    final_published.set()
 
         self.processor.side_effect = HourlyProcessor
         events = SpeechEvents()
@@ -631,6 +638,9 @@ class ControllerTests(unittest.TestCase):
         while processor.received_ms < THREE_HOURS_MS and time.monotonic() < deadline:
             threading.Event().wait(0.01)
         self.assertEqual(processor.received_ms, THREE_HOURS_MS)
+        # The audio counter advances before the callback publishes the final turn.
+        # Acknowledge publication within the same deadline before inspecting state.
+        self.assertTrue(final_published.wait(max(0, deadline - time.monotonic())))
         snapshot = controller.snapshot()
         self.assertEqual(snapshot["phase"], "listening")
         self.assertIsNone(snapshot["error"])

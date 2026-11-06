@@ -14,14 +14,18 @@ import array
 import base64
 import contextlib
 import ctypes
+import errno
 import inspect
+import io
 import json
 import math
 import os
+import secrets
 import selectors
+import stat
 import subprocess
 import sys
-import tempfile
+import threading
 import time
 import wave
 from collections import deque
@@ -32,7 +36,7 @@ from typing import Any, Callable
 from .addressedness import reply_wait
 from .contracts import PROVENANCE, Turn, identifier, utterance_scoped_speaker
 from .providers import Diarizer, Transcriber
-from .turn_merge import TurnMerger, merge_gap, tail_join
+from .turn_merge import TurnMerger, complete_hold, merge_gap, owner_pause, tail_join
 
 SAMPLE_RATE = 16000
 FRAME_BYTES = 640  # 20 ms of mono signed little-endian PCM16
@@ -40,17 +44,57 @@ BYTES_PER_MS = 32  # mono PCM16 at 16 kHz
 MAX_CHUNK_BYTES = 32000  # one second of audio per push
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_SPEAKER = 702  # "Speaker A" .. "Speaker ZZ"; native streams use 1..8
+# A diarizer renewal deferred past an open utterance or held turn is forced this long after the
+# privacy end is reached (#242 round 21), so steady speech cannot keep the old one in use.
+SPEAKER_RENEWAL_LIMIT_MS = 10_000
 # The native stream returns only segments ending within this trailing window of pushed
 # audio. An utterance spans at most `max_utterance_ms` (<= 15 s, pre-roll included), so
 # every segment that can overlap one is inside it with a wide margin, and per-utterance
-# transfer and attribution stay constant however long the session runs (#54).
+# transfer and attribution stay constant however long the session runs (#54). This is the
+# default; `LiveConfig.timeline_window_ms` sets a session's window (#226).
 TIMELINE_WINDOW_MS = 60000
-# Per-response bound for any backend: a 60 s window holds 6,000 native 10 ms frames.
-MAX_TIMELINE_SEGMENTS = 18000
+# The window's bounds, in whole seconds (#226). The lower bound is twice the longest
+# utterance: a shorter window could drop a segment that still overlaps the open utterance,
+# leaving its words unlabelled or, with edge attribution, labelled as a neighbour. The upper
+# bound keeps the worst-case native response under `MAX_RESPONSE_BYTES`, since the worker
+# returns the whole window as one JSON line: each segment `{"start_ms":S,"end_ms":E,
+# "speaker":N},` is 36 bytes plus its two timestamps, so even 16-digit timestamps (a stream
+# of over 30,000 years) give 68 bytes, and 100 s allows 30,000 segments: 30,000 x 68 + 25 =
+# 2,040,025 bytes, under 2,097,152. A 10-hour session's 8-digit timestamps give 52 bytes and
+# 1,560,025 bytes (74%).
+MIN_TIMELINE_WINDOW_MS = 30000
+MAX_TIMELINE_WINDOW_MS = 100000
+# Per-response bound for any backend, derived from the window: an enforced cap of 300
+# segments per second (three for each native 10 ms frame; a 60 s window holds 6,000 frames,
+# so 18,000 segments). It is RightyO's limit, not a native guarantee: a response over it
+# fails closed with a sanitized error rather than being truncated.
+TIMELINE_SEGMENTS_PER_SECOND = 300
+# The bound for the default window, kept for callers that name it.
+MAX_TIMELINE_SEGMENTS = TIMELINE_WINDOW_MS // 1000 * TIMELINE_SEGMENTS_PER_SECOND
 
 
 class LiveAudioError(ValueError):
     """Sanitized failure: never embeds paths, PCM, transcripts, or native logs."""
+
+
+def timeline_window(value: Any) -> int:
+    """`value` when it is a valid timeline window in milliseconds (#226), else an error.
+
+    A whole number of seconds from `MIN_TIMELINE_WINDOW_MS` to `MAX_TIMELINE_WINDOW_MS`
+    inclusive; nothing is clamped.
+    """
+    if (
+        type(value) is not int
+        or not MIN_TIMELINE_WINDOW_MS <= value <= MAX_TIMELINE_WINDOW_MS
+        or value % 1000
+    ):
+        raise LiveAudioError("Invalid timeline window")
+    return value
+
+
+def timeline_segment_limit(window_ms: int) -> int:
+    """The most segments one diarizer response may hold for a window (#226)."""
+    return timeline_window(window_ms) // 1000 * TIMELINE_SEGMENTS_PER_SECOND
 
 
 def _is_backend_instance(value: Any, method: str) -> bool:
@@ -82,6 +126,11 @@ class LiveConfig:
     # Optional content-free stderr diagnostics (counts only): skipped segments and
     # suppressed utterances.
     report: Callable[[str], None] | None = None
+    # Whether audio received between two stream times was heard in privacy mode
+    # (hailing-station #735 S-1). Per-utterance diagnostics (end-of-turn scores and
+    # timing, skipped or suppressed recognizer output) are withheld for it, so logs keep
+    # nothing about private speech. None means never private; a failure counts as private.
+    private: Callable[[int, int], bool] | None = None
     # Total audio accepted per session, in stream milliseconds. None means no ceiling:
     # memory stays bounded by the utterance window and downstream retention limits.
     session_budget_ms: int | None = None
@@ -96,6 +145,9 @@ class LiveConfig:
     # Text predicate for a fragment that must stay a turn of its own and is never joined
     # or held, such as an owner stop phrase matched against a whole turn downstream.
     turn_break: Callable[[str], bool] | None = None
+    # Text predicate for a turn that looks cut off mid-request (#199): when the end-of-turn
+    # model calls it complete, it is held for the merge gap anyway. None trusts the model.
+    turn_unfinished: Callable[[str], bool] | None = None
     # Hold a request-shaped turn at least this long after its last word to observe the
     # post-turn gap (#96); 0, the library default, observes nothing. Joining still uses
     # only `turn_merge_gap_ms`.
@@ -131,17 +183,56 @@ class LiveConfig:
     # it but withhold owner authority from such a turn (`on_inferred`, #137). Only for
     # `diarization-timeline`.
     edge_attribution_ms: int = 0
+    # Coverage labelling (0 = off; #220). When no word of an utterance has a speaker under
+    # the strict rule (each word covered throughout by exactly one speaker), as with a
+    # one-word turn whose timestamps run past the timeline segment, a word that only one
+    # speaker's segments starting inside the utterance touch takes that speaker when they
+    # cover at least this fraction of it. A segment carried over from before the utterance
+    # never counts, since a late speaker switch can stretch it over the next person's word.
+    # Two speakers in a word still leave it unlabelled. Only for `diarization-timeline`;
+    # utterances with any strictly labelled word are unchanged. The labels are not marked
+    # inferred; edge attribution from them is, as usual.
+    word_label_coverage: float = 0.0
     # Tail join (opt-in, 0 = off; #129). Also an inference: an unlabelled, non-overlapping
     # turn starting within this many milliseconds of a held labelled turn's end joins it
     # and takes its speaker (see `TurnMerger`). Edge attribution only reaches words near
     # the speaker's timeline segment; this catches the rest of a trailing piece. Refused
     # with session-label roles, and reported through `on_inferred`, like edge attribution.
     tail_join_ms: int = 0
+    # One thought split into several turns (#216; see `TurnMerger`). Hold a turn the
+    # end-of-turn model called complete this long after its last word for the same
+    # labelled speaker's continuation (0, the default, emits it at once); keep a restart's
+    # repeated words once when a continuation joins such a turn; and keep a held turn held
+    # across another or an unattributed speaker's short backchannel. All off by default.
+    turn_complete_hold_ms: int = 0
+    turn_collapse_restarts: bool = False
+    turn_bridge_backchannels: bool = False
+    # A lone wake word split from the owner's sentence (#230; see `TurnMerger`). With both
+    # set and merging on, an unattributed turn whose text is only a configured name is held
+    # for at most the merge gap, and joined by the owner's labelled continuation, which
+    # keeps its label; the joined turn is reported through `on_inferred`. `turn_wake_word`
+    # takes a turn's text; `turn_owner` a fragment (`speaker`, `speaker_provenance`,
+    # `overlap`) and says whether its label is the owner's now. None, the default, is off.
+    turn_wake_word: Callable[[str], bool] | None = None
+    turn_owner: Callable[[dict[str, Any]], bool] | None = None
+    # The owner-only pause (hailing-station #735; see `TurnMerger`): with `turn_owner`
+    # set, a turn whose label is the owner's is held at least this long, as the complete
+    # hold and as the merge gap for the same speaker's continuation. 0, the default, is off.
+    turn_owner_pause_ms: int = 0
     end_of_turn_threshold: float = 0.5
     end_of_turn_silence_ms: int = 200
+    # The trailing window of the diarizer timeline returned for attribution (#226), and
+    # with it the per-response segment bound (`timeline_segment_limit`). Memory only; set at
+    # session start and never changed during it. The native worker receives it at launch.
+    timeline_window_ms: int = TIMELINE_WINDOW_MS
+    # Local privacy-exit plumbing only. Borrowed view of a finalized turn's exact PCM
+    # from the existing ASR assembly; never a ring or speaker-evidence input. Private
+    # turns bypass continuation holds so only the current sentence needs retaining.
+    on_private_turn_audio: Callable[[Turn, memoryview], None] | None = None
 
     def __post_init__(self) -> None:
         identifier(self.session_id, "session_id")
+        timeline_window(self.timeline_window_ms)
         try:
             merge_gap(self.turn_merge_gap_ms)
         except ValueError:
@@ -154,6 +245,18 @@ class LiveConfig:
             tail_join(self.tail_join_ms)
         except ValueError:
             raise LiveAudioError("Invalid tail join window") from None
+        try:
+            complete_hold(self.turn_complete_hold_ms)
+        except ValueError:
+            raise LiveAudioError("Invalid complete hold") from None
+        try:
+            owner_pause(self.turn_owner_pause_ms)
+        except ValueError:
+            raise LiveAudioError("Invalid owner pause") from None
+        if type(self.turn_collapse_restarts) is not bool or (
+            type(self.turn_bridge_backchannels) is not bool
+        ):
+            raise LiveAudioError("Invalid turn merge option")
         if self.on_post_turn_gap is not None and not callable(self.on_post_turn_gap):
             raise LiveAudioError("Invalid post-turn gap observer")
         if self.on_inferred is not None and not callable(self.on_inferred):
@@ -162,6 +265,18 @@ class LiveConfig:
             raise LiveAudioError("Invalid labelled-span observer")
         if self.turn_break is not None and not callable(self.turn_break):
             raise LiveAudioError("Invalid turn break predicate")
+        if self.turn_unfinished is not None and not callable(self.turn_unfinished):
+            raise LiveAudioError("Invalid unfinished-turn predicate")
+        if self.turn_wake_word is not None and not callable(self.turn_wake_word):
+            raise LiveAudioError("Invalid wake word predicate")
+        if self.turn_owner is not None and not callable(self.turn_owner):
+            raise LiveAudioError("Invalid owner predicate")
+        if (
+            type(self.word_label_coverage) not in (int, float)
+            or not math.isfinite(self.word_label_coverage)
+            or not 0 <= self.word_label_coverage <= 1
+        ):
+            raise LiveAudioError("Invalid word label coverage")
         if self.end_of_turn is not None and not callable(self.end_of_turn):
             raise LiveAudioError("Invalid end-of-turn model")
         if (
@@ -251,7 +366,15 @@ class _Segment(ctypes.Structure):
 class _NativeStream:
     """Used in the isolated child only; never call it concurrently."""
 
-    def __init__(self, library: str, model_path: str):
+    # The stream's window and its segment bound (#226): set per instance from the window
+    # the worker was launched with; these class values are the defaults.
+    window_ms = TIMELINE_WINDOW_MS
+    max_segments = MAX_TIMELINE_SEGMENTS
+
+    def __init__(self, library: str, model_path: str, window_ms: int = TIMELINE_WINDOW_MS):
+        # Validated before anything is loaded: the worker never trusts its argument.
+        self.window_ms = timeline_window(window_ms)
+        self.max_segments = timeline_segment_limit(self.window_ms)
         self.lib = ctypes.CDLL(library)
         self.model = ctypes.c_void_p()
         self.stream = ctypes.c_void_p()
@@ -337,7 +460,7 @@ class _NativeStream:
         # Segment times must lie within audio actually pushed (plus one second of
         # native lookahead/rounding); the bound follows the stream, not a fixed ceiling.
         horizon = self.pushed_bytes / (BYTES_PER_MS * 1000) + 1
-        cutoff_ms = self.pushed_bytes // BYTES_PER_MS - TIMELINE_WINDOW_MS
+        cutoff_ms = self.pushed_bytes // BYTES_PER_MS - self.window_ms
         result, latest = [], None
         for segment in output[: count.value]:
             start, end = segment.start_time, segment.end_time
@@ -362,7 +485,7 @@ class _NativeStream:
         # stays non-empty (it decides `speaker_provenance`); it overlaps no utterance.
         if not result and latest is not None:
             result.append(latest)
-        if len(result) > MAX_TIMELINE_SEGMENTS:
+        if len(result) > self.max_segments:
             raise LiveAudioError("Invalid local diarizer result")
         return result
 
@@ -375,7 +498,29 @@ class _NativeStream:
             self.model = ctypes.c_void_p()
 
 
-def _native_worker(library: str, model: str) -> int:
+def _response_line(response: dict[str, Any]) -> str:
+    """One worker response exactly as it crosses the pipe: compact JSON and a newline."""
+    return json.dumps(response, separators=(",", ":")) + "\n"
+
+
+def _worker_window(text: Any) -> int | None:
+    """The `--native-worker` window argument as milliseconds, or None when invalid (#226).
+
+    Only the canonical decimal form of a valid window (`timeline_window`) is accepted: no
+    sign, spaces, leading zeros or fraction, and nothing outside the bounds.
+    """
+    if not isinstance(text, str) or not (text.isascii() and text.isdigit()) or len(text) > 7:
+        return None
+    value = int(text)
+    if str(value) != text:
+        return None
+    try:
+        return timeline_window(value)
+    except LiveAudioError:
+        return None
+
+
+def _native_worker(library: str, model: str, window_ms: int = TIMELINE_WINDOW_MS) -> int:
     # Preserve a protocol-only descriptor before redirecting every native log.
     protocol = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
     with open(os.devnull, "wb") as sink:
@@ -383,7 +528,7 @@ def _native_worker(library: str, model: str) -> int:
         os.dup2(sink.fileno(), 2)
     native = None
     try:
-        native = _NativeStream(library, model)
+        native = _NativeStream(library, model, window_ms)
         protocol.write('{"ok":true}\n')
         while True:
             line = sys.stdin.buffer.readline(64000)
@@ -406,7 +551,7 @@ def _native_worker(library: str, model: str) -> int:
                 break
             else:
                 raise LiveAudioError("Invalid native command")
-            protocol.write(json.dumps(response, separators=(",", ":")) + "\n")
+            protocol.write(_response_line(response))
         return 0
     except Exception:
         protocol.write('{"ok":false}\n')
@@ -421,8 +566,10 @@ class NemotronCppDiarizer:
     """The default `Diarizer`: one persistent native stream in a private subprocess.
 
     Speaker channels are arrival-ordered and stable for the whole session. Each
-    `segments`/`finish` call returns only the trailing `TIMELINE_WINDOW_MS` of the
-    timeline, so there is no session-length segment limit.
+    `segments`/`finish` call returns only the trailing `LiveConfig.timeline_window_ms`
+    of the timeline (`TIMELINE_WINDOW_MS` by default), so there is no session-length
+    segment limit. The worker receives the window as its last argument and validates it
+    again.
     """
 
     diarizer_id = "nemotron.cpp v3-streaming"
@@ -432,6 +579,7 @@ class NemotronCppDiarizer:
             raise LiveAudioError("Explicit existing runtimes and models are required")
         self.timeout = config.timeout_seconds
         self.cancelled = config.cancelled if config.cancelled is not None else (lambda: False)
+        self.window_ms = timeline_window(config.timeline_window_ms)
         self._check_cancelled()
         source = str(Path(__file__).resolve().parent.parent)
         self.process = subprocess.Popen(
@@ -442,6 +590,7 @@ class NemotronCppDiarizer:
                 "--native-worker",
                 str(Path(config.diarization_library).resolve()),
                 str(Path(config.diarization_model).resolve()),
+                str(self.window_ms),
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -533,7 +682,16 @@ class NemotronCppDiarizer:
 _Diarizer = NemotronCppDiarizer
 
 
-def _attribute(start: int, end: int, timeline: list[dict[str, Any]]) -> tuple[str | None, bool]:
+def _attribute(
+    start: int, end: int, timeline: list[dict[str, Any]], min_coverage: float = 0.0
+) -> tuple[str | None, bool]:
+    """The speaker of the word spanning `start`..`end`, and whether speakers overlap in it.
+
+    By default the word must be covered throughout by exactly one speaker. With
+    `min_coverage` above 0 (#220), uncovered slack at its edges is allowed: a word that
+    only one speaker's segments touch is theirs when they cover at least that fraction of
+    it. Two speakers in the word still leave it unlabelled.
+    """
     relevant = [s for s in timeline if s["start_ms"] < end and s["end_ms"] > start]
     edges = sorted(
         {start, end}
@@ -541,11 +699,15 @@ def _attribute(start: int, end: int, timeline: list[dict[str, Any]]) -> tuple[st
     )
     speakers = set()
     ambiguous = overlap = False
+    covered = 0
     for left, right in zip(edges, edges[1:]):
         active = {s["speaker"] for s in relevant if s["start_ms"] < right and s["end_ms"] > left}
         overlap |= len(active) > 1
         ambiguous |= len(active) != 1
+        covered += right - left if len(active) == 1 else 0
         speakers.update(active)
+    if ambiguous and min_coverage > 0 and not overlap and len(speakers) == 1 and end > start:
+        ambiguous = covered < min_coverage * (end - start)
     if ambiguous or len(speakers) != 1:
         return None, overlap
     # Native channels are arrival-ordered and persist for the whole session.
@@ -633,16 +795,19 @@ def _speaker_label(number: int) -> str:
     return letters
 
 
-def _check_timeline(timeline: Any, received_ms: int) -> None:
+def _check_timeline(
+    timeline: Any, received_ms: int, max_segments: int = MAX_TIMELINE_SEGMENTS
+) -> None:
     """Enforce the `Diarizer` contract at the common boundary, whatever the backend.
 
-    A list of at most `MAX_TIMELINE_SEGMENTS` dicts (one call's window, not the
-    session), each with integer `0 <= start_ms <= end_ms` within the audio received so
-    far plus one second of lookahead (the native stream's own bound) and a positive
-    integer `speaker` no greater than `MAX_SPEAKER`. Order is not required: attribution
-    intersects intervals and the native ABI promises none.
+    A list of at most `max_segments` dicts (one call's window, not the session; the
+    processor passes the bound derived from its configured window), each with integer
+    `0 <= start_ms <= end_ms` within the audio received so far plus one second of
+    lookahead (the native stream's own bound) and a positive integer `speaker` no greater
+    than `MAX_SPEAKER`. Order is not required: attribution intersects intervals and the
+    native ABI promises none.
     """
-    if not isinstance(timeline, list) or len(timeline) > MAX_TIMELINE_SEGMENTS:
+    if not isinstance(timeline, list) or len(timeline) > max_segments:
         raise LiveAudioError("Invalid diarizer timeline")
     horizon = received_ms + 1000
     for segment in timeline:
@@ -672,60 +837,188 @@ def _terminate(process: subprocess.Popen) -> None:
         pass
 
 
+# Where the local recognizer runs (hailing-station #735 S-1): its working directory, HOME
+# and TMPDIR. The audio goes in on stdin and the JSON comes back on stdout, so nothing is
+# ever written to disk, even briefly or after a kill; the directory must be one this
+# process cannot write, so a stray write by the binary fails rather than lands anywhere.
+# There is no fallback: without one, transcription is refused (fail closed). macOS has
+# /var/empty; on Linux, /proc is a real directory in which no file can be created.
+NO_FILES_CANDIDATES = ("/var/empty", "/proc")
+# How much of the recognizer's stdout is read at a time.
+READ_CHUNK_BYTES = 65536
+
+
+class RecognizerSandboxError(LiveAudioError):
+    """No directory this process cannot write is available for the local recognizer."""
+
+
+# What a refused exclusive create in an unwritable directory fails with.
+UNWRITABLE_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOENT})
+# The directory chosen by the first successful probe in this process (see `recognizer_dir`).
+_recognizer_dir_cache: str | None = None
+
+
+def _real_directory(path: str) -> bool:
+    """Whether `path` itself is a directory, by `lstat`: a symlink never is."""
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _refuses_creation(directory: str) -> bool:
+    """Whether creating a file in `directory` really fails, by trying it.
+
+    `os.access` is not enough: root's override reports procfs (which refuses new files)
+    as writable. So this exclusively creates an unpredictably named file, never following
+    a link, and writes nothing. A refusal with EACCES, EPERM, EROFS or ENOENT means
+    unwritable. Any success means writable: the file is closed and unlinked at once. Any
+    other error counts as writable (fail closed).
+    """
+    probe = os.path.join(directory, secrets.token_hex(16))
+    try:
+        descriptor = os.open(
+            probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600
+        )
+    except OSError as error:
+        return error.errno in UNWRITABLE_ERRNOS
+    os.close(descriptor)
+    with contextlib.suppress(OSError):
+        os.unlink(probe)
+    return False
+
+
+def recognizer_dir() -> str:
+    """The first candidate (`NO_FILES_CANDIDATES`) that is a real directory (by `lstat`,
+    so never a symlink, which is never probed) in which this process cannot create a file
+    (`_refuses_creation`).
+
+    Probed once per process and cached; probed again only if the cached directory stops
+    being a real directory. Decided by behaviour rather than permission bits, so it is right
+    for root too. With no candidate left this raises `RecognizerSandboxError`.
+    """
+    global _recognizer_dir_cache
+    cached = _recognizer_dir_cache
+    if cached is not None and _real_directory(cached):
+        return cached
+    _recognizer_dir_cache = None
+    for candidate in NO_FILES_CANDIDATES:
+        if _real_directory(candidate) and _refuses_creation(candidate):
+            _recognizer_dir_cache = candidate
+            return candidate
+    raise RecognizerSandboxError(
+        "The local recognizer needs a directory this process cannot write, such as /var/empty"
+    )
+
+
+def _wav_bytes(pcm: bytes) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(SAMPLE_RATE)
+        target.writeframes(pcm)
+    return buffer.getvalue()
+
+
+def _feed(stream, data: bytes) -> None:
+    """Write `data` to the recognizer's stdin and close it; a closed pipe ends quietly."""
+    try:
+        stream.write(data)
+    except (OSError, ValueError):
+        pass
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            stream.close()
+
+
+def _bounded_stdout(process: subprocess.Popen, deadline: float) -> bytes:
+    """The recognizer's whole stdout, read in chunks; never more than `MAX_RESPONSE_BYTES`.
+
+    Raises `LiveAudioError` as soon as the output passes the cap, before any more is read,
+    and `subprocess.TimeoutExpired` at the deadline.
+    """
+    chunks, total = [], 0
+    descriptor = process.stdout.fileno()
+    with selectors.DefaultSelector() as selector:
+        selector.register(descriptor, selectors.EVENT_READ)
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or not selector.select(left):
+                raise subprocess.TimeoutExpired(process.args, 0)
+            chunk = os.read(descriptor, READ_CHUNK_BYTES)
+            if not chunk:
+                return b"".join(chunks)
+            total += len(chunk)
+            if total > MAX_RESPONSE_BYTES:
+                raise LiveAudioError("Local recognizer failed")
+            chunks.append(chunk)
+
+
 def _transcribe(
     config: LiveConfig,
     pcm: bytes,
     register: Callable[[subprocess.Popen], None] | None = None,
 ) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="rightyo-live-asr-") as directory:
-        audio = Path(directory) / "utterance.wav"
-        with wave.open(str(audio), "wb") as target:
-            target.setnchannels(1)
-            target.setsampwidth(2)
-            target.setframerate(SAMPLE_RATE)
-            target.writeframes(pcm)
-        output = Path(directory) / "transcript"
+    """One whisper.cpp run over `pcm`, in memory only: WAV on stdin, JSON on stdout.
+
+    The WAV is fed from a thread while stdout is read in bounded chunks, so neither pipe
+    can deadlock the other and a runaway recognizer is stopped at `MAX_RESPONSE_BYTES`.
+    stderr goes to the null device, so it is never buffered and never blocks.
+    """
+    sandbox = recognizer_dir()
+    deadline = time.monotonic() + config.timeout_seconds
+    try:
+        process = subprocess.Popen(
+            [
+                str(Path(config.whisper_executable).resolve()),
+                "--model",
+                str(Path(config.whisper_model).resolve()),
+                "--file",
+                "-",
+                "--output-json-full",
+                "--output-file",
+                "-",
+                "--no-prints",
+                "--max-context",
+                "0",
+                "--suppress-nst",
+            ],
+            cwd=sandbox,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env={"PATH": os.defpath, "HOME": sandbox, "TMPDIR": sandbox},
+        )
+        feeder = threading.Thread(
+            target=_feed,
+            args=(process.stdin, _wav_bytes(pcm)),
+            name="rightyo-asr-feed",
+            daemon=True,
+        )
         try:
-            process = subprocess.Popen(
-                [
-                    str(Path(config.whisper_executable).resolve()),
-                    "--model",
-                    str(Path(config.whisper_model).resolve()),
-                    "--file",
-                    str(audio),
-                    "--output-json-full",
-                    "--output-file",
-                    str(output),
-                    "--no-prints",
-                    "--max-context",
-                    "0",
-                    "--suppress-nst",
-                ],
-                cwd=directory,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env={"PATH": os.defpath, "HOME": directory, "TMPDIR": directory},
-            )
-            try:
-                if register is not None:
-                    register(process)
-                if process.wait(timeout=config.timeout_seconds) != 0:
-                    raise LiveAudioError("Local recognizer failed")
-            finally:
-                _terminate(process)
-            with output.with_suffix(".json").open("rb") as source:
-                raw = source.read(MAX_RESPONSE_BYTES + 1)
-            if len(raw) > MAX_RESPONSE_BYTES:
-                raise LiveAudioError("Local recognizer exceeded output limit")
-            document = json.loads(raw)
-            if not isinstance(document, dict):
-                raise ValueError
-            return document
-        except subprocess.TimeoutExpired:
-            raise LiveAudioError("Local recognizer timed out") from None
-        except (OSError, subprocess.CalledProcessError, ValueError, RecursionError):
-            raise LiveAudioError("Local recognizer failed") from None
+            if register is not None:
+                register(process)
+            feeder.start()
+            raw = _bounded_stdout(process, deadline)
+            if process.wait(timeout=max(0.0, deadline - time.monotonic())) != 0:
+                raise LiveAudioError("Local recognizer failed")
+        finally:
+            _terminate(process)
+            # Every path closes both pipes; the feeder ends once its pipe is closed.
+            for stream in (process.stdin, process.stdout):
+                with contextlib.suppress(OSError, ValueError):
+                    stream.close()
+            if feeder.ident is not None:
+                feeder.join(timeout=2)
+        document = json.loads(raw)
+        if not isinstance(document, dict):
+            raise ValueError
+        return document
+    except subprocess.TimeoutExpired:
+        raise LiveAudioError("Local recognizer timed out") from None
+    except (OSError, subprocess.CalledProcessError, ValueError, RecursionError):
+        raise LiveAudioError("Local recognizer failed") from None
 
 
 def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]] | None:
@@ -825,13 +1118,15 @@ def _counted_units(
 
 
 class WhisperCppTranscriber:
-    """The default `Transcriber`: the pinned whisper.cpp CLI on a temporary WAV file."""
+    """The default `Transcriber`: the pinned whisper.cpp CLI, audio and JSON over pipes."""
 
     recognizer_id = "whisper.cpp-live-window"
 
     def __init__(self, config: LiveConfig):
         if config.whisper_executable is None or config.whisper_model is None:
             raise LiveAudioError("Explicit existing runtimes and models are required")
+        # Refused before any audio when no unwritable directory is available (fail closed).
+        recognizer_dir()
         self.config = config
         # Unusable segments, and the utterances they suppressed, this session (see
         # `_counted_units`); read by `LiveProcessor`.
@@ -891,6 +1186,44 @@ def _select(value: Any, default: Callable[[LiveConfig], Any], config: LiveConfig
     return value if _is_backend_instance(value, method) else value(config)
 
 
+class _OffsetDiarizer:
+    """A diarizer started mid-stream (#735 S-1): its own clock starts at zero, so its timeline
+    is shifted onto the stream clock the processor's utterances use."""
+
+    def __init__(self, inner: Diarizer, offset_ms: int):
+        self._inner, self._offset = inner, offset_ms
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def _shifted(self, timeline: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                **segment,
+                **{
+                    key: segment[key] + self._offset
+                    for key in ("start_ms", "end_ms")
+                    if type(segment.get(key)) is int
+                },
+            }
+            if isinstance(segment, dict)
+            else segment
+            for segment in timeline
+        ]
+
+    def push(self, pcm: bytes) -> None:
+        self._inner.push(pcm)
+
+    def segments(self) -> list[dict[str, Any]]:
+        return self._shifted(self._inner.segments())
+
+    def finish(self) -> list[dict[str, Any]]:
+        return self._shifted(self._inner.finish())
+
+    def close(self) -> None:
+        self._inner.close()
+
+
 class LiveProcessor:
     """Single-owner synchronous processor; feed only explicitly consented audio.
 
@@ -911,6 +1244,26 @@ class LiveProcessor:
         self._diarizer: Diarizer = _select(
             config.diarizer, lambda value: _Diarizer(value), config, "push"
         )
+        # A diarizer the processor made (the default, or a factory) can be made again when
+        # privacy ends (`reset_speakers`, hailing-station #735 S-1); a supplied instance cannot.
+        self._diarizer_renewable = config.diarizer is None or not _is_backend_instance(
+            config.diarizer, "push"
+        )
+        self._speaker_reset = False
+        # The stream byte offset privacy last ended at, until the frame holding it is processed;
+        # then what is still buffered from before it is silenced (`_private_cutoff`). Written on
+        # the host thread and taken on the audio thread, both under `_private_lock`.
+        self._private_until: int | None = None
+        self._private_lock = threading.Lock()
+        # Where the last privacy end was reached (audio thread only), bounding a deferred renewal;
+        # and, after a forced one, the renewal's offset: a turn starting before it is unlabelled.
+        self._end_reached_ms: int | None = None
+        self._unlabelled_before_ms = 0
+        # Told when the fresh diarizer takes over, before its first frame: labels restart there,
+        # so whatever was bound to the old ones in the meantime must be forgotten again.
+        self.on_speakers_renewed: Callable[[], None] | None = None
+        # The per-response segment bound for this session's timeline window (#226).
+        self._timeline_limit = timeline_segment_limit(config.timeline_window_ms)
         self._partial = bytearray()
         self._pre_roll: deque[bytes] = deque(maxlen=config.pre_roll_ms // 20)
         self._utterance = bytearray()
@@ -920,6 +1273,10 @@ class LiveProcessor:
         self._counter = 0
         self._utterances = 0
         self._skipped_utterances = 0
+        # Of those, the ones from utterances heard in privacy (hailing-station #735 S-1): kept
+        # apart so the session's reported totals never count private speech.
+        self._private_skipped_segments = 0
+        self._private_skipped_utterances = 0
         self._end_of_turn = config.end_of_turn
         # Whether the end-of-turn model was already asked during the current pause, and
         # whether it judged the turn complete while the diarizer timeline lagged behind.
@@ -935,6 +1292,13 @@ class LiveProcessor:
             config.turn_break,
             reply_wait_ms=config.reply_wait_ms,
             tail_join_ms=config.tail_join_ms,
+            unfinished=config.turn_unfinished,
+            complete_hold_ms=config.turn_complete_hold_ms,
+            collapse_restarts=config.turn_collapse_restarts,
+            bridge_backchannels=config.turn_bridge_backchannels,
+            wake_word=config.turn_wake_word,
+            owner=config.turn_owner,
+            owner_pause_ms=config.turn_owner_pause_ms,
         )
 
     @property
@@ -943,9 +1307,11 @@ class LiveProcessor:
 
     @property
     def skipped_segments(self) -> int:
-        """whisper.cpp segments skipped this session for unusable offsets (see `_units`)."""
+        """whisper.cpp segments skipped this session for unusable offsets (see `_units`), not
+        counting those in utterances heard in privacy."""
         inner = getattr(self._transcriber, "skipped_segments", 0)
-        return inner if type(inner) is int and inner > 0 else 0
+        inner = inner if type(inner) is int and inner > 0 else 0
+        return max(0, inner - self._private_skipped_segments)
 
     @property
     def skipped_utterances(self) -> int:
@@ -956,7 +1322,7 @@ class LiveProcessor:
         """
         inner = getattr(self._transcriber, "suppressed_utterances", 0)
         inner = inner if type(inner) is int and inner > 0 else 0
-        return self._skipped_utterances + inner
+        return max(0, self._skipped_utterances + inner - self._private_skipped_utterances)
 
     @property
     def buffered_audio_bytes(self) -> int:
@@ -984,7 +1350,121 @@ class LiveProcessor:
             self.close()
             raise
 
+    def reset_speakers(self, private_until_bytes: int | None = None) -> None:
+        """Start a fresh diarizer once nothing is open (hailing-station #735 S-1): called when
+        privacy ends, so no speaker channel or state a private voice made outlives it. Deferred
+        to the first frame with no open utterance or held turn, so a turn under way keeps its
+        labels; its timeline continues on the stream clock. The deferral is bounded (round 21):
+        `SPEAKER_RENEWAL_LIMIT_MS` (10 s of stream audio) after the first end reached since the
+        last renewal (round 22: a later end never restarts it), the renewal is forced, once any
+        later end is reached too, and a turn then under way is published with no speaker label.
+
+        `private_until_bytes` is the stream byte offset privacy ended at (by default, the end
+        of the audio pushed so far), exact to the sample (round 19): audio before it still
+        buffered once it is reached is silenced."""
+        if private_until_bytes is None:
+            private_until_bytes = self._received_ms * BYTES_PER_MS + len(self._partial)
+        private_until_bytes += private_until_bytes % 2  # a whole sample
+        with self._private_lock:
+            self._private_until = max(private_until_bytes, self._private_until or 0)
+            # Under the same lock as the end (round 21): a renewal taken meanwhile never clears
+            # the request this end makes.
+            if self._diarizer_renewable:
+                self._speaker_reset = True
+
+    def _private_cutoff(self, pcm: bytes, final: bool = False) -> bytes:
+        """`pcm`, the next audio processed, with what of it was heard before privacy ended
+        silenced (#735 S-1, rounds 18-19). Once the end falls within or before it (or at
+        `finish`, `final`), what is still buffered from before then is silenced too, the
+        pre-roll kept between turns and the start of an utterance open across the end, all
+        before `pcm` reaches the diarizer, the end-of-turn model or ASR, so no audio heard
+        while private is processed with public speech. Silence, not removal, keeps the stream
+        offsets. The end is taken under the lock, so a later one set meanwhile is kept."""
+        start = self._received_ms * BYTES_PER_MS
+        with self._private_lock:
+            until = self._private_until
+            if until is None or (until >= start + len(pcm) and not final):
+                return pcm
+            self._private_until = None
+        if self._end_reached_ms is None:
+            # The first end not yet renewed for (round 22): a later one never restarts the bound.
+            self._end_reached_ms = self._received_ms
+        self._settle_held_at_privacy_end()
+        first = start - FRAME_BYTES * len(self._pre_roll)
+        frames = list(self._pre_roll)
+        self._pre_roll.clear()
+        for index, frame in enumerate(frames):
+            private = min(len(frame), max(0, until - first - FRAME_BYTES * index))
+            self._pre_roll.append(bytes(private) + frame[private:])
+        private = min(len(self._utterance), max(0, until - self._utterance_start * BYTES_PER_MS))
+        self._utterance[:private] = bytes(private)
+        private = min(len(pcm), max(0, until - start))
+        return bytes(private) + pcm[private:]
+
+    def _settle_held_at_privacy_end(self) -> None:
+        """#242 round 27 (Codex P1): what the merger holds when the privacy end is reached was
+        all heard before it. If any of it, the held turn or a bridged backchannel, was heard in
+        privacy (`LiveConfig.private`; unknown counts), all of it is discarded, words and
+        all, so no speech after the end can be joined to it: a joined turn would overlap the
+        privacy span and be dropped whole, losing the first public request. Otherwise it is
+        released now, on its own, for the same reason. The end-of-turn judgement of an
+        utterance open across the end was made on private audio, so it is made again."""
+        self._end_of_turn_asked = self._complete = False
+        spans = self._merger.held_spans()
+        if not spans:
+            return
+        if self.config.private is None or any(self._heard_private(*span) for span in spans):
+            self._merger.discard()
+        else:
+            self._merger.flush()
+
+    def _take_renewal(self) -> bool:
+        """Claims a requested renewal once its privacy end is reached (round 21): the request
+        and the end are read and the request cleared under one lock, so an end stamped while a
+        frame is taken is never lost."""
+        with self._private_lock:
+            if not self._speaker_reset or self._private_until is not None:
+                return False
+            self._speaker_reset = False
+            return True
+
+    def _renew_diarizer(self) -> None:
+        offset = self._received_ms
+        self._end_reached_ms = None
+        if self._utterance or self._merger.holding:
+            # Forced mid-turn (round 21): the old diarizer's labels for it must not cross over.
+            self._unlabelled_before_ms = offset
+        old, self._diarizer = (
+            self._diarizer,
+            _OffsetDiarizer(
+                _select(self.config.diarizer, lambda value: _Diarizer(value), self.config, "push"),
+                offset,
+            ),
+        )
+        with contextlib.suppress(Exception):
+            old.close()
+        if self.on_speakers_renewed is not None:
+            self.on_speakers_renewed()
+
     def _frame(self, frame: bytes) -> None:
+        if self._private_until is not None:
+            frame = self._private_cutoff(frame)
+        # Renewed only once the privacy end is reached (#242 round 20): the controller counts a
+        # chunk before pushing it, so the end can lie ahead, and the fresh diarizer must never
+        # be fed a frame heard while private.
+        # Forced once the end was reached SPEAKER_RENEWAL_LIMIT_MS ago (round 21).
+        if (
+            self._speaker_reset
+            and (
+                (not self._utterance and not self._merger.holding)
+                or (
+                    self._end_reached_ms is not None
+                    and self._received_ms - self._end_reached_ms >= SPEAKER_RENEWAL_LIMIT_MS
+                )
+            )
+            and self._take_renewal()
+        ):
+            self._renew_diarizer()
         self._diarizer.push(frame)
         frame_start = self._received_ms
         self._received_ms += 20
@@ -1045,13 +1525,18 @@ class LiveProcessor:
                 raise LiveAudioError("Audio session was stopped") from None
             # A failing model never ends the session: the silence rules take over.
             self._end_of_turn = None
-            self._diagnostic("end-of-turn model unavailable; using silence end-of-turn")
+            # Withheld for an utterance heard in privacy too: even its failure is about that speech.
+            self._diagnostic(
+                "end-of-turn model unavailable; using silence end-of-turn",
+                span=(self._utterance_start, self._received_ms),
+            )
             return False
         complete = probability >= self.config.end_of_turn_threshold
         # Content-free: a probability and stream timing only, never audio or text.
         self._diagnostic(
             f"end_of_turn p={probability:.3f} silence_ms={silence}"
-            f" outcome={'complete' if complete else 'wait'}"
+            f" outcome={'complete' if complete else 'wait'}",
+            span=(self._utterance_start, self._received_ms),
         )
         return complete
 
@@ -1079,20 +1564,33 @@ class LiveProcessor:
         ):
             return
         self._diagnostic(
-            f"end_of_turn finalized silence_ms={self._received_ms - self._last_voice_ms}"
+            f"end_of_turn finalized silence_ms={self._received_ms - self._last_voice_ms}",
+            span=(self._utterance_start, self._received_ms),
         )
         self._finalize(timeline, complete=True)
 
-    def _diagnostic(self, message: str) -> None:
-        if self.config.report is not None:
-            with contextlib.suppress(Exception):
-                self.config.report(message)
+    def _diagnostic(self, message: str, *, span: tuple[int, int] | None = None) -> None:
+        """Report `message`; one about the utterance heard over `span` is withheld if that
+        audio was heard in privacy mode (`LiveConfig.private`)."""
+        if self.config.report is None or (span is not None and self._heard_private(*span)):
+            return
+        with contextlib.suppress(Exception):
+            self.config.report(message)
+
+    def _heard_private(self, start_ms: int, end_ms: int) -> bool:
+        private = self.config.private
+        if private is None:
+            return False
+        try:
+            return private(start_ms, end_ms) is not False
+        except Exception:  # noqa: BLE001 - fail closed: withhold the diagnostic
+            return True
 
     def _finalize(self, timeline: list[dict[str, Any]], complete: bool = False) -> None:
         self._complete = False
         if not self._utterance:
             return
-        _check_timeline(timeline, self._received_ms)
+        _check_timeline(timeline, self._received_ms, self._timeline_limit)
         pcm = bytes(self._utterance)
         offset = self._utterance_start
         self._utterance.clear()
@@ -1111,7 +1609,14 @@ class LiveProcessor:
             self._skipped_utterances += 1
         skipped = self.skipped_segments - before[0]
         suppressed = self.skipped_utterances > before[1]
-        if (skipped or suppressed) and self.config.report is not None:
+        private = (skipped or suppressed) and self._heard_private(
+            offset, offset + len(pcm) // BYTES_PER_MS
+        )
+        if private:
+            # Taken out of the session's totals too, not only its note (Codex P2 on #242).
+            self._private_skipped_segments += skipped
+            self._private_skipped_utterances += 1 if suppressed else 0
+        if (skipped or suppressed) and self.config.report is not None and not private:
             # Content-free: counts only, never recognizer text or timestamps. A failing
             # diagnostic channel never ends the session.
             segments = f"{skipped} recognizer segment(s) with unusable timestamps"
@@ -1137,6 +1642,30 @@ class LiveProcessor:
         for unit in units:
             start, end = unit["start_ms"] + offset, unit["end_ms"] + offset
             attributed.append([unit, start, end, *_attribute(start, end, relevant)])
+        coverage = self.config.word_label_coverage
+        if (
+            coverage
+            and provenance == "diarization-timeline"
+            and not any(entry[3] is not None for entry in attributed)
+        ):
+            # No word has a strict label (#220): let one speaker's coverage label them.
+            # Only segments that start inside this utterance (pre-roll included) count: a
+            # streaming diarizer switches speaker late, so an earlier speaker's segment can
+            # run on over the next person's first word before their own segment arrives.
+            # A carried-over segment may still block a label: any other speaker touching
+            # the word, carried over or not, leaves it unlabelled.
+            own = [segment for segment in relevant if segment["start_ms"] >= offset]
+            for entry in attributed:
+                # The overlap flag stays the strict pass's, over every segment.
+                start, end = entry[1], entry[2]
+                label = _attribute(start, end, own, coverage)[0]
+                touching = {
+                    "Speaker " + _speaker_label(segment["speaker"])
+                    for segment in relevant
+                    if segment["start_ms"] < end and segment["end_ms"] > start
+                }
+                if label is not None and touching == {label}:
+                    entry[3] = label
         inferred: set[int] = set()
         if self.config.edge_attribution_ms and provenance == "diarization-timeline":
             inferred = _attribute_edges(attributed, relevant, self.config.edge_attribution_ms)
@@ -1178,14 +1707,28 @@ class LiveProcessor:
                 )
             # Only the speaker who just paused was judged finished; earlier groups in the
             # utterance were followed by other speech already.
-            self._merger.offer(group, complete=complete and index == len(kept) - 1)
+            if self.config.on_private_turn_audio is not None and self._heard_private(
+                group["start_ms"], group["end_ms"]
+            ):
+                # Privacy wins a continuation tie: discard the held public prefix without
+                # publishing it, while keeping only this private sentence's PCM for exit.
+                self._merger.discard()
+                start = (group["start_ms"] - offset) * BYTES_PER_MS
+                end = (group["end_ms"] - offset) * BYTES_PER_MS
+                self._emit(group, memoryview(pcm)[start:end])
+            else:
+                self._merger.offer(group, complete=complete and index == len(kept) - 1)
 
-    def _emit(self, group: dict[str, Any]) -> None:
+    def _emit(self, group: dict[str, Any], private_pcm: memoryview | None = None) -> None:
         """Number and emit one finalized (possibly joined) turn; ids follow emission order."""
         self._counter += 1
         gap = group.pop("post_turn_gap", None)
         inferred = group.pop("inferred", False) is True
         spans = group.pop("labelled_spans", None)
+        if group["start_ms"] < self._unlabelled_before_ms:
+            # Under way at a forced renewal (round 21): labelled, wholly or partly, by the old
+            # diarizer, or joined to its label, so published unlabelled with no label evidence.
+            group["speaker"], inferred, spans = None, False, None
         turn = Turn(
             session_id=self.config.session_id,
             utterance_id=f"live-{self._counter}",
@@ -1206,16 +1749,19 @@ class LiveProcessor:
             self.config.on_inferred(turn.utterance_id)
         if spans is not None and self.config.on_labelled_spans is not None:
             self.config.on_labelled_spans(turn.utterance_id, tuple(spans))
+        if private_pcm is not None:
+            self.config.on_private_turn_audio(turn, private_pcm)
         self.on_turn(turn)
 
     def finish(self) -> None:
         if self.closed:
             return
         try:
-            if self._partial:
+            # Any privacy end not reached yet is applied here, to the tail and what is buffered.
+            pcm = self._private_cutoff(bytes(self._partial), final=True)
+            self._partial.clear()
+            if pcm:
                 # Process actual tail only. Synthetic zero-padding must not enter native history.
-                pcm = bytes(self._partial)
-                self._partial.clear()
                 self._diarizer.push(pcm)
                 if self._utterance:
                     self._utterance.extend(pcm)
@@ -1252,6 +1798,10 @@ class LiveProcessor:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "--native-worker":
-        raise SystemExit(_native_worker(sys.argv[2], sys.argv[3]))
+    # `--native-worker LIBRARY MODEL [WINDOW_MS]`: without the window the default applies.
+    if len(sys.argv) in (4, 5) and sys.argv[1] == "--native-worker":
+        window = _worker_window(sys.argv[4]) if len(sys.argv) == 5 else TIMELINE_WINDOW_MS
+        if window is None:
+            raise SystemExit(2)
+        raise SystemExit(_native_worker(sys.argv[2], sys.argv[3], window))
     raise SystemExit(2)

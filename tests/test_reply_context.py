@@ -95,6 +95,16 @@ class ReplyContextTests(unittest.TestCase):
         state = self.decide(turn("Thanks.", "u2", start=1500, end=2000))
         self.assertEqual(state["assistant_reply"], {"playing": False, "ended_ms_before": 500})
 
+    def test_scoped_old_end_does_not_close_competing_new_playback(self):
+        self.runner.note_reply("started", 1000, request_id="session:a")
+        self.runner.note_reply("started", 2000, request_id="session:b")
+        self.runner.note_reply("ended", 3000, request_id="session:a")
+        state = self.decide(turn("A new turn.", "u1", start=4000, end=4500))
+        self.assertEqual(state["assistant_reply"], {"playing": True})
+        self.runner.note_reply("ended", 5000, request_id="session:b")
+        state = self.decide(turn("Thanks.", "u2", start=6000, end=6500))
+        self.assertEqual(state["assistant_reply"], {"playing": False, "ended_ms_before": 1000})
+
     def test_an_unknown_phase_is_refused(self):
         with self.assertRaises(ValueError):
             self.runner.note_reply("paused", 1000)
