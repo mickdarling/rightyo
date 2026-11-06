@@ -39,9 +39,22 @@ the runtime forms of address described in [the tool API](tool-api.md); `--name` 
 the command line replace the file's names. The object may also list recognizer spellings
 of a name, for example `"variants": {"Hailing Station": ["Haling Station"]}`; see
 [name variants](tool-api.md#transport-and-lifecycle). An optional
+`"meeting": {"ask_anywhere": true}` configures meeting mode
+(hailing-station#735 meeting mode (#227)). The boolean defaults to true: while the host's
+meeting control is on, an owner-authority turn naming the assistant anywhere promotes
+`uncertain` to `attend`, never `ignore`. False keeps the name/owner bar without promotion.
+With no speaker roles, meeting mode attends nothing; inferred or unlabelled turns never pass.
+The section accepts only `ask_anywhere`; it does not turn meeting mode on. See the
+[control contract](tool-api.md#meeting-mode). An optional
 `"turns": {"merge_gap_ms": 2000}` sets how long a finalized turn waits for a continuation
 by the same speaker before it is emitted and decided (default 2,000 ms, 0 to 5,000, 0
-off); see [joined turns](tool-api.md#joined-turns). The same object's `reply_wait_ms`
+off); see [joined turns](tool-api.md#joined-turns), which also covers `complete_hold_ms`,
+`collapse_restarts` and `bridge_backchannels` for one thought split into several
+requests (#216), `wake_join` (default true) for a lone wake word split from the owner's
+sentence (#230), `owner_pause_ms` (default 0, off; 0 to 10,000) for a longer pause
+on the owner's turns only, which joins them even with `merge_gap_ms` 0
+(hailing-station#735), and `word_label_coverage` (default 0, off; 0.5 suggested) for one-word
+turns left without a speaker (#220). The same object's `reply_wait_ms`
 (default 1,200 ms, 0 to 3,000, 0 off) sets how long a question or request is held to
 observe the [post-turn gap](tool-api.md#scene-and-post-turn-gap). The same object's
 `edge_attribution_ms` (default 0, off; 0 to 2,000 in 20 ms steps) turns on edge
@@ -76,7 +89,8 @@ cool-down), with optional `window_ms`, `cooldown_ms` and `cooldown_min_confidenc
 off when absent. An optional `"conversation": {}` object turns on
 [conversation mode](tool-api.md#conversation-mode) (#82): engaged follow-ups after a
 request and the `conversation` event, with optional `window_ms`,
-`follow_up_min_probability` and `closing_phrases`; it is off when absent. An optional
+`follow_up_min_probability`, `closing_phrases`, `appendix_ms`, `require_cue`,
+`cue_min_attend` and `continuation_cue`; it is off when absent. An optional
 `"acknowledgement": {}` object turns on [acknowledgement gating](tool-api.md#acknowledgement-gating)
 (#132): each request carries `acknowledge`, true only when the turn uses a configured name
 or its attend confidence reaches `min_confidence` (default 0.7, 0 to 1), so the host skips
@@ -126,6 +140,32 @@ budget's worth of audio is processed. In replay/demo mode the budget is the exac
 boundary: the replay is trimmed there however slowly it processes, and the wall clock
 does not apply. Demo audio whose length equals the budget exactly ends `cancelled`
 (budget reached) rather than `complete`.
+
+An optional `"audio_retention"` object ([#226](https://github.com/mickdarling/rightyo/issues/226))
+sets how much audio RightyO keeps in memory, with two independent keys. Both are whole
+seconds and both default to 60, the fixed value before:
+
+- `speaker_ring_seconds` (10 to 600): how much of the session's PCM
+  [live speaker identification](speaker-enrollment.md#shadow-identification-in-live-sessions)
+  keeps to cut each turn's audio from. It costs memory only: PCM16 at 16 kHz is 32 KB/s,
+  so about 19 MB at 600 s. A shorter ring clips the audio of long turns (counted as
+  `clipped`).
+- `timeline_window_seconds` (30 to 100): how far back the diarizer's speaker timeline is
+  returned at each utterance for attribution. It also sets the per-response segment bound,
+  300 segments per second of window (18,000 at 60 s). The lower bound is twice the longest
+  utterance (15 s), so no segment that overlaps an open utterance is dropped. The upper
+  bound keeps the native diarizer worker's reply inside its 2 MiB pipe limit: the worker
+  returns the whole window as one JSON line, and at 100 s its worst case is 30,000
+  segments of at most 68 bytes each, 2,040,025 bytes.
+
+For example `"audio_retention": {"speaker_ring_seconds": 120, "timeline_window_seconds": 90}`.
+A value out of range or not a whole number is refused when the configuration loads, with
+an error that names the rule; nothing is clamped. Both buffers stay in memory and are
+never written. The values are read when RightyO starts, so a change takes effect at the
+next restart. Each `listen` session logs them once on stderr, in seconds only:
+`audio_retention speaker_ring_s=120 timeline_window_s=90`. The lab has no report channel
+and logs nothing.
+
 An optional `"decision": {"provider": "jev", "allow_hosted": true}` is the file form of
 `listen --use-jev --allow-hosted`, for hosts that start `listen` with a fixed argument list.
 Both keys are required and strictly typed; `"provider": "jev"` without
@@ -248,6 +288,11 @@ The confidence slider is an experiment setting, not a calibrated accuracy guaran
 
 ## Context and stopping
 
+Everything here is in memory unless the operator opts in to the
+[decision state log](tool-quickstart.md) (`decision.state_log`, #199). That log writes
+each decided turn's state, including transcript text, to a private local file, and
+nothing in the lab clears it: Clear and Stop leave it in place.
+
 The local transcript retains five minutes by default, configurable from one to ten minutes,
 with retained text capped at 1,000 turns / 1 MiB. These retention caps evict older
 turns. Separately, each session permits at most 1,000 unique finalized turns in total,
@@ -257,7 +302,8 @@ reach it well within a long ambient session. Reaching 1,000 turns stops processi
 an explicit message to start a new session, preserving valid history until expiry or Stop.
 The native diarizer returns only the trailing 60 seconds of its speaker timeline at each
 utterance (an utterance spans at most 15 seconds), so it imposes no session-length limit
-([#54](https://github.com/mickdarling/rightyo/issues/54)).
+([#54](https://github.com/mickdarling/rightyo/issues/54)). The configuration's
+`audio_retention.timeline_window_seconds` sets that window from 30 to 100 seconds.
 The whole turn overlapping the time boundary is retained and its overlap is reported. Ignore and uncertain decisions remain in local context: a later
 request can refer to the preceding discussion. Copy context produces speaker-labelled text
 for manual use downstream, including unknown-speaker and overlap indications.

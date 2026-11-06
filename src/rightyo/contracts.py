@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from dataclasses import asdict, dataclass
@@ -21,6 +22,8 @@ DEFAULT_COOLDOWN_MIN_CONFIDENCE = 0.9
 # attend probability an engaged speaker's undecided follow-up needs to become a request.
 DEFAULT_CONVERSATION_WINDOW_MS = 20000
 MAX_CONVERSATION_WINDOW_MS = 120000
+# An appendix (#199) is a quick continuation of a just-formed request; keep it short.
+MAX_APPENDIX_MS = 5000
 DEFAULT_FOLLOW_UP_MIN_PROBABILITY = 0.4
 DEFAULT_CLOSING_PHRASES = (
     "that's all",
@@ -43,6 +46,12 @@ DEFAULT_ACK_MIN_CONFIDENCE = 0.7
 # an acknowledged request's turn, a later request goes unacknowledged; 0 turns it off.
 DEFAULT_ACK_DEDUP_WINDOW_MS = 8000
 MAX_ACK_DEDUP_WINDOW_MS = 60000
+# Host-supplied listener descriptions (#69). Bound both decoded fields and the ASCII
+# JSON wire representation: non-ASCII prose can expand substantially when serialized.
+MAX_LISTENER_PROFILE_TEXT_CHARS = 1024
+MAX_LISTENER_PROFILE_BYTES = 4096
+MAX_LISTENER_PROFILE_PRIORITY = 100
+MAX_LISTENER_PROFILE_COOLDOWN_MS = 600000
 CONVERSATION_REASONS = frozenset({"request", "timeout", "other_human", "closed", "dismissed"})
 PROVENANCE = frozenset({"synthetic", "recorded-file", "causal-replay", "live-microphone"})
 SPEAKER_PROVENANCE = frozenset(
@@ -159,6 +168,85 @@ def probability(value: Any) -> float:
 def name_key(text: str) -> str:
     """Casefolded ASCII letters and digits only, so "Righty-O" and "righty o" compare equal."""
     return _NAME_KEY_SEPARATORS.sub("", text.casefold())
+
+
+@dataclass(frozen=True)
+class ListenerProfile:
+    """Versioned descriptions supplied explicitly by the embedding host, never speech.
+
+    These are model-neutral inputs, not permission to invoke an agent. Delivery and
+    pacing are hints for downstream consumers; this contract makes no decisions.
+    """
+
+    listener_id: str
+    name: str
+    domain: str
+    speak_when: str
+    stay_quiet_when: str
+    delivery: str
+    priority: int = 0
+    cooldown_ms: int = 0
+    version: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.version) is not int or self.version != 1:
+            raise ContractError("unsupported listener profile version")
+        identifier(self.listener_id, "listener id")
+        if self.listener_id != self.listener_id.strip():
+            raise ContractError("invalid listener id")
+        address_name(self.name)
+        for value in (self.domain, self.speak_when, self.stay_quiet_when):
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+                or len(value) > MAX_LISTENER_PROFILE_TEXT_CHARS
+                or any(
+                    ord(char) < 32 and char not in "\t\r\n" or ord(char) == 127 for char in value
+                )
+            ):
+                raise ContractError("invalid listener profile description")
+            try:
+                value.encode("utf-8")
+            except UnicodeError:
+                raise ContractError("invalid listener profile description") from None
+        if not isinstance(self.delivery, str) or self.delivery not in {"room", "owner_private"}:
+            raise ContractError("invalid listener profile delivery")
+        if (
+            type(self.priority) is not int
+            or not 0 <= self.priority <= MAX_LISTENER_PROFILE_PRIORITY
+        ):
+            raise ContractError("invalid listener profile priority")
+        if (
+            type(self.cooldown_ms) is not int
+            or not 0 <= self.cooldown_ms <= MAX_LISTENER_PROFILE_COOLDOWN_MS
+        ):
+            raise ContractError("invalid listener profile cooldown")
+        if len(json.dumps(self.to_dict(), ensure_ascii=True, separators=(",", ":"))) > (
+            MAX_LISTENER_PROFILE_BYTES
+        ):
+            raise ContractError("listener profile byte budget exceeded")
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> ListenerProfile:
+        if not isinstance(raw, dict) or "version" not in raw:
+            raise ContractError("listener profile must be a versioned object")
+        try:
+            return cls(**raw)
+        except TypeError:
+            raise ContractError("missing or unrecognized listener profile fields") from None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "listener_id": self.listener_id,
+            "name": self.name,
+            "domain": self.domain,
+            "speak_when": self.speak_when,
+            "stay_quiet_when": self.stay_quiet_when,
+            "delivery": self.delivery,
+            "priority": self.priority,
+            "cooldown_ms": self.cooldown_ms,
+        }
 
 
 @dataclass(frozen=True)
@@ -427,11 +515,28 @@ class Conversation:
     ambient when the window lapses, when Jev confidently judges their turn addressed to
     another person, on a `closing_phrases` match
     (courtesy words around it are tolerated, `is_closing`), or on a dismissal.
+
+    `appendix_ms` (#199; 0, the default, is off): the engaged speaker's `uncertain` turn
+    starting within this long after their latest direct request ended is an appendix to it
+    ("... and eggs") and needs no follow-up attend probability. Every other follow-up rule
+    applies (a confident `ignore` still never is one), it never names another agent, and
+    each direct request takes at most one appendix.
     """
 
     window_ms: int = DEFAULT_CONVERSATION_WINDOW_MS
     follow_up_min_probability: float = DEFAULT_FOLLOW_UP_MIN_PROBABILITY
     closing_phrases: tuple[str, ...] = DEFAULT_CLOSING_PHRASES
+    appendix_ms: int = 0
+    # With `require_cue` (#199), a follow-up also needs a cue that it continues the exchange
+    # (`follow_up_cued`): the name, second person, a referring word or an adding opener.
+    require_cue: bool = False
+    # With `require_cue`, a follow-up whose attend probability reaches `cue_min_attend`
+    # (#199; None, the default, is off) needs no cue: Jev is already fairly sure of it.
+    cue_min_attend: float | None = None
+    # With `require_cue`, `continuation_cue` (#213) lets the engaged speaker's own turn that
+    # Jev chose to attend, starting once the assistant has begun replying, continue the
+    # exchange without a cue: their whole message is answered, not just a "yes".
+    continuation_cue: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -441,6 +546,14 @@ class Conversation:
             raise ContractError("invalid conversation window")
         if probability(self.follow_up_min_probability) <= 0:
             raise ContractError("invalid follow-up probability")
+        if type(self.appendix_ms) is not int or not 0 <= self.appendix_ms <= MAX_APPENDIX_MS:
+            raise ContractError("invalid appendix window")
+        if type(self.require_cue) is not bool:
+            raise ContractError("invalid follow-up cue requirement")
+        if self.cue_min_attend is not None and probability(self.cue_min_attend) <= 0:
+            raise ContractError("invalid follow-up cue bypass")
+        if type(self.continuation_cue) is not bool:
+            raise ContractError("invalid continuation cue")
         phrases = self.closing_phrases
         if not isinstance(phrases, tuple) or len(phrases) > MAX_CLOSING_PHRASES:
             raise ContractError("invalid closing phrases")
@@ -478,7 +591,15 @@ class Conversation:
 
     @classmethod
     def from_dict(cls, raw: Any) -> Conversation:
-        allowed = {"window_ms", "follow_up_min_probability", "closing_phrases"}
+        allowed = {
+            "window_ms",
+            "follow_up_min_probability",
+            "closing_phrases",
+            "appendix_ms",
+            "require_cue",
+            "cue_min_attend",
+            "continuation_cue",
+        }
         if not isinstance(raw, dict) or set(raw) - allowed:
             raise ContractError("conversation must be an object with known keys only")
         values = dict(raw)
@@ -495,6 +616,11 @@ class Conversation:
             "window_ms": self.window_ms,
             "follow_up_min_probability": self.follow_up_min_probability,
             "closing_phrases": list(self.closing_phrases),
+            # An added key, only when on: hosts ignore keys they do not know.
+            **({"appendix_ms": self.appendix_ms} if self.appendix_ms else {}),
+            **({"require_cue": True} if self.require_cue else {}),
+            **({"cue_min_attend": self.cue_min_attend} if self.cue_min_attend is not None else {}),
+            **({"continuation_cue": True} if self.continuation_cue else {}),
         }
 
 
@@ -515,9 +641,15 @@ class Acknowledgement:
 
     min_confidence: float = DEFAULT_ACK_MIN_CONFIDENCE
     dedup_window_ms: int = DEFAULT_ACK_DEDUP_WINDOW_MS
+    # A separate bar for a conversation follow-up's attend probability (#199), so a
+    # mid-confidence follow-up delivered to the agent never plays the instant
+    # acknowledgement. None uses `min_confidence`, as before. A named turn is acknowledged.
+    follow_up_min_confidence: float | None = None
 
     def __post_init__(self) -> None:
         probability(self.min_confidence)
+        if self.follow_up_min_confidence is not None:
+            probability(self.follow_up_min_confidence)
         if (
             type(self.dedup_window_ms) is not int
             or not 0 <= self.dedup_window_ms <= MAX_ACK_DEDUP_WINDOW_MS
@@ -526,7 +658,8 @@ class Acknowledgement:
 
     @classmethod
     def from_dict(cls, raw: Any) -> Acknowledgement:
-        if not isinstance(raw, dict) or set(raw) - {"min_confidence", "dedup_window_ms"}:
+        allowed = {"min_confidence", "dedup_window_ms", "follow_up_min_confidence"}
+        if not isinstance(raw, dict) or set(raw) - allowed:
             raise ContractError("acknowledgement must be an object with known keys only")
         return cls(**raw)
 
@@ -537,6 +670,11 @@ class Acknowledgement:
             "version": 1,
             "min_confidence": self.min_confidence,
             "dedup_window_ms": self.dedup_window_ms,
+            **(
+                {"follow_up_min_confidence": self.follow_up_min_confidence}
+                if self.follow_up_min_confidence is not None
+                else {}
+            ),
         }
 
 
@@ -622,6 +760,10 @@ class ProviderDecision:
     dismissal_confidence: float | None = None
     # True when the dismissal answer was missing or malformed and degraded to `uncertain`.
     dismissal_malformed: bool = False
+    # With the answered gate on (#199): the stream time a different speaker started within
+    # the reply window after this unnamed turn, or None. The event layer decides whether it
+    # withholds the turn (not while the assistant's own audio was playing then).
+    answered_at_ms: int | None = None
 
     def __post_init__(self) -> None:
         if self.label not in LABELS:
@@ -636,6 +778,10 @@ class ProviderDecision:
             probability(self.dismissal_confidence)
         if self.attention_choice is not None and self.attention_choice not in LABELS:
             raise ContractError("invalid raw attention choice")
+        if self.answered_at_ms is not None and (
+            type(self.answered_at_ms) is not int or self.answered_at_ms < 0
+        ):
+            raise ContractError("invalid answered time")
         identifier(self.recipient, "recipient")
         identifier(self.model, "model")
         identifier(self.provider_id, "provider_id")

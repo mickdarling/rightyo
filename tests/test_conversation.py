@@ -124,6 +124,43 @@ class ConversationEventTests(unittest.TestCase):
         )
         self.assertEqual(engaged["request_id"], events[1]["request_id"])
 
+    def test_a_turn_decided_after_the_speakers_are_forgotten_engages_no_one(self):
+        # hailing-station #735 S-1, round 17: accepted under the old labels, decided after a
+        # forget, its request still goes as heard, but nothing is kept by its label.
+        self.start(dismissal=Dismissal())
+        owner = turn("t1", 0, 900, "Haili, what time is it?")
+        self.events.transcript(owner, owner.end_ms)
+        self.events.forget_speakers(now_ms=900)
+        self.events.decision(decided(owner, "attend"), owner.end_ms + 100)
+        events = [e for e in self.events.drain() if e["type"] in {"request", "conversation"}]
+        self.assertEqual(self.kinds(events), ["request"])
+        self.assertEqual(events[0]["turn"]["speaker_id"], "Speaker A")
+        guest = turn("t2", 2000, 2900, "and the other thing")  # the recycled label
+        self.assertFalse(self.events._engaged_with(guest))
+        self.assertEqual(
+            (self.events._delivered, self.events._appendix_from, self.events._label_stale),
+            ({}, {}, set()),
+        )
+        later = self.say(turn("t3", 3000, 3900, "And tomorrow?"), "uncertain", attend=0.8)
+        self.assertEqual(self.kinds(later), ["attention"])  # no follow-up without the name
+
+    def test_after_forgetting_a_configured_owner_label_gives_no_owner_role(self):
+        # Round 17 (Jarvis, option iii): the fresh diarizer may give the owner's configured label
+        # to anyone, so until the session restarts it gives no owner role. Fails closed.
+        notes = []
+        self.events = SpeechEvents(report=notes.append)
+        self.start(priority=ConfiguredPriorityProvider(SpeakerPriority(owners=("Speaker A",))))
+        before = self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
+        self.assertEqual(before[1]["turn"]["role"], "owner")
+        self.events.forget_speakers(now_ms=1000)
+        ended = [e for e in self.events.drain() if e["type"] == "conversation"]
+        self.assertEqual([(e["state"], e["reason"]) for e in ended], [("ambient", "timeout")])
+        after = self.say(turn("t2", 2000, 2900, "Haili, what time is it?"), "attend")
+        self.assertEqual(after[1]["turn"]["role"], "unknown")
+        self.assertEqual(sum("configured owner" in note for note in notes), 1)
+        self.events.forget_speakers(now_ms=3000)
+        self.assertEqual(sum("configured owner" in note for note in notes), 1)  # logged once
+
     def test_an_engaged_speakers_undecided_follow_up_becomes_a_request(self):
         self.start()
         self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend")
@@ -1095,6 +1132,39 @@ class ControlInputTests(unittest.TestCase):
             if phase not in {"started", "ended"}:
                 raise PrototypeError("invalid reply phase")
             self.phases.append(phase)
+
+    def test_meeting_lines_forward_on_off_and_refuse_extra_keys_or_non_booleans(self):
+        import contextlib
+        import io
+        import os
+        import threading
+        from types import SimpleNamespace
+
+        from rightyo.prototype import PrototypeController
+        from rightyo.tool import _read_control
+
+        events = SpeechEvents()
+        controller = SimpleNamespace(_lock=threading.RLock(), _events=events)
+        calls = []
+
+        def meeting(on):
+            PrototypeController.meeting(controller, on)
+            calls.append(on)
+
+        read, write = os.pipe()
+        os.write(
+            write,
+            b'{"meeting": true}\n{"meeting": false}\n'
+            b'{"meeting": false, "media": true}\n'
+            b'{"meeting": 1}\n{"meeting": "yes"}\n{"meeting": null}\n',
+        )
+        os.close(write)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            _read_control(read, SimpleNamespace(meeting=meeting))
+        self.assertEqual(calls, [True, False])
+        self.assertEqual(errors.getvalue(), "rightyo: invalid control line; skipped\n" * 4)
+        self.assertIs(events._meeting, False)
 
     def test_reports_are_forwarded_and_junk_is_skipped(self):
         import contextlib

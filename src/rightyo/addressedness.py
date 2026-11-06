@@ -38,6 +38,24 @@ DEFAULT_SCENE = (
     "rather than people in the room. A question or request that no other person answers "
     "is likely meant for the assistant."
 )
+# A precision-first setting (#199): only clear requests to the assistant are addressed to it;
+# thinking aloud, narration, reading aloud, talk about it and media are not. Evaluated on a
+# private hold-out of real turns it raised precision to 0.86 at 0.52 recall, so it is a
+# per-session choice for situations that need few false acts, not the default.
+CLEAR_REQUESTS_SCENE = (
+    "One owner and possibly other people are in the room with an AI assistant listening "
+    "through a device. The assistant acts only on clear requests or questions addressed to "
+    "it, with or without its name. Thinking aloud, narrating what is on a screen, reading "
+    "text or errors aloud, notes to self, talk between people, talk about the assistant in "
+    "the third person, and media playback are not addressed to the assistant. If a person "
+    "present could be the intended recipient, assume they are. A request nobody present "
+    "answers, in a quiet gap, is more likely meant for the assistant. When the assistant has "
+    "just acted or replied, a short continuation from the same speaker that refers back to "
+    'that request ("and the second one too", "no, the other one", "make it shorter", "not '
+    'you", "thanks") is addressed to the assistant. When in doubt, the assistant stays silent.'
+)
+# The built-in scenes `listen --scene` selects by name for one session.
+SCENES = {"default": DEFAULT_SCENE, "clear-requests": CLEAR_REQUESTS_SCENE}
 MAX_SCENE_CHARS = 1000
 
 # How long a request-shaped turn is held after its last word to observe the gap (#96).
@@ -179,6 +197,170 @@ def request_shaped(text: str) -> bool:
     return index < len(words) and words[index] in _OPENERS
 
 
+# Words a finished request rarely ends on: articles, connectives, a few prepositions,
+# fillers, modals and possessives ("add the", "remind me to", "and"). Particles and object
+# pronouns ("turn it on", "do it", "thank you", "play this") end complete commands, so
+# they are left out.
+_DANGLING = frozenset(
+    "a an the and or but because if when like um uh to of with for at "
+    "can could would should will my your our".split()
+)
+# Words that open a request and may come alone, or beside a name, before it.
+_OPENING = frozenset({"can", "could", "you", "hey", "so", "um", "uh"})
+
+
+# A listener's short acknowledgement while someone else holds the floor (#216): "mm",
+# "yeah", "uh-huh". After Pipecat's user backchannel frames, it is not a turn of its own
+# that ends the speaker's; the turn merger may bridge it. "yes", "sure", "okay" and
+# "right" are left out: they are often real answers or consent.
+_BACKCHANNEL = frozenset("mm mmm mhm hmm hm uh huh uhhuh yeah aha ah oh".split())
+MAX_BACKCHANNEL_WORDS = 3
+_LETTERS_ONLY = re.compile(r"[a-z]+")
+
+
+def backchannel_shaped(text: str) -> bool:
+    """Whether a turn is only a short backchannel ("mm", "yeah", "uh-huh", "mm-hmm").
+
+    At most three words, each a backchannel token; a question mark ("yeah?") asks for a
+    reply and is not one. English, deterministic, approximate.
+    """
+    if text.rstrip().endswith("?"):
+        return False
+    words = _LETTERS_ONLY.findall(text.lower())
+    return 0 < len(words) <= MAX_BACKCHANNEL_WORDS and all(w in _BACKCHANNEL for w in words)
+
+
+def unfinished_shaped(text: str, addressing: Addressing | None = None) -> bool:
+    """Whether a turn looks cut off mid-request (English, deterministic, approximate, #199).
+
+    True when its last word is an article, connective, preposition, filler, modal or
+    possessive that expects more, or when it is one or two words, each a name of the
+    assistant or a request opener ("Jarvis,", "hey Jarvis", "can you"). A question mark
+    ends a turn ("What time is it?"); other trailing punctuation is ignored, since
+    recognition often ends a fragment with a period.
+    """
+    words = _WORDS.findall(text.lower())
+    if not words or text.rstrip().endswith("?"):
+        return False
+    if words[-1] in _DANGLING:
+        return True
+    if len(words) > 2:
+        return False
+    # A bare name or opener, or one beside the other ("hey Jarvis"), but not "Jarvis stop".
+    named = [word for word in words if mentions_name(addressing, word)]
+    rest = [word for word in words if word not in named]
+    return all(word in _OPENING for word in rest) and bool(named or rest)
+
+
+# A follow-up's cue that it continues the exchange with the assistant (#199). Precision
+# first: talk to a pet or a passer-by often has "it", "that", "you" or "no" in it ("No,
+# sit", "Is that your dog?"), so those count only in the shapes below.
+_LETTERS = re.compile(r"[a-z]+")
+# Words that refer back to the request or its result, anywhere in the turn; "other",
+# "same", "second" and "first" count only in the phrases below ("just a second", "same to
+# you" and "on the other hand" are everyday talk).
+_REFERRING = frozenset({"again", "instead", "previous"})
+_REFERRING_PAIRS = frozenset(
+    {
+        ("the", "same"),
+        ("the", "second"),
+        ("second", "one"),
+        ("the", "first"),
+        ("first", "one"),
+        ("other", "one"),
+        ("one", "more"),
+    }
+)
+# A bare "it", "that" or "this" counts after a verb that acts on the assistant's output.
+_OUTPUT_VERBS = frozenset(
+    "turn make change play read repeat send set cancel skip undo save open show fix delete "
+    "add remove move".split()
+)
+_OBJECTS = frozenset({"it", "that", "this", "those", "these", "them"})
+_MODALS = frozenset({"can", "could", "would", "will"})
+# Short adjustments of what the assistant just did ("louder", "next one", "more please").
+_ADJUSTMENTS = frozenset(
+    (
+        "louder quieter softer more less another next skip repeat cancel slower faster "
+        "shorter longer bigger smaller"
+    ).split()
+)
+# Verbs that open a request to the assistant ("Run the review", "Check my calendar") when
+# the turn has at least three words and no "your" ("Call your mom back" is to a person).
+# Verbs of pet commands and everyday talk ("drop", "make", "put", "get", "go", "come",
+# "leave", "look", "give", "show", "play", "tell") are left out.
+_REQUEST_VERBS = frozenset(
+    (
+        "run check search open close write create draft summarize summarise review update "
+        "list explain call email text message remind schedule book read pause resume "
+        "send add remove delete fix"
+    ).split()
+)
+# Courtesy and transition words that may come before the opening verb ("please run ...").
+_VERB_LEAD = frozenset("please ok okay now so alright".split())
+# A correction of what the assistant just said ("you mean $134", "I meant the other one").
+# "I said ..." is left out: "No, I said sit" is how a dog is told twice. "What do you mean"
+# and "do you mean" ask a person.
+_CORRECTIONS = frozenset({("you", "mean"), ("i", "meant")})
+
+
+# How an answer to the assistant's own question opens ("Yes, do both", "Go ahead") (#199).
+_ANSWER_WORDS = frozenset("yes yeah yep yup sure no nope okay ok".split())
+_ANSWER_PAIRS = frozenset({("go", "ahead"), ("do", "it"), ("sounds", "good")})
+
+
+def answer_shaped(text: str) -> bool:
+    """Whether a turn opens as an answer to a yes/no question (English, approximate, #199).
+
+    True when its first word is "yes", "yeah", "yep", "yup", "sure", "no", "nope", "okay"
+    or "ok", or it opens "go ahead", "do it" or "sounds good". Only meaningful right after
+    the assistant asked the owner a question; contractions are split as in `follow_up_cued`.
+    """
+    words = _LETTERS.findall(text.lower())
+    return bool(words) and (words[0] in _ANSWER_WORDS or tuple(words[:2]) in _ANSWER_PAIRS)
+
+
+def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
+    """Whether a turn carries a cue that it continues an exchange with the assistant (#199).
+
+    True when it names the assistant; asks the assistant ("can you", "could you"); refers
+    back ("the other one", "again", "instead"); acts on the result ("play that", "turn it
+    up"); opens by adding to it ("and ...", "what about ...", "how about ...", "actually
+    ..."); is a short adjustment ("louder", "next one"); opens a request of three or more
+    words with a request verb ("run the review"); says "please" beside a request verb or
+    a modal ("please have it fix both"); or corrects it ("you mean ...",
+    "I meant ..."). Talk to a pet or a passer-by
+    ("No, sit", "Is that your dog?") usually carries none. English, deterministic,
+    approximate; contractions are split ("that's" is "that s").
+    """
+    words = _LETTERS.findall(text.lower())
+    if not words:
+        return False
+    pairs = list(zip(words, words[1:]))
+    # "And eggs" adds to a request; "and you" is a reply to someone else.
+    adds = words[0] == "and" and len(words) > 1 and words[1] != "you"
+    lead = next((word for word in words if word not in _VERB_LEAD), "")
+    return (
+        mentions_name(addressing, text)
+        or adds
+        or words[0] == "actually"
+        or not _REFERRING_PAIRS.isdisjoint(pairs)
+        or tuple(words[:2]) in {("what", "about"), ("how", "about")}
+        or not _REFERRING.isdisjoint(words)
+        or any(a in _MODALS and b == "you" for a, b in pairs)
+        or any(a in _OUTPUT_VERBS and b in _OBJECTS for a, b in pairs)
+        # One word between ("show me that", "read me this").
+        or any(a in _OUTPUT_VERBS and c in _OBJECTS for a, c in zip(words, words[2:]))
+        or (len(words) <= 3 and words[0] in _ADJUSTMENTS)
+        or (len(words) >= 3 and lead in _REQUEST_VERBS and "your" not in words)
+        or ("please" in words and not (_REQUEST_VERBS | _MODALS).isdisjoint(words))
+        or any(
+            pair in _CORRECTIONS and (index == 0 or words[index - 1] not in {"do", "what"})
+            for index, pair in enumerate(pairs)
+        )
+    )
+
+
 # Cue phrases of a dismissal, as `normalize_phrase` writes them (apostrophes removed,
 # casefolded). A turn is dismissal-shaped only when one of them opens it (after fillers
 # and an optional short vocative) and nothing but tail words follow, so a request that
@@ -300,7 +482,7 @@ def mentions_name(addressing: Addressing | None, text: str) -> bool:
 
     Runs are as long as the longest configured name or variant, so a long name is found.
     """
-    if addressing is None:
+    if addressing is None or not addressing.names:
         return False
     spellings = [s for name in addressing.names for s in (name, *addressing.spellings(name))]
     longest = max(len(normalize_phrase(spelling).split()) for spelling in spellings)

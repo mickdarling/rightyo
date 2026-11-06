@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hmac
+import inspect
 import json
 import math
 import queue
@@ -15,7 +16,8 @@ import wave
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Callable
 
 from rightyo.addressedness import (
     DEFAULT_REPLY_WAIT_MS,
@@ -23,6 +25,7 @@ from rightyo.addressedness import (
     dismissal_shaped,
     reply_wait,
     scene_text,
+    unfinished_shaped,
 )
 from rightyo.capture import CaptureError, MacMicrophoneCapture, StdinPcmCapture
 from rightyo.contracts import (
@@ -40,11 +43,25 @@ from rightyo.contracts import (
 )
 from rightyo.credentials import CredentialError
 from rightyo.live_audio import (
+    MAX_TIMELINE_WINDOW_MS,
+    MIN_TIMELINE_WINDOW_MS,
+    TIMELINE_WINDOW_MS,
     LiveAudioError,
     LiveConfig,
     LiveProcessor,
+    RecognizerSandboxError,
+    recognizer_dir,
+    timeline_window,
 )
-from rightyo.live_speaker_id import EnrolledRoles, ShadowSpeakerId
+from rightyo.live_speaker_id import (
+    MAX_RING_MS,
+    MIN_RING_MS,
+    RING_MS,
+    EnrolledRoles,
+    PrivateTurnAudio,
+    ShadowSpeakerId,
+    speaker_ring_ms,
+)
 from rightyo.memory import MemorySessionLimitError, TranscriptMemory
 from rightyo.pipeline import ReplayRunner
 from rightyo.providers import (
@@ -64,12 +81,21 @@ from rightyo.speech_backends import (
     diarizer_factory,
     diarizer_spec,
     is_hosted,
+    is_synthetic,
     speech_summary,
     transcriber_factory,
     transcriber_spec,
     utterance_local_labels,
 )
-from rightyo.turn_merge import DEFAULT_TURN_MERGE_GAP_MS, merge_gap, tail_join
+from rightyo.state_log import DecisionStateLog
+from rightyo.tool_events import privacy_phrase
+from rightyo.turn_merge import (
+    DEFAULT_TURN_MERGE_GAP_MS,
+    complete_hold,
+    merge_gap,
+    owner_pause,
+    tail_join,
+)
 
 BROWSER_LEASE_SECONDS = 15
 # Jev requests per demo session unless the session or configuration sets a cap. Live
@@ -104,7 +130,48 @@ class DecisionConfigError(PrototypeError):
     """An invalid `decision` section; its message names the rule rather than a value."""
 
 
+class RetentionConfigError(PrototypeError):
+    """An invalid `audio_retention` section; its message names the rule, never the value."""
+
+
 DECISION_PROVIDERS = ("mock", "jev")
+AUDIO_RETENTION_KEYS = frozenset({"speaker_ring_seconds", "timeline_window_seconds"})
+
+
+def audio_retention_spec(value: Any) -> tuple[int, int]:
+    """The `audio_retention` section (#226) as (speaker ring ms, timeline window ms).
+
+    Both keys are optional and independent; an absent key keeps its 60 s default. Each is
+    a whole number of seconds within its bounds, and anything else is refused, never
+    clamped. Memory only: neither buffer is ever written, and a change applies when
+    RightyO next starts.
+    """
+    if not isinstance(value, dict) or not set(value) <= AUDIO_RETENTION_KEYS:
+        raise RetentionConfigError(
+            "The audio_retention section must be an object with only the optional keys "
+            "speaker_ring_seconds and timeline_window_seconds"
+        )
+    ring = value.get("speaker_ring_seconds", RING_MS // 1000)
+    window = value.get("timeline_window_seconds", TIMELINE_WINDOW_MS // 1000)
+    try:
+        if type(ring) is not int:
+            raise ValueError
+        ring_ms = speaker_ring_ms(ring * 1000)
+    except ValueError:
+        raise RetentionConfigError(
+            "The audio_retention speaker_ring_seconds value must be a whole number of "
+            f"seconds from {MIN_RING_MS // 1000} to {MAX_RING_MS // 1000}"
+        ) from None
+    try:
+        if type(window) is not int:
+            raise LiveAudioError("Invalid timeline window")
+        window_ms = timeline_window(window * 1000)
+    except LiveAudioError:
+        raise RetentionConfigError(
+            "The audio_retention timeline_window_seconds value must be a whole number of "
+            f"seconds from {MIN_TIMELINE_WINDOW_MS // 1000} to {MAX_TIMELINE_WINDOW_MS // 1000}"
+        ) from None
+    return ring_ms, window_ms
 
 
 def decision_spec(value: Any) -> bool:
@@ -123,11 +190,16 @@ def decision_spec(value: Any) -> bool:
             "allow_hosted",
             "max_requests",
             "scene",
+            "attend_min_probability",
+            "other_answered_blocks",
+            "state_log",
+            "request_context",
         }
     ):
         raise DecisionConfigError(
             "The decision section requires exactly the keys provider and allow_hosted, "
-            "with an optional max_requests and scene"
+            "with an optional max_requests, scene, attend_min_probability, "
+            "other_answered_blocks, state_log and request_context"
         )
     provider, allow_hosted = value["provider"], value["allow_hosted"]
     if type(provider) is not str or provider not in DECISION_PROVIDERS:
@@ -146,6 +218,30 @@ def decision_spec(value: Any) -> bool:
             )
         if provider != "jev":
             raise DecisionConfigError("max_requests applies only to the jev decision provider")
+    if "attend_min_probability" in value:
+        bar = value["attend_min_probability"]
+        if type(bar) not in {int, float} or not 0 <= bar <= 1:
+            raise DecisionConfigError(
+                "The decision attend_min_probability value must be a number from 0 to 1"
+            )
+        if provider != "jev":
+            raise DecisionConfigError(
+                "attend_min_probability applies only to the jev decision provider"
+            )
+    if "request_context" in value and type(value["request_context"]) is not bool:
+        raise DecisionConfigError("The decision request_context value must be true or false")
+    if "other_answered_blocks" in value and type(value["other_answered_blocks"]) is not bool:
+        raise DecisionConfigError("The decision other_answered_blocks value must be true or false")
+    if "state_log" in value:
+        log = value["state_log"]
+        if type(log) is not str or not log.startswith("/") or "\x00" in log:
+            raise DecisionConfigError("The decision state_log value must be an absolute path")
+        if any((parent / ".git").exists() for parent in Path(log).resolve().parents):
+            raise DecisionConfigError(
+                "The decision state_log must be stored outside the repository"
+            )
+        if provider != "jev":
+            raise DecisionConfigError("state_log applies only to the jev decision provider")
     if "scene" in value:
         try:
             scene_text(value["scene"])
@@ -169,14 +265,19 @@ def validate_session_budget(value: Any) -> int | None:
     return value
 
 
+# One speaker's share of a word that labels it when no word of the utterance is
+# otherwise labelled (#220). Off until validated live; 0.5 is the suggested value.
+DEFAULT_WORD_LABEL_COVERAGE = 0
+
+
 @dataclass(frozen=True)
 class PrototypeConfig:
-    # Local assets are required by the local backends only; a hosted selection may omit them.
+    # Native assets are required only by native backends; explicit mocks need none.
     whisper_executable: Path | None
     whisper_model: Path | None
     diarization_library: Path | None
     diarization_model: Path | None
-    microphone_helper: Path
+    microphone_helper: Path | None
     demo_audio: Path | None = None
     addressing: Addressing | None = None
     other_agents: Addressing | None = None
@@ -191,9 +292,38 @@ class PrototypeConfig:
     # The section's optional `max_requests`: a per-session Jev request cap for sessions
     # that set none themselves (`listen`). None leaves live sessions uncapped (#75).
     decision_max_requests: int | None = None
+    # The section's optional `attend_min_probability`: Jev's attend probability an attend
+    # needs, above `min_confidence` (evaluation favoured 0.9). None leaves attend as is.
+    decision_attend_min_probability: float | None = None
+    # The section's optional `other_answered_blocks` (#199): with the post-turn gap on, an
+    # unnamed turn another speaker answers within the reply window is not attended.
+    decision_other_answered_blocks: bool = False
+    # The section's optional `state_log` (#199): an absolute path where each decided live
+    # turn's exact state and answer are appended (transcript text included; `0600`).
+    decision_state_log: Path | None = None
+    # The section's optional `request_context` (#199): decision states carry the latest
+    # request formed and how long ago, so a follow-up that refers back to it is recognized.
+    decision_request_context: bool = False
     # The optional `turns` section's `merge_gap_ms` (#73): a same-speaker turn starting
     # within this gap of the previous one is joined before it is emitted or decided.
     turn_merge_gap_ms: int = DEFAULT_TURN_MERGE_GAP_MS
+    # The `turns` section's `hold_unfinished` (#199): a turn that looks cut off mid-request
+    # ("Jarvis, add the") is held for the merge gap even when the end-of-turn model calls
+    # it complete, so its continuation can join it. On by default.
+    turn_hold_unfinished: bool = True
+    # The `turns` section's `complete_hold_ms`, `collapse_restarts` and
+    # `bridge_backchannels` (#216): see `LiveConfig`. All off by default: the hold delays
+    # every complete request, and the other two only act with it or change a turn's text.
+    turn_complete_hold_ms: int = 0
+    turn_collapse_restarts: bool = False
+    turn_bridge_backchannels: bool = False
+    # The `turns` section's `wake_join` (#230): a lone unattributed wake word joins the
+    # owner's following sentence. On by default; acts only with names and owners.
+    turn_wake_join: bool = True
+    # The `turns` section's `owner_pause_ms` (hailing-station #735 R-1): the owner's own
+    # turns wait this long for a continuation, as the complete hold and the merge gap; see
+    # `LiveConfig.turn_owner_pause_ms`. 0, the default, is off; acts only with owners.
+    turn_owner_pause_ms: int = 0
     # The `decision` section's optional `scene` (#96): the setting text given to the
     # decision model. Absent means the single-user pilot default; null turns it off.
     decision_scene: str | None = DEFAULT_SCENE
@@ -206,6 +336,9 @@ class PrototypeConfig:
     # The `turns` section's `tail_join_ms` (#129): joining an unlabelled tail into the
     # held labelled turn (see `LiveConfig.tail_join_ms`); 0, the default, is off.
     tail_join_ms: int = 0
+    # The `turns` section's `word_label_coverage` (#220): see
+    # `LiveConfig.word_label_coverage`; 0 turns it off.
+    word_label_coverage: float = DEFAULT_WORD_LABEL_COVERAGE
     # The optional `dismissal` section (#98): natural dismissal and the `dismiss` event.
     # Absent means off; `{}` turns it on with the defaults.
     dismissal: Dismissal | None = None
@@ -219,12 +352,21 @@ class PrototypeConfig:
     # acknowledgement on confidence or a name. Absent means off (every request is
     # acknowledged, as before); `{}` turns it on with the default threshold.
     acknowledgement: Acknowledgement | None = None
+    # hailing-station#735 meeting mode (#227): named owner abstentions may attend,
+    # anywhere in a turn, only while the host's meeting control is on.
+    meeting_ask_anywhere: bool = True
     # The optional `speaker_id` section (#137 step 3): the local speaker-embedding model
     # and enrollment store used by `rightyo enroll`. Absent or `"enabled": false` means
     # off. With `"live": true`, live sessions also run shadow identification (step 4a):
     # per-label scores on stderr, with no change to turns, roles or events. With
     # `"roles": true` as well (step 4b), bound labels carry their enrolled role.
     speaker_id: SpeakerIdConfig | None = None
+    # The optional `audio_retention` section (#226), memory only and fixed for the process:
+    # how much session PCM live speaker identification keeps to cut turns from, and the
+    # trailing diarizer timeline window used for attribution (see `LiveConfig`). Both
+    # default to 60 s and are independent.
+    speaker_ring_ms: int = RING_MS
+    timeline_window_ms: int = TIMELINE_WINDOW_MS
 
     @property
     def voiceprint_roles(self) -> bool:
@@ -232,9 +374,26 @@ class PrototypeConfig:
         return self.speaker_id is not None and self.speaker_id.roles
 
     @property
+    def hosted_audio_consumers(self) -> tuple[str, ...]:
+        """#242 round 27: every consumer of session audio that is not local, by name. Each one
+        declares it here: the transcriber and diarizer by their selected kind; the end-of-turn
+        model (`end_of_turn`) and the speaker-ID embedder (`speaker_id`) are local subprocesses
+        by construction (no hosted kind exists); decisions and roles never take audio (a private
+        turn's words never reach them, `_accept`, and model-sourced roles are refused live)."""
+        return tuple(
+            name
+            for name, spec in (("transcriber", self.transcriber), ("diarizer", self.diarizer))
+            if is_hosted(spec)
+        )
+
+    @property
     def hosted_speech(self) -> bool:
         """Whether a selected speech backend would send audio to a hosted service."""
-        return is_hosted(self.transcriber) or is_hosted(self.diarizer)
+        return bool(self.hosted_audio_consumers)
+
+    @property
+    def synthetic_speech(self) -> bool:
+        return is_synthetic(self.transcriber) or is_synthetic(self.diarizer)
 
     @classmethod
     def load(cls, path: Path) -> PrototypeConfig:
@@ -248,18 +407,31 @@ class PrototypeConfig:
                 raise ValueError
             transcriber = transcriber_spec(raw.pop("transcriber", None))
             diarizer = diarizer_spec(raw.pop("diarizer", None))
+            synthetic = is_synthetic(transcriber) or is_synthetic(diarizer)
+            if synthetic and (
+                not (is_synthetic(transcriber) and is_synthetic(diarizer))
+                or "end_of_turn" in raw
+                or "speaker_id" in raw
+            ):
+                raise ValueError
             has_decision = "decision" in raw
             decision = raw.pop("decision", None)
             hosted_decisions = has_decision and decision_spec(decision)
+            if synthetic and hosted_decisions:
+                raise ValueError
             # Optional per-session cap on live Jev requests; absent means none (#75).
             decision_requests = decision.get("max_requests") if hosted_decisions else None
+            attend_bar = decision.get("attend_min_probability") if hosted_decisions else None
+            answered = bool(has_decision and decision.get("other_answered_blocks", False))
+            state_log = decision.get("state_log") if hosted_decisions else None
+            acted = bool(has_decision and decision.get("request_context", False))
             scene = (
                 scene_text(decision.get("scene", DEFAULT_SCENE)) if has_decision else DEFAULT_SCENE
             )
-            required = {"microphone_helper"}
-            if not is_hosted(transcriber):
+            required = set() if synthetic else {"microphone_helper"}
+            if transcriber["kind"] == "whisper.cpp":
                 required |= {"whisper_executable", "whisper_model"}
-            if not is_hosted(diarizer):
+            if diarizer["kind"] == "nemotron.cpp":
                 required |= {"diarization_library", "diarization_model"}
             if not required <= raw.keys():
                 raise ValueError
@@ -274,8 +446,11 @@ class PrototypeConfig:
                 "end_of_turn",
                 "conversation",
                 "acknowledgement",
+                "meeting",
                 "speaker_id",
                 "other_agents",
+                "audio_retention",
+                "microphone_helper",
                 *LOCAL_ASSETS,
             }
             if raw.keys() - required - optional:
@@ -303,26 +478,58 @@ class PrototypeConfig:
             acknowledgement = raw.pop("acknowledgement", None)
             if acknowledgement is not None:
                 acknowledgement = Acknowledgement.from_dict(acknowledgement)
+            meeting = raw.pop("meeting", {})
+            if not isinstance(meeting, dict) or set(meeting) - {"ask_anywhere"}:
+                raise ValueError
+            ask_anywhere = meeting.get("ask_anywhere", True)
+            if type(ask_anywhere) is not bool:
+                raise ValueError
             end_of_turn = raw.pop("end_of_turn", None)
             if end_of_turn is not None:
                 end_of_turn = EndOfTurn.from_dict(end_of_turn)
             speaker_id = raw.pop("speaker_id", None)
             if speaker_id is not None:
                 speaker_id = SpeakerIdConfig.from_dict(speaker_id)
+            ring_ms, window_ms = audio_retention_spec(raw.pop("audio_retention", {}))
             turns = raw.pop("turns", {})
             if not isinstance(turns, dict) or set(turns) - {
                 "merge_gap_ms",
                 "reply_wait_ms",
                 "edge_attribution_ms",
                 "tail_join_ms",
+                "hold_unfinished",
+                "word_label_coverage",
+                "complete_hold_ms",
+                "collapse_restarts",
+                "bridge_backchannels",
+                "wake_join",
+                "owner_pause_ms",
             }:
                 raise ValueError
+            hold_unfinished = turns.get("hold_unfinished", True)
+            restarts = turns.get("collapse_restarts", False)
+            bridge = turns.get("bridge_backchannels", False)
+            wake_join = turns.get("wake_join", True)
+            if type(hold_unfinished) is not bool or {
+                type(restarts),
+                type(bridge),
+                type(wake_join),
+            } != {bool}:
+                raise ValueError
+            hold_complete = complete_hold(turns.get("complete_hold_ms", 0))
+            pause = owner_pause(turns.get("owner_pause_ms", 0))
             tail = tail_join(turns.get("tail_join_ms", 0))
+            coverage = turns.get("word_label_coverage", DEFAULT_WORD_LABEL_COVERAGE)
+            if type(coverage) not in (int, float) or not 0 <= coverage <= 1:
+                raise ValueError
             edges = turns.get("edge_attribution_ms", 0)
             if type(edges) is not int or not 0 <= edges <= 2000 or edges % 20:
                 raise ValueError
             gap = merge_gap(turns.get("merge_gap_ms", DEFAULT_TURN_MERGE_GAP_MS))
             wait = reply_wait(turns.get("reply_wait_ms", DEFAULT_REPLY_WAIT_MS))
+            if answered and not wait:
+                # The gate reads the post-turn gap (#199); without it, it would do nothing.
+                raise DecisionConfigError("other_answered_blocks needs turns.reply_wait_ms above 0")
             values = {}
             for name, value in raw.items():
                 if not isinstance(value, str) or not value or not Path(value).is_absolute():
@@ -330,7 +537,7 @@ class PrototypeConfig:
                 values[name] = Path(value)
             config = cls(
                 **{name: values.get(name) for name in LOCAL_ASSETS},
-                microphone_helper=values["microphone_helper"],
+                microphone_helper=values.get("microphone_helper"),
                 demo_audio=values.get("demo_audio"),
                 addressing=addressing,
                 other_agents=other_agents,
@@ -341,16 +548,30 @@ class PrototypeConfig:
                 diarizer=diarizer,
                 hosted_decisions=hosted_decisions,
                 decision_max_requests=decision_requests,
+                decision_attend_min_probability=attend_bar,
+                decision_other_answered_blocks=answered,
+                decision_state_log=None if state_log is None else Path(state_log),
+                decision_request_context=acted,
                 turn_merge_gap_ms=gap,
+                turn_hold_unfinished=hold_unfinished,
+                turn_complete_hold_ms=hold_complete,
+                turn_collapse_restarts=restarts,
+                turn_bridge_backchannels=bridge,
+                turn_wake_join=wake_join,
+                turn_owner_pause_ms=pause,
                 decision_scene=scene,
                 reply_wait_ms=wait,
                 edge_attribution_ms=edges,
                 tail_join_ms=tail,
+                word_label_coverage=coverage,
                 dismissal=dismissal,
                 end_of_turn=end_of_turn,
                 conversation=conversation,
                 acknowledgement=acknowledgement,
+                meeting_ask_anywhere=ask_anywhere,
                 speaker_id=speaker_id,
+                speaker_ring_ms=ring_ms,
+                timeline_window_ms=window_ms,
             )
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
@@ -371,12 +592,33 @@ class PrototypeConfig:
                 # none named every voice would be a participant, which is a mistake.
                 raise ValueError
             return config
-        except DecisionConfigError:
+        except (DecisionConfigError, RetentionConfigError):
             raise
         except (OSError, ValueError, TypeError, UnicodeError, RecursionError):
             raise PrototypeError(
                 "Prototype requires an existing local asset configuration"
             ) from None
+
+
+def _takes_keyword(factory: Any, name: str) -> bool:
+    """Whether `factory` accepts the keyword argument `name` (#226).
+
+    True when its signature names it as a keyword parameter or takes `**kwargs`, and also
+    when the signature cannot be read, so such a factory is called exactly as before.
+    `inspect.signature` follows `functools.wraps`, so a wrapper that accepts `ring_ms`
+    around a function that does not counts as ring-less: the ring is not applied, and the
+    note says so.
+    """
+    try:
+        parameters = inspect.signature(factory).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    keyword = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        or (parameter.name == name and parameter.kind in keyword)
+        for parameter in parameters
+    )
 
 
 def _no_report(_message: str) -> None:
@@ -407,7 +649,11 @@ class PrototypeController:
         speaker_id_factory=ShadowSpeakerId,
         owner_voice=None,
         input_route=None,
+        retain_transcripts=True,
     ):
+        if type(retain_transcripts) is not bool:
+            raise PrototypeError("Invalid transcript retention setting")
+        self.retain_transcripts = retain_transcripts
         self.config = config
         # Owner-voice status events (rightyo#164): an `OwnerVoice` from the host's opt-in,
         # else None and nothing new is advertised or emitted.
@@ -437,6 +683,16 @@ class PrototypeController:
         self._stdin_used = False
         # Optional host-facing stream. The lab retains its browser lease and UI controls.
         self._events = event_publisher
+        # #242 round 27: a publisher already private (as `--start-private` makes it) is refused
+        # here with hosted speech, as the CLI and `duck(True)` refuse it: the audio heard while
+        # private would still be sent to the hosted backend. Checked again at every start.
+        self._refuse_private_hosted()
+        # #242 round 28: a publisher that can be private must say what it heard in privacy
+        # (`heard_ducked`); one that cannot would leave every privacy judgement unknown.
+        if callable(getattr(event_publisher, "duck", None)) and not callable(
+            getattr(event_publisher, "heard_ducked", None)
+        ):
+            raise PrototypeError("A private-capable publisher must report what it heard privately")
         self._event_terminal = True
         self._lock = threading.RLock()
         self._generation = 0
@@ -451,6 +707,8 @@ class PrototypeController:
         self._runner: ReplayRunner | None = None
         self._capture = None
         self._processor = None
+        # The session's speaker identifier, while one runs (forgotten when privacy ends).
+        self._shadow = None
         self._audio_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._decision_cancel = threading.Event()
@@ -464,11 +722,15 @@ class PrototypeController:
         self._turn_spans: dict[str, tuple[tuple[int, int], ...]] = {}
         # The session's live identification role provider, or None (#137 step 4b).
         self._enrolled_roles: EnrolledRoles | None = None
+        self._private_sentence = PrivateTurnAudio()
         self._pending = 0
         self._requests = 0
         self._request_limit: int | None = DEFAULT_REQUEST_LIMIT
         self._received_ms = 0
         self._received_bytes = 0
+        # #242 round 27: the stream byte offset the current privacy interval began at, or None
+        # when unknown or public; an interval that received no audio forgets no speaker (`duck`).
+        self._private_from_bytes: int | None = 0 if self._private_audio() else None
         self._budget_ms: int | None = None
         self._budget_reached = False
         self._audio_started: float | None = None
@@ -564,6 +826,20 @@ class PrototypeController:
             raise PrototypeError("Stdin audio requires an explicit source provenance")
         if mode == "stdin" and self._stdin_used:
             raise PrototypeError("Stdin audio feeds one session only; start a new process")
+        if not self.retain_transcripts and hosted:
+            raise PrototypeError("Ordinary decisions require transcript retention")
+        if self.config.synthetic_speech and (
+            not (is_synthetic(self.config.transcriber) and is_synthetic(self.config.diarizer))
+            or mode != "stdin"
+            or self.audio_provenance != "synthetic"
+            or hosted
+            or self.config.hosted_decisions
+            or self.config.end_of_turn is not None
+            or self.config.speaker_id is not None
+        ):
+            # Reject before starting workers or selecting any backend/helper. A host
+            # must explicitly identify authored PCM; mocks never label live speech.
+            raise PrototypeError("Synthetic speech requires model-free synthetic stdin mode")
         if self.config.speakers is not None and self.config.speakers.source == "model":
             # A hosted role question would run on the audio path under the controller
             # lock, where Stop and lease expiry cannot reach it; tool-replay has no such
@@ -574,6 +850,22 @@ class PrototypeController:
             )
         if self.config.hosted_speech and not self.allow_hosted_speech:
             raise PrototypeError("Hosted speech backends require explicit hosted consent")
+        # #242 round 27: a restart, a replay or a demo, a configuration swapped since
+        # construction, or a publisher made private outside the controller since: none starts
+        # a hosted-speech session in privacy.
+        self._refuse_private_hosted()
+        if self.processor_factory is LiveProcessor and self.config.transcriber["kind"] == (
+            "whisper.cpp"
+        ):
+            # The local recognizer runs only in a directory this process cannot write
+            # (hailing-station #735 S-1); without one, refuse before any audio.
+            try:
+                recognizer_dir()
+            except RecognizerSandboxError:
+                raise PrototypeError(
+                    "Transcription refused: the local recognizer needs a directory this "
+                    "process cannot write, such as /var/empty"
+                ) from None
         roles = self.config.speakers
         if (
             roles is not None
@@ -633,6 +925,7 @@ class PrototypeController:
 
             memory = TranscriptMemory(retention_ms=retention * 1000)
             try:
+                bar = self.config.decision_attend_min_probability
                 provider = (
                     self.provider_factory(
                         allow_hosted=True,
@@ -640,6 +933,7 @@ class PrototypeController:
                         timeout_seconds=10,
                         min_confidence=confidence,
                         cancelled=cancelled,
+                        **({} if bar is None else {"attend_min_probability": bar}),
                     )
                     if hosted
                     else MockProvider()
@@ -648,11 +942,18 @@ class PrototypeController:
                 raise PrototypeError("Hosted decisions could not be initialized") from None
             runner = ReplayRunner(
                 provider,
-                memory=memory,
+                memory=memory if self.retain_transcripts else None,
                 cancelled=cancelled,
                 addressing=self.config.addressing,
                 scene=self.config.decision_scene,
                 post_turn_gaps=self.config.reply_wait_ms > 0,
+                other_answered_blocks=self.config.decision_other_answered_blocks,
+                state_log=(
+                    None
+                    if self.config.decision_state_log is None
+                    else DecisionStateLog(self.config.decision_state_log, report=self.report)
+                ),
+                request_context=self.config.decision_request_context,
                 dismissal_phrases=(
                     None
                     if self.config.dismissal is None
@@ -673,6 +974,9 @@ class PrototypeController:
                 else ConfiguredPriorityProvider(self.config.speakers)
             )
             self._enrolled_roles = priority if voiceprint else None
+            self._private_sentence.clear()
+            if self._enrolled_roles is not None:
+                self._enrolled_roles.exit_audio = self._private_sentence
             runner.restart(session)
             self._generation += 1
             generation = self._generation
@@ -687,6 +991,9 @@ class PrototypeController:
             self._turn_spans = {}
             self._pending = self._requests = self._received_ms = 0
             self._received_bytes = 0
+            # #242 round 27: a session that starts private (`--start-private`, or the mode held
+            # from before) has heard nothing in it yet; one that starts public, nothing private.
+            self._private_from_bytes = 0 if self._private_audio() else None
             self._budget_ms = None if budget_seconds is None else budget_seconds * 1000
             self._budget_reached = False
             self._audio_started = None
@@ -714,13 +1021,42 @@ class PrototypeController:
                     dismissal=self.config.dismissal,
                     conversation=self.config.conversation,
                     acknowledgement=self.config.acknowledgement,
+                    meeting_ask_anywhere=self.config.meeting_ask_anywhere,
                     other_agents=self.config.other_agents,
                     **({} if self.owner_voice is None else {"owner_voice": self.owner_voice}),
+                    # Privacy mode (internally duck, hailing-station #735): the live
+                    # controller takes the control, so a publisher that holds it advertises
+                    # it, unless its host control channel does not carry the line (a
+                    # coaching listener), or a hosted speech backend would still be sent the
+                    # audio heard while private (S-1, fail closed: the host then refuses).
+                    **(
+                        {"duck": True}
+                        if getattr(self._events, "duck_control", False) is True
+                        and callable(getattr(self._events, "duck", None))
+                        and not self.config.hosted_speech
+                        else {}
+                    ),
+                    # Meeting uses ordinary host controls, including with hosted speech.
+                    # Coaching's descriptor carries only its separate record protocol.
+                    **(
+                        {"meeting": True}
+                        if getattr(self._events, "meeting_control", False) is True
+                        and callable(getattr(self._events, "meeting", None))
+                        else {}
+                    ),
                 )
                 self._event_terminal = False
                 if self.owner_voice is not None and not voiceprint and self.report is not None:
                     with contextlib.suppress(Exception):
                         self.report("owner_voice off: speaker identification roles are not on")
+            if self.report is not None:
+                # The in-memory audio retention in force (#226): seconds only, once per
+                # session (one per `listen` process); best-effort, like every note.
+                with contextlib.suppress(Exception):
+                    self.report(
+                        f"audio_retention speaker_ring_s={self.config.speaker_ring_ms // 1000}"
+                        f" timeline_window_s={self.config.timeline_window_ms // 1000}"
+                    )
             threading.Thread(
                 target=self._decide,
                 args=(generation, stop, work, runner, hosted),
@@ -733,18 +1069,31 @@ class PrototypeController:
             )
             self._audio_thread.start()
 
-    def _accept(self, generation: int, work: queue.Queue, memory: TranscriptMemory, turn: Turn):
+    def _accept(
+        self, generation: int, work: queue.Queue, memory: TranscriptMemory, turn: Turn
+    ) -> bool | None:
+        """Accept a final turn; whether it was heard in privacy, or None once stopped."""
         with self._lock:
             if generation != self._generation or self._stop.is_set():
-                return
-            memory.append(turn)
+                return None
+            # Privacy mode (internally duck, hailing-station #735 S-1), judged by when the
+            # turn was heard (see `SpeechEvents.heard_ducked`): no hosted decision is ever
+            # asked for it and it is kept out of the memory every later decision's context
+            # is read from. It is still passed to the publisher, which only matches it for
+            # the local exit and status phrases and emits no transcript (`_private`).
+            ducked = self._heard_private(turn)
+            if ducked:
+                # Observed just before this accept (#96); no decision will ever take it.
+                self._turn_gaps.pop(turn.utterance_id, None)
+            if self.retain_transcripts and not ducked:
+                memory.append(turn)
             inferred = turn.utterance_id in self._inferred_turns
             self._inferred_turns.discard(turn.utterance_id)
             if self._events is not None:
                 # Passed only when set, so publishers without live roles see no change.
                 self._publish("transcript", turn, **({"inferred": True} if inferred else {}))
-            if self._decision_status == "off" or self._decision_cancel.is_set():
-                return
+            if self._decision_status == "off" or self._decision_cancel.is_set() or ducked:
+                return ducked
             try:
                 work.put_nowait(turn)
             except queue.Full:
@@ -753,15 +1102,118 @@ class PrototypeController:
                     self._decision_status = "unavailable"
                 self._discard_pending()
                 self._tool_attention_error("attention-backlog")
-                return
+                return ducked
             self._pending += 1
+            return ducked
+
+    def _heard_private_span(self, start_ms: int, end_ms: int) -> bool | None:
+        """Whether audio over this stream span was heard in privacy mode (#735 S-1), by the
+        same rule as a turn (`SpeechEvents.heard_ducked`); for the processor's diagnostics and
+        its settle at a privacy end. A publisher that can be private but cannot say gives None,
+        which the processor counts as private (#242 round 28: unknown counts); one with no
+        privacy at all never heard anything privately."""
+        heard_ducked = getattr(self._events, "heard_ducked", None)
+        if not callable(heard_ducked):
+            return None if callable(getattr(self._events, "duck", None)) else False
+        return heard_ducked(SimpleNamespace(start_ms=start_ms, end_ms=end_ms)) is True
+
+    def _heard_private(self, turn: Turn) -> bool:
+        """Whether the publisher heard this turn in privacy mode (hailing-station #735)."""
+        heard_ducked = getattr(self._events, "heard_ducked", None)
+        return callable(heard_ducked) and heard_ducked(turn) is True
 
     def _turn_break(self):
-        """The predicate for turns that are never joined or held (#89, #98)."""
+        """The predicate for turns that are never joined or held (#89, #98).
+
+        Privacy mode (internally duck, hailing-station #735 S-1): while it is on, a piece
+        holding a named exit or a status question, so the owner pause never delays the way
+        back in; while it is off, a piece that is an intentional entry ("stop recording",
+        "privacy mode", "go private" and the like as the whole piece), so the host's safety
+        matcher sees it at once. Matched as `privacy_phrase` does; nothing is kept.
+        """
         stop = (self.config.speakers or SpeakerPriority()).is_stop_phrase
-        if self.config.dismissal is None:
-            return stop
-        return lambda text: stop(text) or dismissal_shaped(text)
+        addressing = self.config.addressing
+        dismissal = self.config.dismissal is not None
+
+        def ducking() -> bool:
+            # Read as the merger releases the piece; the publisher holds the mode.
+            return getattr(self._events, "ducked", False) is True
+
+        def breaks(text: str) -> bool:
+            if stop(text) or (dismissal and dismissal_shaped(text)):
+                return True
+            try:
+                kinds = privacy_phrase(text, addressing)
+            except Exception:  # noqa: BLE001 - the words must never reach an error or a log
+                return False
+            return bool(kinds & ({"exit", "status"} if ducking() else {"entry"}))
+
+        return breaks
+
+    def _wake_join(
+        self,
+    ) -> tuple[Callable[[str], bool] | None, Callable[[dict[str, Any]], bool] | None]:
+        """The wake-word and owner predicates of the lone wake word join (#230), or Nones.
+
+        Only with configured names and owners, and `turns.wake_join` on: the wake word is
+        a turn whose text is only a configured name or variant; the owner is a fragment
+        whose label resolves to the owner role now, by the same rules the turn's published
+        role uses (configured session labels, or live identification bindings, looked up
+        without side effects). A guest, a participant and an unknown speaker are never the
+        owner, so the name never raises anyone's role.
+        """
+        addressing = self.config.addressing
+        if not self.config.turn_wake_join or addressing is None:
+            return None, None
+        owner = self._turn_owner()
+        if owner is None:
+            return None, None
+
+        def wake_word(text: str) -> bool:
+            return addressing.name_for(text) is not None
+
+        return wake_word, owner
+
+    def _turn_owner(self) -> Callable[[dict[str, Any]], bool] | None:
+        """The turn merger's owner predicate (#230, #735), or None without owners.
+
+        A fragment is the owner's when its label resolves to the owner role now, by the
+        same rules the turn's published role uses: configured session labels, or live
+        identification bindings looked up without side effects.
+        """
+        speakers = self.config.speakers
+        if speakers is None or not speakers.owners:
+            return None
+        enrolled = self._enrolled_roles
+
+        def owner(fragment: dict[str, Any]) -> bool:
+            if enrolled is None:
+                return speakers.configured_role(fragment["speaker"]) == "owner"
+            # The identification role, as `SpeechEvents` would resolve it at emission,
+            # looked up without touching the binding its `name_for` reads.
+            probe = SimpleNamespace(
+                utterance_id=None,
+                speaker_id=fragment["speaker"],
+                overlap=fragment["overlap"],
+                speaker_provenance=fragment["speaker_provenance"],
+            )
+            return enrolled.role_of(probe) == "owner"
+
+        return owner
+
+    def _turn_unfinished(self):
+        """The predicate for turns held despite end-of-turn's "complete" (#199), or None.
+
+        A stop phrase or a dismissal-shaped turn ("stop it", "forget it") is never held,
+        whether or not natural dismissal is on, so a stop is never delayed or joined.
+        """
+        if not self.config.turn_hold_unfinished:
+            return None
+        stop = (self.config.speakers or SpeakerPriority()).is_stop_phrase
+        addressing = self.config.addressing
+        return lambda text: (
+            not stop(text) and not dismissal_shaped(text) and unfinished_shaped(text, addressing)
+        )
 
     def _observe_gap(self, generation: int, utterance_id: str, gap: dict[str, Any]) -> None:
         """Keep a turn's observed post-turn gap until its decision takes it (#96)."""
@@ -822,12 +1274,24 @@ class PrototypeController:
         try:
             # With roles on (step 4b) it runs without a diagnostic channel too (the lab).
             report = self.report if self.report is not None else _no_report
-            route = {} if self.input_route is None else {"route": self.input_route}
-            shadow = self.speaker_id_factory(settings, report=report, **route)
+            options = {} if self.input_route is None else {"route": self.input_route}
+            # A configured ring length (#226); the default passes nothing, as before. A
+            # provider that takes no `ring_ms` runs with its own ring, and a note says so.
+            ring_not_applied = False
+            if self.config.speaker_ring_ms != RING_MS:
+                if _takes_keyword(self.speaker_id_factory, "ring_ms"):
+                    options["ring_ms"] = self.config.speaker_ring_ms
+                else:
+                    ring_not_applied = True
+            shadow = self.speaker_id_factory(settings, report=report, **options)
             shadow.start()
             if roles is not None:
                 # Turns read the bindings from here on; until now every label is unknown.
                 roles.source = shadow
+            if ring_not_applied:
+                # Content-free and best-effort: speaker ID stays on either way.
+                with contextlib.suppress(Exception):
+                    report("audio_retention speaker_ring not applied: provider takes no ring_ms")
             return shadow
         except Exception:
             if self.report is not None:
@@ -844,17 +1308,58 @@ class PrototypeController:
             # voiceprint evidence (#137), in shadow mode or with roles.
             inferred = turn.utterance_id in self._inferred_turns
             spans = self._turn_spans.pop(turn.utterance_id, None)
-        self._accept(generation, work, memory, turn)
-        if shadow is not None:
+            roles = self._enrolled_roles
+            if roles is not None:
+                # The privacy-entry voice check (hailing-station #735) scores these pieces and
+                # the rest of the span apart, when the transcript is published below.
+                roles.note_spans(turn.utterance_id, spans)
+        # A private turn is never speaker evidence (#735 S-1): no binding or count is
+        # derived from speech heard in privacy, judged by the same decision `_accept` made
+        # (so a mode change between the two cannot split them). Only a matched local exit
+        # may score its isolated sentence, without ever offering it to shadow.turn.
+        with self._lock:
+            private = self._accept(generation, work, memory, turn)
+            # #242 round 23: the speaker epoch is read in the same critical section as the
+            # privacy state, so a privacy cycle completing before `shadow.turn` queues the
+            # turn (`forget` advances the epoch) discards it instead of binding its old label.
+            epoch = (
+                getattr(shadow, "epoch", None) if shadow is not None and private is False else None
+            )
+        if shadow is not None and private is False:
             # After the turn is accepted and published; it never raises or blocks.
-            shadow.turn(turn, inferred=inferred, spans=spans)
+            shadow.turn(
+                turn,
+                inferred=inferred,
+                spans=spans,
+                **({"epoch": epoch} if type(epoch) is int else {}),
+            )
+
+    def _private_turn_audio(self, generation, turn, pcm):
+        with self._lock:
+            if generation != self._generation:
+                return
+            self._private_sentence.clear()
+            if self._stop.is_set() or not self._private_audio() or self._enrolled_roles is None:
+                return
+            start = self._private_from_bytes
+            # Unknown on-edge or a public prefix: refuse instead of copying public audio.
+            if start is None or turn.start_ms * PCM_BYTES_PER_MS < start:
+                return
+            self._private_sentence.replace(turn, pcm)
 
     def _audio(self, generation, stop, session, work, memory, mode):
         capture = processor = end_of_turn = shadow = None
         try:
             end_of_turn = self._end_of_turn_model(stop)
             shadow = self._shadow_speaker_id()
+            with self._lock:
+                if generation == self._generation:
+                    self._shadow = shadow
             settings = self.config.end_of_turn
+            wake_word, owner = self._wake_join()
+            if owner is None and self.config.turn_owner_pause_ms:
+                # The owner-only pause (#735) uses the same owner predicate.
+                owner = self._turn_owner()
             processor = self.processor_factory(
                 LiveConfig(
                     session_id=session,
@@ -871,6 +1376,10 @@ class PrototypeController:
                     ),
                     cancelled=stop.is_set,
                     report=self.report,
+                    private=self._heard_private_span,
+                    on_private_turn_audio=lambda turn, pcm: self._private_turn_audio(
+                        generation, turn, pcm
+                    ),
                     session_budget_ms=self._budget_ms,
                     transcriber=transcriber_factory(
                         self.config.transcriber, allow_hosted=self.allow_hosted_speech
@@ -883,6 +1392,7 @@ class PrototypeController:
                     # never absorb one; the defaults apply when roles are off. With
                     # dismissal on (#98), a dismissal-shaped turn is released at once too.
                     turn_break=self._turn_break(),
+                    turn_unfinished=self._turn_unfinished(),
                     reply_wait_ms=self.config.reply_wait_ms,
                     on_post_turn_gap=lambda utterance_id, gap: self._observe_gap(
                         generation, utterance_id, gap
@@ -901,8 +1411,18 @@ class PrototypeController:
                     end_of_turn=end_of_turn.score if end_of_turn is not None else None,
                     edge_attribution_ms=self.config.edge_attribution_ms,
                     tail_join_ms=self.config.tail_join_ms,
+                    word_label_coverage=self.config.word_label_coverage,
+                    turn_complete_hold_ms=self.config.turn_complete_hold_ms,
+                    turn_collapse_restarts=self.config.turn_collapse_restarts,
+                    turn_bridge_backchannels=self.config.turn_bridge_backchannels,
+                    # A lone wake word joins the owner's following sentence (#230).
+                    turn_wake_word=wake_word,
+                    turn_owner=owner,
+                    # The owner's own turns wait longer for a continuation (#735).
+                    turn_owner_pause_ms=self.config.turn_owner_pause_ms,
                     end_of_turn_threshold=settings.threshold if settings else 0.5,
                     end_of_turn_silence_ms=settings.silence_ms if settings else 200,
+                    timeline_window_ms=self.config.timeline_window_ms,
                 ),
                 lambda turn: self._turn(generation, work, memory, shadow, turn),
             )
@@ -910,6 +1430,8 @@ class PrototypeController:
                 if generation != self._generation or stop.is_set():
                     return
                 self._processor = self._session_processor = processor
+                if hasattr(processor, "on_speakers_renewed"):
+                    processor.on_speakers_renewed = self._speakers_renewed
             if mode == "microphone":
                 capture = self.capture_factory(self.config.microphone_helper)
                 with self._lock:
@@ -1025,6 +1547,9 @@ class PrototypeController:
                         self._runner.clear(clear_memory=False)
                     self._event_end("error", "audio-unavailable")
         finally:
+            with self._lock:
+                if generation == self._generation:
+                    self._private_sentence.clear()
             if capture is not None:
                 capture.stop()
             if processor is not None:
@@ -1037,6 +1562,8 @@ class PrototypeController:
                 with contextlib.suppress(Exception):
                     shadow.close(drain=not stop.is_set())
             with self._lock:
+                if self._shadow is shadow:
+                    self._shadow = None
                 if generation == self._generation:
                     self._capture = self._processor = None
                 elif generation + 1 == self._generation and self._phase == "stopping":
@@ -1061,9 +1588,23 @@ class PrototypeController:
             if self._audio_started is None:
                 self._audio_started = time.monotonic()
             self._phase = "listening" if self._live() else "replaying"
+            # Read with the clock under the lock, so a change stamped after this chunk
+            # never leaves a chunk heard in privacy in the speaker ring.
+            private = self._private_audio()
+            if private and self.config.hosted_speech:
+                # #242 round 27, the one choke point every audio consumer is fed through: in
+                # privacy, a hosted consumer (`hosted_audio_consumers`) receives nothing, by
+                # whatever path privacy became active. Unreachable while the refusals hold;
+                # if one is bypassed, the session ends as an error before this chunk goes on.
+                self._end_private_hosted(generation)
+                return False
         if shadow is not None:
             # Before the processor, so a turn it finalizes on this chunk finds its audio.
-            shadow.audio(pcm)
+            # In privacy mode (hailing-station #735 S-1) the speaker ring keeps silence of
+            # the same length instead: its stream offsets stay aligned, and none of the
+            # private audio enters the speaker ring. A separate single-sentence buffer
+            # may authenticate a matched exit; private audio is never speaker evidence.
+            shadow.audio(bytes(len(pcm)) if private else pcm)
         processor.push_pcm16(pcm)
         if boundary:
             # The budget discards the open utterance, but a turn already finalized and
@@ -1075,6 +1616,32 @@ class PrototypeController:
                 if generation == self._generation:
                     self._budget_reached = True
         return not boundary
+
+    def _private_audio(self) -> bool:
+        """Whether privacy mode is on now, as the publisher holds it."""
+        return getattr(self._events, "ducked", False) is True
+
+    def _refuse_private_hosted(self) -> None:
+        """#242 round 27: privacy is never active with a hosted audio consumer configured; the
+        same refusal as `duck(True)` and `--start-private`, fail closed and announced."""
+        if self.config.hosted_speech and self._private_audio():
+            raise PrototypeError("duck mode is refused with a hosted speech backend")
+
+    def _end_private_hosted(self, generation: int) -> None:
+        """End the session as an error: privacy became active with a hosted audio consumer by
+        a path that bypassed every refusal (#242 round 27). Under the lock."""
+        if generation != self._generation or self._stop.is_set():
+            return
+        self._phase = "error"
+        self._error = "Privacy mode is refused with a hosted speech backend; the session ended."
+        self._stop.set()
+        if self._decision_status != "off":
+            self._decision_status = "unavailable"
+        self._completed_at = time.monotonic()
+        self._discard_pending()
+        if self._runner is not None:
+            self._runner.clear(clear_memory=False)
+        self._event_end("error", "privacy-hosted-speech")
 
     def _decide(self, generation, stop, work, runner, hosted):
         enabled = hosted
@@ -1150,6 +1717,7 @@ class PrototypeController:
                                 event,
                                 **({} if unavailable is None else {"unavailable": unavailable}),
                             )
+
             except Exception:
                 enabled = False
                 with self._lock:
@@ -1248,8 +1816,14 @@ class PrototypeController:
             self._error = None
             self._memory.clear()
             self._decisions.clear()
+            # Per-turn notes observed before an accept that the stop cut off (#735 S-1).
+            self._turn_gaps.clear()
+            self._inferred_turns.clear()
+            self._turn_spans.clear()
             self._pending = self._received_ms = 0
             self._received_bytes = 0
+            # #242 round 27: the stream clock restarts; nothing is heard in privacy until audio.
+            self._private_from_bytes = 0 if self._private_audio() else None
             self._budget_ms = None
             self._budget_reached = False
             self._audio_started = None
@@ -1282,13 +1856,16 @@ class PrototypeController:
         self._closed.set()
         self.stop()
 
-    def reply(self, phase: str) -> None:
+    def reply(self, phase: str, *, asked: bool = False) -> None:
         """Forward the host's report that a spoken reply `started` or `ended` (#124).
 
-        Timed by this session's own stream clock when it arrives; ignored when no session
-        is running. A malformed phase raises before anything is forwarded.
+        `asked`: an ended reply ended with a question to the owner (#199). Timed by this
+        session's own stream clock when it arrives; ignored when no session is running. A
+        malformed phase raises before anything is forwarded.
         """
-        if phase not in {"started", "ended"}:
+        if phase not in {"started", "ended"} or type(asked) is not bool:
+            raise PrototypeError("invalid reply phase")
+        if asked and phase != "ended":
             raise PrototypeError("invalid reply phase")
         with self._lock:
             if (
@@ -1298,10 +1875,159 @@ class PrototypeController:
                 or self._phase not in {"listening", "replaying", "finishing"}
             ):
                 return
-            self._publish("reply", phase)
+            self._publish("reply", phase, **({"asked": True} if asked else {}))
             if self._runner is not None:
-                # The decision context sees the reply too (rightyo#153), on the same clock.
-                self._runner.note_reply(phase, self._now_ms())
+                if not getattr(self._events, "scoped_replies", False):
+                    self._runner.note_reply(phase, self._now_ms())
+                elif phase == "ended":
+                    # A legacy ack may have started before the first lifecycle control.
+                    # Only close an already-known physical span; never open or renew one.
+                    self._runner.close_legacy_reply(self._now_ms())
+
+    def request_outcome(self, value) -> None:
+        """Trusted control-FD lifecycle report, scoped to this producer session (#262)."""
+        from rightyo.request_outcomes import validate
+
+        validate(value)
+        with self._lock:
+            if (
+                self._events is None
+                or self._event_terminal
+                or self._stop.is_set()
+                or self._phase not in {"listening", "replaying", "finishing"}
+            ):
+                return
+            result = self._publish("request_outcome", value)
+            phase = getattr(result, "playback", None)
+            if phase is not None and self._runner is not None:
+                self._runner.note_reply(phase, self._now_ms(), request_id=value["request_id"])
+
+    def media(self, on: bool) -> None:
+        """Forward the host's media mode (hailing-station #551) to the event publisher.
+
+        Held by the publisher across sessions, so it applies whether or not one is running;
+        ignored without one (the web lab). A malformed value raises before anything is
+        forwarded.
+        """
+        if type(on) is not bool:
+            raise PrototypeError("invalid media mode")
+        with self._lock:
+            if self._events is not None:
+                self._events.media(on)
+
+    def meeting(self, on: bool) -> None:
+        """hailing-station#735 meeting mode (#227), held across sessions; emits nothing."""
+        if type(on) is not bool:
+            raise PrototypeError("invalid meeting mode")
+        with self._lock:
+            if self._events is not None:
+                self._events.meeting(on)
+
+    def duck(self, on: bool) -> None:
+        """Forward the host's duck mode (hailing-station #735) to the event publisher.
+
+        Held by the publisher across sessions, like media mode; ignored without one (the
+        web lab). Stamped with the received-audio clock turns are timed in (never the wall
+        clock, which runs ahead of it for good after lost audio), so a turn heard while it
+        was on is never decided, even when it is released after it was turned off (see
+        `_accept`), and speech after it is. A malformed value raises before anything is
+        forwarded. Turning it on is refused with a hosted speech backend, which would
+        still be sent the audio heard while private (S-1; `started` never advertises it
+        there, and `--start-private` is refused): fail closed, never apparently private.
+        """
+        if type(on) is not bool:
+            raise PrototypeError("invalid duck mode")
+        if on and self.config.hosted_speech:
+            raise PrototypeError("duck mode is refused with a hosted speech backend")
+        with self._lock:
+            if self._events is not None:
+                self._private_sentence.clear()
+                ending = not on and self._events.ducked is True
+                if on and self._events.ducked is not True:
+                    # #242 round 27: where this privacy interval starts, in stream bytes.
+                    self._private_from_bytes = self._received_bytes
+                # At least the end of every piece received so far, held ones included. Every
+                # applied on, a redundant one included, is acked (#735 S-8): audio received
+                # after the ack's `at_ms` falls inside the span.
+                try:
+                    self._events.duck(on, now_ms=self._received_ms, ack=on)
+                except ContractError:
+                    # The ack overran the event backlog after the duck was applied: the
+                    # session fails as any lost event fails it (Codex on #248), so `listen`
+                    # never sits waiting for audio the host withholds, nor ends as a clean
+                    # stop. The caller still applies later control lines (an off included).
+                    self._event_delivery_failed()
+                    raise
+                if ending:
+                    # #242 round 27: an interval in which no audio was received, judged on the
+                    # stream clock in bytes (one sample counts), heard no one, so it forgets no
+                    # speaker: every effect of `_forget_speakers` (the publisher's renewed and
+                    # stale labels, the runner's, the diarizer renewal, the identifier's
+                    # bindings) assumes private audio was heard. Unknown (privacy began outside
+                    # the controller mid-session) forgets, fail closed.
+                    start = self._private_from_bytes
+                    self._private_from_bytes = None
+                    if start is None or self._received_bytes > start:
+                        self._forget_speakers()
+
+    def _speakers_renewed(self) -> None:
+        """The fresh diarizer takes over (#735 S-1, round 15): its labels restart from the first
+        voice heard, so every binding or role made for the old labels since privacy ended (a
+        turn finalized while the renewal waited) is forgotten again before any new label is
+        scored. Called on the audio thread."""
+        with self._lock:
+            self._private_sentence.clear()
+            if self._publisher_forgets_speakers():
+                self._runner_forgets_speakers()
+            if self._shadow is not None:
+                with contextlib.suppress(Exception):
+                    self._shadow.forget()
+
+    def _publisher_forgets_speakers(self) -> bool:
+        """Under the lock: the publisher forgets the old labels, stamped on the received-audio
+        clock turns are timed in. Whether it has `forget_speakers`. An engaged conversation is
+        ended aloud there (rightyo#244), after everything is dropped; if that end overruns the
+        event backlog the session fails as any lost event fails it (as the ack does on #248),
+        and every other effect of the forget still applies."""
+        forget = getattr(self._events, "forget_speakers", None)
+        if not callable(forget):
+            return False
+        try:
+            forget(now_ms=self._received_ms)
+        except ContractError:
+            self._event_delivery_failed()
+        return True
+
+    def _runner_forgets_speakers(self) -> None:
+        """#242 round 25: the decision runner forgets the old labels with the publisher, so no
+        later decision state names one: not its past turns or participants, a turn decided
+        after the forget, nor the latest request, whose copy loses its label too. Stamped on
+        the received-audio clock turns are timed in. Under the lock, like `note_request`."""
+        runner = self._runner
+        if runner is None:
+            return
+        runner.forget_speakers(self._received_ms)
+        if runner.request_context:
+            runner.note_request(getattr(self._events, "last_request", None))
+
+    def _forget_speakers(self) -> None:
+        """Privacy ended (#735 S-1, Codex P1 on #242): no speaker state from it may outlive it.
+        Under the lock. The diarizer starts afresh (once nothing is open), every speaker-ID
+        label binding is dropped and the publisher's per-label roles with it, so the owner is
+        identified again from public speech. The owner's exit already used its labels. Audio
+        heard before the end and still buffered is silenced, stamped on the same clock as the
+        mode (round 18) but in bytes, exact where the millisecond stamp rounds down (round 19),
+        so none of it, not one sample, is sent to ASR with the next public utterance."""
+        self._private_sentence.clear()
+        if self._publisher_forgets_speakers():
+            self._runner_forgets_speakers()
+        if self._processor is not None and callable(
+            getattr(self._processor, "reset_speakers", None)
+        ):
+            self._processor.reset_speakers(self._received_bytes)
+        if self._shadow is not None:
+            with contextlib.suppress(Exception):
+                self._shadow.forget()
 
     def _publish(self, method, value, **fields):
         """Run under the controller lock; a broken consumer cancels observation."""
@@ -1311,17 +2037,26 @@ class PrototypeController:
                 if method == "transcript"
                 else fields
             )
-            getattr(self._events, method)(value, now_ms=self._now_ms(), **options)
+            result = getattr(self._events, method)(value, now_ms=self._now_ms(), **options)
+            runner = self._runner
+            if runner is not None and runner.request_context:
+                # What the assistant last acted on, or None once dismissed (#199).
+                runner.note_request(getattr(self._events, "last_request", None))
+            return result
         except Exception:
-            self._stop.set()
-            self._decision_cancel.set()
-            self._phase = "error"
-            self._error = "Tool event delivery failed; the session is incomplete."
-            self._memory.clear()
-            self._decisions.clear()
-            self._discard_pending()
-            self._event_end("error", "event-delivery-failed")
+            self._event_delivery_failed()
             raise PrototypeError("Tool event delivery failed") from None
+
+    def _event_delivery_failed(self):
+        """Run under the controller lock: a lost event fails the session, terminally."""
+        self._stop.set()
+        self._decision_cancel.set()
+        self._phase = "error"
+        self._error = "Tool event delivery failed; the session is incomplete."
+        self._memory.clear()
+        self._decisions.clear()
+        self._discard_pending()
+        self._event_end("error", "event-delivery-failed")
 
     def _tool_attention_error(self, reason):
         """A tool cannot silently continue after losing its promised attention service."""
@@ -1338,6 +2073,7 @@ class PrototypeController:
         self._event_end("error", reason)
 
     def _event_end(self, phase, reason=None):
+        self._private_sentence.clear()
         if self._events is not None and not self._event_terminal:
             capture = self._stdin_capture
             gaps = None
