@@ -170,7 +170,7 @@ def _stderr(message: str) -> None:
     print(f"rightyo: {message}", file=sys.stderr, flush=True)
 
 
-MAX_CONTROL_LINE = 256
+MAX_CONTROL_LINE = 512
 
 
 def _read_control(fd: int, controller) -> None:
@@ -179,7 +179,8 @@ def _read_control(fd: int, controller) -> None:
     Bounded lines of `{"reply": "started"}` or `{"reply": "ended"}` (an ended reply may add
     `"asked": true` when it ended with a question, #199), and the host's media mode
     `{"media": true}` or `{"media": false}` (hailing-station #551), and its duck mode
-    `{"duck": true}` or `{"duck": false}` (hailing-station #735); anything else is
+    `{"duck": true}` or `{"duck": false}` (hailing-station #735), and meeting mode
+    `{"meeting": true|false}` (hailing-station#735 meeting mode (#227)); anything else is
     reported on stderr (content-free) and skipped. The reader never ends the session.
     """
     try:
@@ -195,6 +196,8 @@ def _read_control(fd: int, controller) -> None:
                     if discarding:
                         # The rest of an overlong line is never read as a line of its own.
                         discarding = False
+                    elif len(line) > MAX_CONTROL_LINE:
+                        _stderr("control line too long; skipped")
                     elif line.strip():
                         _apply_control(line, controller)
                 if len(pending) > MAX_CONTROL_LINE:
@@ -205,20 +208,35 @@ def _read_control(fd: int, controller) -> None:
         _stderr("control input unavailable; reply timing off")
 
 
+def _unique_control_keys(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate control key")
+        value[key] = item
+    return value
+
+
 def _apply_control(line: bytes, controller) -> None:
     try:
-        message = json.loads(line)
+        message = json.loads(line, object_pairs_hook=_unique_control_keys)
         if not isinstance(message, dict) or set(message) not in (
             {"reply"},
             {"reply", "asked"},
             {"media"},
             {"duck"},
+            {"meeting"},
+            {"request_outcome"},
         ):
             raise ValueError
-        if "media" in message:
+        if "request_outcome" in message:
+            controller.request_outcome(message["request_outcome"])
+        elif "media" in message:
             controller.media(message["media"])
         elif "duck" in message:
             controller.duck(message["duck"])
+        elif "meeting" in message:
+            controller.meeting(message["meeting"])
         elif "asked" in message:
             if message["reply"] != "ended" or type(message["asked"]) is not bool:
                 raise ValueError
@@ -295,11 +313,13 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
     if start_private and config.hosted_speech:
         raise PrototypeError("--start-private is refused with a hosted speech backend")
     # A coaching listener's control descriptor carries only coaching records (it refuses a
-    # `{"duck": ...}` line), so it never advertises duck mode (hailing-station #735).
+    # duck or meeting line), so it advertises neither mode (hailing-station #735).
     events = SpeechEvents(
         report=None if coaching else _stderr,
         retain_transcripts=not coaching,
         duck_control=not coaching,
+        meeting_control=not coaching,
+        request_control=not coaching,
     )
     if start_private:
         # Exactly as if `{"duck": true}` arrived at stream time 0, before any audio: the

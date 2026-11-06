@@ -482,7 +482,7 @@ def mentions_name(addressing: Addressing | None, text: str) -> bool:
 
     Runs are as long as the longest configured name or variant, so a long name is found.
     """
-    if addressing is None:
+    if addressing is None or not addressing.names:
         return False
     spellings = [s for name in addressing.names for s in (name, *addressing.spellings(name))]
     longest = max(len(normalize_phrase(spelling).split()) for spelling in spellings)

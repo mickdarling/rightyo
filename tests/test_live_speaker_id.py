@@ -533,6 +533,39 @@ class ToneEmbedder:
         self.closed = True
 
 
+class OwnerRefusalReasonTests(unittest.TestCase):
+    def test_reasons_are_read_only_and_enrolled_owner_stays_boolean(self):
+        roles = EnrolledRoles(SpeakerPriority(owners=("owner-0",)))
+        for binding, current, allowed, reason in (
+            (("bound", "owner-0"), turn(0, 1), True, "not_owner"),
+            (("bound", "guest-0"), turn(0, 1), False, "not_owner"),
+            (None, turn(0, 1), False, "unbound"),
+            (("tentative", "owner-0"), turn(0, 1), False, "unbound"),
+            (("unknown", None), turn(0, 1), False, "unbound"),
+            (("bound", "owner-0"), turn(0, 1, None), False, "unlabelled"),
+            (("bound", "owner-0"), turn(0, 1, overlap=True), False, "unlabelled"),
+            (("bound", "owner-0"), turn(0, 1, provenance="unknown"), False, "unlabelled"),
+        ):
+            with self.subTest(binding=binding, speaker=current.speaker_id, reason=reason):
+                source = MagicMock()
+                source.binding.return_value = binding
+                roles.source = source
+                before = roles._resolved, roles._spans
+                self.assertIs(roles.enrolled_owner(current), allowed)
+                self.assertEqual(roles.enrolled_owner_refusal_reason(current), reason)
+                self.assertIs(roles.enrolled_owner(current), allowed)
+                self.assertEqual((roles._resolved, roles._spans), before)
+                self.assertEqual(source.binding.return_value, binding)
+        # A configured session label is never a bound owner identity.
+        roles = EnrolledRoles(SpeakerPriority(owners=("Speaker A",)))
+        self.assertIs(roles.enrolled_owner(turn(0, 1)), False)
+        self.assertEqual(roles.enrolled_owner_refusal_reason(turn(0, 1)), "unbound")
+        # A diagnostic failure remains content free and cannot change the boolean.
+        with patch.object(roles, "_lookup", side_effect=RuntimeError(PRIVATE_TEXT)):
+            self.assertIs(roles.enrolled_owner(turn(0, 1)), False)
+            self.assertEqual(roles.enrolled_owner_refusal_reason(turn(0, 1)), "error")
+
+
 class EntryCheckTests(unittest.TestCase):
     """The privacy-entry voice check (hailing-station #735, rightyo#250): a turn's own-label
     pieces and its inferred remainder, each scored on its own against the owner's voiceprint;

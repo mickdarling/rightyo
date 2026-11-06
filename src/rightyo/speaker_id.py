@@ -84,6 +84,24 @@ def _kaldi_fbank(np, x, bins=80):
     return (feats - feats.mean(axis=0)).astype(np.float32)
 
 
+def _read_private_pcm(source, size: int) -> bytearray:
+    """Read local exit-only PCM directly into mutable storage; wipe a partial failure."""
+    if type(size) is not int or not 0 < size <= 10 * SAMPLE_RATE * 2 or size % 2:
+        raise SpeakerIdError("Invalid audio")
+    pcm = bytearray(size)
+    view = memoryview(pcm)
+    try:
+        while view:
+            count = source.readinto(view)
+            if not count:
+                raise SpeakerIdError("Invalid audio")
+            view = view[count:]
+        return pcm
+    except BaseException:
+        pcm[:] = b"\0" * len(pcm)
+        raise
+
+
 def _worker(model: str, threads: int) -> int:
     protocol = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
     with open(os.devnull, "wb") as sink:
@@ -107,15 +125,33 @@ def _worker(model: str, threads: int) -> int:
             if not line or not line.endswith(b"\n"):
                 break
             request = json.loads(line)
-            if request.get("command") != "embed":
+            private = request.get("command") == "embed_private"
+            if private:
+                pcm = _read_private_pcm(sys.stdin.buffer, request.get("size"))
+            elif request.get("command") == "embed":
+                pcm = base64.b64decode(request["pcm"], validate=True)
+            else:
                 break
-            pcm = base64.b64decode(request["pcm"], validate=True)
             if not pcm or len(pcm) > MAX_PCM_BYTES or len(pcm) % 2:
                 raise SpeakerIdError("Invalid audio")
-            samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
-            output = session.run(None, {name: _kaldi_fbank(np, samples)[None]})
-            vector = np.asarray(output[0], dtype=np.float64).reshape(-1)
-            protocol.write(json.dumps({"ok": True, "embedding": vector.tolist()}) + "\n")
+            samples = features = None
+            try:
+                samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+                samples /= 32768.0
+                features = _kaldi_fbank(np, samples)
+                output = session.run(None, {name: features[None]})
+                vector = np.asarray(output[0], dtype=np.float64).reshape(-1)
+                response = json.dumps({"ok": True, "embedding": vector.tolist()}) + "\n"
+            finally:
+                if private:
+                    pcm[:] = b"\0" * len(pcm)
+                    if samples is not None:
+                        samples.fill(0)
+                    if features is not None:
+                        features.fill(0)
+            # A successful response must not release the caller before the worker's
+            # private PCM has been wiped too.
+            protocol.write(response)
         return 0
     except Exception:
         protocol.write('{"ok":false}\n')
@@ -391,19 +427,39 @@ class SpeakerEmbedder:
             raise SpeakerIdError("The speaker model failed") from None
         return result
 
+    def embed_private(self, pcm: memoryview) -> list[float]:
+        """Local worker only, mutable PCM over its pipe, without base64/JSON audio copies.
+
+        The caller owns and wipes the borrowed view. The worker wipes its mutable input.
+        Ordinary public embedding keeps its existing wire request.
+        """
+        if (
+            not isinstance(pcm, memoryview)
+            or pcm.readonly
+            or not pcm
+            or len(pcm) % 2
+            or len(pcm) > 10 * SAMPLE_RATE * 2
+        ):
+            raise SpeakerIdError("Invalid audio")
+        header = (json.dumps({"command": "embed_private", "size": len(pcm)}) + "\n").encode()
+        return self._embed_request(header, pcm)
+
     def embed(self, pcm: bytes) -> list[float]:
         """One embedding for mono PCM16 at 16 kHz, at most 30 s."""
         if not isinstance(pcm, bytes) or not pcm or len(pcm) % 2 or len(pcm) > MAX_PCM_BYTES:
             raise SpeakerIdError("Invalid audio")
+        request = {"command": "embed", "pcm": base64.b64encode(pcm).decode("ascii")}
+        return self._embed_request((json.dumps(request) + "\n").encode())
+
+    def _embed_request(self, header, pcm=None) -> list[float]:
         try:
             assert self.process.stdin is not None
-            request = {"command": "embed", "pcm": base64.b64encode(pcm).decode("ascii")}
-            data = memoryview((json.dumps(request) + "\n").encode())
-            while data:
-                written = self.process.stdin.write(data)
-                if not written:
-                    raise BrokenPipeError
-                data = data[written:]
+            for data in (memoryview(header),) if pcm is None else (memoryview(header), pcm):
+                while data:
+                    written = self.process.stdin.write(data)
+                    if not written:
+                        raise BrokenPipeError
+                    data = data[written:]
             vector = self._receive(self.timeout).get("embedding")
         except SpeakerIdError:
             self.close()

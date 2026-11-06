@@ -142,6 +142,8 @@ class ReplayRunner:
         # the stream clock, end None while playing; recent ones only, so a decision made after
         # its turn still sees what was true when the turn began.
         self._replies: deque[list[int | None]] = deque(maxlen=MAX_REPLY_INTERVALS)
+        self._reply_scopes: dict[str, list[int | None]] = {}
+        self._legacy_reply_span: list[int | None] | None = None
         self.skipped = 0
         self.partial_turns = 0
 
@@ -159,6 +161,8 @@ class ReplayRunner:
         self._history.clear()
         self._last_end_ms = 0
         self._replies.clear()
+        self._reply_scopes.clear()
+        self._legacy_reply_span = None
         self._last_request = None
         self._labels_until_ms = None
 
@@ -240,7 +244,7 @@ class ReplayRunner:
         }
 
     @_locked
-    def note_reply(self, phase: str, now_ms: int) -> None:
+    def note_reply(self, phase: str, now_ms: int, *, request_id: str | None = None) -> None:
         """The host's report that the assistant's spoken reply `started` or `ended` (rightyo#153).
 
         Later decisions then see `assistant_reply` in their state: whether a reply was
@@ -249,15 +253,44 @@ class ReplayRunner:
         """
         if phase not in {"started", "ended"}:
             raise ValueError("invalid reply phase")
-        playing = bool(self._replies) and self._replies[-1][1] is None
+        if request_id is not None:
+            # Physical playback is independent of which request currently owns engagement.
+            # An old end closes only its own span; it cannot close a newer playing reply.
+            if not isinstance(request_id, str) or not 1 <= len(request_id) <= 193:
+                raise ValueError("invalid reply request")
+            span = self._reply_scopes.get(request_id)
+            if phase == "started" and span is None:
+                if len(self._reply_scopes) >= MAX_REPLY_INTERVALS:
+                    del self._reply_scopes[next(iter(self._reply_scopes))]
+                span = [now_ms, None]
+                self._replies.append(span)
+                self._reply_scopes[request_id] = span
+            elif phase == "ended":
+                span = self._reply_scopes.pop(request_id, None)
+                if span is not None:
+                    span[1] = now_ms
+                else:
+                    self._replies.append([now_ms, now_ms])
+            return
+        span = self._legacy_reply_span
+        playing = span is not None and span[1] is None
         if phase == "started" and not playing:
-            self._replies.append([now_ms, None])
+            self._legacy_reply_span = [now_ms, None]
+            self._replies.append(self._legacy_reply_span)
         elif phase == "ended":
             if playing:
-                self._replies[-1][1] = now_ms
+                span[1] = now_ms
             else:
                 # An end with no start seen: the reply had begun before this session knew.
-                self._replies.append([now_ms, now_ms])
+                self._legacy_reply_span = [now_ms, now_ms]
+                self._replies.append(self._legacy_reply_span)
+
+    @_locked
+    def close_legacy_reply(self, now_ms: int) -> None:
+        """Close only a known pre-opt-in physical span; create no reply authority."""
+        span = self._legacy_reply_span
+        if span is not None and span[1] is None:
+            span[1] = now_ms
 
     def note_request(self, request: tuple[int, str, str, str | None] | None) -> None:
         """Record the latest request formed, (end_ms, text, utterance_id, speaker_id), or
@@ -310,7 +343,8 @@ class ReplayRunner:
             if begun <= start and (end is None or end > start):
                 return {"playing": True}
             if end is not None and end <= start:
-                ended_before = start - end
+                elapsed = start - end
+                ended_before = elapsed if ended_before is None else min(ended_before, elapsed)
         if ended_before is not None and ended_before <= REPLY_CONTEXT_MS:
             return {"playing": False, "ended_ms_before": ended_before}
         return None
