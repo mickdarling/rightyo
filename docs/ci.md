@@ -198,6 +198,10 @@ Its accepted grammar is deliberately limited to the observed clean completion:
 - Exactly one summary marker on the first line, then exactly one `codex-review-state:v1`
   JSON comment on the second line. The existing 4,096-character JSON limit, duplicate-key
   rejection and exact two-review/four-field schema apply unchanged.
+  Because this table has no security row, `security_review` must have all four
+  fields null: `status`, `commit_sha`, `has_any_findings` and `has_unresolved_findings`.
+  Any active security state is unsupported, including old-head findings, current-head
+  clean completion or a running review.
 - A blank line, `<details>` on its own line, and exactly
   `<summary><strong>Codex Review Summary</strong>: ✅ Completed</summary>`, followed by
   the observed introductory sentence and blank lines.
@@ -222,8 +226,8 @@ Its accepted grammar is deliberately limited to the observed clean completion:
 Other details-layout statuses (including Running and Queued), findings, review kinds,
 header/table changes or altered About blocks are unsupported and fail closed even beside
 an explicit clean receipt. This does not claim support for unobserved security-review row
-layouts. Current-head security JSON is still checked independently before an older code
-row can be ignored. Legacy Markdown summaries, with or without v1 state, and legacy/v1
+layouts. Non-null security JSON blocks this details layout before an older code row can
+be ignored. Legacy Markdown summaries, with or without v1 state, and legacy/v1
 receipts retain their existing behavior. Summary-only and reaction-only evidence still
 cannot approve. Synthetic variants cover findings, pending statuses, human edits,
 duplicate/misplaced markers, unknown versions/schema/rows, commit and state disagreement,

@@ -152,6 +152,9 @@ def summary_state(body):
         ):
             raise GateError("Native summary review state is unsupported")
     if details:
+        # This observed table has no security row to corroborate active state.
+        if any(value is not None for value in state["security_review"].values()):
+            raise GateError("Native details summary carries unsupported security state")
         code = state["code_review"]
         if (
             code["status"] != "completed"

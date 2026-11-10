@@ -15,6 +15,8 @@ from test_subscription_review import BASE, completion, reaction
 from scripts.subscription_review import (
     AUDITED_RECHECK_PAIRS,
     BOT_NODE_ID,
+    DETAILS_SUMMARY,
+    SUMMARY,
     GateError,
     clean_completion,
     comment_provenance,
@@ -80,13 +82,27 @@ class DetailsReviewSummaryTests(unittest.TestCase):
             lambda item: True,
         )
 
-    def assert_blocked(self, item):
+    def assert_blocked(self, item, message=None):
         # A malformed current envelope must abort even with older usable evidence.
-        with self.assertRaises(GateError):
+        with self.assertRaises(GateError) as raised:
             self.check(
                 [public_comment(), public_comment("receipt"), item],
                 reactions=[reaction("2026-11-10T19:37:15Z")],
             )
+        if message is not None:
+            self.assertEqual(str(raised.exception), message)
+
+    def test_freshness_regex_extracts_the_details_grammar_completion_time(self):
+        for stamp in [COMPLETED, "2026-11-10T19:37:15Z", "2026-11-10T19:37:15.1Z"]:
+            with self.subTest(stamp=stamp):
+                body = public_comment()["body"].replace(COMPLETED, stamp)
+                rest = body.split("\n", 2)[2]
+                details = DETAILS_SUMMARY.fullmatch(rest)
+                self.assertIsNotNone(details)
+                completed = SUMMARY.findall(body)
+                self.assertEqual(len(completed), 1)
+                self.assertEqual(completed[0][0], details["time"])
+                self.assertEqual(details["time"], stamp)
 
     def test_verbatim_public_fixtures(self):
         expected = {
@@ -114,7 +130,7 @@ class DetailsReviewSummaryTests(unittest.TestCase):
         item = public_comment()
         item["body"] = item["body"].replace("Manual request", "PR opened")
         self.assertIsNotNone(summary_state(item["body"]))
-        self.assert_blocked(item)
+        self.assert_blocked(item, "Native comment edit provenance is invalid")
 
     def test_source_pair_change_does_not_register_original_main_or_new_helper(self):
         # Immutable source digests read locally from 1c72ac8, the repair's base.
@@ -246,27 +262,37 @@ class DetailsReviewSummaryTests(unittest.TestCase):
             with self.subTest(body=changed):
                 self.assert_blocked({**public_comment(), "body": changed})
 
-    def test_current_security_state_checked_even_with_old_code_row(self):
-        for status, findings in [
-            ("running", None),
-            ("queued", None),
-            ("completed", True),
-            ("completed", None),
-        ]:
-            item = public_comment()
-            item["body"] = item["body"].replace(HEAD, BASE).replace("`f00a638`", "`bbbbbbb`")
-            item = change_state(
-                item,
-                lambda s: s["security_review"].update(
-                    commit_sha=HEAD,
-                    status=status,
-                    has_any_findings=findings,
-                    has_unresolved_findings=findings,
-                ),
-            )
-            # The old code summary is structurally valid; security blocks independently.
-            self.assertEqual(summary_state(item["body"])["code_review"]["commit_sha"], BASE)
-            self.assert_blocked(item)
+    def test_security_state_without_a_details_row_blocks_even_with_old_code_row(self):
+        for code_revision in [HEAD, BASE]:
+            for revision, status, findings in [
+                (BASE, "completed", True),
+                (HEAD, "completed", False),
+                (HEAD, "running", None),
+                (BASE, "running", None),
+                (HEAD, "queued", None),
+                (HEAD, "completed", True),
+                (HEAD, "completed", None),
+            ]:
+                with self.subTest(
+                    code=code_revision, security=revision, status=status, flags=findings
+                ):
+                    item = public_comment()
+                    if code_revision == BASE:
+                        item["body"] = (
+                            item["body"].replace(HEAD, BASE).replace("`f00a638`", "`bbbbbbb`")
+                        )
+                    item = change_state(
+                        item,
+                        lambda s: s["security_review"].update(
+                            commit_sha=revision,
+                            status=status,
+                            has_any_findings=findings,
+                            has_unresolved_findings=findings,
+                        ),
+                    )
+                    self.assert_blocked(
+                        item, "Native details summary carries unsupported security state"
+                    )
 
     def test_connector_edit_provenance_preserves_exact_fixture_body(self):
         item = public_comment()
