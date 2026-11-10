@@ -1120,8 +1120,8 @@ Every other handoff phrasing leaves the provider's decision unchanged, including
 "Helper, that's all, can you write up the notes", "Helper, that's it, send me the
 summary", and "Helper, that's all, and stop the timer". Tests deliberately assert
 these current unvetoed dismissals. General dismissal-versus-request disambiguation
-needs a classifier follow-up; no broader regex rule or validated classifier improvement
-is included here. A separate follow-up issue has not been linked yet.
+needs a classifier follow-up, tracked in [#269](https://github.com/mickdarling/rightyo/issues/269);
+no broader regex rule or validated classifier improvement is included here.
 
 A dismissed turn never forms a request, even when its attention was `attend` (Jev often
 attends "Haili, stop." as addressed to the system, which is right about the addressee).

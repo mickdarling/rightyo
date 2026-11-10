@@ -778,7 +778,7 @@ class DismissEventTests(unittest.TestCase):
         )
 
     def test_broader_requests_remain_unvetoed_pending_classifier_followup(self):
-        # Known limitations: classifier follow-up to #268; do not broaden this guard.
+        # Known limitations: classifier follow-up #269 (from #268); do not broaden this guard.
         names = Addressing.from_names(["Helper"])
         for text in (
             "Helper, that's all, can you write up the notes",
