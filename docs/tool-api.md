@@ -1096,6 +1096,15 @@ That set excludes pronouns, determiners, auxiliaries, conjunctions, prepositions
 common grammatical adverbs and courtesy words; tails such as `it`, `is`, `that`,
 `this and that please`, or `you and me` alone never supply a task object.
 
+A whole temporal task-words tail also defeats the veto: `day`, `today`, `tonight`,
+`night`, `now`, `the moment`, `the time being`, `the week`, `this week`, `the weekend`,
+`the morning`, `this morning`, `the afternoon`, `this afternoon`, `the evening`,
+`this evening`, or `the year`. The optional `the` is removed before comparing the
+whole tail (excluding trailing courtesy words). Thus "Helper, that's all for you for
+the day", "...for the night", and "...for today" preserve provider dismissals, as do
+"...for now", "...for the week", and "...for this evening". This is not a substring
+match: `the day's notes` and `the end-of-day report` still count as task objects.
+
 A stop, dismissal or farewell phrase anywhere in the utterance defeats the veto,
 including inside the task words or configured name. The fixed phrases are `quit`,
 `be quiet`, `shut up`, `go away`, `hang up`, `never mind`, `that's enough`, `leave it`,

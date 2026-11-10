@@ -156,6 +156,28 @@ REFUSED_NAME_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
 DEFAULT_OWNER_VOICE_THRESHOLD_S = 20
 MIN_OWNER_VOICE_THRESHOLD_S = 5
 MAX_OWNER_VOICE_THRESHOLD_S = 600
+# Whole temporal tails after the optional "the" are not handoff task objects (#268).
+HANDOFF_TEMPORAL_TAILS = frozenset(
+    {
+        "day",
+        "today",
+        "tonight",
+        "night",
+        "now",
+        "moment",
+        "time being",
+        "week",
+        "this week",
+        "weekend",
+        "morning",
+        "this morning",
+        "afternoon",
+        "this afternoon",
+        "evening",
+        "this evening",
+        "year",
+    }
+)
 # Closed-class/courtesy words alone cannot supply a handoff task object (#268).
 HANDOFF_FUNCTION_WORDS = frozenset(
     "a an the this that these those i me my mine myself we us our ours ourselves "
@@ -411,8 +433,10 @@ def _named_handoff(text, addressing):
         r"(?:,? (?:please|thanks))?",
         body,
     )
-    # Courtesy words and function words alone are not a task object.
-    return match is not None and any(
+    # A whole temporal tail, courtesy words or function words alone are not a task object.
+    if match is None or match["task"] in HANDOFF_TEMPORAL_TAILS:
+        return False
+    return any(
         word not in HANDOFF_FUNCTION_WORDS and any(c.isalpha() for c in word)
         for word in match["task"].split()
     )

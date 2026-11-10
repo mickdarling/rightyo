@@ -671,6 +671,8 @@ class DismissEventTests(unittest.TestCase):
             "HELPER, THAT’S ALL FOR YOU ABOUT THE ITEM",
             "Helper, that's all for you for the research and design please",
             "Helper, that's all for you for the stop-loss report",
+            "Helper, that's all for you for the day's notes",
+            "Helper, that's all for you for the end-of-day report",
         ):
             for kind in ("stop", "disengage"):
                 with self.subTest(text=text, kind=kind):
@@ -693,6 +695,32 @@ class DismissEventTests(unittest.TestCase):
         dismiss = events[2]
         self.assertEqual((dismiss["reason"], dismiss["confidence"]), ("decision", 0.97))
         self.assertEqual(dismiss["withdrawn_request_ids"], [])
+
+    def test_temporal_handoff_tails_keep_provider_dismissals(self):
+        names = Addressing.from_names(["Helper"])
+        for tail in (
+            "the day",
+            "today",
+            "tonight",
+            "the night",
+            "now",
+            "the moment",
+            "the time being",
+            "the week",
+            "this week",
+            "the weekend",
+            "the morning",
+            "this morning",
+            "the afternoon",
+            "this afternoon",
+            "the evening",
+            "this evening",
+            "the year",
+        ):
+            for courtesy in ("", ", thanks"):
+                text = f"Helper, that's all for you for {tail}{courtesy}"
+                with self.subTest(text=text):
+                    self.assert_provider_dismisses(text, names)
 
     def test_other_closings_and_handoff_phrasings_keep_provider_dismissals(self):
         names = Addressing.from_names(["Helper"])
