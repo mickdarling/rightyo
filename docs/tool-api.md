@@ -1078,6 +1078,51 @@ the request. A bare "Stop." during playback is a dismissal. Hosts that want any 
 during media to halt it at once should treat `stop`-kind dismissals and such requests
 alike.
 
+**Narrow named-handoff veto (#268).** Only a provider dismissal (`reason: "decision"`)
+can be vetoed, and only when the whole utterance has this form:
+
+```text
+<configured assistant name>, <that's all | that is all | that's it> for you <for | on | about> [the] <task words> [please | thanks]
+```
+
+The name must be directly addressed before the first comma; a configured variant also
+counts. Case, repeated whitespace and curly apostrophes are normalized. No leading
+address words, alternative handoff phrasings, extra clauses or sentence punctuation
+qualify. The optional trailing `please` or `thanks` may have a preceding comma.
+Task words are letters/digits with optional internal hyphens/apostrophes and spaces.
+At least one must contain a letter and be outside the fixed function/courtesy word
+set `HANDOFF_FUNCTION_WORDS` in [the event producer](../src/rightyo/tool_events.py).
+That set excludes pronouns, determiners, auxiliaries, conjunctions, prepositions,
+common grammatical adverbs and courtesy words; tails such as `it`, `is`, `that`,
+`this and that please`, or `you and me` alone never supply a task object.
+
+A stop, dismissal or farewell phrase anywhere in the utterance defeats the veto,
+including inside the task words or configured name. The fixed phrases are `quit`,
+`be quiet`, `shut up`, `go away`, `hang up`, `never mind`, `that's enough`, `leave it`,
+`leave me alone`, `end the call`, `we're done` (optionally `here`), `call it a day`,
+`take it easy`, `take care`, `write me off`, `catch you later`, `check you later`,
+`talk later`, `see you`, `bye`, `goodbye`, `good night`, and `stop` followed by `speaking`,
+`talking`, `reading` or `listening`. Bare `stop` commands also defeat it: clauses split
+on commas, periods, question marks, exclamation marks, semicolons, `and` and `then`;
+a clause containing only `stop`, optionally preceded by `please` and followed by
+`please` or `thanks`, counts. Word boundaries keep hyphenated task compounds intact.
+These exclusions preserve the provider dismissal; they do not create dismissals.
+
+Synthetic examples that veto a decision dismissal are "Helper, that's all for you for
+the sample case", "Helper, that is all for you on the topic", and "Helper, that's it
+for you about the item, thanks". The veto reports `dismissal: "uncertain"` in the
+existing attention/request evidence and preserves the provider's dismissal confidence.
+Normal attention, speaker, meeting and media policy still govern request delivery.
+Configured stop-phrase dismissals (`reason: "stop-phrase"`) are never vetoed.
+
+**Known limitations and classifier follow-up to [#268](https://github.com/mickdarling/rightyo/issues/268).**
+Every other handoff phrasing leaves the provider's decision unchanged, including
+"Helper, that's all, can you write up the notes", "Helper, that's it, send me the
+summary", and "Helper, that's all, and stop the timer". Tests deliberately assert
+these current unvetoed dismissals. General dismissal-versus-request disambiguation
+needs a classifier follow-up; no broader regex rule or validated classifier improvement
+is included here. A separate follow-up issue has not been linked yet.
+
 A dismissed turn never forms a request, even when its attention was `attend` (Jev often
 attends "Haili, stop." as addressed to the system, which is right about the addressee).
 Its attention evidence then has no `request_id`, and carries two optional keys whenever
@@ -1109,6 +1154,10 @@ second time by its decision.
   need confirmation.
 - `reason` is `stop-phrase` or `decision`; `confidence` is `null` for a stop phrase.
 - `cooldown_until_ms` (stream time) is present when a `disengage` started a cool-down.
+
+`utterance_id` and `confidence` already provide turn provenance and decision confidence
+in dismissal version 1. The narrow veto adds no event keys and does not change that
+advertised version. Synthetic tests establish policy behavior, not live speech quality.
 
 **Who can dismiss.** On an anonymous session every dismissal has full effect. On an
 enrolled session, owners and trusted speakers have full effect. Any other speaker's
