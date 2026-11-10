@@ -189,7 +189,73 @@ Its code-review commit, completion state and clean findings flags must agree wit
 independently resolved Markdown. State cannot supply approval by itself. Unknown versions,
 inconsistent or malformed metadata, and current-head findings fail closed. Envelope parsing
 never changes the exact body used for GraphQL edit-provenance validation. This source
-compatibility repair does not deploy a validator or alter repository protection settings.
+adapter does not alter repository protection settings.
+
+The current details-based summary layout (#271) is matched as a complete body, using
+the verbatim public PR #270 summary and receipt in `tests/fixtures/native-review/`.
+Its accepted grammar is deliberately limited to the observed clean completion:
+
+- Exactly one summary marker on the first line, then exactly one `codex-review-state:v1`
+  JSON comment on the second line. The existing 4,096-character JSON limit, duplicate-key
+  rejection and exact two-review/four-field schema apply unchanged.
+  Because this table has no security row, `security_review` must have all four
+  fields null: `status`, `commit_sha`, `has_any_findings` and `has_unresolved_findings`.
+  Any active security state is unsupported, including old-head findings, current-head
+  clean completion or a running review.
+- A blank line, `<details>` on its own line, and exactly
+  `<summary><strong>Codex Review Summary</strong>: ✅ Completed</summary>`, followed by
+  the observed introductory sentence and blank lines.
+- Exactly the `| Review | Status | Commit | Review trigger |` header and
+  `| --- | --- | --- | --- |` separator, then exactly one row of the form
+  `| 📝 **Code Review** | ✅ **Completed** [relative-time] | ` followed by a backtick-quoted
+  7–40 lowercase hexadecimal commit, ` | `, the trigger, and ` |`.
+  The trigger is 1–80 ASCII characters matching `[A-Za-z][A-Za-z0-9 ._-]{0,79}`;
+  it is descriptive text and grants no authority. The optional time element is exactly
+  `<relative-time datetime="T">T</relative-time>` with equal attribute/text timestamps.
+  Without it the row cannot establish a completed cycle and both positive paths block.
+  When present, `T` must pass the existing UTC timestamp parser, whole-second freshness
+  checks and comment-update-time check. The short commit must agree with JSON and resolve
+  uniquely through GitHub to the current full head. Code state must be completed with
+  both findings flags explicitly false.
+- Exactly three blank lines after the row, then the complete observed nested
+  **About Codex in GitHub** details block (including its link, bullets, security-review
+  request text, reaction explanation and whitespace), then the outer closing details tag.
+  Only the final LF is optional. No extra row, HTML, text or trailing content block is
+  accepted. The fixture and `DETAILS_SUMMARY` pattern specify the literal bytes.
+
+Other details-layout statuses (including Running and Queued), findings, review kinds,
+header/table changes or altered About blocks are unsupported and fail closed even beside
+an explicit clean receipt. This does not claim support for unobserved security-review row
+layouts. Non-null security JSON blocks this details layout before an older code row can
+be ignored. Legacy Markdown summaries, with or without v1 state, and legacy/v1
+receipts retain their existing behavior. Summary-only and reaction-only evidence still
+cannot approve. Synthetic variants cover findings, pending statuses, human edits,
+duplicate/misplaced markers, unknown versions/schema/rows, commit and state disagreement,
+missing/malformed/future times and extra content, including with older clean evidence.
+
+For rollout of #271, changing `subscription_review.py` changes the producer fingerprint
+pair even though `ai-review.yml` is unchanged. `RECHECK_SOURCE_PATHS`, immutable Contents
+API verification and `AUDITED_RECHECK_PAIRS` are unchanged. Once this repair is the trusted
+workflow checkout on main, its exact workflow/helper bytes qualify through the existing
+current-pair comparison; no registration of the new pair inside its own helper is needed.
+The registered historical pairs remain accepted as pairs. Neither old main nor another
+checkout automatically trusts this new helper: cross-revision queued-manual compatibility
+requires a separate independently reviewed registration of the exact two SHA-256 digests
+in the consumer's `AUDITED_RECHECK_PAIRS`. Do not register speculative/unreviewed pairs or
+weaken the comparison. Unregistered queued manual runs block until drained, as designed;
+active/requested/waiting/pending runs always block regardless of pair.
+
+Main at `1c72ac8` cannot parse the new summary on the repair PR itself, even with its real
+clean receipt. This PR cannot pass that current main gate on its own. That is an owner
+admin-merge/bootstrap decision after independent exact-head review, not a passing review
+or an automated bypass. Do not delete/edit connector evidence, fabricate a status or run
+PR-controlled code in the privileged lane to get around it. After merge, let callbacks
+drain and perform an exact-revision main dispatch for a PR with fresh authentic native
+evidence. Verify the actual producer's authoritative full head, both fixed Contents API
+paths and their bounded decoded bytes/digests against the immutable trusted checkout pair,
+the unchanged mutex and publisher identity, and actual required-status recognition on the
+current PR head. Local mocked source-pair and envelope tests are verification of the
+adapter, not evidence that this post-merge producer/rollout verification has occurred.
 
 All native app-authored comments are checked for edit provenance, including metadata whose
 header was removed or rows malformed. Human edits or ambiguous native summaries fail closed
