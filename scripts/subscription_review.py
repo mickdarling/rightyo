@@ -49,6 +49,28 @@ SUMMARY = re.compile(
     r"\| `([0-9a-f]{7,40})` \| [^|\n]+\|$",
     re.M,
 )
+# The observed details layout is a complete envelope, not a search for a clean
+# row in arbitrary Markdown. Only the observed Completed / Code Review shape is
+# supported; other statuses/kinds remain denial, including beside a clean receipt.
+DETAILS_SUMMARY = re.compile(
+    r"\n<details>\n<summary><strong>Codex Review Summary</strong>: ✅ Completed</summary>\n\n"
+    r"This comment shows the latest Codex review activity on this pull request\.\n\n"
+    r"\| Review \| Status \| Commit \| Review trigger \|\n"
+    r"\| --- \| --- \| --- \| --- \|\n"
+    r"\| 📝 \*\*Code Review\*\* \| ✅ \*\*Completed\*\*"
+    r'(?: <relative-time datetime="(?P<time>[^"\n]+)">(?P=time)</relative-time>)?'
+    r" \| `(?P<commit>[0-9a-f]{7,40})` \| (?P<trigger>[A-Za-z][A-Za-z0-9 ._-]{0,79}) \|\n"
+    r"\n\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n"
+    r"\[Your team has set up Codex to review pull requests in this repo\]"
+    r"\(https://chatgpt\.com/codex/cloud/settings/general\)\. "
+    r"Reviews are triggered when you\n"
+    r"- Open a pull request for review\n"
+    r"- Mark a draft as ready\n"
+    r'- Comment "@codex review" or "@codex security review"\.\n\n'
+    r"Codex reacts with 👀 while any review is running, comments if it has suggestions, "
+    r"and reacts with 👍 once all reviews finish with no findings\.\n\n"
+    r"</details>\n\n</details>\n?\Z"
+)
 COMMENT_QUERY = (
     "query($id:ID!){node(id:$id){... on IssueComment{"
     "id body databaseId updatedAt lastEditedAt editor{__typename login ... on Bot{id}}}}}"
@@ -100,7 +122,8 @@ def summary_state(body):
         raise GateError("Native summary state marker is missing or repeated")
     line, _, rest = body[len(marker) :].partition("\n")
     match = re.fullmatch(r"<!-- codex-review-state:v1 ([^\n]{1,4096}) -->", line)
-    if not match or not rest.startswith(heading):
+    details = DETAILS_SUMMARY.fullmatch(rest)
+    if not match or not (rest.startswith(heading) or details):
         raise GateError("Native summary envelope is unsupported")
     try:
         state = json.loads(match[1], object_pairs_hook=unique_fields)
@@ -128,6 +151,20 @@ def summary_state(body):
             )
         ):
             raise GateError("Native summary review state is unsupported")
+    if details:
+        code = state["code_review"]
+        if (
+            code["status"] != "completed"
+            or not code["commit_sha"].startswith(details["commit"])
+            or code["has_any_findings"] is not False
+            or code["has_unresolved_findings"] is not False
+        ):
+            raise GateError("Native summary state conflicts with its markdown")
+        # A missing time is a recognized row shape, but cannot establish a fresh
+        # completed cycle for either approval path. Never infer time from an edit.
+        if details["time"] is None:
+            raise GateError("Native summary completion timestamp is unavailable")
+        timestamp(details["time"])
     return state
 
 
