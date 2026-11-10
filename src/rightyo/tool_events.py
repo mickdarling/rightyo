@@ -156,6 +156,48 @@ REFUSED_NAME_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"})
 DEFAULT_OWNER_VOICE_THRESHOLD_S = 20
 MIN_OWNER_VOICE_THRESHOLD_S = 5
 MAX_OWNER_VOICE_THRESHOLD_S = 600
+# Whole temporal tails after the optional "the" are not handoff task objects (#268).
+HANDOFF_TEMPORAL_TAILS = frozenset(
+    {
+        "day",
+        "today",
+        "tonight",
+        "night",
+        "now",
+        "moment",
+        "time being",
+        "week",
+        "this week",
+        "weekend",
+        "morning",
+        "this morning",
+        "afternoon",
+        "this afternoon",
+        "evening",
+        "this evening",
+        "year",
+    }
+)
+# Closed-class/courtesy words alone cannot supply a handoff task object (#268).
+HANDOFF_FUNCTION_WORDS = frozenset(
+    "a an the this that these those i me my mine myself we us our ours ourselves "
+    "you your yours yourself yourselves he him his himself she her hers herself "
+    "it its itself they them their theirs themselves who whom whose which what "
+    "whatever whichever whoever whomever all any anybody anyone anything both each "
+    "either everybody everyone everything few many most much neither nobody none "
+    "noone nothing one other others several some somebody someone something such "
+    "am is are was were be being been do does did have has had can could may might "
+    "must shall should will would ought need dare and as because but if nor or so "
+    "than though unless until when whenever where wherever whether while why how "
+    "about above across after against along among around at before behind below "
+    "beneath beside besides between beyond by despite down during except for from "
+    "in inside into like near of off on onto out outside over past since through "
+    "throughout till to toward towards under underneath unlike up upon via with "
+    "within without not no yes only also even just still yet already again very "
+    "too quite rather then there here now please thanks that's don't doesn't "
+    "didn't isn't aren't wasn't weren't haven't hasn't hadn't can't couldn't "
+    "won't wouldn't shouldn't mustn't i'm you're he's she's it's we're they're".split()
+)
 
 
 class OwnerVoice:
@@ -359,6 +401,44 @@ def _starts_named(text, addressing):
         "".join(words[at : at + width]) in named_keys
         for at in starts
         for width in range(1, min(max_width, len(words) - at) + 1)
+    )
+
+
+def _named_handoff(text, addressing):
+    """Veto only the whole named `all/it for you for/on/about <task>` form (#268)."""
+    if addressing is None:
+        return False
+    text = " ".join(text.casefold().replace("\u2019", "'").split())
+    name, comma, body = text.partition(",")
+    if not comma or addressing.name_for(name.strip()) is None:
+        return False
+    # Fixed exclusions anywhere, including inside the task or the addressed name.
+    # Keep compounds intact: a stop-loss report does not contain a stop command.
+    left, right = r"(?<![\w-])", r"(?![\w-])"
+    if re.search(
+        left + r"(?:stop (?:speaking|talking|reading|listening)|quit|be quiet|shut up|"
+        r"go away|hang up|never mind|that's enough|leave it|leave me alone|end the call|"
+        r"we're done(?: here)?|call it a day|take it easy|take care|write me off|"
+        r"catch you later|check you later|talk later|see you|bye|goodbye|good night)" + right,
+        text,
+    ):
+        return False
+    clauses = re.split(r"[,\.?!;]|\b(?:and|then)\b", text)
+    if any(re.fullmatch(r"\s*(?:please\s+)?stop(?:\s+(?:please|thanks))?\s*", c) for c in clauses):
+        return False
+    word = r"[^\W_]+(?:[-'][^\W_]+)*"
+    match = re.fullmatch(
+        r"\s*(?:that's all|that is all|that's it) for you (?:for|on|about) "
+        r"(?:the )?(?P<task>" + word + r"(?: " + word + r")*?)"
+        r"(?:,? (?:please|thanks))?",
+        body,
+    )
+    # A whole temporal tail, courtesy words or function words alone are not a task object.
+    if match is None or match["task"] in HANDOFF_TEMPORAL_TAILS:
+        return False
+    return any(
+        word not in HANDOFF_FUNCTION_WORDS and any(c.isalpha() for c in word)
+        for word in match["task"].split()
     )
 
 
@@ -2551,7 +2631,11 @@ class SpeechEvents:
                 and event.decision.dismissal in DISMISSING
                 and self._dismissed.get(key, True)
             ):
-                kind = event.decision.dismissal
+                if key not in self._dismissed and _named_handoff(turn.text, self._addressing):
+                    # Preserve confidence; this narrow policy abstains from dismissal.
+                    evidence["dismissal"] = "uncertain"
+                else:
+                    kind = event.decision.dismissal
             dismissed = kind is not None or key in self._dismissed
             to_other_agent = mentions_name(self._other_agents, turn.text) and not mentions_name(
                 self._addressing, turn.text

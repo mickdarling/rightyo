@@ -660,6 +660,203 @@ class DismissEventTests(unittest.TestCase):
             events = self.deliver(current, dismissal=judged)
             self.assertEqual([e["type"] for e in events], ["transcript", "attention", "request"])
 
+    def test_only_whole_named_handoff_forms_veto_decision_dismissals(self):
+        names = Addressing.from_names(["Helper"], {"Helper": ["Aide"]})
+        for text in (
+            "Helper, that's all for you for the sample case",
+            "Helper, that is all for you on the topic",
+            "Helper, that's it for you about the item, thanks",
+            "Helper, that's all for you for sample case please",
+            "Aide, that's it for you on topic",
+            "HELPER, THAT’S ALL FOR YOU ABOUT THE ITEM",
+            "Helper, that's all for you for the research and design please",
+            "Helper, that's all for you for the stop-loss report",
+            "Helper, that's all for you for the day's notes",
+            "Helper, that's all for you for the end-of-day report",
+        ):
+            for kind in ("stop", "disengage"):
+                with self.subTest(text=text, kind=kind):
+                    self.start(addressing=names)
+                    events = self.deliver(turn("task", 0, 900, text), dismissal=(kind, 0.97))
+                    self.assertEqual(
+                        [e["type"] for e in events], ["transcript", "attention", "request"]
+                    )
+                    attention, request = events[1:]
+                    self.assertEqual(attention["decision"], request["decision"])
+                    self.assertEqual(request["turn"]["text"], text)
+                    self.assertEqual(request["decision"]["dismissal"], "uncertain")
+                    self.assertEqual(request["decision"]["dismissal_confidence"], 0.97)
+
+    def assert_provider_dismisses(self, text, addressing=None):
+        self.start(addressing=addressing)
+        events = self.deliver(turn("closing", 0, 900, text), dismissal=("disengage", 0.97))
+        self.assertEqual([e["type"] for e in events], ["transcript", "attention", "dismiss"])
+        self.assertEqual(events[1]["decision"]["dismissal"], "disengage")
+        dismiss = events[2]
+        self.assertEqual((dismiss["reason"], dismiss["confidence"]), ("decision", 0.97))
+        self.assertEqual(dismiss["withdrawn_request_ids"], [])
+
+    def test_temporal_handoff_tails_keep_provider_dismissals(self):
+        names = Addressing.from_names(["Helper"])
+        for tail in (
+            "the day",
+            "today",
+            "tonight",
+            "the night",
+            "now",
+            "the moment",
+            "the time being",
+            "the week",
+            "this week",
+            "the weekend",
+            "the morning",
+            "this morning",
+            "the afternoon",
+            "this afternoon",
+            "the evening",
+            "this evening",
+            "the year",
+        ):
+            for courtesy in ("", ", thanks"):
+                text = f"Helper, that's all for you for {tail}{courtesy}"
+                with self.subTest(text=text):
+                    self.assert_provider_dismisses(text, names)
+
+    def test_other_closings_and_handoff_phrasings_keep_provider_dismissals(self):
+        names = Addressing.from_names(["Helper"])
+        for text in (
+            "Helper, that's all",
+            "Helper, that's all, thanks",
+            "we're done here",
+            "that's all, goodbye",
+            "please stop speaking",
+            "take it easy",
+            "write me off for today",
+            "check you later",
+            "Helper, that's all for you for the sample case. Please stop speaking",
+            "Helper, that's all for you for the sample case, and stop",
+            "Helper, that's all for you for the sample case, then stop",
+            "Helper, that's all for you for the sample case and stop",
+            "Helper, that's all for you for the sample case then stop please",
+            "Helper, that's all for you for the sample case and please stop thanks",
+            "Helper, that's all for the sample case",
+            "Helper, that's it on the topic",
+            "Helper, we're done for you for the sample case",
+            "Helper, that is it for you for the sample case",
+            "Helper, that's all for you for the",
+            "Helper, that's all for you about please",
+            "Helper, that's all for you on the thanks",
+            "Helper, that's all for you on the 123",
+            "Helper, that's all for you on it",
+            "Helper, that's all for you on is",
+            "Helper, that's all for you on that",
+            "Helper, that's all for you on this and that please",
+            "Helper, that's all for you about you and me",
+            "Helper, that's all for you for the sample case, send the notes",
+            "Other, that's all for you for the sample case",
+            "Hey Helper, that's all for you for the sample case",
+            "I told Helper, that's all for you for the sample case",
+            "Helper that's all for you for the sample case",
+        ):
+            with self.subTest(text=text):
+                self.assert_provider_dismisses(text, names)
+        self.assert_provider_dismisses("Helper, that's all for you for the sample case")
+
+    def test_fixed_stop_and_farewell_phrases_anywhere_defeat_the_veto(self):
+        names = Addressing.from_names(["Helper"])
+        phrases = (
+            "stop speaking",
+            "stop talking",
+            "stop reading",
+            "stop listening",
+            "quit",
+            "be quiet",
+            "shut up",
+            "go away",
+            "hang up",
+            "never mind",
+            "that's enough",
+            "leave it",
+            "leave me alone",
+            "end the call",
+            "we're done",
+            "we're done here",
+            "call it a day",
+            "take it easy",
+            "take care",
+            "write me off",
+            "catch you later",
+            "check you later",
+            "talk later",
+            "see you",
+            "bye",
+            "goodbye",
+            "good night",
+        )
+        for phrase in phrases:
+            # These otherwise fit the task-word grammar, so exclusions must inspect it.
+            with self.subTest(phrase=phrase):
+                self.assert_provider_dismisses(
+                    f"Helper, that's all for you for the {phrase} sample", names
+                )
+        # The exclusion also covers a phrase inside a configured assistant name.
+        self.assert_provider_dismisses(
+            "Take Care, that's all for you for the sample case",
+            Addressing.from_names(["Take Care"]),
+        )
+
+    def test_broader_requests_remain_unvetoed_pending_classifier_followup(self):
+        # Known limitations: classifier follow-up #269 (from #268); do not broaden this guard.
+        names = Addressing.from_names(["Helper"])
+        for text in (
+            "Helper, that's all, can you write up the notes",
+            "Helper, that's it, send me the summary",
+            "Helper, that's all, and stop the timer",
+        ):
+            with self.subTest(text=text):
+                self.assert_provider_dismisses(text, names)
+
+    def test_a_configured_handoff_stop_phrase_is_never_vetoed(self):
+        text = "Helper, that's all for you on topic"
+        self.start(
+            addressing=Addressing.from_names(["Helper"]),
+            priority=ConfiguredPriorityProvider(
+                SpeakerPriority(stop_phrases=(text.replace(",", ""),))
+            ),
+        )
+        events = self.deliver(turn("stop", 0, 900, text), dismissal=("disengage", 0.97))
+        self.assertEqual([e["type"] for e in events], ["transcript", "dismiss", "attention"])
+        self.assertEqual(events[1]["reason"], "stop-phrase")
+        self.assertIsNone(events[1]["confidence"])
+        self.assertEqual(events[2]["decision"]["dismissal"], "disengage")
+
+    def test_decision_dismiss_event_keys_and_advertised_version_are_unchanged(self):
+        self.events = SpeechEvents()
+        self.events.start("dismissal-test", dismissal=WINDOW)
+        self.assertEqual(self.events.drain()[0]["dismissal"]["version"], 1)
+        for kind in ("stop", "disengage"):
+            with self.subTest(kind=kind):
+                self.start()
+                events = self.deliver(turn("closing", 0, 900, "Goodbye"), dismissal=(kind, 0.97))
+                (dismiss,) = self.of(events, "dismiss")
+                expected = {
+                    "schema_version",
+                    "type",
+                    "session_id",
+                    "sequence",
+                    "emitted_at_ms",
+                    "utterance_id",
+                    "speech_end_ms",
+                    "speaker_id",
+                    "scope",
+                    "withdrawn_request_ids",
+                    "reason",
+                    "confidence",
+                }
+                if kind == "disengage":
+                    expected.add("cooldown_until_ms")
+                self.assertEqual(set(dismiss), expected)
+
     def test_disengage_ends_engagement_and_starts_a_cooldown(self):
         self.start()
         away = turn("away", 0, 1000, "Jarvis, go away.")
