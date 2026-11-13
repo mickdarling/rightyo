@@ -2,7 +2,7 @@
 
 ## Original work
 
-Copyright (C) 2026 Mick Darling. RightyO's original code and documentation are offered under GNU Affero GPL version 3 or, at your option, any later version (`AGPL-3.0-or-later`). The full text is in LICENSE. No warranty is offered.
+Copyright (C) 2026 Mick Darling. RightyO's original code and documentation are offered under GNU Affero GPL version 3 or, at your option, any later version (`AGPL-3.0-or-later`). The full text is in LICENSE. No warranty is offered. The copyright holder may also offer an alternative commercial licence for distributions that cannot or do not wish to comply with the AGPL; this does not change the public AGPL availability of the source, and it does not extend to upstream code, third-party weights, or datasets, which keep their own terms.
 
 The intended license for project-owned trained weights is also AGPL-3.0-or-later. No weights exist in this bootstrap and none are licensed by implication as an existing release. A model release must explicitly identify its covered artifacts, upstream notices, and the available source/reproduction materials. We will publish training and inference code, exact configs, preprocessing/label specifications, dataset provenance and permitted reconstruction instructions, and evaluation/model-card materials to the extent distribution rights permit. Do not promise full reconstruction if inaccessible or restricted data makes that impossible; disclose the limitation and assess whether the proposed release satisfies its obligations.
 
