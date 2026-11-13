@@ -8,7 +8,7 @@ Keep experiments reproducible. Distinguish stubs, synthetic examples, prerecorde
 
 Never commit recordings, private transcripts, credentials, source/device identifiers, or unreviewed downloaded weights. License review covers code, datasets, and weights separately. Every issue/PR is public; use sanitized summaries and artifact hashes rather than private content.
 
-Contributions of original code/documentation use AGPL-3.0-or-later. Preserve upstream notices. Changes to trained weights require the model-release checklist, not only a code review. See docs/licensing.md and docs/training-process.md.
+External code contributions are not yet being accepted. RightyO is intended to remain available under AGPL-3.0-or-later while also supporting separately licensed commercial distributions, and a contributor agreement that grants the necessary relicensing rights will be published before outside code is merged. Bug reports, design discussion, and reproducible test reports are welcome. Original code/documentation in this repository is licensed AGPL-3.0-or-later. Preserve upstream notices. Changes to trained weights require the model-release checklist, not only a code review. See docs/licensing.md and docs/training-process.md.
 
 The initial commit is a design-only bootstrap. Subsequent changes follow the issue/PR workflow above.
 

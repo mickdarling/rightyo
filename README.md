@@ -133,4 +133,8 @@ Jev's documented input is text only. It can be evaluated as a transcript-based c
 
 RightyO's original code and documentation are licensed under **GNU Affero GPL version 3 or later** (`AGPL-3.0-or-later`); see [LICENSE](LICENSE). Copyright (C) 2026 Mick Darling. There is no warranty.
 
+Alternative commercial licensing may be made available by the copyright holder. The commercial option permits distributions that cannot or do not wish to comply with the AGPL; it does not change the availability of this public source tree.
+
+External code contributions are not yet being accepted because the contributor agreement needed to preserve dual licensing has not been finalized. Bug reports, design discussion, and reproducible test reports are welcome.
+
 We intend to release project-owned trained weights openly under AGPL-3.0-or-later too, accompanied by the training code, configurations, provenance, and reproducibility materials we have the right to distribute. No weights are released yet. Upstream code/weights retain their original notices, and datasets retain their own licenses and privacy restrictions. A repository license does not grant rights to somebody else's data or guarantee that every trained checkpoint can be redistributed. See the [release licensing policy](docs/licensing.md).
