@@ -587,6 +587,12 @@ class SpeechEvents:
         # it plays), as the host reports them (#124); bounded.
         self._playbacks = deque(maxlen=MAX_PLAYBACKS)
         self._playback_scopes = {}
+        # Eligible voice times/labels only (#283), independent of decision arrival. The
+        # session accepts at most 1,000 turns, so this cannot discard qualifying history.
+        self._cue_voices = deque(maxlen=1000)
+        # Acceptance-time comparison speaker; the same 1,000-turn session bound applies.
+        # A later request must not change the presence test of a pending direct attend.
+        self._cue_references = {}
         # Stream time the latest reply ended with a question to the owner (#199), or None;
         # cleared when the next reply starts.
         self._asked_at = None
@@ -791,6 +797,8 @@ class SpeechEvents:
         self._superseded.clear()
         self._appendix_from.clear()
         self.last_request = None
+        self._cue_voices.clear()
+        self._cue_references.clear()
         self._playbacks.clear()
         self._playback_scopes.clear()
         self._asked_at = None
@@ -1202,6 +1210,7 @@ class SpeechEvents:
                     raise ContractError("pending attention context budget exceeded")
                 self._pending[turn.utterance_id] = (turn, context, size, role)
                 self._pending_bytes += size
+            self._hear_other_voice(turn, role)
             name = self._speaker_name(turn, role)
             source = self._role_source(turn, role, inferred)
             self._emit(
@@ -1787,6 +1796,8 @@ class SpeechEvents:
             ended = (
                 self._engaged["speaker_id"] if self._engaged is not None and self._active else None
             )
+            self._cue_voices.clear()
+            self._cue_references.clear()
             self._roles.clear()
             self._request_outcomes.clear()
             self._request_outcome_ends.clear()
@@ -1858,18 +1869,22 @@ class SpeechEvents:
         return turn.utterance_id in self._meeting_turns
 
     def _meeting_attends(self, turn, authority):
-        """Meeting's bar (#227): media's bar plus owner authority, with no exception for a
+        """Meeting's bar (#227): media's bar plus a labelled owner, with no exception for a
         session without speaker roles. Passing it implies passing media's, so meeting with
         media on is exactly as strict as meeting alone.
         """
-        return authority == "owner" and self._media_attends(turn, authority)
+        return (
+            turn.speaker_id is not None
+            and authority == "owner"
+            and self._media_attends(turn, authority)
+        )
 
     def _meeting_blocks(self, turn, authority):
         """Whether meeting mode rejects this turn if considered for attention."""
         return self._meeting_for(turn) and not self._meeting_attends(turn, authority)
 
     def _attention_blocked(self, turn, authority):
-        """The mode whose bar rejects this turn, `meeting` before `media`, or None.
+        """The rejecting bar: explicit meeting, media, then automatic meeting, or None.
 
         Every promotion (meeting's and #251's) goes through this, so no promotion attends
         a turn that the provider-labeled attend gates would refuse.
@@ -1878,15 +1893,22 @@ class SpeechEvents:
             return "meeting"
         if self._media_blocks(turn, authority):
             return "media"
+        if self._others_present(turn) and not self._meeting_attends(turn, authority):
+            return "others_present"
         return None
 
     def _meeting_promote(self, turn, authority, decision, evidence):
-        """hailing-station#735 meeting mode (#227): owner + name anywhere beats only
-        abstention, never ignore/another agent. Inferred labels carry no authority.
+        """Explicit or automatic meeting: owner + name anywhere beats only abstention,
+        never ignore/another agent. Inferred labels carry no authority.
         Kept separate from #251's start-of-turn promotion; an attend needs no promotion.
         """
+        mode = (
+            "meeting"
+            if self._meeting_for(turn)
+            else ("others_present" if self._others_present(turn) else None)
+        )
         if (
-            self._meeting_for(turn)
+            mode is not None
             and self._meeting_ask_anywhere
             and not self._duck
             and self._attention_blocked(turn, authority) is None
@@ -1896,7 +1918,7 @@ class SpeechEvents:
             evidence["label"] = "attend"
             evidence["recipient_kind"] = "system"
             # Optional evidence, like `media`; strict hosts ignore unknown keys.
-            evidence["meeting"] = "ask_anywhere"
+            evidence[mode] = "ask_anywhere"
 
     def _retire_request_outcome(self, request):
         self._request_outcomes.pop(request, None)
@@ -2357,6 +2379,8 @@ class SpeechEvents:
         if self._media_for(turn):
             # Media mode: a show's dialogue in the window is never a follow-up.
             return "media"
+        if evidence.get("others_present") is True:
+            return "others_present"
         if unavailable is not None:
             return "unavailable"
         if evidence.get("answered_by_other"):
@@ -2373,16 +2397,20 @@ class SpeechEvents:
         if conversation.is_closing(turn.text):
             # A closing phrase ends the conversation; it is never a request of its own.
             return "closing"
-        if (
-            conversation.require_cue
-            and not self._cue_waived(decision)
+        needs_cue = (
+            not self._cue_waived(decision)
             and not follow_up_cued(turn.text, self._addressing)
             and not self._answers_question(turn)
             and not self._continues(turn, decision)
-        ):
+        )
+        if conversation.require_cue and needs_cue:
             # Talk to a pet or a passer-by in the window carries no cue that it continues
             # the exchange with the assistant (#199). It applies to an appendix too.
             return "no_cue"
+        if self._others_present(turn):
+            # Like explicit meeting, automatic meeting never admits a follow-up. A named
+            # owner abstention may already have passed the shared promotion above.
+            return "others_present" if self._named(turn) else "no_cue_others"
         if role is not None and self._priority.priority.owner_only and role != "owner":
             # Owner-only mode never lets another speaker's turn become a request.
             return "owner_only"
@@ -2439,6 +2467,45 @@ class SpeechEvents:
             f" attend={attend:.6g} bar={self._follow_up_bar(role):.6g}"
         )
 
+    def _playback_overlaps(self, start_ms, end_ms):
+        """Host-reported playback, including the shared echo margin (#199, #283)."""
+        return any(
+            start - PLAYBACK_MARGIN_MS <= end_ms
+            and (end is None or start_ms <= end + PLAYBACK_MARGIN_MS)
+            for start, end in self._playbacks
+        )
+
+    def _hear_other_voice(self, turn, role):
+        """Remember eligible voice metadata, including before engagement (#283)."""
+        if self._conversation is None or not self._conversation.cue_when_others_ms:
+            return
+        self._cue_references[turn.utterance_id] = (
+            self._engaged["speaker_id"] if self._engaged else turn.speaker_id
+        )
+        if (
+            turn.speaker_id is not None
+            and not (self._per_turn and role in {"owner", "trusted"})
+            and not self._playback_overlaps(turn.start_ms, turn.end_ms)
+        ):
+            self._cue_voices.append((turn.end_ms, turn.speaker_id))
+
+    def _others_present(self, turn):
+        """Find the latest qualifying time before this turn, never later speech.
+
+        Usually the latest voice settles this; the bounded history also handles pending
+        decisions and overlapping or out-of-order turns without losing earlier evidence.
+        """
+        if self._conversation is None or not self._conversation.cue_when_others_ms:
+            return False
+        window = self._conversation.cue_when_others_ms
+        # Direct requests need this bar even without an engaged conversation. With no
+        # engaged speaker, compare with the current voice instead of dereferencing None.
+        speaker_id = self._cue_references.get(turn.utterance_id, turn.speaker_id)
+        return any(
+            speaker != speaker_id and 0 <= turn.start_ms - at <= window
+            for at, speaker in reversed(self._cue_voices)
+        )
+
     def _answered(self, turn, decision, role):
         """Whether another person's answer withholds `turn` (#199): the pipeline saw a
         different speaker start within the reply window, no playback of the assistant's own
@@ -2448,10 +2515,7 @@ class SpeechEvents:
         at = decision.answered_at_ms
         if at is None or (self._per_turn and role in {"owner", "trusted"}):
             return False
-        return not any(
-            start - PLAYBACK_MARGIN_MS <= at and (end is None or at <= end + PLAYBACK_MARGIN_MS)
-            for start, end in self._playbacks
-        )
+        return not self._playback_overlaps(at, at)
 
     def _appendix(self, turn):
         """Whether the engaged speaker's undecided `turn` starts within the appendix window
@@ -2645,20 +2709,16 @@ class SpeechEvents:
                 # a follow-up or an acknowledgement here, and it ends this assistant's
                 # conversation with them below. Naming this assistant too keeps it ours.
                 evidence["label"] = "ignore"
-            if evidence["label"] == "attend" and self._meeting_blocks(turn, authority):
-                # Meeting (#227) always requires owner authority, even without roles, and
-                # inferred labels never authorize. Like media, only an attend is relabeled:
+            blocked = self._attention_blocked(turn, authority)
+            if evidence["label"] == "attend" and blocked is not None:
+                # Shared meeting/media/others-present bars apply to direct attends too.
+                # Like media, only an attend is relabeled:
                 # an abstention stays `uncertain` (unavailable evidence stays as documented,
                 # and it never ends a conversation), and both promotions re-check this bar.
                 evidence["label"] = "ignore"
-                evidence["meeting"] = True
+                evidence[blocked] = True
             elif unavailable is None and not stop and not dismissed:
                 self._meeting_promote(turn, authority, event.decision, evidence)
-            if evidence["label"] == "attend" and self._media_blocks(turn, authority):
-                # Media mode (hailing-station #551): TV dialogue stays context. An optional
-                # key, like role_status: strict hosts ignore unknown keys.
-                evidence["label"] = "ignore"
-                evidence["media"] = True
             if self._answered(turn, event.decision, current):
                 # Another person answered this unnamed turn at once (#199): it is theirs. An
                 # optional key, like media: strict hosts ignore unknown keys.
@@ -3051,6 +3111,9 @@ class SpeechEvents:
                         self._report(ack_note)
                     except Exception:  # noqa: BLE001
                         pass
+            if evidence.get("others_present") is True and self._report is not None:
+                with contextlib.suppress(Exception):
+                    self._report("attention_blocked reason=others_present")
             if named_owner and self._report is not None:
                 # Content-free and last, like ack/follow-up notes; a failed report never
                 # changes delivery or engagement. One token per promoted decision (#735).

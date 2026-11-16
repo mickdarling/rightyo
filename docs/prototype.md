@@ -90,7 +90,12 @@ off when absent. An optional `"conversation": {}` object turns on
 [conversation mode](tool-api.md#conversation-mode) (#82): engaged follow-ups after a
 request and the `conversation` event, with optional `window_ms`,
 `follow_up_min_probability`, `closing_phrases`, `appendix_ms`, `require_cue`,
-`cue_min_attend` and `continuation_cue`; it is off when absent. An optional
+`cue_min_attend`, `continuation_cue` and `cue_when_others_ms`; it is off when absent.
+With `cue_when_others_ms` on, while another voice is present, RightyO applies the meeting bar
+automatically: every request needs owner authority and the assistant's name, even a direct
+model `attend`. There are no follow-ups in this window; owner + name anywhere may promote
+abstention through the same meeting policy. Static cue shapes and waivers never bypass it.
+With the owner alone, behavior is unchanged. An optional
 `"acknowledgement": {}` object turns on [acknowledgement gating](tool-api.md#acknowledgement-gating)
 (#132): each request carries `acknowledge`, true only when the turn uses a configured name
 or its attend confidence reaches `min_confidence` (default 0.7, 0 to 1), so the host skips

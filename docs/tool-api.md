@@ -790,9 +790,35 @@ events. The object takes eight optional keys:
 | `follow_up_min_probability` | 0.4 | above 0, up to 1 | The attend probability an engaged speaker's `uncertain` turn needs to become a follow-up |
 | `closing_phrases` | "that's all", "that's it", "thanks, that's all", "never mind", and so on | up to 16 | Phrases that end the conversation (see [closings](#closings)) |
 | `appendix_ms` | 0 (off) | 0 to 5,000 | How soon after a request ends the same speaker's next turn counts as an appendix to it (see below) |
+| `cue_when_others_ms` | 0 (off) | 0 to 120,000 | Apply the meeting attention bar automatically while another voice was recently heard (see below) |
 | `require_cue` | false | true or false | Whether a follow-up must also carry a cue that it continues the exchange (see below) |
 | `cue_min_attend` | absent (off) | above 0 to 1 | With `require_cue`, the attend probability at which a follow-up needs no cue |
 | `continuation_cue` | false | true or false | With `require_cue`, whether the requester continuing after a reply needs no cue (see below) |
+
+With `cue_when_others_ms` above zero ([#283](https://github.com/mickdarling/rightyo/issues/283)),
+while another voice is present, RightyO applies the meeting bar automatically to **all
+attention**, including direct model `attend` decisions. Every request needs owner
+authority and the configured assistant's name; inferred and unlabelled turns fail closed,
+as do sessions without speaker roles. No turn is promoted as a conversation follow-up.
+The same meeting `ask_anywhere` policy may promote an owner's named abstention (never an
+`ignore`), with `others_present: "ask_anywhere"` in its evidence. The assistant's name
+may occur anywhere, including configured variants and the meeting policy's split names.
+The presence window lasts this many milliseconds after an eligible other turn ends.
+While engaged, another voice differs from the engaged speaker; without engagement it
+differs from the current turn's speaker, so a first direct request is protected too.
+Unattributed turns, enrolled owner or trusted turns when per-turn roles are on, and turns
+overlapping host-reported playback (including its 300 ms margin) never count.
+Nothing else satisfies this bar: neither `cue_min_attend`,
+`continuation_cue`, an answer to the assistant's question, nor generic second-person,
+referring or adding cues. A refused model `attend` becomes `ignore` with
+`others_present: true` and the content-free diagnostic
+`attention_blocked reason=others_present`. Explicit meeting and media refusals take
+precedence. Existing follow-up diagnostics retain `no_cue_others` for a missing name
+(or an earlier static `no_cue` refusal); other automatic-meeting refusals use
+`others_present`. With no other voice in the window, behavior and static cue waivers are
+unchanged. Once the window lapses, follow-ups work as before. The started
+event advertises `cue_when_others_ms` only when nonzero. This is a transcript policy;
+synthetic replay tests do not establish live speaker or addressee accuracy.
 
 **States.**
 - **Ambient**, the default: a turn forms a request only on a confident `attend`, as
