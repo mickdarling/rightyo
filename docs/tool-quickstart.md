@@ -85,16 +85,23 @@ the descriptor directly, so interpreter shutdown no longer aborts on the stdin b
 Unusable recognizer timestamps no longer end the session
 ([#78](https://github.com/mickdarling/rightyo/issues/78)):
 
-- whisper.cpp only: a segment that overruns by at most the CLI's one second of padding is
-  clamped, as before. If a segment's word timings are out of order, its whole text is kept
-  as one unit with the segment's own valid timing. A segment with text whose own offsets
-  are unusable suppresses the whole utterance. Unusable means not integers, negative,
-  reversed, zero-length, starting at or after the end of the received audio, or ending
-  more than that padding past it. A zero-length segment can't be attributed to a speaker,
-  so keeping it would split the utterance into separately judged turns. The segment is
-  counted in `skipped_segments`, and the utterance in `skipped_utterances`. Zero-length
-  word units inside a valid segment are unchanged
-  ([#95](https://github.com/mickdarling/rightyo/issues/95)).
+- whisper.cpp only ([#285](https://github.com/mickdarling/rightyo/issues/285)): retain
+  the bounded PCM window through validation. Keep usable segments in source order with
+  their times, dropping only unrepairable segments. Clamp end padding of at most 1,000 ms
+  to received audio, preserving the pinned CLI's existing padding allowance. Repair
+  reversals and neighbour-order jitter of at most 20 ms (two timestamp ticks, one PCM
+  frame); larger reversals, negative or non-integer offsets, and onsets beyond the window
+  are rejected. Zero-duration text stays at a point, without direct speaker evidence;
+  zero-duration word units remain valid
+  ([#95](https://github.com/mickdarling/rightyo/issues/95)). Inconsistent token timing falls
+  back to whole-segment text/times, including when token detail backtracks between valid
+  overlapping segments. Neither turn merging nor edge attribution crosses dropped text.
+  If no text survives, try the same PCM once more with the same local executable/model,
+  with a 5-second decode deadline (or the configured timeout if shorter) and the existing
+  bounded process cleanup. No network fallback is used. An unsuccessful retry loses only
+  that window; the session continues and a turn cannot merge across it. Rejected segments
+  from both attempts count in `skipped_segments`; only wholly lost windows count in
+  `skipped_utterances`.
 - Every backend: the units an utterance produces are then checked together. If any unit
   has timestamps that are not integers, NaN, negative, reversed, past the utterance, or
   earlier than the unit before it, the whole utterance is suppressed. No turn is
@@ -104,10 +111,16 @@ Unusable recognizer timestamps no longer end the session
   units in order, such as punctuation, are valid.
 
 The session keeps listening, and the next valid utterance is published as usual. Each
-affected utterance writes a count-only notice to stderr, never recognizer text. The
-terminal session event of a live session carries `skipped_segments` and
-`skipped_utterances` only when they are nonzero. A malformed recognizer result structure
-still ends the session with `error`.
+salvaged, re-decoded or lost Whisper window reports a content-free `rightyo: asr_window`
+line on stderr: window id, stream bounds in ms, original/retry segment counts, retained
+unit and repair/rejection counts, numeric rejection counts, and total ASR elapsed ms.
+The five `reasons` counts are ordered: type, bounds, reversal, order, retry failure or
+malformed retry. Recognizer text, audio and paths are never included. As before, diagnostics
+and public loss counters are withheld for private windows. Other backends retain their
+count-only suppression notice. The terminal session event still carries `skipped_segments`
+and `skipped_utterances` only when nonzero; host event keys are unchanged. A malformed
+initial recognizer result structure still ends the session with `error`; a failed or
+malformed recovery attempt is contained to its already unusable window.
 
 Repeatable `--name` flags (for example `--name "Hailing Station" --name computer`) declare
 the forms of address the system answers to for `listen`, `tool-replay` and `prototype`. They

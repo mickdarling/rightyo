@@ -29,7 +29,7 @@ import threading
 import time
 import wave
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -43,6 +43,13 @@ FRAME_BYTES = 640  # 20 ms of mono signed little-endian PCM16
 BYTES_PER_MS = 32  # mono PCM16 at 16 kHz
 MAX_CHUNK_BYTES = 32000  # one second of audio per push
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+# Preserve the pinned CLI's existing allowance for its one second of end padding.
+# Clamp only the end, never extend the received audio or accept an onset beyond it.
+ASR_END_PADDING_MS = 1000
+# Two 10 ms whisper timestamp ticks (one PCM frame): tolerate rounding jitter only.
+ASR_TIMING_JITTER_MS = 20
+# One recovery attempt, using the same local executable/model and PCM, never a queue.
+ASR_REDECODE_SECONDS = 5.0
 MAX_SPEAKER = 702  # "Speaker A" .. "Speaker ZZ"; native streams use 1..8
 # A diarizer renewal deferred past an open utterance or held turn is forced this long after the
 # privacy end is reached (#242 round 21), so steady speech cannot keep the old one in use.
@@ -1021,36 +1028,54 @@ def _transcribe(
         raise LiveAudioError("Local recognizer failed") from None
 
 
-def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]] | None:
-    """The usable units of one whisper.cpp document, or None; see `_counted_units`."""
+def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]]:
+    """The salvaged units of one whisper.cpp document; see `_recognizer_window`."""
     return _counted_units(document, duration_ms)[0]
 
 
-def _counted_units(
-    document: dict[str, Any], duration_ms: int
-) -> tuple[list[dict[str, Any]] | None, int]:
-    """Use complete token-derived word intervals; fall back to whole segments.
+@dataclass
+class _RecognizerWindow:
+    """Internal validation evidence only; never serialized into host events."""
 
-    No majority speaker vote, guessed timestamps, or splitting a word between
-    speakers. Zero-duration punctuation attaches to its word; words with only
-    zero-duration timestamps remain unassigned.
+    units: list[dict[str, Any]]
+    gaps: set[int]  # unit indices before/after unresolved text, including 0 and len(units)
+    segments: int = 0
+    repaired: int = 0
+    # Rejections: 1=type, 2=bounds, 3=reversal, 4=order, 5=retry failure/invalid structure.
+    reasons: tuple[int, ...] = (0, 0, 0, 0, 0)
+    retry_segments: int = 0
+    retried: bool = False
+    elapsed_ms: int = 0
 
-    whisper.cpp emits odd offsets on short, noisy or near-silent windows (#78). A
-    nonempty segment whose own offsets are unusable (not integers, negative, reversed,
-    zero-length, starting at or after the end of the received audio, or ending more
-    than the CLI's one second of padding past it) makes the whole utterance unusable:
-    publishing the remaining segments could invert meaning ("do not stop" becoming
-    "do stop"), and a zero-length segment cannot be attributed to a speaker, so it
-    would split the utterance into separately judged turns. Returns
-    `(None, n)` then, with `n` the number of unusable segments, so the caller
-    suppresses the utterance and keeps listening; otherwise `(units, 0)`. A
-    malformed document structure still fails closed.
+    @property
+    def rejected(self) -> int:
+        return sum(self.reasons[:4])
+
+
+def _counted_units(document: dict[str, Any], duration_ms: int) -> tuple[list[dict[str, Any]], int]:
+    """Compatibility view of the validated units and rejected segment count."""
+    window = _recognizer_window(document, duration_ms)
+    return window.units, window.rejected
+
+
+def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _RecognizerWindow:
+    """Keep every usable segment in source order, without moving its valid times.
+
+    Clamp CLI end padding, retain zero-duration text (no direct speaker evidence), and
+    collapse <=20 ms reversed intervals to a point. Small inter-segment jitter is
+    clamped to the preceding retained interval; larger reversals are rejected, never
+    sorted. Dropped segments leave barriers, including at the window's two edges.
+    Token timing still falls back to the complete segment on any inconsistency.
+    Malformed document structures fail closed as before.
     """
     segments = document.get("transcription")
     if not isinstance(segments, list) or len(segments) > 1000:
         raise LiveAudioError("Invalid local recognizer result")
-    result = []
-    skipped = 0
+    result: list[dict[str, Any]] = []
+    fallbacks: list[dict[str, Any]] = []
+    segment_gaps: set[int] = set()
+    window = _RecognizerWindow(result, set(), segments=len(segments))
+    reasons = [0] * 5
     for segment in segments:
         if not isinstance(segment, dict):
             raise LiveAudioError("Invalid local recognizer result")
@@ -1060,20 +1085,39 @@ def _counted_units(
         if not text.strip():
             continue
         start, end = offsets.get("from"), offsets.get("to")
-        if (
-            type(start) is not int
-            or type(end) is not int
-            or not 0 <= start < end <= duration_ms + 1000
-            or start >= duration_ms
-        ):
-            skipped += 1
+        previous_start = fallbacks[-1]["start_ms"] if fallbacks else 0
+        previous_end = fallbacks[-1]["end_ms"] if fallbacks else 0
+        reason = 0
+        original = (start, end)
+        if type(start) is not int or type(end) is not int:
+            reason = 1
+        elif not (0 <= start <= duration_ms and 0 <= end <= duration_ms + ASR_END_PADDING_MS):
+            reason = 2
+        elif start - end > ASR_TIMING_JITTER_MS:
+            reason = 3
+        else:
+            end = min(max(start, end), duration_ms)
+            if max(previous_start - start, previous_end - end) > ASR_TIMING_JITTER_MS:
+                reason = 4
+            else:
+                start, end = max(start, previous_start), max(end, previous_end)
+        if reason:
+            reasons[reason - 1] += 1
+            window.gaps.add(len(result))
+            segment_gaps.add(len(fallbacks))
             continue
-        # The pinned CLI rounds final segment offsets into its padded audio.
-        # Bound evidence to actually received PCM; never invent future frames.
-        end = min(end, duration_ms)
+        repaired = (start, end) != original or start == end
+        window.repaired += int(repaired)
         fallback = {"text": text, "start_ms": start, "end_ms": end}
+        fallbacks.append(fallback)
         tokens = segment.get("tokens")
-        if not isinstance(tokens, list) or len(tokens) > 4000:
+        if (
+            start != original[0]
+            or end > original[1]
+            or start == end
+            or not isinstance(tokens, list)
+            or len(tokens) > 4000
+        ):
             result.append(fallback)
             continue
         words: list[dict[str, Any]] = []
@@ -1090,6 +1134,9 @@ def _counted_units(
                 continue
             reconstructed += value
             interval = token.get("offsets", {})
+            if not isinstance(interval, dict):
+                usable = False
+                break
             left, right = interval.get("from"), interval.get("to")
             if (
                 type(left) is not int
@@ -1113,8 +1160,20 @@ def _counted_units(
             a["start_ms"] <= b["start_ms"] and a["end_ms"] <= b["end_ms"]
             for a, b in zip(words, words[1:])
         )
+        usable &= bool(words) and (
+            words[0]["start_ms"] >= previous_start and words[0]["end_ms"] >= previous_end
+        )
         result.extend(words if usable else [fallback])
-    return (None if skipped else result), skipped
+    if any(
+        a["start_ms"] > b["start_ms"] or a["end_ms"] > b["end_ms"]
+        for a, b in zip(result, result[1:])
+    ):
+        # Ordered overlapping segments can have token detail that backtracks across
+        # their boundary. Keep all segment text/times; sacrifice detail, never words.
+        result[:] = fallbacks
+        window.gaps = segment_gaps
+    window.reasons = tuple(reasons)
+    return window
 
 
 class WhisperCppTranscriber:
@@ -1128,22 +1187,40 @@ class WhisperCppTranscriber:
         # Refused before any audio when no unwritable directory is available (fail closed).
         recognizer_dir()
         self.config = config
-        # Unusable segments, and the utterances they suppressed, this session (see
-        # `_counted_units`); read by `LiveProcessor`.
+        # Rejected segments (both attempts), and wholly lost windows, this session.
+        self._window: _RecognizerWindow | None = None
         self.skipped_segments = 0
         self.suppressed_utterances = 0
 
     def transcribe(
         self, pcm: bytes, register: Callable[[subprocess.Popen], None] | None = None
     ) -> list[dict[str, Any]]:
+        started = time.monotonic()
+        duration = len(pcm) // BYTES_PER_MS
+        self._window = None
         document = _transcribe(self.config, pcm, register)
-        units, skipped = _counted_units(document, len(pcm) // BYTES_PER_MS)
-        self.skipped_segments += skipped
-        if units is None:
-            # The whole utterance is unusable: publish nothing from it.
+        window = _recognizer_window(document, duration)
+        if not window.units and window.rejected:
+            # Retain the bounded PCM until validation and one bounded recovery finish.
+            retry_config = replace(
+                self.config, timeout_seconds=min(self.config.timeout_seconds, ASR_REDECODE_SECONDS)
+            )
+            try:
+                retry = _recognizer_window(_transcribe(retry_config, pcm, register), duration)
+            except LiveAudioError:
+                # Timeout, local process failure or malformed retry: lose this window only.
+                retry = _RecognizerWindow([], {0}, reasons=(0, 0, 0, 0, 1))
+            retry.retry_segments = retry.segments
+            retry.segments = window.segments
+            retry.reasons = tuple(a + b for a, b in zip(window.reasons, retry.reasons))
+            retry.retried = True
+            window = retry
+        window.elapsed_ms = max(0, round((time.monotonic() - started) * 1000))
+        self._window = window
+        self.skipped_segments += window.rejected
+        if not window.units and (window.rejected or window.retried):
             self.suppressed_utterances += 1
-            return []
-        return units
+        return window.units
 
 
 def _checked_units(units: Any, duration_ms: int) -> list[dict[str, Any]] | None:
@@ -1317,8 +1394,8 @@ class LiveProcessor:
     def skipped_utterances(self) -> int:
         """Utterances suppressed whole this session for invalid or out-of-order timing.
 
-        Counts the common unit check's suppressions plus a transcriber's own (whisper.cpp
-        suppresses an utterance with an unusable segment before the unit check).
+        Counts the common unit check's suppressions plus windows with no salvageable
+        whisper.cpp text after the single recovery attempt.
         """
         inner = getattr(self._transcriber, "suppressed_utterances", 0)
         inner = inner if type(inner) is int and inner > 0 else 0
@@ -1593,18 +1670,24 @@ class LiveProcessor:
         _check_timeline(timeline, self._received_ms, self._timeline_limit)
         pcm = bytes(self._utterance)
         offset = self._utterance_start
-        self._utterance.clear()
-        self._pre_roll.clear()
         before = (self.skipped_segments, self.skipped_utterances)
         try:
             units = self._transcriber.transcribe(pcm, self._register_asr)
         finally:
             self._asr_process = None
+        window = getattr(self._transcriber, "_window", None)
+        if isinstance(window, _RecognizerWindow):
+            # Metadata/text belong only to this finalization, including private windows.
+            self._transcriber._window = None
+        else:
+            window = None
         if self.closed:
             raise LiveAudioError("Audio session was stopped")
         provenance = getattr(self._diarizer, "speaker_provenance", "diarization-timeline")
         self._utterances += 1
         checked = _checked_units(units, len(pcm) // BYTES_PER_MS)
+        self._utterance.clear()
+        self._pre_roll.clear()
         if checked is None:
             self._skipped_utterances += 1
         skipped = self.skipped_segments - before[0]
@@ -1616,7 +1699,19 @@ class LiveProcessor:
             # Taken out of the session's totals too, not only its note (Codex P2 on #242).
             self._private_skipped_segments += skipped
             self._private_skipped_utterances += 1 if suppressed else 0
-        if (skipped or suppressed) and self.config.report is not None and not private:
+        if window is not None and (window.repaired or window.rejected or window.retried):
+            outcome = "lost" if suppressed else "redecoded" if window.retried else "salvaged"
+            # Fixed tokens and numbers only. The tool's report sink adds `rightyo:` on stderr.
+            self._diagnostic(
+                f"asr_window outcome={outcome} window_id={self._utterances}"
+                f" start_ms={offset} end_ms={offset + len(pcm) // BYTES_PER_MS}"
+                f" segments={window.segments} retry_segments={window.retry_segments}"
+                f" units={len(window.units)} repaired={window.repaired} rejected={window.rejected}"
+                f" reasons={','.join(map(str, window.reasons))}"
+                f" asr_elapsed_ms={window.elapsed_ms}",
+                span=(offset, offset + len(pcm) // BYTES_PER_MS),
+            )
+        elif (skipped or suppressed) and self.config.report is not None and not private:
             # Content-free: counts only, never recognizer text or timestamps. A failing
             # diagnostic channel never ends the session.
             segments = f"{skipped} recognizer segment(s) with unusable timestamps"
@@ -1634,7 +1729,33 @@ class LiveProcessor:
             # one ("Do not stop." published as "Do stop."): release it on its own now.
             self._merger.flush()
             return
-        units = checked
+        gaps = window.gaps if window is not None else set()
+        cuts = sorted({0, len(checked)} | gaps)
+        for left, right in zip(cuts, cuts[1:]):
+            if left in gaps:
+                self._merger.flush()
+            self._publish_units(
+                checked[left:right],
+                timeline,
+                offset,
+                pcm,
+                provenance,
+                complete=complete and right == len(checked) and right not in gaps,
+            )
+        if len(checked) in gaps:
+            self._merger.flush()
+
+    def _publish_units(
+        self,
+        units: list[dict[str, Any]],
+        timeline: list[dict[str, Any]],
+        offset: int,
+        pcm: bytes,
+        provenance: str,
+        *,
+        complete: bool,
+    ) -> None:
+        """Attribute one uninterrupted run; neither edge inference nor merging crosses loss."""
         # Units start at or after `offset`; a segment ending by then overlaps none of them,
         # so attribution scans only this utterance's part of the timeline.
         relevant = [segment for segment in timeline if segment["end_ms"] > offset]
