@@ -393,3 +393,186 @@ class OthersCueTests(unittest.TestCase):
             raw.pop("version")
             self.assertEqual(Conversation.from_dict(raw), mode)
             self.assertEqual("cue_when_others_ms" in raw, bool(value))
+
+
+class OthersPresentSnapshotTests(unittest.TestCase):
+    """Per-turn policy survives public pending decisions, not reusable speaker labels."""
+
+    def pending(self, *, others=True, meeting=False, media=False, max_pending=128):
+        self.notes = []
+        events = SpeechEvents(report=self.notes.append, max_pending=max_pending, retention_ms=10000)
+        events.meeting(meeting)
+        events.media(media)
+        events.start(
+            SESSION, now_ms=0, conversation=MODE, addressing=NAMES, priority=OWNER, duck=True
+        )
+        events.drain()
+        owner = turn("owner", 0, 900, "Jarvis, open the authored folder")
+        events.transcript(owner, 900)
+        events.decision(decided(owner, "attend"), 1000)
+        events.drain()
+        if others:
+            participant = turn("participant", 1100, 2400, "Lovely morning", speaker="Speaker B")
+            events.transcript(participant, 2400, expect_decision=False)
+        current = turn("pending", 3000, 3800, "The green folder")
+        events.transcript(current, 3800)
+        events.drain()
+        self.assertIn(current.utterance_id, events._pending)
+        self.assertIs(events._others_present(current), others)
+        return events, current
+
+    def assert_blocked(self, events, current, *, now=5000, reason="others_present"):
+        events.drain()
+        events.decision(decided(current, "attend", attend=0.98, confidence=0.98), now)
+        output = events.drain()
+        self.assertFalse(any(e["type"] == "request" for e in output))
+        evidence = next(e["decision"] for e in output if e["type"] == "attention")
+        self.assertEqual(evidence["label"], "ignore")
+        self.assertIs(evidence[reason], True)
+        return evidence
+
+    def test_pending_attend_stays_blocked_after_privacy_and_speaker_reset(self):
+        events, current = self.pending()
+        events.duck(True, now_ms=4000)
+        events.duck(False, now_ms=4100)
+        events.forget_speakers(now_ms=4200)
+        self.assertEqual(list(events._cue_voices), [])
+        evidence = self.assert_blocked(events, current)
+        self.assertEqual(evidence["role"], "unknown")
+        self.assertIn("attention_blocked reason=others_present", self.notes)
+        self.assertNotIn(current.text, " ".join(self.notes))
+
+    def test_other_reset_and_toggle_paths_keep_the_accepted_bar(self):
+        for reset in (
+            "forget",
+            "forget_twice",
+            "privacy_on",
+            "privacy_cycle",
+            "meeting",
+            "media",
+            "meeting_media_cycle",
+        ):
+            with self.subTest(reset=reset):
+                events, current = self.pending()
+                if reset.startswith("forget"):
+                    events.forget_speakers(now_ms=4000)
+                    if reset == "forget_twice":
+                        events.forget_speakers(now_ms=4100)
+                elif reset.startswith("privacy"):
+                    events.duck(True, now_ms=4000)
+                    if reset == "privacy_cycle":
+                        events.duck(False, now_ms=4100)
+                else:
+                    if "meeting" in reset:
+                        events.meeting(True)
+                    if "media" in reset:
+                        events.media(True)
+                    if reset.endswith("cycle"):
+                        events.meeting(False)
+                        events.media(False)
+                self.assertIs(events._others_present(current), True)
+                self.assert_blocked(events, current)
+
+    def test_existing_meeting_and_media_snapshots_keep_precedence_after_reset(self):
+        for meeting, media, reason in (
+            (True, False, "meeting"),
+            (False, True, "media"),
+            (True, True, "meeting"),
+        ):
+            with self.subTest(meeting=meeting, media=media):
+                events, current = self.pending(meeting=meeting, media=media)
+                events.meeting(False)
+                events.media(False)
+                events.forget_speakers(now_ms=4000)
+                evidence = self.assert_blocked(events, current, reason=reason)
+                self.assertNotIn("others_present", evidence)
+                self.assertIs(events._others_present(current), True)
+
+    def test_reset_clears_history_for_new_turns_but_not_the_old_verdict(self):
+        events, current = self.pending()
+        events.forget_speakers(now_ms=4000)
+        self.assert_blocked(events, current)
+        fresh = turn("fresh", 6000, 6800, "The blue folder")
+        events.transcript(fresh, 6800)
+        self.assertIs(events._others_present(fresh), False)
+        events.decision(decided(fresh, "attend", attend=0.98), 6900)
+        request = next(e for e in events.drain() if e["type"] == "request")
+        self.assertNotIn("others_present", request["decision"])
+
+    def test_a_turn_accepted_alone_does_not_acquire_a_bar_after_reset_or_later_speech(self):
+        for reset in (False, True):
+            with self.subTest(reset=reset):
+                events, current = self.pending(others=False)
+                if reset:
+                    events.forget_speakers(now_ms=4000)
+                later = turn("later", 4000, 4800, "Lovely morning", speaker="Speaker B")
+                events.transcript(later, 4800, expect_decision=False)
+                self.assertIs(events._others_present(current), False)
+                events.decision(decided(current, "attend", attend=0.98), 5000)
+                request = next(e for e in events.drain() if e["type"] == "request")
+                self.assertNotIn("others_present", request["decision"])
+
+    def test_private_turns_never_add_presence_snapshots_or_history(self):
+        events, current = self.pending()
+        snapshots = dict(events._others_turns)
+        voices = list(events._cue_voices)
+        events.duck(True, now_ms=4000)
+        private = turn("private", 4100, 4800, "Synthetic private sentence", speaker="Speaker B")
+        events.transcript(private, 4800)
+        self.assertEqual(events._others_turns, snapshots)
+        self.assertEqual(list(events._cue_voices), voices)
+        events.duck(False, now_ms=4900)
+        self.assert_blocked(events, current, now=5000)
+
+    def test_presence_snapshot_expires_with_the_other_per_turn_snapshots(self):
+        events, current = self.pending(meeting=True, media=True)
+        events.forget_speakers(now_ms=4000)
+        expiry = current.end_ms + events.retention_ms
+        events.expire(expiry - 1)
+        for snapshots in (events._others_turns, events._meeting_turns, events._media_turns):
+            self.assertEqual(snapshots, {current.utterance_id: current.end_ms})
+        self.assertIn(current.utterance_id, events._pending)
+        events.expire(expiry)
+        for snapshots in (events._others_turns, events._meeting_turns, events._media_turns):
+            self.assertEqual(snapshots, {})
+        self.assertEqual(events._pending, {})
+        events.decision(decided(current, "attend", attend=0.98), expiry)
+        self.assertFalse(any(e["type"] == "request" for e in events.drain()))
+
+    def test_session_end_and_restart_discard_pending_verdicts_and_history(self):
+        for phase in ("stopped", "cancelled", "error"):
+            with self.subTest(phase=phase):
+                events, current = self.pending()
+                events.end(phase, now_ms=4000)
+                self.assertEqual(events._others_turns, {})
+                self.assertEqual(list(events._cue_voices), [])
+                self.assertEqual(events._pending, {})
+                events.drain()
+                session = SESSION + "-" + phase
+                events.start(session, now_ms=0, conversation=MODE, addressing=NAMES, priority=OWNER)
+                events.drain()
+                with self.assertRaises(ContractError):
+                    events.decision(decided(current, "attend", attend=0.98), 1000)
+                fresh = replace(current, session_id=session, start_ms=0, end_ms=800)
+                events.transcript(fresh, 800)
+                self.assertIs(events._others_present(fresh), False)
+                events.decision(decided(fresh, "attend", attend=0.98), 900)
+                request = next(e for e in events.drain() if e["type"] == "request")
+                self.assertNotIn("others_present", request["decision"])
+
+    def test_backlog_teardown_discards_the_pending_verdict_with_its_turn(self):
+        events, current = self.pending(max_pending=5)
+        with self.assertRaises(ContractError):
+            for index in range(6):
+                extra = turn(
+                    f"extra-{index}",
+                    4000 + index * 1000,
+                    4800 + index * 1000,
+                    "Authored extra turn",
+                )
+                events.transcript(extra, extra.end_ms, expect_decision=False)
+        self.assertEqual(events._others_turns, {})
+        self.assertEqual(list(events._cue_voices), [])
+        self.assertEqual(events._pending, {})
+        events.decision(decided(current, "attend", attend=0.98), 11000)
+        self.assertEqual(events.drain(), [])

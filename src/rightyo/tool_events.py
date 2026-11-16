@@ -590,9 +590,6 @@ class SpeechEvents:
         # Eligible voice times/labels only (#283), independent of decision arrival. The
         # session accepts at most 1,000 turns, so this cannot discard qualifying history.
         self._cue_voices = deque(maxlen=1000)
-        # Acceptance-time comparison speaker; the same 1,000-turn session bound applies.
-        # A later request must not change the presence test of a pending direct attend.
-        self._cue_references = {}
         # Stream time the latest reply ended with a question to the owner (#199), or None;
         # cleared when the next reply starts.
         self._asked_at = None
@@ -622,6 +619,9 @@ class SpeechEvents:
         # with the same acceptance-time snapshot and retention as media.
         self._meeting = False
         self._meeting_turns = {}
+        # Acceptance-time others-present verdicts, like meeting/media snapshots: id -> end.
+        # No speaker labels: pending decisions keep their bar across speaker resets.
+        self._others_turns = {}
         # Privacy mode (internally duck, v3; hailing-station #735 S-1), set by the host: a
         # turn heard while it is on is never emitted, decided or kept, and is matched only
         # for the local exit and status phrases (see `duck`). Like media mode it outlasts
@@ -798,7 +798,7 @@ class SpeechEvents:
         self._appendix_from.clear()
         self.last_request = None
         self._cue_voices.clear()
-        self._cue_references.clear()
+        self._others_turns.clear()
         self._playbacks.clear()
         self._playback_scopes.clear()
         self._asked_at = None
@@ -1035,6 +1035,9 @@ class SpeechEvents:
             for key, end_ms in list(self._meeting_turns.items()):
                 if end_ms <= cutoff:
                     del self._meeting_turns[key]
+            for key, end_ms in list(self._others_turns.items()):
+                if end_ms <= cutoff:
+                    del self._others_turns[key]
             for key in list(self._superseded):
                 if key not in self._pending:
                     del self._superseded[key]
@@ -1797,7 +1800,8 @@ class SpeechEvents:
                 self._engaged["speaker_id"] if self._engaged is not None and self._active else None
             )
             self._cue_voices.clear()
-            self._cue_references.clear()
+            # Per-turn attention snapshots deliberately survive: pending public turns
+            # must keep the bar they had when accepted, even with their labels forgotten.
             self._roles.clear()
             self._request_outcomes.clear()
             self._request_outcome_ends.clear()
@@ -2476,35 +2480,26 @@ class SpeechEvents:
         )
 
     def _hear_other_voice(self, turn, role):
-        """Remember eligible voice metadata, including before engagement (#283)."""
+        """Record eligible history and snapshot this turn's presence bar (#283)."""
         if self._conversation is None or not self._conversation.cue_when_others_ms:
             return
-        self._cue_references[turn.utterance_id] = (
-            self._engaged["speaker_id"] if self._engaged else turn.speaker_id
-        )
+        speaker_id = self._engaged["speaker_id"] if self._engaged else turn.speaker_id
         if (
             turn.speaker_id is not None
             and not (self._per_turn and role in {"owner", "trusted"})
             and not self._playback_overlaps(turn.start_ms, turn.end_ms)
         ):
             self._cue_voices.append((turn.end_ms, turn.speaker_id))
-
-    def _others_present(self, turn):
-        """Find the latest qualifying time before this turn, never later speech.
-
-        Usually the latest voice settles this; the bounded history also handles pending
-        decisions and overlapping or out-of-order turns without losing earlier evidence.
-        """
-        if self._conversation is None or not self._conversation.cue_when_others_ms:
-            return False
         window = self._conversation.cue_when_others_ms
-        # Direct requests need this bar even without an engaged conversation. With no
-        # engaged speaker, compare with the current voice instead of dereferencing None.
-        speaker_id = self._cue_references.get(turn.utterance_id, turn.speaker_id)
-        return any(
+        if any(
             speaker != speaker_id and 0 <= turn.start_ms - at <= window
             for at, speaker in reversed(self._cue_voices)
-        )
+        ):
+            self._others_turns[turn.utterance_id] = turn.end_ms
+
+    def _others_present(self, turn):
+        """The acceptance-time verdict, unaffected by later speech, modes or label resets."""
+        return turn.utterance_id in self._others_turns
 
     def _answered(self, turn, decision, role):
         """Whether another person's answer withholds `turn` (#199): the pipeline saw a
@@ -3258,6 +3253,8 @@ class SpeechEvents:
             self._memory.clear()
             self._pending.clear()
             self._pending_bytes = 0
+            self._cue_voices.clear()
+            self._others_turns.clear()
             self._open.clear()
             self._delivered.clear()
             self._withdrawn.clear()

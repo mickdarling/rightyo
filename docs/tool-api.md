@@ -806,6 +806,11 @@ may occur anywhere, including configured variants and the meeting policy's split
 The presence window lasts this many milliseconds after an eligible other turn ends.
 While engaged, another voice differs from the engaged speaker; without engagement it
 differs from the current turn's speaker, so a first direct request is protected too.
+The verdict is snapshotted when each public turn is accepted, like meeting and media.
+Privacy changes, speaker resets, later speech and mode toggles cannot change that turn's
+bar while its decision is pending. A speaker reset clears reusable voice history, but
+retains these content-free per-turn verdicts until normal transcript retention expires.
+Session teardown clears the verdicts and pending decisions; a new session starts fresh.
 Unattributed turns, enrolled owner or trusted turns when per-turn roles are on, and turns
 overlapping host-reported playback (including its 300 ms margin) never count.
 Nothing else satisfies this bar: neither `cue_min_attend`,
