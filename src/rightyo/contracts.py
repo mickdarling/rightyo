@@ -476,6 +476,8 @@ class Dismissal:
     window_ms: int = DEFAULT_DISMISSAL_WINDOW_MS
     cooldown_ms: int = DEFAULT_DISMISSAL_COOLDOWN_MS
     cooldown_min_confidence: float = DEFAULT_COOLDOWN_MIN_CONFIDENCE
+    # Same-turn attend probability required for decision dismissals (#282); None is off.
+    min_attend: float | None = None
 
     def __post_init__(self) -> None:
         if type(self.window_ms) is not int or not 1 <= self.window_ms <= MAX_DISMISSAL_WINDOW_MS:
@@ -486,10 +488,12 @@ class Dismissal:
         ):
             raise ContractError("invalid dismissal cooldown")
         probability(self.cooldown_min_confidence)
+        if self.min_attend is not None:
+            probability(self.min_attend)
 
     @classmethod
     def from_dict(cls, raw: Any) -> Dismissal:
-        allowed = {"window_ms", "cooldown_ms", "cooldown_min_confidence"}
+        allowed = {"window_ms", "cooldown_ms", "cooldown_min_confidence", "min_attend"}
         if not isinstance(raw, dict) or set(raw) - allowed:
             raise ContractError("dismissal must be an object with known keys only")
         return cls(**raw)
@@ -500,6 +504,7 @@ class Dismissal:
             "window_ms": self.window_ms,
             "cooldown_ms": self.cooldown_ms,
             "cooldown_min_confidence": self.cooldown_min_confidence,
+            **({"min_attend": self.min_attend} if self.min_attend is not None else {}),
         }
 
 
@@ -537,6 +542,9 @@ class Conversation:
     # Jev chose to attend, starting once the assistant has begun replying, continue the
     # exchange without a cue: their whole message is answered, not just a "yes".
     continuation_cue: bool = False
+    # Apply the meeting attention bar after another diarized voice (#283); 0 is off.
+    # Every request needs owner authority plus the assistant name; no follow-ups.
+    cue_when_others_ms: int = 0
 
     def __post_init__(self) -> None:
         if (
@@ -548,6 +556,11 @@ class Conversation:
             raise ContractError("invalid follow-up probability")
         if type(self.appendix_ms) is not int or not 0 <= self.appendix_ms <= MAX_APPENDIX_MS:
             raise ContractError("invalid appendix window")
+        if (
+            type(self.cue_when_others_ms) is not int
+            or not 0 <= self.cue_when_others_ms <= MAX_CONVERSATION_WINDOW_MS
+        ):
+            raise ContractError("invalid other-voice cue window")
         if type(self.require_cue) is not bool:
             raise ContractError("invalid follow-up cue requirement")
         if self.cue_min_attend is not None and probability(self.cue_min_attend) <= 0:
@@ -599,6 +612,7 @@ class Conversation:
             "require_cue",
             "cue_min_attend",
             "continuation_cue",
+            "cue_when_others_ms",
         }
         if not isinstance(raw, dict) or set(raw) - allowed:
             raise ContractError("conversation must be an object with known keys only")
@@ -621,6 +635,7 @@ class Conversation:
             **({"require_cue": True} if self.require_cue else {}),
             **({"cue_min_attend": self.cue_min_attend} if self.cue_min_attend is not None else {}),
             **({"continuation_cue": True} if self.continuation_cue else {}),
+            **({"cue_when_others_ms": self.cue_when_others_ms} if self.cue_when_others_ms else {}),
         }
 
 

@@ -790,9 +790,40 @@ events. The object takes eight optional keys:
 | `follow_up_min_probability` | 0.4 | above 0, up to 1 | The attend probability an engaged speaker's `uncertain` turn needs to become a follow-up |
 | `closing_phrases` | "that's all", "that's it", "thanks, that's all", "never mind", and so on | up to 16 | Phrases that end the conversation (see [closings](#closings)) |
 | `appendix_ms` | 0 (off) | 0 to 5,000 | How soon after a request ends the same speaker's next turn counts as an appendix to it (see below) |
+| `cue_when_others_ms` | 0 (off) | 0 to 120,000 | Apply the meeting attention bar automatically while another voice was recently heard (see below) |
 | `require_cue` | false | true or false | Whether a follow-up must also carry a cue that it continues the exchange (see below) |
 | `cue_min_attend` | absent (off) | above 0 to 1 | With `require_cue`, the attend probability at which a follow-up needs no cue |
 | `continuation_cue` | false | true or false | With `require_cue`, whether the requester continuing after a reply needs no cue (see below) |
+
+With `cue_when_others_ms` above zero ([#283](https://github.com/mickdarling/rightyo/issues/283)),
+while another voice is present, RightyO applies the meeting bar automatically to **all
+attention**, including direct model `attend` decisions. Every request needs owner
+authority and the configured assistant's name; inferred and unlabelled turns fail closed,
+as do sessions without speaker roles. No turn is promoted as a conversation follow-up.
+The same meeting `ask_anywhere` policy may promote an owner's named abstention (never an
+`ignore`), with `others_present: "ask_anywhere"` in its evidence. The assistant's name
+may occur anywhere, including configured variants and the meeting policy's split names.
+The presence window lasts this many milliseconds after an eligible other turn ends.
+While engaged, another voice differs from the engaged speaker; without engagement it
+differs from the current turn's speaker, so a first direct request is protected too.
+The verdict is snapshotted when each public turn is accepted, like meeting and media.
+Privacy changes, speaker resets, later speech and mode toggles cannot change that turn's
+bar while its decision is pending. A speaker reset clears reusable voice history, but
+retains these content-free per-turn verdicts until normal transcript retention expires.
+Session teardown clears the verdicts and pending decisions; a new session starts fresh.
+Unattributed turns, enrolled owner or trusted turns when per-turn roles are on, and turns
+overlapping host-reported playback (including its 300 ms margin) never count.
+Nothing else satisfies this bar: neither `cue_min_attend`,
+`continuation_cue`, an answer to the assistant's question, nor generic second-person,
+referring or adding cues. A refused model `attend` becomes `ignore` with
+`others_present: true` and the content-free diagnostic
+`attention_blocked reason=others_present`. Explicit meeting and media refusals take
+precedence. Existing follow-up diagnostics retain `no_cue_others` for a missing name
+(or an earlier static `no_cue` refusal); other automatic-meeting refusals use
+`others_present`. With no other voice in the window, behavior and static cue waivers are
+unchanged. Once the window lapses, follow-ups work as before. The started
+event advertises `cue_when_others_ms` only when nonzero. This is a transcript policy;
+synthetic replay tests do not establish live speaker or addressee accuracy.
 
 **States.**
 - **Ambient**, the default: a turn forms a request only on a confident `attend`, as
@@ -1015,13 +1046,14 @@ host; stopping speech output is the host's job.
 changes: no third decision question, no `dismiss` event, and the shared fixtures are
 byte-identical. Turn it on with the configuration's `"dismissal": {}` object, or with
 `--dismissal` on `listen` and `tool-replay` (the defaults; a configuration file's own
-`dismissal` object wins). The object takes three optional keys:
+`dismissal` object wins). The object takes four optional keys:
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
 | `window_ms` | 10,000 | 1 to 60,000 | Self-withdrawal window: how long after a request turn ended its speaker can still withdraw it |
 | `cooldown_ms` | 30,000 | 0 to 600,000 | How long a `disengage` dismissal raises the bar for unnamed attends; 0 is off |
 | `cooldown_min_confidence` | 0.9 | 0 to 1 | The attention confidence an unnamed attend needs during the cool-down |
+| `min_attend` | absent (off) | 0 to 1, or null (off) | Same-turn attend probability needed for a model-judged dismissal |
 
 When it is on, the `started` event carries a separate top-level object beside the
 unchanged capability set,
@@ -1070,6 +1102,17 @@ capability (`dismiss` event, version 1).
    malformed `dismissal` answer is treated as no dismissal (`uncertain`, confidence 0),
    marked in the attention evidence by the optional key `dismissal_status: "malformed"`;
    the attention decision still stands.
+
+With `dismissal.min_attend` set ([#282](https://github.com/mickdarling/rightyo/issues/282)),
+a model-judged `stop` or `disengage` below that same turn's attend-probability bar is
+recorded as `dismissal: "uncertain"`, preserving dismissal confidence. It neither stops
+playback nor withdraws delivered or pending requests, ends engagement, or starts a
+cool-down. The content-free diagnostic is
+`dismissal outcome=uncertain reason=below_attend_bar`. Equality passes the bar; the
+existing `other_human` recipient downgrade still applies. Exact configured stop phrases
+keep their immediate effects regardless of attend probability. The started event carries
+`min_attend` only when set. An absent or null bar preserves the prior policy; this
+configurable transcript guard does not establish model accuracy on real speech.
 
 **Contract decision: "stop the music".** When the host itself plays media the assistant
 started, "Stop the music" is judged a request (`none`, usually attended), not a
