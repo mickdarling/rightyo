@@ -498,12 +498,18 @@ class Dismissal:
             raise ContractError("dismissal must be an object with known keys only")
         return cls(**raw)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_capability(self) -> dict[str, Any]:
+        """Host's closed v1 object; local policy settings must never be advertised."""
         return {
             "version": 1,
             "window_ms": self.window_ms,
             "cooldown_ms": self.cooldown_ms,
             "cooldown_min_confidence": self.cooldown_min_confidence,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **self.to_capability(),
             **({"min_attend": self.min_attend} if self.min_attend is not None else {}),
         }
 

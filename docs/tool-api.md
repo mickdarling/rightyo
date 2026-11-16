@@ -1063,6 +1063,14 @@ emitted without it. `schema_version` stays 1. When the capabilities command of
 [#79](https://github.com/mickdarling/rightyo/issues/79) lands, it should list this
 capability (`dismiss` event, version 1).
 
+For an offline decoder fixture, run
+`PYTHONPATH=src python3 scripts/emit_started_event.py --config <path> --out <path>`.
+It validates a prototype config and emits only the real producer's `started` JSON,
+with fixed stdin/control host options (initially private for local speech and owner-voice
+status when voiceprint roles are configured). It starts no controller, audio, model or
+inference worker and reads no enrollment data. The all-options authored config in
+`tests/test_host_contract.py` uses inert assets and must never be run as a listener.
+
 **Two ways a dismissal is detected.**
 
 1. *Exact stop phrases, the fast fallback.* A turn whose whole text is a configured stop
@@ -1110,8 +1118,9 @@ playback nor withdraws delivered or pending requests, ends engagement, or starts
 cool-down. The content-free diagnostic is
 `dismissal outcome=uncertain reason=below_attend_bar`. Equality passes the bar; the
 existing `other_human` recipient downgrade still applies. Exact configured stop phrases
-keep their immediate effects regardless of attend probability. The started event carries
-`min_attend` only when set. An absent or null bar preserves the prior policy; this
+keep their immediate effects regardless of attend probability. `min_attend` is local
+policy and is never advertised in the started event's closed v1 `dismissal` object.
+An absent or null bar preserves the prior policy; this
 configurable transcript guard does not establish model accuracy on real speech.
 
 **Contract decision: "stop the music".** When the host itself plays media the assistant
