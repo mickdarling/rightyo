@@ -2695,7 +2695,18 @@ class SpeechEvents:
                 and event.decision.dismissal in DISMISSING
                 and self._dismissed.get(key, True)
             ):
-                if key not in self._dismissed and _named_handoff(turn.text, self._addressing):
+                bar = self._dismissal.min_attend
+                if bar is not None and event.decision.probabilities["attend"] < bar:
+                    # The model judged a dismissal without enough evidence that this turn
+                    # addressed the assistant (#282). Preserve its confidence, abstain from
+                    # every decision dismissal effect, including a late fast-path upgrade.
+                    evidence["dismissal"] = "uncertain"
+                    if self._report is not None:
+                        try:
+                            self._report("dismissal outcome=uncertain reason=below_attend_bar")
+                        except Exception:  # noqa: BLE001 - diagnostics never fail a decision
+                            pass
+                elif key not in self._dismissed and _named_handoff(turn.text, self._addressing):
                     # Preserve confidence; this narrow policy abstains from dismissal.
                     evidence["dismissal"] = "uncertain"
                 else:

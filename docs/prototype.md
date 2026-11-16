@@ -85,8 +85,8 @@ speaker's, and is refused together with configured speaker roles the same way, w
 same exception for live speaker identification roles. An optional
 `"dismissal": {}` object turns on [natural dismissal](tool-api.md#natural-dismissal-and-barge-in)
 (the decision model's dismissal question, the `dismiss` event, self-withdrawal and the
-cool-down), with optional `window_ms`, `cooldown_ms` and `cooldown_min_confidence`; it is
-off when absent. An optional `"conversation": {}` object turns on
+cool-down), with optional `window_ms`, `cooldown_ms`, `cooldown_min_confidence` and
+`min_attend`; it is off when absent. An optional `"conversation": {}` object turns on
 [conversation mode](tool-api.md#conversation-mode) (#82): engaged follow-ups after a
 request and the `conversation` event, with optional `window_ms`,
 `follow_up_min_probability`, `closing_phrases`, `appendix_ms`, `require_cue`,

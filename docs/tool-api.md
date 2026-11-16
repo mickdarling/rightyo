@@ -1041,13 +1041,14 @@ host; stopping speech output is the host's job.
 changes: no third decision question, no `dismiss` event, and the shared fixtures are
 byte-identical. Turn it on with the configuration's `"dismissal": {}` object, or with
 `--dismissal` on `listen` and `tool-replay` (the defaults; a configuration file's own
-`dismissal` object wins). The object takes three optional keys:
+`dismissal` object wins). The object takes four optional keys:
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
 | `window_ms` | 10,000 | 1 to 60,000 | Self-withdrawal window: how long after a request turn ended its speaker can still withdraw it |
 | `cooldown_ms` | 30,000 | 0 to 600,000 | How long a `disengage` dismissal raises the bar for unnamed attends; 0 is off |
 | `cooldown_min_confidence` | 0.9 | 0 to 1 | The attention confidence an unnamed attend needs during the cool-down |
+| `min_attend` | absent (off) | 0 to 1, or null (off) | Same-turn attend probability needed for a model-judged dismissal |
 
 When it is on, the `started` event carries a separate top-level object beside the
 unchanged capability set,
@@ -1096,6 +1097,17 @@ capability (`dismiss` event, version 1).
    malformed `dismissal` answer is treated as no dismissal (`uncertain`, confidence 0),
    marked in the attention evidence by the optional key `dismissal_status: "malformed"`;
    the attention decision still stands.
+
+With `dismissal.min_attend` set ([#282](https://github.com/mickdarling/rightyo/issues/282)),
+a model-judged `stop` or `disengage` below that same turn's attend-probability bar is
+recorded as `dismissal: "uncertain"`, preserving dismissal confidence. It neither stops
+playback nor withdraws delivered or pending requests, ends engagement, or starts a
+cool-down. The content-free diagnostic is
+`dismissal outcome=uncertain reason=below_attend_bar`. Equality passes the bar; the
+existing `other_human` recipient downgrade still applies. Exact configured stop phrases
+keep their immediate effects regardless of attend probability. The started event carries
+`min_attend` only when set. An absent or null bar preserves the prior policy; this
+configurable transcript guard does not establish model accuracy on real speech.
 
 **Contract decision: "stop the music".** When the host itself plays media the assistant
 started, "Stop the music" is judged a request (`none`, usually attended), not a
