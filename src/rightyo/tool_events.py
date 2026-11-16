@@ -969,7 +969,7 @@ class SpeechEvents:
                 **({} if audio_input is None else {"audio_input": audio_input}),
                 # And for natural dismissal (#98): a host that accepts this object must
                 # accept `dismiss` events, which are never emitted without it.
-                **({} if dismissal is None else {"dismissal": dismissal.to_dict()}),
+                **({} if dismissal is None else {"dismissal": dismissal.to_capability()}),
                 # And for conversation mode (#82): a host that accepts this object must
                 # accept `conversation` events, which are never emitted without it.
                 **({} if conversation is None else {"conversation": conversation.to_dict()}),

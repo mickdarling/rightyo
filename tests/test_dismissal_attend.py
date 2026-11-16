@@ -20,7 +20,8 @@ class DismissalAttendTests(unittest.TestCase):
             addressing=NAMES,
         )
         started = events.drain()[0]
-        self.assertEqual(started["dismissal"].get("min_attend"), bar)
+        self.assertNotIn("min_attend", started["dismissal"])
+        self.assertEqual(events._dismissal.min_attend, bar)
         request = turn("request", 0, 900, "Haili, read the authored list")
         events.transcript(request, 900)
         events.decision(decision(request), 1000)
