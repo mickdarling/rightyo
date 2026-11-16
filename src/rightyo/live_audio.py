@@ -48,8 +48,14 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 ASR_END_PADDING_MS = 1000
 # Two 10 ms whisper timestamp ticks (one PCM frame): tolerate rounding jitter only.
 ASR_TIMING_JITTER_MS = 20
-# One recovery attempt, using the same local executable/model and PCM, never a queue.
+# Default capture capacity is 160 * 200 ms = 32 s. Even including both runs' bounded
+# cleanup (terminate 2 s + kill/reap 2 s + feeder join 2 s each), 12 + 5 + 6 + 6 =
+# 29 s leaves 3 s of headroom. Recovery never waits on the input consumer at all.
+ASR_FIRST_DECODE_SECONDS = 12.0
 ASR_REDECODE_SECONDS = 5.0
+ASR_CLEANUP_SECONDS = 6.0
+# At most two completed windows wait behind the single pending recovery.
+ASR_HELD_WINDOWS = 2
 MAX_SPEAKER = 702  # "Speaker A" .. "Speaker ZZ"; native streams use 1..8
 # A diarizer renewal deferred past an open utterance or held turn is forced this long after the
 # privacy end is reached (#242 round 21), so steady speech cannot keep the old one in use.
@@ -1041,8 +1047,8 @@ class _RecognizerWindow:
     gaps: set[int]  # unit indices before/after unresolved text, including 0 and len(units)
     segments: int = 0
     repaired: int = 0
-    # Rejections: 1=type, 2=bounds, 3=reversal, 4=order, 5=retry failure/invalid structure.
-    reasons: tuple[int, ...] = (0, 0, 0, 0, 0)
+    # 1=type, 2=bounds, 3=reversal, 4=order, 5=retry failure, 6=retry busy/hold bound.
+    reasons: tuple[int, ...] = (0, 0, 0, 0, 0, 0)
     retry_segments: int = 0
     retried: bool = False
     elapsed_ms: int = 0
@@ -1075,7 +1081,7 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
     fallbacks: list[dict[str, Any]] = []
     segment_gaps: set[int] = set()
     window = _RecognizerWindow(result, set(), segments=len(segments))
-    reasons = [0] * 5
+    reasons = [0] * 6
     for segment in segments:
         if not isinstance(segment, dict):
             raise LiveAudioError("Invalid local recognizer result")
@@ -1187,10 +1193,8 @@ class WhisperCppTranscriber:
         # Refused before any audio when no unwritable directory is available (fail closed).
         recognizer_dir()
         self.config = config
-        # Rejected segments (both attempts), and wholly lost windows, this session.
+        # First-pass evidence is transferred to the input owner for ordered accounting.
         self._window: _RecognizerWindow | None = None
-        self.skipped_segments = 0
-        self.suppressed_utterances = 0
 
     def transcribe(
         self, pcm: bytes, register: Callable[[subprocess.Popen], None] | None = None
@@ -1198,29 +1202,95 @@ class WhisperCppTranscriber:
         started = time.monotonic()
         duration = len(pcm) // BYTES_PER_MS
         self._window = None
-        document = _transcribe(self.config, pcm, register)
+        config = replace(
+            self.config, timeout_seconds=min(self.config.timeout_seconds, ASR_FIRST_DECODE_SECONDS)
+        )
+        document = _transcribe(config, pcm, register)
         window = _recognizer_window(document, duration)
-        if not window.units and window.rejected:
-            # Retain the bounded PCM until validation and one bounded recovery finish.
-            retry_config = replace(
-                self.config, timeout_seconds=min(self.config.timeout_seconds, ASR_REDECODE_SECONDS)
-            )
-            try:
-                retry = _recognizer_window(_transcribe(retry_config, pcm, register), duration)
-            except LiveAudioError:
-                # Timeout, local process failure or malformed retry: lose this window only.
-                retry = _RecognizerWindow([], {0}, reasons=(0, 0, 0, 0, 1))
-            retry.retry_segments = retry.segments
-            retry.segments = window.segments
-            retry.reasons = tuple(a + b for a, b in zip(window.reasons, retry.reasons))
-            retry.retried = True
-            window = retry
         window.elapsed_ms = max(0, round((time.monotonic() - started) * 1000))
         self._window = window
-        self.skipped_segments += window.rejected
-        if not window.units and (window.rejected or window.retried):
-            self.suppressed_utterances += 1
+        # The processor owns ordered accounting and optional background recovery.
         return window.units
+
+
+@dataclass
+class _FinalizedWindow:
+    pcm: bytes
+    offset: int
+    through_ms: int
+    voice_start: int
+    number: int
+    timeline: list[dict[str, Any]]
+    provenance: str
+    complete: bool
+    units: Any
+    window: _RecognizerWindow | None
+    before: tuple[int, int]
+
+
+class _WindowRecovery:
+    """One bounded local retry. Only the input owner publishes results or updates counters.
+
+    Cancellation is a signal and nonblocking kill; never join/reap from ingestion.
+    The worker owns process cleanup and never calls the host's event/report callbacks.
+    """
+
+    def __init__(self, config: LiveConfig, packet: _FinalizedWindow):
+        self.packet = packet
+        self.cancelled = threading.Event()
+        self.done = threading.Event()
+        self.process: subprocess.Popen | None = None
+        self.result: _RecognizerWindow | None = None
+        self.config = replace(
+            config, timeout_seconds=min(config.timeout_seconds, ASR_REDECODE_SECONDS)
+        )
+        self.started = time.monotonic()
+        self.expires = self.started + self.config.timeout_seconds + ASR_CLEANUP_SECONDS
+        # Snapshot evidence before starting: pressure cancellation may resolve the packet
+        # as lost while the worker still owns its bounded local process.
+        assert packet.window is not None
+        initial = replace(packet.window)
+        self.thread = threading.Thread(
+            target=self._run, args=(packet.pcm, initial), name="rightyo-asr-recovery", daemon=True
+        )
+        self.thread.start()
+
+    def _register(self, process: subprocess.Popen) -> None:
+        self.process = process
+        if self.cancelled.is_set():
+            with contextlib.suppress(OSError):
+                process.kill()
+            raise LiveAudioError("Audio recovery was cancelled")
+
+    def _run(self, pcm: bytes, initial: _RecognizerWindow) -> None:
+        try:
+            if self.cancelled.is_set():
+                return
+            try:
+                retry = _recognizer_window(
+                    _transcribe(self.config, pcm, self._register), len(pcm) // BYTES_PER_MS
+                )
+            except Exception:  # noqa: BLE001 - no private exception escapes the worker
+                retry = _RecognizerWindow([], {0}, reasons=(0, 0, 0, 0, 1, 0))
+            retry.retry_segments = retry.segments
+            retry.segments = initial.segments
+            retry.reasons = tuple(a + b for a, b in zip(initial.reasons, retry.reasons))
+            retry.retried = True
+            retry.elapsed_ms = initial.elapsed_ms + max(
+                0, round((time.monotonic() - self.started) * 1000)
+            )
+            if not self.cancelled.is_set():
+                self.result = retry
+        finally:
+            self.process = None
+            self.done.set()
+
+    def cancel(self) -> None:
+        self.cancelled.set()
+        process = self.process
+        if process is not None:
+            with contextlib.suppress(OSError):
+                process.kill()
 
 
 def _checked_units(units: Any, duration_ms: int) -> list[dict[str, Any]] | None:
@@ -1302,7 +1372,9 @@ class _OffsetDiarizer:
 
 
 class LiveProcessor:
-    """Single-owner synchronous processor; feed only explicitly consented audio.
+    """Single-owner processor with one bounded recovery worker.
+
+    Feed only explicitly consented audio.
 
     `close` cancels and discards an unfinished utterance. `finish` flushes the
     finite causal input and emits its tail. Failures leave `failed=True` and
@@ -1350,6 +1422,10 @@ class LiveProcessor:
         self._counter = 0
         self._utterances = 0
         self._skipped_utterances = 0
+        self._skipped_segments = 0
+        self._waiting: deque[_FinalizedWindow] = deque()
+        self._recovery: _WindowRecovery | None = None
+        self._voice_start = 0
         # Of those, the ones from utterances heard in privacy (hailing-station #735 S-1): kept
         # apart so the session's reported totals never count private speech.
         self._private_skipped_segments = 0
@@ -1388,7 +1464,7 @@ class LiveProcessor:
         counting those in utterances heard in privacy."""
         inner = getattr(self._transcriber, "skipped_segments", 0)
         inner = inner if type(inner) is int and inner > 0 else 0
-        return max(0, inner - self._private_skipped_segments)
+        return max(0, self._skipped_segments + inner - self._private_skipped_segments)
 
     @property
     def skipped_utterances(self) -> int:
@@ -1403,12 +1479,18 @@ class LiveProcessor:
 
     @property
     def buffered_audio_bytes(self) -> int:
-        return len(self._partial) + len(self._utterance) + sum(map(len, self._pre_roll))
+        held = sum(len(packet.pcm) for packet in self._waiting)
+        if self._recovery is not None and not any(
+            packet is self._recovery.packet for packet in self._waiting
+        ):
+            held += len(self._recovery.packet.pcm)
+        return len(self._partial) + len(self._utterance) + sum(map(len, self._pre_roll)) + held
 
     def push_pcm16(self, pcm: bytes) -> None:
         if self.closed or self.failed:
             raise LiveAudioError("Audio session is closed")
         try:
+            self._drain_results()
             if not isinstance(pcm, bytes) or len(pcm) > MAX_CHUNK_BYTES or len(pcm) % 2:
                 raise LiveAudioError("Invalid mono PCM16 frame")
             budget = self.config.session_budget_ms
@@ -1508,7 +1590,7 @@ class LiveProcessor:
     def _renew_diarizer(self) -> None:
         offset = self._received_ms
         self._end_reached_ms = None
-        if self._utterance or self._merger.holding:
+        if self._utterance or self._merger.holding or self._waiting:
             # Forced mid-turn (round 21): the old diarizer's labels for it must not cross over.
             self._unlabelled_before_ms = offset
         old, self._diarizer = (
@@ -1533,7 +1615,7 @@ class LiveProcessor:
         if (
             self._speaker_reset
             and (
-                (not self._utterance and not self._merger.holding)
+                (not self._utterance and not self._merger.holding and not self._waiting)
                 or (
                     self._end_reached_ms is not None
                     and self._received_ms - self._end_reached_ms >= SPEAKER_RENEWAL_LIMIT_MS
@@ -1549,10 +1631,11 @@ class LiveProcessor:
         rms = math.sqrt(sum(value * value for value in values) / len(values)) / 32768
         voiced = rms >= self.config.energy_threshold
         if voiced and not self._utterance:
+            self._voice_start = frame_start
             self._utterance_start = frame_start - len(self._pre_roll) * 20
             self._utterance.extend(b"".join(self._pre_roll))
             self._pre_roll.clear()
-            if self._merger.holding:
+            if self._merger.holding and not self._waiting:
                 # Followed by detected speech, whether or not it yields text (#96).
                 self._merger.heard(frame_start)
         if self._utterance or voiced:
@@ -1569,7 +1652,7 @@ class LiveProcessor:
                 self._finalize_when_attributed()
         else:
             self._pre_roll.append(frame)
-        if self._merger.holding:
+        if self._merger.holding and not self._waiting:
             self._merger.due(self._received_ms, self._utterance_start if self._utterance else None)
 
     def release_pending(self) -> None:
@@ -1577,7 +1660,9 @@ class LiveProcessor:
         if self.closed or self.failed:
             return
         try:
-            self._merger.flush()
+            self._drain_results()
+            if not self._waiting:
+                self._merger.flush()
         except Exception:
             self.failed = True
             self.close()
@@ -1683,27 +1768,106 @@ class LiveProcessor:
             window = None
         if self.closed:
             raise LiveAudioError("Audio session was stopped")
-        provenance = getattr(self._diarizer, "speaker_provenance", "diarization-timeline")
         self._utterances += 1
-        checked = _checked_units(units, len(pcm) // BYTES_PER_MS)
+        packet = _FinalizedWindow(
+            pcm,
+            offset,
+            self._received_ms,
+            self._voice_start,
+            self._utterances,
+            [dict(segment) for segment in timeline],
+            getattr(self._diarizer, "speaker_provenance", "diarization-timeline"),
+            complete,
+            units,
+            window,
+            before,
+        )
         self._utterance.clear()
         self._pre_roll.clear()
-        if checked is None:
-            self._skipped_utterances += 1
-        skipped = self.skipped_segments - before[0]
-        suppressed = self.skipped_utterances > before[1]
+        self._drain_results()
+        if len(self._waiting) >= 1 + ASR_HELD_WINDOWS:
+            # The hold is full: resolve the oldest recovery as lost, never discard a
+            # newer good result or wait for the recovery worker on the input path.
+            self._abandon_recovery()
+            self._drain_results()
+        if window is not None and not window.units and window.rejected:
+            if self._recovery is None:
+                self._waiting.append(packet)
+                self._recovery = _WindowRecovery(self.config, packet)
+                return
+            # One worker (including a cancelling worker) already owns the retry slot.
+            window.reasons = (*window.reasons[:5], window.reasons[5] + 1)
+        if self._waiting:
+            self._waiting.append(packet)
+        else:
+            self._commit_window(packet)
+
+    def _abandon_recovery(self) -> None:
+        recovery = self._recovery
+        if recovery is None:
+            return
+        recovery.cancel()
+        packet = recovery.packet
+        if self._waiting and self._waiting[0] is packet:
+            window = packet.window
+            assert window is not None
+            window.retried = True
+            window.reasons = (*window.reasons[:5], window.reasons[5] + 1)
+            window.elapsed_ms += max(0, round((time.monotonic() - recovery.started) * 1000))
+            self._waiting.popleft()
+            self._commit_window(packet)
+
+    def _drain_results(self, *, wait: bool = False) -> None:
+        recovery = self._recovery
+        if recovery is not None:
+            if wait and self._waiting:
+                # Only EOF waits. Live push/release calls never wait for recognition.
+                recovery.done.wait(max(0.0, recovery.expires - time.monotonic()))
+            if recovery.done.is_set():
+                if self._waiting and self._waiting[0] is recovery.packet:
+                    packet = recovery.packet
+                    if recovery.result is not None:
+                        packet.window = recovery.result
+                        packet.units = recovery.result.units
+                    else:
+                        self._abandon_recovery()
+                self._recovery = None
+            elif time.monotonic() >= recovery.expires:
+                self._abandon_recovery()
+        while self._waiting and not self.closed:
+            if self._recovery is not None and self._waiting[0] is self._recovery.packet:
+                break
+            self._commit_window(self._waiting.popleft())
+
+    def _commit_window(self, packet: _FinalizedWindow) -> None:
+        pcm, offset, timeline = packet.pcm, packet.offset, packet.timeline
+        window, complete, provenance = packet.window, packet.complete, packet.provenance
+        checked = _checked_units(packet.units, len(pcm) // BYTES_PER_MS)
+        if window is not None:
+            skipped = window.rejected
+            self._skipped_segments += skipped
+            suppressed = checked is None or (
+                not checked and bool(window.rejected or window.retried)
+            )
+            self._skipped_utterances += int(suppressed)
+        else:
+            if checked is None:
+                self._skipped_utterances += 1
+            skipped = self.skipped_segments - packet.before[0]
+            suppressed = self.skipped_utterances > packet.before[1]
         private = (skipped or suppressed) and self._heard_private(
             offset, offset + len(pcm) // BYTES_PER_MS
         )
         if private:
-            # Taken out of the session's totals too, not only its note (Codex P2 on #242).
             self._private_skipped_segments += skipped
-            self._private_skipped_utterances += 1 if suppressed else 0
+            self._private_skipped_utterances += int(suppressed)
+        if self._merger.holding:
+            self._merger.heard(packet.voice_start)
         if window is not None and (window.repaired or window.rejected or window.retried):
             outcome = "lost" if suppressed else "redecoded" if window.retried else "salvaged"
             # Fixed tokens and numbers only. The tool's report sink adds `rightyo:` on stderr.
             self._diagnostic(
-                f"asr_window outcome={outcome} window_id={self._utterances}"
+                f"asr_window outcome={outcome} window_id={packet.number}"
                 f" start_ms={offset} end_ms={offset + len(pcm) // BYTES_PER_MS}"
                 f" segments={window.segments} retry_segments={window.retry_segments}"
                 f" units={len(window.units)} repaired={window.repaired} rejected={window.rejected}"
@@ -1740,10 +1904,12 @@ class LiveProcessor:
                 offset,
                 pcm,
                 provenance,
+                number=packet.number,
                 complete=complete and right == len(checked) and right not in gaps,
             )
         if len(checked) in gaps:
             self._merger.flush()
+        self._merger.due(packet.through_ms, None)
 
     def _publish_units(
         self,
@@ -1753,6 +1919,7 @@ class LiveProcessor:
         pcm: bytes,
         provenance: str,
         *,
+        number: int,
         complete: bool,
     ) -> None:
         """Attribute one uninterrupted run; neither edge inference nor merging crosses loss."""
@@ -1789,13 +1956,25 @@ class LiveProcessor:
                     entry[3] = label
         inferred: set[int] = set()
         if self.config.edge_attribution_ms and provenance == "diarization-timeline":
-            inferred = _attribute_edges(attributed, relevant, self.config.edge_attribution_ms)
+            # Edge inference may use evidence only inside this uninterrupted run.
+            # Keep strict attribution/overlap checks on the original timeline.
+            run_start, run_end = attributed[0][1], attributed[-1][2]
+            edges = [
+                dict(
+                    segment,
+                    start_ms=max(run_start, segment["start_ms"]),
+                    end_ms=min(run_end, segment["end_ms"]),
+                )
+                for segment in relevant
+                if segment["start_ms"] < run_end and segment["end_ms"] > run_start
+            ]
+            inferred = _attribute_edges(attributed, edges, self.config.edge_attribution_ms)
         groups: list[dict[str, Any]] = []
         for index, (unit, start, end, speaker, overlap) in enumerate(attributed):
             if speaker is not None and provenance == "diarization-utterance":
                 # Per-request labels are namespaced by utterance so that equal labels
                 # from independent requests can never be merged into one participant.
-                speaker = utterance_scoped_speaker(self._utterances, speaker)
+                speaker = utterance_scoped_speaker(number, speaker)
             if groups and (groups[-1]["speaker"], groups[-1]["overlap"]) == (speaker, overlap):
                 groups[-1]["text"] += unit["text"]
                 groups[-1]["end_ms"] = max(groups[-1]["end_ms"], end)
@@ -1890,6 +2069,7 @@ class LiveProcessor:
             # diarizer must not send audio that no turn will use.
             if self._utterance:
                 self._finalize(self._diarizer.finish())
+            self._drain_results(wait=True)
             self._merger.flush()
         except Exception:
             self.failed = True
@@ -1907,6 +2087,10 @@ class LiveProcessor:
         if self.closed:
             return
         self.closed = True
+        if self._recovery is not None:
+            self._recovery.cancel()
+            self._recovery = None
+        self._waiting.clear()
         if self._asr_process is not None:
             _terminate(self._asr_process)
         # Cancellation discards a turn still held for a continuation, like the open

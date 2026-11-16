@@ -96,12 +96,30 @@ Unusable recognizer timestamps no longer end the session
   ([#95](https://github.com/mickdarling/rightyo/issues/95)). Inconsistent token timing falls
   back to whole-segment text/times, including when token detail backtracks between valid
   overlapping segments. Neither turn merging nor edge attribution crosses dropped text.
-  If no text survives, try the same PCM once more with the same local executable/model,
-  with a 5-second decode deadline (or the configured timeout if shorter) and the existing
-  bounded process cleanup. No network fallback is used. An unsuccessful retry loses only
-  that window; the session continues and a turn cannot merge across it. Rejected segments
-  from both attempts count in `skipped_segments`; only wholly lost windows count in
-  `skipped_utterances`.
+  If no text survives, schedule one local background re-decode with the same PCM and
+  executable/model. Its decode deadline is 5 seconds (or the configured timeout if shorter).
+  Ingestion never waits for this recovery worker. Results publish on the input owner in
+  window order: at most two completed windows wait behind one recovery. A newer invalid
+  window skips its retry while that slot is occupied and receives a loss diagnostic in
+  order. If a third later window arrives, cancel/resolve the older recovery as lost,
+  release the two held results, then publish the new result. This preserves newer good
+  text and the loss barrier without an unbounded output backlog. Stop cancels/discards;
+  EOF alone waits, at most the retry's remaining deadline plus bounded cleanup.
+  The first local decode is capped at 12 seconds (or the configured timeout if shorter).
+  Default capture holds 160 chunks of 200 ms = 32 seconds. Conservatively allowing both
+  runs their existing cleanup (2 s terminate + 2 s kill/reap + 2 s feeder join each),
+  12 + 5 + 6 + 6 = 29 seconds leaves 3 seconds of capture headroom; a 29-second first
+  decode is no longer permitted. The retry's time is also off the ingestion path.
+  These are configured bounds, not a sustained-throughput or OS scheduling guarantee;
+  smaller custom capture queues need their own budget. No network fallback is used.
+  Retention is bounded by one pending window plus two completed windows and one active
+  window: four window slots (each at most `max_utterance_ms + 20` ms), plus a bounded
+  active PCM snapshot, pre-roll/input chunk, native WAV/response staging and per-window
+  timelines. At most two local recognizer processes can overlap (first decode and retry);
+  native model memory and sustained throughput remain unvalidated. A cancelled
+  worker still occupies the retry slot until it exits; it never publishes late events.
+  Rejected segments from both attempts count in `skipped_segments`; only wholly lost
+  windows count in `skipped_utterances`.
 - Every backend: the units an utterance produces are then checked together. If any unit
   has timestamps that are not integers, NaN, negative, reversed, past the utterance, or
   earlier than the unit before it, the whole utterance is suppressed. No turn is
@@ -114,8 +132,8 @@ The session keeps listening, and the next valid utterance is published as usual.
 salvaged, re-decoded or lost Whisper window reports a content-free `rightyo: asr_window`
 line on stderr: window id, stream bounds in ms, original/retry segment counts, retained
 unit and repair/rejection counts, numeric rejection counts, and total ASR elapsed ms.
-The five `reasons` counts are ordered: type, bounds, reversal, order, retry failure or
-malformed retry. Recognizer text, audio and paths are never included. As before, diagnostics
+The six `reasons` counts are ordered: type, bounds, reversal, order, retry failure or
+malformed retry, retry unavailable (busy slot or output hold bound). Recognizer text, audio and paths are never included. As before, diagnostics
 and public loss counters are withheld for private windows. Other backends retain their
 count-only suppression notice. The terminal session event still carries `skipped_segments`
 and `skipped_utterances` only when nonzero; host event keys are unchanged. A malformed

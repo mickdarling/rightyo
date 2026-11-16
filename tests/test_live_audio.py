@@ -1105,6 +1105,10 @@ class ConservativeAlignmentTests(unittest.TestCase):
                     processor.push_pcm16(VOICE)
                 for _ in range(72):
                     processor.push_pcm16(SILENCE)
+                recovery = processor._recovery
+                if recovery is not None:
+                    self.assertTrue(recovery.done.wait(3))
+                    processor._drain_results()
             processor.finish()
         self.assertFalse(processor.failed)
         # Nothing from the suppressed utterance; the next valid one is published whole.
@@ -1114,7 +1118,7 @@ class ConservativeAlignmentTests(unittest.TestCase):
         self.assertEqual(processor.skipped_utterances, 1)
         self.assertEqual(len(reports), 1)
         self.assertIn("asr_window outcome=lost window_id=1 start_ms=0 end_ms=1640", reports[0])
-        self.assertIn("rejected=2 reasons=0,2,0,0,0", reports[0])
+        self.assertIn("rejected=2 reasons=0,2,0,0,0,0", reports[0])
         # Heard in privacy (hailing-station #735 S-1): counted, never reported.
         turns, reports = [], []
         with (
@@ -1136,6 +1140,10 @@ class ConservativeAlignmentTests(unittest.TestCase):
                     processor.push_pcm16(VOICE)
                 for _ in range(72):
                     processor.push_pcm16(SILENCE)
+                recovery = processor._recovery
+                if recovery is not None:
+                    self.assertTrue(recovery.done.wait(3))
+                    processor._drain_results()
             processor.finish()
         # Nor counted in the session's totals, which the terminal event reports.
         self.assertEqual((processor.skipped_segments, processor.skipped_utterances), (0, 0))
