@@ -256,8 +256,8 @@ class ShadowTests(unittest.TestCase):
         self.assertTrue(embedder.closed)
 
     def test_forget_drops_every_binding_and_the_owner_binds_again(self):
-        # Codex P1 on #242: no speaker state outlives privacy; the owner rebinds from public
-        # speech after `bind_min_seconds`.
+        # #291: a fallback renewal forgets labels, then enrollment can bind on the
+        # first above-bar public turn without accumulating `bind_min_seconds`.
         embedder = ScriptedEmbedder(
             [unit(1, 0.2, 0), unit(1, 0.1, 0), unit(1, 0.2, 0), unit(1, 0.1, 0)]
         )
@@ -271,7 +271,7 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual(harness.shadow._bound_ids, set())
         harness.speak(2.0)
         wait_for(lambda: harness.shadow.scored == 3)
-        self.assertNotEqual(harness.shadow.binding("Speaker A"), ("bound", "owner"))
+        self.assertEqual(harness.shadow.binding("Speaker A"), ("bound", "owner"))
         harness.speak(2.0)
         wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
         harness.shadow.close(drain=True)

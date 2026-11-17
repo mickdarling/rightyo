@@ -128,11 +128,12 @@ class RequestOutcomeTests(unittest.TestCase):
         self.events.end(now_ms=2000)
         self.assertFalse(self.apply())
 
-    def test_privacy_and_forget_revoke_old_request_identity(self):
+    def test_privacy_preserves_request_identity_but_renewal_revokes_it(self):
         self.say("a")
         self.apply()
         self.events.duck(True, now_ms=1000)
-        self.assertFalse(self.apply(state="reply_ended"))
+        # #291: public request records are not derived from private audio.
+        self.assertTrue(self.apply(state="reply_ended"))
         self.events.duck(False, now_ms=2000)
         self.say("b", 3000)
         self.events.forget_speakers(now_ms=4000)

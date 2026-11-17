@@ -1580,15 +1580,9 @@ class SpeechEvents:
         phrase is a no-op. A turn accepted before it was turned on and
         heard before it is still decided, but engages no conversation while it is on.
 
-        No `conversation` event is emitted while it is on (rightyo#244): a timer-driven
-        timeout's `emitted_at_ms` would say that private speech was being handled, and when.
-        Turning it on ends any engagement, said once at the entry (`conversation` back to
-        `ambient`, reason `timeout`, `at_ms` the entry), with nothing kept to revive, so nothing
-        can lapse, end or revive while private, and nothing deferred is emitted at the exit:
-        the next public request starts a fresh conversation. Nor is an owner-voice status
-        polled while it is on: the first poll after the exit may still show, at most once,
-        that private speech happened, though not when. Emits nothing else (but the on ack
-        below); turning it off reports counts only.
+        Privacy preserves the public conversation, dormant state and follow-up eligibility
+        (#291). Private turns cannot extend or end it. Normal public timeout and dismissal
+        rules still apply after the exit. Turning it off reports counts only.
 
         `ack` (#735 S-8) is true only for a host's applied `{"duck": true}` control line. Each
         such on, a redundant one while already on included, then emits one content-free
@@ -1605,25 +1599,13 @@ class SpeechEvents:
         with self._lock:
             at = now_ms
             self._clear_exit_audio()
-            ended = None
             # A change of mode always ends a split exit.
             self._private_name_end = None
             if on and not self._duck:
-                self._request_outcomes.clear()
-                self._request_outcome_ends.clear()
-                self._pending_ack = None
-                # Privacy ends the conversation (rightyo#244), said at the entry itself, the
-                # moment the host already knows of, so the host never thinks it engaged: no
-                # timeout can fall due while private, and none is owed at the exit. Said once
-                # the mode is applied, so a failed emit cannot leave the entry half done.
+                # Keep the entry/ack clock identical to the former conversation end,
+                # without ending or otherwise changing the public engagement.
                 if self._engaged is not None and self._active:
-                    ended = self._engaged["speaker_id"]
-                self._engaged = None
-                self._dormant = None
-                # Defensive: with nothing engaged or dormant these no longer matter, and a
-                # fresh request resets them anyway.
-                self._asked_at = None
-                self._replied_at = None
+                    self._now = max(self._now, at)
                 self._duck_spans.append([at, None])
                 if len(self._duck_spans) > MAX_DUCK_SPANS:
                     first, second = self._duck_spans[0], self._duck_spans.pop(1)
@@ -1646,13 +1628,6 @@ class SpeechEvents:
                             + " ".join(f"{key}={value}" for key, value in counts.items())
                         )
             self._duck = on
-            if ended is not None:
-                # Stamped at the entry: the host refuses an `at_ms` after `emitted_at_ms`.
-                # The reason is `timeout` (no turn named), the end the host already accepts.
-                self._now = max(self._now, at)
-                self._emit(
-                    "conversation", state="ambient", reason="timeout", speaker_id=ended, at_ms=at
-                )
             if on and ack and self._active and self._duck_acks:
                 self._emit("privacy", action="on", at_ms=at)
 
@@ -2131,7 +2106,7 @@ class SpeechEvents:
             unscoped = self._scoped_replies and (
                 request_id is None or current is None or current.get("request_id") != request_id
             )
-            if self._active and not unscoped:
+            if self._active and not unscoped and not self._duck:
                 self._asked_at = now_ms if asked else None
                 if self._replied_at is None:
                     # The first phase reported since the request: a host may forward only
@@ -2153,7 +2128,7 @@ class SpeechEvents:
                     span = self._playback_scopes.pop(scope, None)
                     if span is not None:
                         span[1] = now_ms
-            if unscoped:
+            if unscoped or self._duck:
                 return
             if self._active and self._pending_ack is not None:
                 self._answer_ack(phase)
@@ -2230,7 +2205,7 @@ class SpeechEvents:
         follow-up. Only speech after the reply counts. An explicit end (closing, dismissal,
         another person) left nothing dormant. Emits nothing: engagement events name a request."""
         dormant = self._dormant
-        if dormant is None or now_ms - dormant["at_ms"] > REVIVE_WINDOW_MS:
+        if self._duck or dormant is None or now_ms - dormant["at_ms"] > REVIVE_WINDOW_MS:
             return None
         self._dormant = None
         engaged = {
@@ -2284,7 +2259,7 @@ class SpeechEvents:
     def _lapse(self, now_ms):
         """Return to ambient once stream time passes the engagement window (#82)."""
         engaged = self._engaged
-        if engaged is not None and now_ms >= self._window_end(engaged):
+        if not self._duck and engaged is not None and now_ms >= self._window_end(engaged):
             self._engaged = None
             # A question belongs to its conversation (#199); a revival starts a new reply.
             self._asked_at = None

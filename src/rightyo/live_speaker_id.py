@@ -23,9 +23,10 @@ gives a bound label its enrolled identifier's configured role; it never waits fo
 Embedding runs on a dedicated worker thread behind a small bounded queue, never on the
 audio thread: when the worker is busy, a turn is dropped and counted. A worker that fails
 is reported once and switches shadow identification off for the rest of the session; the
-live session itself never stalls or fails because of it. Audio is never written: the ring
-holds at most `RING_MS` of PCM in memory by default (`audio_retention.speaker_ring_seconds`
-sets it, #226) and is cleared when the session ends.
+normal live scoring stays asynchronous. After a renewal, unbound roles wait for their
+own score before publication; privacy controls and Stop remain responsive. Audio is never
+written: the ring holds at most `RING_MS` of PCM in memory by default
+(`audio_retention.speaker_ring_seconds` sets it, #226) and is cleared when the session ends.
 
 Private turns never enter that queue, ring or accumulated evidence. An enrolled-owner
 exit candidate may borrow one mutable sentence for an isolated check (#946 step 1),
@@ -358,7 +359,7 @@ def _default_entries(settings: SpeakerIdConfig) -> list[dict[str, Any]]:
 
 
 class ShadowSpeakerId:
-    """Per-session shadow identification; `audio` and `turn` never block or raise."""
+    """Per-session identification; ordinary `audio` and `turn` calls never block or raise."""
 
     def __init__(
         self,
@@ -379,7 +380,9 @@ class ShadowSpeakerId:
         self._report_to = report
         self._embedder_factory = embedder_factory
         self._entries = entries
-        self._queue: queue.Queue[tuple[str, int, int, bytes]] = queue.Queue(maxsize=queue_size)
+        self._queue: queue.Queue[tuple[int, str, int, int, bytes, threading.Event | None]] = (
+            queue.Queue(maxsize=queue_size)
+        )
         # Privacy-entry voice checks (#735), taken before queued turns: a caller waits on one.
         self._checks: queue.Queue[_EntryCheck | _ExitCheck] = queue.Queue(maxsize=ENTRY_CHECKS)
         self._ring = PcmRing(ring_ms)
@@ -429,10 +432,13 @@ class ShadowSpeakerId:
         state = self._labels.get(label)
         if state is None:
             return None
-        if state.state == "unknown" and state.seconds < self.settings.bind_min_seconds:
+        if state.state == "unknown" and (
+            self._epoch > 0 or state.seconds < self.settings.bind_min_seconds
+        ):
             # Too little speech to say this is *not* an enrolled voice: one short, noisy turn
             # of the owner scores low. Only a label with as much evidence as binding needs
             # may be judged a non-enrolled participant; until then it stays undetermined.
+            # After a renewal, below-bar labels stay unknown until a public turn binds.
             return "insufficient", state.identity
         return state.state, state.identity
 
@@ -478,8 +484,15 @@ class ShadowSpeakerId:
         with self._epoch_lock:
             return self._epoch
 
-    def turn(self, turn, *, inferred: bool = False, spans=None, epoch: int | None = None) -> None:
-        """Queue one finalized turn for scoring; never blocks, never raises.
+    def turn(
+        self, turn, *, inferred: bool = False, spans=None, epoch: int | None = None, wait=False
+    ) -> None:
+        """Queue one finalized turn for scoring; never raises.
+
+        `wait` is used only for unbound public roles after a renewal: finish this turn's
+        scoring before its role is first published. The embedder owns its request timeout;
+        worker failure/discard also releases the waiter.
+        Normal shadow scoring remains asynchronous.
 
         `spans` are the `(start_ms, end_ms)` stream-time pieces of the turn's span that the
         diarizer timeline gave the turn's own label and no other speaker (#148). Only that
@@ -530,9 +543,17 @@ class ShadowSpeakerId:
             if not pcm:
                 return
             try:
+                done = threading.Event() if wait else None
                 self._queue.put_nowait(
-                    (epoch, turn.speaker_id, turn.end_ms - turn.start_ms, labelled_ms, pcm)
+                    (epoch, turn.speaker_id, turn.end_ms - turn.start_ms, labelled_ms, pcm, done)
                 )
+                if done is not None:
+                    while not done.wait(0.05):
+                        # Admission can race the worker's final drain. Never leave a
+                        # late enqueue waiting on a worker that has already exited.
+                        if self._off.is_set() or self._stop.is_set():
+                            self._discard_queue()
+                            return
             except queue.Full:
                 self.dropped += 1
                 if self.dropped == 1:
@@ -586,9 +607,13 @@ class ShadowSpeakerId:
                     if self._closing.is_set():
                         break
                     continue
-                if self._stop.is_set():
-                    break
-                self._score(embedder, prints, *item)
+                try:
+                    if self._stop.is_set():
+                        break
+                    self._score(embedder, prints, *item[:-1])
+                finally:
+                    if item[-1] is not None:
+                        item[-1].set()
         except Exception:  # noqa: BLE001 - any failure switches shadow ID off, once
             self._off.set()
             if not self._stop.is_set():
@@ -603,8 +628,8 @@ class ShadowSpeakerId:
 
     def forget(self) -> None:
         """Drop every label's evidence and binding (hailing-station #735 S-1): called when
-        privacy ends, with the diarizer reset, so no speaker state from before it survives.
-        The owner binds again from public speech. Never blocks on the worker.
+        a contaminated diarizer is reset, so no stale label evidence survives.
+        Enrolled voices bind again on their first above-bar public turn. Never blocks on the worker.
 
         The owner-voice evidence restarts with them (round 18): seconds scored before, kept
         without the bindings they produced, would soon report a recognised owner as not."""
@@ -650,6 +675,12 @@ class ShadowSpeakerId:
                 {key: cosine(mean, value) for key, value in comparable.items()},
                 self.settings,
             )
+            if epoch > 0 and state.state != "bound":
+                # Renewal changes labels, not enrollment. The first independently scored
+                # public turn can bind without the accumulated-duration requirement.
+                best = min(turn_scores, key=lambda key: (-turn_scores[key], key))
+                if turn_scores[best] >= self.settings.bind_threshold:
+                    state.state, state.identity, state.score = "bound", best, turn_scores[best]
             self._labels[label] = state
             self.scored += 1
             if state.state == "bound" and state.identity is not None:
@@ -850,9 +881,11 @@ class ShadowSpeakerId:
     def _discard_queue(self) -> None:
         while True:
             try:
-                self._queue.get_nowait()
+                item = self._queue.get_nowait()
             except queue.Empty:
                 return
+            if item[-1] is not None:
+                item[-1].set()
 
     # ------------------------------------------------------------------ teardown
 
@@ -1077,10 +1110,11 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         label = turn.speaker_id
         if label is None:
             return "unknown", None
-        configured = self.priority.configured_role(label)
-        if configured is not None:
-            return configured, None
         source = self.source
+        configured = self.priority.configured_role(label)
+        epoch = getattr(source, "epoch", 0)
+        if configured is not None and not (type(epoch) is int and epoch > 0):
+            return configured, None
         if source is None or turn.overlap or turn.speaker_provenance != "diarization-timeline":
             return "unknown", None
         try:

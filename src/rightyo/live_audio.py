@@ -1500,6 +1500,10 @@ class LiveProcessor:
         self._private_until: int | None = None
         self._private_lock = threading.Lock()
         self._frame_private = False
+        self._diarizer_private_voiced = 0
+        self._privacy_uncertain = False
+        self._diarizer_pending = 0
+        self._diarizer_audited_bytes = 0
         # Where the last privacy end was reached (audio thread only), bounding a deferred renewal;
         # and, after a forced one, the renewal's offset: a turn starting before it is unlabelled.
         self._end_reached_ms: int | None = None
@@ -1608,7 +1612,7 @@ class LiveProcessor:
             self.close()
             raise
 
-    def reset_speakers(self, private_until_bytes: int | None = None) -> None:
+    def reset_speakers(self, private_until_bytes: int | None = None, *, renew: bool = True) -> None:
         """Start a fresh diarizer once nothing is open (hailing-station #735 S-1): called when
         privacy ends, so no speaker channel or state a private voice made outlives it. Deferred
         to the first frame with no open utterance or held turn, so a turn under way keeps its
@@ -1627,8 +1631,41 @@ class LiveProcessor:
             self._private_until = max(private_until_bytes, self._private_until or 0)
             # Under the same lock as the end (round 21): a renewal taken meanwhile never clears
             # the request this end makes.
-            if self._diarizer_renewable:
+            if renew and self._diarizer_renewable:
                 self._speaker_reset = True
+
+    def end_privacy(self, private_until_bytes: int) -> tuple[int, str | None]:
+        """Silence buffered private audio; audit what actually entered the diarizer.
+
+        The push and its accounting share this lock with the exit. Unknown predicates
+        also require renewal even when substitution prevented contamination.
+        """
+        self.reset_speakers(private_until_bytes, renew=False)
+        with self._private_lock:
+            count = self._diarizer_private_voiced
+            # The controller accepts a chunk before the audio thread processes it.
+            # A sub-frame tail is safe: finish's cutoff silences it before any push.
+            # Complete accepted frames still awaiting their verdict are not certified.
+            audited_bytes = self._diarizer_audited_bytes + min(len(self._partial), FRAME_BYTES - 2)
+            reason = (
+                "private_voiced"
+                if count
+                else "privacy_unknown"
+                if (
+                    self._privacy_uncertain
+                    or self._diarizer_pending
+                    or private_until_bytes > audited_bytes
+                    or self.config.private is None
+                )
+                else None
+            )
+            self._diarizer_private_voiced = 0
+            self._privacy_uncertain = False
+        return count, reason
+
+    def _diarizer_frame(self, frame: bytes, private: bool) -> bytes:
+        # Same PCM16 format and byte length: native time never skips a private frame.
+        return bytes(len(frame)) if private else frame
 
     def _private_cutoff(self, pcm: bytes, final: bool = False) -> bytes:
         """`pcm`, the next audio processed, with what of it was heard before privacy ended
@@ -1644,7 +1681,7 @@ class LiveProcessor:
             if until is None or (until >= start + len(pcm) and not final):
                 return pcm
             self._private_until = None
-        if self._end_reached_ms is None:
+        if self._speaker_reset and self._end_reached_ms is None:
             # The first end not yet renewed for (round 22): a later one never restarts the bound.
             self._end_reached_ms = self._received_ms
         self._settle_held_at_privacy_end()
@@ -1714,6 +1751,10 @@ class LiveProcessor:
     def _renew_diarizer(self) -> None:
         offset = self._received_ms
         self._end_reached_ms = None
+        with self._private_lock:
+            # Audit from frames handled after the off edge belongs to the old stream too.
+            self._diarizer_private_voiced = 0
+            self._privacy_uncertain = False
         if self._utterance or self._merger.holding or self._waiting:
             # Forced mid-turn (round 21): the old diarizer's labels for it must not cross over.
             self._unlabelled_before_ms = offset
@@ -1729,9 +1770,34 @@ class LiveProcessor:
         if self.on_speakers_renewed is not None:
             self.on_speakers_renewed()
 
+    def _diarizer_privacy(self, duration_ms: int) -> tuple[bool, bool]:
+        # Register before asking a predicate that may wait for the controller lock.
+        # An exit racing an unfinished verdict/substitution cannot certify preservation.
+        with self._private_lock:
+            self._diarizer_pending += 1
+        if self.config.private is None:
+            return False, False
+        try:
+            state = self.config.private(self._received_ms, self._received_ms + duration_ms)
+            return state is not False, type(state) is not bool
+        except Exception:  # noqa: BLE001 - no predicate content escapes
+            return True, True
+
+    def _push_diarizer(self, pcm: bytes, private: bool, uncertain: bool) -> None:
+        diarizer_pcm = self._diarizer_frame(pcm, private)
+        with self._private_lock:
+            self._diarizer_pending -= 1
+            self._privacy_uncertain |= uncertain
+            if private:
+                values = _pcm_samples(diarizer_pcm)
+                rms = math.sqrt(sum(value * value for value in values) / len(values)) / 32768
+                self._diarizer_private_voiced += rms >= self.config.energy_threshold
+            self._diarizer.push(diarizer_pcm)
+            self._diarizer_audited_bytes += len(pcm)
+
     def _frame(self, frame: bytes) -> None:
+        private, uncertain = self._diarizer_privacy(20)
         if self.config.private is not None:
-            private = self._heard_private(self._received_ms, self._received_ms + 20)
             if private != self._frame_private:
                 # Observe privacy starts as well as ends on the received-audio clock.
                 # No frame between toggles means no private audio and no new text.
@@ -1755,7 +1821,7 @@ class LiveProcessor:
             and self._take_renewal()
         ):
             self._renew_diarizer()
-        self._diarizer.push(frame)
+        self._push_diarizer(frame, private, uncertain)
         frame_start = self._received_ms
         self._received_ms += 20
         values = _pcm_samples(frame)
@@ -2295,9 +2361,13 @@ class LiveProcessor:
         inferred = group.pop("inferred", False) is True
         spans = group.pop("labelled_spans", None)
         head = group.pop("diarized_head", None)
-        if group["start_ms"] < self._unlabelled_before_ms:
+        if group["start_ms"] < self._unlabelled_before_ms or self._heard_private(
+            group["start_ms"], group["end_ms"]
+        ):
             # Under way at a forced renewal (round 21): labelled, wholly or partly, by the old
             # diarizer, or joined to its label, so published unlabelled with no label evidence.
+            # Private PCM was replaced by silence: even a stale timeline's owner label
+            # cannot authenticate that voice. Full exits use the isolated sentence check.
             group["speaker"], inferred, spans, head = None, False, None, None
         turn = Turn(
             session_id=self.config.session_id,
@@ -2334,7 +2404,8 @@ class LiveProcessor:
             self._partial.clear()
             if pcm:
                 # Process actual tail only. Synthetic zero-padding must not enter native history.
-                self._diarizer.push(pcm)
+                private, uncertain = self._diarizer_privacy(math.ceil(len(pcm) / BYTES_PER_MS))
+                self._push_diarizer(pcm, private, uncertain)
                 if self._utterance:
                     self._utterance.extend(pcm)
             # Flush only for a pending utterance: nothing else is emitted, and a hosted
