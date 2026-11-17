@@ -1233,6 +1233,13 @@ class _FinalizedWindow:
     last_number: int = 0
     private_loss: bool = False
 
+    def release(self) -> None:
+        """Discard owned PCM/text evidence; safe to repeat during shutdown."""
+        self.pcm = b""
+        self.units = []
+        self.window = None
+        self.timeline = []
+
     def held_bytes(self) -> int:
         # A logical admission budget, not a claim about a native model's RSS.
         return (
@@ -1245,14 +1252,22 @@ class _FinalizedWindow:
 
 
 class _WindowRecovery:
-    """One bounded local retry. Only the input owner publishes results or updates counters.
+    """One local retry, constructed without starting; the owner publishes before start.
 
-    Cancellation is a signal and nonblocking kill; never join/reap from ingestion.
-    The worker owns process cleanup and never calls the host's event/report callbacks.
+    Lifecycle state uses the processor's one lock. Process cleanup and shutdown joins
+    run outside it. Normal ingestion never waits for the worker or invokes its callbacks.
     """
 
-    def __init__(self, config: LiveConfig, packet: _FinalizedWindow):
+    def __init__(
+        self,
+        config: LiveConfig,
+        packet: _FinalizedWindow,
+        lock,
+        shutdown: threading.Event,
+    ):
         self.packet = packet
+        self._lock = lock
+        self._shutdown = shutdown
         self.cancelled = threading.Event()
         self.done = threading.Event()
         self.process: subprocess.Popen | None = None
@@ -1260,27 +1275,44 @@ class _WindowRecovery:
         self.config = replace(
             config, timeout_seconds=min(config.timeout_seconds, ASR_REDECODE_SECONDS)
         )
+        self.started = self.expires = 0.0
+        assert packet.window is not None
+        self.pcm = packet.pcm
+        self._initial = replace(packet.window)
+        # No PCM/text in Thread.args: ownership stays explicit and accountable.
+        self.thread = threading.Thread(target=self._run, name="rightyo-asr-recovery", daemon=True)
+
+    def start(self) -> None:
+        """Called under the lifecycle lock, after publication, while still open."""
+        if self._shutdown.is_set():
+            self.pcm = b""
+            self._initial = None
+            self.result = None
+            self.packet.release()
+            self.done.set()
+            return
         self.started = time.monotonic()
         self.expires = self.started + self.config.timeout_seconds + ASR_CLEANUP_SECONDS
-        # Snapshot evidence before starting: deadline/shutdown cancellation can resolve
-        # the packet while the worker still owns its bounded local process.
-        assert packet.window is not None
-        initial = replace(packet.window)
-        self.thread = threading.Thread(
-            target=self._run, args=(packet.pcm, initial), name="rightyo-asr-recovery", daemon=True
-        )
         self.thread.start()
 
     def _register(self, process: subprocess.Popen) -> None:
-        self.process = process
-        if self.cancelled.is_set():
+        with self._lock:
+            self.process = process
+            stopped = self.cancelled.is_set() or self._shutdown.is_set()
+            if stopped:
+                self.cancelled.set()
+        if stopped:
             with contextlib.suppress(OSError):
                 process.kill()
             raise LiveAudioError("Audio recovery was cancelled")
 
-    def _run(self, pcm: bytes, initial: _RecognizerWindow) -> None:
+    def _run(self) -> None:
+        # These immutable inputs remain visible in self.pcm until finally releases
+        # the local references too. Startup/shutdown cannot clear a running input.
+        pcm, initial = self.pcm, self._initial
+        retry = None
         try:
-            if self.cancelled.is_set():
+            if self.cancelled.is_set() or self._shutdown.is_set():
                 return
             try:
                 retry = _recognizer_window(
@@ -1295,18 +1327,47 @@ class _WindowRecovery:
             retry.elapsed_ms = initial.elapsed_ms + max(
                 0, round((time.monotonic() - self.started) * 1000)
             )
-            if not self.cancelled.is_set():
-                self.result = retry
+            with self._lock:
+                if not self.cancelled.is_set() and not self._shutdown.is_set():
+                    self.result = retry
         finally:
-            self.process = None
-            self.done.set()
+            # _transcribe normally reaps its child. Also cover cancellation during
+            # registration/startup, before a decoder can enter its usual cleanup.
+            with self._lock:
+                process = self.process
+            if process is not None:
+                with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                    _terminate(process)
+            pcm, initial, retry = b"", None, None
+            with self._lock:
+                self.process = None
+                self.pcm = b""
+                self._initial = None
+                if self.cancelled.is_set() or self._shutdown.is_set():
+                    self.result = None
+                if self._shutdown.is_set():
+                    self.packet.release()
+                self.done.set()
 
     def cancel(self) -> None:
-        self.cancelled.set()
-        process = self.process
+        with self._lock:
+            already_cancelled = self.cancelled.is_set()
+            self.cancelled.set()
+            self.result = None
+            process = None if already_cancelled else self.process
+            if self.thread.ident is None:
+                self.pcm = b""
+                self._initial = None
+                if self._shutdown.is_set():
+                    self.packet.release()
+                self.done.set()
         if process is not None:
             with contextlib.suppress(OSError):
                 process.kill()
+
+    def join(self) -> None:
+        if self.thread.ident is not None and self.thread is not threading.current_thread():
+            self.thread.join(timeout=self.config.timeout_seconds + ASR_CLEANUP_SECONDS)
 
 
 def _checked_units(units: Any, duration_ms: int) -> list[dict[str, Any]] | None:
@@ -1401,6 +1462,8 @@ class LiveProcessor:
         self.config = config
         self.on_turn = on_turn
         self.failed = False
+        self._recovery_lock = threading.Lock()
+        self._recovery_shutdown = threading.Event()
         self.closed = False
         self._transcriber: Transcriber = _select(
             config.transcriber, WhisperCppTranscriber, config, "transcribe"
@@ -1496,13 +1559,14 @@ class LiveProcessor:
 
     @property
     def buffered_audio_bytes(self) -> int:
-        held = sum(len(packet.pcm) for packet in self._waiting)
-        held += sum(
-            len(packet.pcm)
-            for packet in self._recoveries
-            if not any(packet is waiting for waiting in self._waiting)
-        )
-        return len(self._partial) + len(self._utterance) + sum(map(len, self._pre_roll)) + held
+        with self._recovery_lock:
+            owned = {id(packet.pcm): packet.pcm for packet in (*self._waiting, *self._recoveries)}
+            recovery = self._recovery
+            if recovery is not None:
+                owned[id(recovery.packet.pcm)] = recovery.packet.pcm
+                owned[id(recovery.pcm)] = recovery.pcm
+            held = sum(len(pcm) for pcm in owned.values())
+            return len(self._partial) + len(self._utterance) + sum(map(len, self._pre_roll)) + held
 
     def push_pcm16(self, pcm: bytes) -> None:
         if self.closed or self.failed:
@@ -1810,28 +1874,45 @@ class LiveProcessor:
         self._utterance.clear()
         self._pre_roll.clear()
         self._drain_results()
-        if self._waiting and self._waiting[-1].overflow:
-            # Keep overload loss metadata bounded too: once the result hold fills,
-            # later windows join its tail gap until all preceding results resolve.
-            self._append_overflow(packet)
-            return
-        invalid = window is not None and not window.units and window.rejected
-        if invalid and len(self._recoveries) < ASR_RECOVERY_WINDOWS:
-            packet.retry_pending = True
-            self._recoveries.append(packet)
-        else:
-            if invalid:
-                # Only the newest is refused when all four recovery slots are occupied.
-                self._lose_window(packet, reason=5, compact=True)
-            held = [entry for entry in self._waiting if not entry.retry_pending]
-            if self._waiting and (
-                len(held) >= ASR_HELD_WINDOWS
-                or sum(entry.held_bytes() for entry in held) + packet.held_bytes() > ASR_HELD_BYTES
-            ):
-                self._append_overflow(packet)
+        self._queue_window(packet)
+
+    def _queue_window(self, packet: _FinalizedWindow) -> None:
+        queued = False
+        with self._recovery_lock:
+            if self.closed:
+                packet.release()
                 return
-        if self._waiting or packet.retry_pending:
-            self._waiting.append(packet)
+            overflow = bool(self._waiting and self._waiting[-1].overflow)
+            invalid = (
+                packet.window is not None and not packet.window.units and packet.window.rejected
+            )
+            if not overflow and invalid and len(self._recoveries) < ASR_RECOVERY_WINDOWS:
+                packet.retry_pending = True
+                self._recoveries.append(packet)
+            elif not overflow:
+                if invalid:
+                    self._lose_window(packet, reason=5, compact=True)
+                held = [entry for entry in self._waiting if not entry.retry_pending]
+                overflow = bool(self._waiting) and (
+                    len(held) >= ASR_HELD_WINDOWS
+                    or sum(entry.held_bytes() for entry in held) + packet.held_bytes()
+                    > ASR_HELD_BYTES
+                )
+            if not overflow and (self._waiting or packet.retry_pending):
+                self._waiting.append(packet)
+                queued = True
+        if overflow:
+            # The privacy callback may take a host lock: never invoke it while holding
+            # the lifecycle lock that Stop needs.
+            packet.private_loss = self._heard_private(
+                packet.offset, packet.offset + packet.duration_ms
+            )
+            with self._recovery_lock:
+                if self.closed:
+                    packet.release()
+                    return
+                self._append_overflow(packet)
+        elif queued:
             self._drain_results()
         else:
             self._commit_window(packet)
@@ -1852,7 +1933,6 @@ class LiveProcessor:
 
     def _append_overflow(self, packet: _FinalizedWindow) -> None:
         self._lose_window(packet, reason=5, compact=True)
-        packet.private_loss = self._heard_private(packet.offset, packet.offset + packet.duration_ms)
         if self._waiting and self._waiting[-1].overflow:
             gap = self._waiting[-1]
             gap.duration_ms = packet.offset + packet.duration_ms - gap.offset
@@ -1869,53 +1949,71 @@ class LiveProcessor:
             packet.overflow = True
             self._waiting.append(packet)
 
-    def _abandon_recovery(self) -> None:
-        # Called only at this job's own deadline, never because later results arrived.
-        recovery = self._recovery
-        if recovery is None:
-            return
-        recovery.cancel()
+    def _expire_recovery_locked(self, recovery: _WindowRecovery) -> None:
         packet = recovery.packet
         if packet.retry_pending:
             self._lose_window(packet, reason=4, compact=False)
             packet.window.retried = True
             packet.window.elapsed_ms += max(0, round((time.monotonic() - recovery.started) * 1000))
 
+    def _start_recovery_locked(self) -> None:
+        if self.closed or self._recovery is not None or not self._recoveries:
+            return
+        recovery = _WindowRecovery(
+            self.config, self._recoveries[0], self._recovery_lock, self._recovery_shutdown
+        )
+        self._recovery = recovery
+        recovery.start()
+
     def _drain_results(self, *, wait: bool = False) -> None:
-        while not self.closed:
-            recovery = self._recovery
-            if recovery is not None:
-                if wait:
-                    # Only EOF waits; each queued job gets its own deadline at launch.
-                    recovery.done.wait(max(0.0, recovery.expires - time.monotonic()))
-                if recovery.done.is_set():
-                    packet = recovery.packet
-                    if packet.retry_pending:
-                        if recovery.result is not None:
-                            packet.window = recovery.result
-                            packet.units = recovery.result.units
-                            packet.retry_pending = False
-                        else:
-                            self._lose_window(packet, reason=4, compact=False)
-                    assert self._recoveries[0] is packet
-                    self._recoveries.popleft()
-                    self._recovery = None
-                elif time.monotonic() >= recovery.expires:
-                    self._abandon_recovery()
-            if self._recovery is None and self._recoveries:
-                self._recovery = _WindowRecovery(self.config, self._recoveries[0])
-            while self._waiting and not self.closed and not self._waiting[0].retry_pending:
-                self._commit_window(self._waiting.popleft())
-            if not wait or not any(packet.retry_pending for packet in self._recoveries):
+        while True:
+            with self._recovery_lock:
+                if self.closed:
+                    return
+                recovery = self._recovery
+            if wait and recovery is not None:
+                # Only EOF waits. No joins, waits or host callbacks under the lock.
+                recovery.done.wait(max(0.0, recovery.expires - time.monotonic()))
+            expired = None
+            with self._recovery_lock:
+                if self.closed:
+                    return
+                if recovery is not None:
+                    if recovery.done.is_set():
+                        packet = recovery.packet
+                        if packet.retry_pending:
+                            if recovery.result is not None:
+                                packet.window = recovery.result
+                                packet.units = recovery.result.units
+                                packet.retry_pending = False
+                            else:
+                                self._lose_window(packet, reason=4, compact=False)
+                        assert self._recoveries[0] is packet
+                        self._recoveries.popleft()
+                        self._recovery = None
+                    elif time.monotonic() >= recovery.expires:
+                        self._expire_recovery_locked(recovery)
+                        expired = recovery
+                self._start_recovery_locked()
+                ready = []
+                while self._waiting and not self._waiting[0].retry_pending:
+                    ready.append(self._waiting.popleft())
+                pending = any(packet.retry_pending for packet in self._recoveries)
+                active = self._recovery
+            if expired is not None:
+                expired.cancel()
+            for packet in ready:
+                self._commit_window(packet)
+            if not wait or not pending:
                 return
-            recovery = self._recovery
-            if recovery.cancelled.is_set() and not recovery.done.is_set():
-                # A broken local worker must not spin or grow a replacement pool. At
-                # EOF, allow one bounded cleanup grace then fail the session explicitly.
-                if not recovery.done.wait(ASR_CLEANUP_SECONDS):
+            if active.cancelled.is_set() and not active.done.is_set():
+                if not active.done.wait(ASR_CLEANUP_SECONDS):
                     raise LiveAudioError("Local recovery worker could not stop")
 
     def _commit_window(self, packet: _FinalizedWindow) -> None:
+        if self.closed:
+            packet.release()
+            return
         pcm, offset, timeline = packet.pcm, packet.offset, packet.timeline
         window, complete, provenance = packet.window, packet.complete, packet.provenance
         checked = _checked_units(packet.units, packet.duration_ms)
@@ -2108,6 +2206,8 @@ class LiveProcessor:
 
     def _emit(self, group: dict[str, Any], private_pcm: memoryview | None = None) -> None:
         """Number and emit one finalized (possibly joined) turn; ids follow emission order."""
+        if self.closed:
+            return
         self._counter += 1
         gap = group.pop("post_turn_gap", None)
         inferred = group.pop("inferred", False) is True
@@ -2165,29 +2265,44 @@ class LiveProcessor:
             self.close()
 
     def _register_asr(self, process: subprocess.Popen) -> None:
-        self._asr_process = process
-        if self.closed:
+        with self._recovery_lock:
+            stopped = self.closed
+            if not stopped:
+                self._asr_process = process
+        if stopped:
             _terminate(process)
             raise LiveAudioError("Audio session was stopped")
 
     def close(self) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        if self._recovery is not None:
-            self._recovery.cancel()
-            self._recovery = None
-        self._waiting.clear()
-        self._recoveries.clear()
-        if self._asr_process is not None:
-            _terminate(self._asr_process)
-        # Cancellation discards a turn still held for a continuation, like the open
-        # utterance; `finish` and `release_pending` emit it instead.
-        self._merger.discard()
-        self._partial.clear()
-        self._pre_roll.clear()
-        self._utterance.clear()
-        self._diarizer.close()
+        with self._recovery_lock:
+            first = not self.closed
+            self.closed = True
+            self._recovery_shutdown.set()
+            recovery = self._recovery
+            process = self._asr_process if first else None
+            self._asr_process = None
+            for packet in (*self._waiting, *self._recoveries):
+                packet.release()
+            self._waiting.clear()
+            self._recoveries.clear()
+        # Startup/publication cannot race this snapshot. Native cleanup and worker
+        # joins must stay outside the lock needed by registration and the finalizer.
+        try:
+            if recovery is not None:
+                recovery.cancel()
+                recovery.join()
+            if process is not None:
+                _terminate(process)
+        finally:
+            with self._recovery_lock:
+                if recovery is not None and recovery.done.is_set() and self._recovery is recovery:
+                    self._recovery = None
+            if first:
+                self._merger.discard()
+                self._partial.clear()
+                self._pre_roll.clear()
+                self._utterance.clear()
+                self._diarizer.close()
 
 
 if __name__ == "__main__":

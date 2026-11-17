@@ -128,7 +128,15 @@ Unusable recognizer timestamps no longer end the session
   queue; this is a pre-existing limitation, not a queue-safety guarantee. The background
   retry adds no wait to this input path. Moving first-pass decoding off the input path is
   a separate follow-up. EOF alone drains queued recoveries, each with its own deadline;
-  Stop cancels/discards. No network fallback is used. Rejected segments from both
+  Stop cancels/discards. Worker construction, publication-before-start and the closed
+  flag share one lifecycle lock, so Stop cannot miss a starting worker or start another
+  once closing begins. Stop takes the reference under that lock, then cancels/reaps/joins
+  outside it; no native wait or host callback holds the lock. Late recovery results are
+  discarded and owned PCM/text are released. `buffered_audio_bytes` includes worker-held
+  PCM until release even after the input queues are cleared. A repeated Stop can finish
+  a pending join without repeating backend teardown. Shutdown joins have a bounded retry
+  timeout plus cleanup allowance; if still finishing, ownership/accounting remain visible
+  until cleanup completes. No network fallback is used. Rejected segments from both
   attempts count in `skipped_segments`; wholly lost windows count in `skipped_utterances`.
 - Every backend: the units an utterance produces are then checked together. If any unit
   has timestamps that are not integers, NaN, negative, reversed, past the utterance, or

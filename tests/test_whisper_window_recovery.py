@@ -4,8 +4,10 @@ import io
 import json
 import re
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stderr
 from dataclasses import replace
@@ -22,6 +24,7 @@ from rightyo.live_audio import (
     LiveProcessor,
     _checked_units,
     _recognizer_window,
+    _WindowRecovery,
 )
 from rightyo.tool import _stderr
 
@@ -415,8 +418,12 @@ class WhisperWindowRecoveryTests(unittest.TestCase):
             if config.timeout_seconds == 5.0:
                 retry_calls.append(pcm)
                 entered.set()
-                if not release.wait(5):
-                    raise LiveAudioError("Authored retry watchdog")
+                deadline = time.monotonic() + 5
+                while not release.wait(0.01):
+                    if register.__self__.cancelled.is_set():
+                        raise LiveAudioError("Authored retry cancelled")
+                    if time.monotonic() >= deadline:
+                        raise LiveAudioError("Authored retry watchdog")
                 return doc(GOOD)
             first_calls.append(pcm)
             if len(first_calls) == 1 or later_bad:
@@ -647,6 +654,171 @@ class WhisperWindowRecoveryTests(unittest.TestCase):
                 release.set()
             self.assertTrue(recovery.done.wait(2))
             processor.release_pending()
+        self.assertEqual((turns, reports), ([], []))
+
+    def test_close_during_worker_start_reaps_child_and_releases_all_recovery_data(self):
+        processor, turns, reports = self.processor()
+        constructing, allow_start = threading.Event(), threading.Event()
+        stop_attempted, spawned, reaped = threading.Event(), threading.Event(), threading.Event()
+        allow_cleanup, stopped, stopped_again = (
+            threading.Event(),
+            threading.Event(),
+            threading.Event(),
+        )
+        repeat_join = threading.Event()
+        workers, published, children, errors = [], [], [], []
+        actual_lock = processor._recovery_lock
+
+        class ObservedLock:
+            def __enter__(self):
+                if threading.current_thread().name == "authored-stop":
+                    stop_attempted.set()  # Stop is about to contend for the held lock.
+                actual_lock.acquire()
+                return self
+
+            def __exit__(self, *_args):
+                actual_lock.release()
+
+        processor._recovery_lock = ObservedLock()
+        original_start, original_join = _WindowRecovery.start, _WindowRecovery.join
+
+        def start(worker):
+            workers.append(worker)
+            published.append(processor._recovery)
+            constructing.set()
+            if not allow_start.wait(10):
+                raise AssertionError("authored startup watchdog")
+            original_start(worker)
+            # Keep the creation/start lock held until a real synthetic child exists.
+            if not spawned.wait(5):
+                raise AssertionError("authored child startup watchdog")
+
+        def join(worker):
+            if threading.current_thread().name == "authored-stop-again":
+                repeat_join.set()
+            original_join(worker)
+
+        def decode(config, _pcm, register):
+            if config.timeout_seconds != 5.0:
+                return doc(BAD)
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            children.append(child)
+            spawned.set()
+            try:
+                try:
+                    register(child)
+                except LiveAudioError:
+                    pass  # Stop may win the registration lock; the child still must be reaped.
+                child.wait(timeout=5)
+                reaped.set()
+                if not allow_cleanup.wait(10):
+                    raise AssertionError("authored cleanup watchdog")
+                return doc(GOOD)  # Deliberate late result after Stop: never retain or emit it.
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+
+        def ingest():
+            try:
+                for frame in [VOICE] * 10 + [SILENCE] * 72:
+                    processor.push_pcm16(frame)
+            except LiveAudioError:
+                pass  # Concurrent Stop may end the active push.
+            except BaseException as error:
+                errors.append(error)
+
+        def stop(done):
+            try:
+                processor.close()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                done.set()
+
+        ingest_thread = threading.Thread(target=ingest, name="authored-input")
+        stop_thread = threading.Thread(target=stop, args=(stopped,), name="authored-stop")
+        repeat_thread = threading.Thread(
+            target=stop, args=(stopped_again,), name="authored-stop-again"
+        )
+        with (
+            patch("rightyo.live_audio._transcribe", side_effect=decode),
+            patch.object(_WindowRecovery, "start", new=start),
+            patch.object(_WindowRecovery, "join", new=join),
+            patch.object(
+                processor._diarizer, "close", wraps=processor._diarizer.close
+            ) as close_diarizer,
+        ):
+            ingest_thread.start()
+            try:
+                self.assertTrue(constructing.wait(5))
+                worker = workers[0]
+                stop_thread.start()
+                self.assertTrue(stop_attempted.wait(5))
+                self.assertFalse(processor.closed)  # Stop cannot cross construction/start.
+                self.assertFalse(stopped.is_set())
+                allow_start.set()
+                self.assertTrue(reaped.wait(5))
+                # Cleanup is paused: Stop must join OUTSIDE the lock, and PCM remains
+                # accounted for even after Stop removed both owner-side queues.
+                with processor._recovery_lock:
+                    self.assertTrue(processor.closed)
+                    self.assertEqual((len(processor._waiting), len(processor._recoveries)), (0, 0))
+                self.assertEqual(processor.buffered_audio_bytes, 1640 * 32)
+                self.assertEqual(worker.packet.pcm, b"")
+                self.assertFalse(stopped.is_set())
+                repeat_thread.start()
+                self.assertTrue(repeat_join.wait(5))
+                self.assertFalse(stopped_again.is_set())
+                self.assertEqual((turns, reports), ([], []))
+            finally:
+                allow_start.set()
+                allow_cleanup.set()
+                for thread in (ingest_thread, stop_thread, repeat_thread):
+                    if thread.ident is not None:
+                        thread.join(timeout=12)
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait(timeout=5)
+            self.assertTrue(stopped.is_set())
+            self.assertTrue(stopped_again.is_set())
+            self.assertFalse(any(t.is_alive() for t in (ingest_thread, stop_thread, repeat_thread)))
+            self.assertEqual(errors, [])
+            self.assertIs(published[0], worker)  # Publication BEFORE start is an invariant.
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].poll())
+            self.assertFalse(worker.thread.is_alive())
+            self.assertTrue(worker.done.is_set())
+            self.assertEqual(worker.pcm, b"")
+            self.assertIsNone(worker._initial)
+            self.assertIsNone(worker.result)
+            self.assertIsNone(worker.packet.window)
+            self.assertEqual(
+                (worker.packet.pcm, worker.packet.units, worker.packet.timeline), (b"", [], [])
+            )
+            self.assertIsNone(processor._recovery)
+            self.assertEqual(processor.buffered_audio_bytes, 0)
+            processor.close()
+            processor.close()
+            close_diarizer.assert_called_once()
+            processor.release_pending()
+            self.assertEqual((turns, reports), ([], []))
+
+    def test_close_before_scheduling_never_constructs_or_starts_recovery(self):
+        processor, turns, reports = self.processor()
+        processor.close()
+        with patch("rightyo.live_audio._WindowRecovery") as factory:
+            processor._drain_results()
+            with processor._recovery_lock:
+                processor._start_recovery_locked()
+            factory.assert_not_called()
+        self.assertEqual(processor.buffered_audio_bytes, 0)
         self.assertEqual((turns, reports), ([], []))
 
     def test_deferred_windows_keep_their_utterance_local_speaker_namespaces(self):
