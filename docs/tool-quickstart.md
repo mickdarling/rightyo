@@ -47,10 +47,10 @@ some-local-pcm-source | .venv/bin/rightyo listen --config local/prototype.json \
 
 `--mode stdin` is a local adapter only. It adds no network transport, authentication, or
 source authorization, and the provenance it reports is whatever the local caller declares.
-Hailing Station's ambient-audio path, which will pipe a phone's microphone into this
-command, is in progress (hailing-station #203) and is not yet available. In that setup the
-Hailing Station daemon owns transport and authentication, runs this command as a local
-child process, and declares `--provenance live-microphone` for the audio it relays.
+Hailing Station's ambient-audio path (hailing-station #203) pipes a phone's or Mac's
+microphone into this command and is in daily use. In that setup the Hailing Station daemon
+owns transport and authentication, runs this command as a local child process, and declares
+`--provenance live-microphone` for the audio it relays.
 
 `--mode stdin` reads headerless mono 16,000 Hz signed 16-bit little-endian PCM (the format
 the Mac capture helper produces and `push_pcm16` accepts) from stdin. Nothing else is

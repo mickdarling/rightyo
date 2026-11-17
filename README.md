@@ -21,9 +21,10 @@ What runs today:
 - **Conversation rules on top:**
   - follow-ups without repeating the name;
   - natural "stop" and "never mind" dismissals;
-  - meeting, media and privacy modes, which hold back or exclude speech.
-- **For hosts:** a versioned JSONL event stream, with a contract test against Hailing
-  Station's decoder so the two stay in step.
+  - meeting, media and privacy modes, which hold back or exclude speech;
+  - an optional stricter bar while another voice is in the room.
+- **For hosts:** a versioned JSONL event stream, with a contract test against pinned
+  Hailing Station decoder key sets.
 
 What is still experimental:
 
