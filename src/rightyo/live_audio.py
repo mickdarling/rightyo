@@ -29,7 +29,7 @@ import threading
 import time
 import wave
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -43,6 +43,21 @@ FRAME_BYTES = 640  # 20 ms of mono signed little-endian PCM16
 BYTES_PER_MS = 32  # mono PCM16 at 16 kHz
 MAX_CHUNK_BYTES = 32000  # one second of audio per push
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+# Preserve the pinned CLI's existing allowance for its one second of end padding.
+# Clamp only the end, never extend the received audio or accept an onset beyond it.
+ASR_END_PADDING_MS = 1000
+# Two 10 ms whisper timestamp ticks (one PCM frame): tolerate rounding jitter only.
+ASR_TIMING_JITTER_MS = 20
+# Recovery alone is asynchronous and bounded. The first decode retains its configured
+# timeout, including the base's pre-existing synchronous input-path blocking.
+ASR_REDECODE_SECONDS = 5.0
+ASR_CLEANUP_SECONDS = 6.0  # terminate 2 s + kill/reap 2 s + feeder join 2 s
+ASR_RECOVERY_WINDOWS = 4  # includes the active/cancelling worker's window
+# Four serial jobs can take 4 * (5 + 6) = 44 s. The fastest endpoint is a 20 ms
+# voice frame plus 20 ms silence, so 44,000 / 40 = 1,100 completed windows.
+ASR_HELD_WINDOWS = 1100
+# Independent payload guard: PCM plus conservative charges for text/timeline entries.
+ASR_HELD_BYTES = 16 * 1024 * 1024
 MAX_SPEAKER = 702  # "Speaker A" .. "Speaker ZZ"; native streams use 1..8
 # A diarizer renewal deferred past an open utterance or held turn is forced this long after the
 # privacy end is reached (#242 round 21), so steady speech cannot keep the old one in use.
@@ -715,7 +730,11 @@ def _attribute(
 
 
 def _attribute_edges(
-    attributed: list[list[Any]], timeline: list[dict[str, Any]], gap_ms: int
+    attributed: list[list[Any]],
+    timeline: list[dict[str, Any]],
+    gap_ms: int,
+    *,
+    blockers: list[dict[str, Any]] | None = None,
 ) -> set[int]:
     """Give unlabelled edge words the utterance's only labelled speaker, in place.
 
@@ -725,6 +744,8 @@ def _attribute_edges(
     exactly one labelled speaker; only for a word that overlaps no one and either touches
     segments of that speaker alone, or touches no segment and lies within `gap_ms` of one
     of that speaker's segments (timestamps running just past the segment's edge).
+    `blockers` can retain touching evidence across a run's loss boundary solely to
+    refuse a label; it cannot supply positive evidence or extend the inference slack.
     """
     inferred: set[int] = set()
     labels = {entry[3] for entry in attributed if entry[3] is not None}
@@ -742,11 +763,12 @@ def _attribute_edges(
             continue
         touching = {
             "Speaker " + _speaker_label(segment["speaker"])
-            for segment in timeline
+            for segment in (timeline if blockers is None else blockers)
             if segment["start_ms"] <= end and segment["end_ms"] >= start
         }
+        supported = any(seg_start <= end and seg_end >= start for seg_start, seg_end in own)
         near = any(max(start - seg_end, seg_start - end, 0) <= gap_ms for seg_start, seg_end in own)
-        if touching == {label} or (not touching and near):
+        if (touching == {label} and supported) or (not touching and near):
             entry[3] = label
             inferred.add(index)
     return inferred
@@ -1021,36 +1043,54 @@ def _transcribe(
         raise LiveAudioError("Local recognizer failed") from None
 
 
-def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]] | None:
-    """The usable units of one whisper.cpp document, or None; see `_counted_units`."""
+def _units(document: dict[str, Any], duration_ms: int) -> list[dict[str, Any]]:
+    """The salvaged units of one whisper.cpp document; see `_recognizer_window`."""
     return _counted_units(document, duration_ms)[0]
 
 
-def _counted_units(
-    document: dict[str, Any], duration_ms: int
-) -> tuple[list[dict[str, Any]] | None, int]:
-    """Use complete token-derived word intervals; fall back to whole segments.
+@dataclass
+class _RecognizerWindow:
+    """Internal validation evidence only; never serialized into host events."""
 
-    No majority speaker vote, guessed timestamps, or splitting a word between
-    speakers. Zero-duration punctuation attaches to its word; words with only
-    zero-duration timestamps remain unassigned.
+    units: list[dict[str, Any]]
+    gaps: set[int]  # unit indices before/after unresolved text, including 0 and len(units)
+    segments: int = 0
+    repaired: int = 0
+    # 1=type, 2=bounds, 3=reversal, 4=order, 5=retry failure/deadline, 6=queue/hold full.
+    reasons: tuple[int, ...] = (0, 0, 0, 0, 0, 0)
+    retry_segments: int = 0
+    retried: bool = False
+    elapsed_ms: int = 0
 
-    whisper.cpp emits odd offsets on short, noisy or near-silent windows (#78). A
-    nonempty segment whose own offsets are unusable (not integers, negative, reversed,
-    zero-length, starting at or after the end of the received audio, or ending more
-    than the CLI's one second of padding past it) makes the whole utterance unusable:
-    publishing the remaining segments could invert meaning ("do not stop" becoming
-    "do stop"), and a zero-length segment cannot be attributed to a speaker, so it
-    would split the utterance into separately judged turns. Returns
-    `(None, n)` then, with `n` the number of unusable segments, so the caller
-    suppresses the utterance and keeps listening; otherwise `(units, 0)`. A
-    malformed document structure still fails closed.
+    @property
+    def rejected(self) -> int:
+        return sum(self.reasons[:4])
+
+
+def _counted_units(document: dict[str, Any], duration_ms: int) -> tuple[list[dict[str, Any]], int]:
+    """Compatibility view of the validated units and rejected segment count."""
+    window = _recognizer_window(document, duration_ms)
+    return window.units, window.rejected
+
+
+def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _RecognizerWindow:
+    """Keep every usable segment in source order, without moving its valid times.
+
+    Clamp CLI end padding, retain zero-duration text (no direct speaker evidence), and
+    collapse <=20 ms reversed intervals to a point. Small inter-segment jitter is
+    clamped to the preceding retained interval; larger reversals are rejected, never
+    sorted. Dropped segments leave barriers, including at the window's two edges.
+    Token timing still falls back to the complete segment on any inconsistency.
+    Malformed document structures fail closed as before.
     """
     segments = document.get("transcription")
     if not isinstance(segments, list) or len(segments) > 1000:
         raise LiveAudioError("Invalid local recognizer result")
-    result = []
-    skipped = 0
+    result: list[dict[str, Any]] = []
+    fallbacks: list[dict[str, Any]] = []
+    segment_gaps: set[int] = set()
+    window = _RecognizerWindow(result, set(), segments=len(segments))
+    reasons = [0] * 6
     for segment in segments:
         if not isinstance(segment, dict):
             raise LiveAudioError("Invalid local recognizer result")
@@ -1060,20 +1100,39 @@ def _counted_units(
         if not text.strip():
             continue
         start, end = offsets.get("from"), offsets.get("to")
-        if (
-            type(start) is not int
-            or type(end) is not int
-            or not 0 <= start < end <= duration_ms + 1000
-            or start >= duration_ms
-        ):
-            skipped += 1
+        previous_start = fallbacks[-1]["start_ms"] if fallbacks else 0
+        previous_end = fallbacks[-1]["end_ms"] if fallbacks else 0
+        reason = 0
+        original = (start, end)
+        if type(start) is not int or type(end) is not int:
+            reason = 1
+        elif not (0 <= start <= duration_ms and 0 <= end <= duration_ms + ASR_END_PADDING_MS):
+            reason = 2
+        elif start - end > ASR_TIMING_JITTER_MS:
+            reason = 3
+        else:
+            end = min(max(start, end), duration_ms)
+            if max(previous_start - start, previous_end - end) > ASR_TIMING_JITTER_MS:
+                reason = 4
+            else:
+                start, end = max(start, previous_start), max(end, previous_end)
+        if reason:
+            reasons[reason - 1] += 1
+            window.gaps.add(len(result))
+            segment_gaps.add(len(fallbacks))
             continue
-        # The pinned CLI rounds final segment offsets into its padded audio.
-        # Bound evidence to actually received PCM; never invent future frames.
-        end = min(end, duration_ms)
+        repaired = (start, end) != original or start == end
+        window.repaired += int(repaired)
         fallback = {"text": text, "start_ms": start, "end_ms": end}
+        fallbacks.append(fallback)
         tokens = segment.get("tokens")
-        if not isinstance(tokens, list) or len(tokens) > 4000:
+        if (
+            start != original[0]
+            or end > original[1]
+            or start == end
+            or not isinstance(tokens, list)
+            or len(tokens) > 4000
+        ):
             result.append(fallback)
             continue
         words: list[dict[str, Any]] = []
@@ -1090,6 +1149,9 @@ def _counted_units(
                 continue
             reconstructed += value
             interval = token.get("offsets", {})
+            if not isinstance(interval, dict):
+                usable = False
+                break
             left, right = interval.get("from"), interval.get("to")
             if (
                 type(left) is not int
@@ -1113,8 +1175,20 @@ def _counted_units(
             a["start_ms"] <= b["start_ms"] and a["end_ms"] <= b["end_ms"]
             for a, b in zip(words, words[1:])
         )
+        usable &= bool(words) and (
+            words[0]["start_ms"] >= previous_start and words[0]["end_ms"] >= previous_end
+        )
         result.extend(words if usable else [fallback])
-    return (None if skipped else result), skipped
+    if any(
+        a["start_ms"] > b["start_ms"] or a["end_ms"] > b["end_ms"]
+        for a, b in zip(result, result[1:])
+    ):
+        # Ordered overlapping segments can have token detail that backtracks across
+        # their boundary. Keep all segment text/times; sacrifice detail, never words.
+        result[:] = fallbacks
+        window.gaps = segment_gaps
+    window.reasons = tuple(reasons)
+    return window
 
 
 class WhisperCppTranscriber:
@@ -1128,22 +1202,183 @@ class WhisperCppTranscriber:
         # Refused before any audio when no unwritable directory is available (fail closed).
         recognizer_dir()
         self.config = config
-        # Unusable segments, and the utterances they suppressed, this session (see
-        # `_counted_units`); read by `LiveProcessor`.
-        self.skipped_segments = 0
-        self.suppressed_utterances = 0
+        # First-pass evidence is transferred to the input owner for ordered accounting.
+        self._window: _RecognizerWindow | None = None
 
     def transcribe(
         self, pcm: bytes, register: Callable[[subprocess.Popen], None] | None = None
     ) -> list[dict[str, Any]]:
+        started = time.monotonic()
+        duration = len(pcm) // BYTES_PER_MS
+        self._window = None
         document = _transcribe(self.config, pcm, register)
-        units, skipped = _counted_units(document, len(pcm) // BYTES_PER_MS)
-        self.skipped_segments += skipped
-        if units is None:
-            # The whole utterance is unusable: publish nothing from it.
-            self.suppressed_utterances += 1
-            return []
-        return units
+        window = _recognizer_window(document, duration)
+        window.elapsed_ms = max(0, round((time.monotonic() - started) * 1000))
+        self._window = window
+        # The processor owns ordered accounting and optional background recovery.
+        return window.units
+
+
+@dataclass
+class _FinalizedWindow:
+    pcm: bytes
+    offset: int
+    through_ms: int
+    voice_start: int
+    number: int
+    timeline: list[dict[str, Any]]
+    provenance: str
+    complete: bool
+    units: Any
+    window: _RecognizerWindow | None
+    before: tuple[int, int]
+    duration_ms: int
+    timeline_present: bool
+    retry_pending: bool = False
+    overflow: bool = False
+    loss_count: int = 1
+    last_number: int = 0
+    private_loss: bool = False
+    # Ordered after this result, even if recovery has not resolved it yet. Adjacent
+    # barriers have no intervening text, so the stronger privacy settlement subsumes
+    # a plain flush. One token per bounded window; no separate growing event queue.
+    barrier_after: str | None = None
+
+    def release(self) -> None:
+        """Discard owned PCM/text evidence; safe to repeat during shutdown."""
+        self.pcm = b""
+        self.units = []
+        self.window = None
+        self.timeline = []
+
+    def held_bytes(self) -> int:
+        # A logical admission budget, not a claim about a native model's RSS.
+        return (
+            1024
+            + len(self.pcm)
+            + 512 * len(self.timeline)
+            + sum(512 + 4 * len(unit["text"]) for unit in self.units)
+            + (512 * len(self.window.gaps) if self.window is not None else 0)
+        )
+
+
+class _WindowRecovery:
+    """One local retry, constructed without starting; the owner publishes before start.
+
+    Lifecycle state uses the processor's one lock. Process cleanup and shutdown joins
+    run outside it. Normal ingestion never waits for the worker or invokes its callbacks.
+    """
+
+    def __init__(
+        self,
+        config: LiveConfig,
+        packet: _FinalizedWindow,
+        lock,
+        shutdown: threading.Event,
+    ):
+        self.packet = packet
+        self._lock = lock
+        self._shutdown = shutdown
+        self.cancelled = threading.Event()
+        self.done = threading.Event()
+        self.process: subprocess.Popen | None = None
+        self.result: _RecognizerWindow | None = None
+        self.config = replace(
+            config, timeout_seconds=min(config.timeout_seconds, ASR_REDECODE_SECONDS)
+        )
+        self.started = self.expires = 0.0
+        assert packet.window is not None
+        self.pcm = packet.pcm
+        self._initial = replace(packet.window)
+        # No PCM/text in Thread.args: ownership stays explicit and accountable.
+        self.thread = threading.Thread(target=self._run, name="rightyo-asr-recovery", daemon=True)
+
+    def start(self) -> None:
+        """Called under the lifecycle lock, after publication, while still open."""
+        if self._shutdown.is_set():
+            self.pcm = b""
+            self._initial = None
+            self.result = None
+            self.packet.release()
+            self.done.set()
+            return
+        self.started = time.monotonic()
+        self.expires = self.started + self.config.timeout_seconds + ASR_CLEANUP_SECONDS
+        self.thread.start()
+
+    def _register(self, process: subprocess.Popen) -> None:
+        with self._lock:
+            self.process = process
+            stopped = self.cancelled.is_set() or self._shutdown.is_set()
+            if stopped:
+                self.cancelled.set()
+        if stopped:
+            with contextlib.suppress(OSError):
+                process.kill()
+            raise LiveAudioError("Audio recovery was cancelled")
+
+    def _run(self) -> None:
+        # These immutable inputs remain visible in self.pcm until finally releases
+        # the local references too. Startup/shutdown cannot clear a running input.
+        pcm, initial = self.pcm, self._initial
+        retry = None
+        try:
+            if self.cancelled.is_set() or self._shutdown.is_set():
+                return
+            try:
+                retry = _recognizer_window(
+                    _transcribe(self.config, pcm, self._register), len(pcm) // BYTES_PER_MS
+                )
+            except Exception:  # noqa: BLE001 - no private exception escapes the worker
+                retry = _RecognizerWindow([], {0}, reasons=(0, 0, 0, 0, 1, 0))
+            retry.retry_segments = retry.segments
+            retry.segments = initial.segments
+            retry.reasons = tuple(a + b for a, b in zip(initial.reasons, retry.reasons))
+            retry.retried = True
+            retry.elapsed_ms = initial.elapsed_ms + max(
+                0, round((time.monotonic() - self.started) * 1000)
+            )
+            with self._lock:
+                if not self.cancelled.is_set() and not self._shutdown.is_set():
+                    self.result = retry
+        finally:
+            # _transcribe normally reaps its child. Also cover cancellation during
+            # registration/startup, before a decoder can enter its usual cleanup.
+            with self._lock:
+                process = self.process
+            if process is not None:
+                with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                    _terminate(process)
+            pcm, initial, retry = b"", None, None
+            with self._lock:
+                self.process = None
+                self.pcm = b""
+                self._initial = None
+                if self.cancelled.is_set() or self._shutdown.is_set():
+                    self.result = None
+                if self._shutdown.is_set():
+                    self.packet.release()
+                self.done.set()
+
+    def cancel(self) -> None:
+        with self._lock:
+            already_cancelled = self.cancelled.is_set()
+            self.cancelled.set()
+            self.result = None
+            process = None if already_cancelled else self.process
+            if self.thread.ident is None:
+                self.pcm = b""
+                self._initial = None
+                if self._shutdown.is_set():
+                    self.packet.release()
+                self.done.set()
+        if process is not None:
+            with contextlib.suppress(OSError):
+                process.kill()
+
+    def join(self) -> None:
+        if self.thread.ident is not None and self.thread is not threading.current_thread():
+            self.thread.join(timeout=self.config.timeout_seconds + ASR_CLEANUP_SECONDS)
 
 
 def _checked_units(units: Any, duration_ms: int) -> list[dict[str, Any]] | None:
@@ -1225,7 +1460,9 @@ class _OffsetDiarizer:
 
 
 class LiveProcessor:
-    """Single-owner synchronous processor; feed only explicitly consented audio.
+    """Single-owner processor with one bounded recovery worker.
+
+    Feed only explicitly consented audio.
 
     `close` cancels and discards an unfinished utterance. `finish` flushes the
     finite causal input and emits its tail. Failures leave `failed=True` and
@@ -1236,6 +1473,8 @@ class LiveProcessor:
         self.config = config
         self.on_turn = on_turn
         self.failed = False
+        self._recovery_lock = threading.Lock()
+        self._recovery_shutdown = threading.Event()
         self.closed = False
         self._transcriber: Transcriber = _select(
             config.transcriber, WhisperCppTranscriber, config, "transcribe"
@@ -1255,6 +1494,7 @@ class LiveProcessor:
         # the host thread and taken on the audio thread, both under `_private_lock`.
         self._private_until: int | None = None
         self._private_lock = threading.Lock()
+        self._frame_private = False
         # Where the last privacy end was reached (audio thread only), bounding a deferred renewal;
         # and, after a forced one, the renewal's offset: a turn starting before it is unlabelled.
         self._end_reached_ms: int | None = None
@@ -1273,6 +1513,11 @@ class LiveProcessor:
         self._counter = 0
         self._utterances = 0
         self._skipped_utterances = 0
+        self._skipped_segments = 0
+        self._waiting: deque[_FinalizedWindow] = deque()
+        self._recoveries: deque[_FinalizedWindow] = deque()
+        self._recovery: _WindowRecovery | None = None
+        self._voice_start = 0
         # Of those, the ones from utterances heard in privacy (hailing-station #735 S-1): kept
         # apart so the session's reported totals never count private speech.
         self._private_skipped_segments = 0
@@ -1311,14 +1556,14 @@ class LiveProcessor:
         counting those in utterances heard in privacy."""
         inner = getattr(self._transcriber, "skipped_segments", 0)
         inner = inner if type(inner) is int and inner > 0 else 0
-        return max(0, inner - self._private_skipped_segments)
+        return max(0, self._skipped_segments + inner - self._private_skipped_segments)
 
     @property
     def skipped_utterances(self) -> int:
         """Utterances suppressed whole this session for invalid or out-of-order timing.
 
-        Counts the common unit check's suppressions plus a transcriber's own (whisper.cpp
-        suppresses an utterance with an unusable segment before the unit check).
+        Counts the common unit check's suppressions plus windows with no salvageable
+        whisper.cpp text after the single recovery attempt.
         """
         inner = getattr(self._transcriber, "suppressed_utterances", 0)
         inner = inner if type(inner) is int and inner > 0 else 0
@@ -1326,12 +1571,20 @@ class LiveProcessor:
 
     @property
     def buffered_audio_bytes(self) -> int:
-        return len(self._partial) + len(self._utterance) + sum(map(len, self._pre_roll))
+        with self._recovery_lock:
+            owned = {id(packet.pcm): packet.pcm for packet in (*self._waiting, *self._recoveries)}
+            recovery = self._recovery
+            if recovery is not None:
+                owned[id(recovery.packet.pcm)] = recovery.packet.pcm
+                owned[id(recovery.pcm)] = recovery.pcm
+            held = sum(len(pcm) for pcm in owned.values())
+            return len(self._partial) + len(self._utterance) + sum(map(len, self._pre_roll)) + held
 
     def push_pcm16(self, pcm: bytes) -> None:
         if self.closed or self.failed:
             raise LiveAudioError("Audio session is closed")
         try:
+            self._drain_results()
             if not isinstance(pcm, bytes) or len(pcm) > MAX_CHUNK_BYTES or len(pcm) % 2:
                 raise LiveAudioError("Invalid mono PCM16 frame")
             budget = self.config.session_budget_ms
@@ -1410,6 +1663,31 @@ class LiveProcessor:
         released now, on its own, for the same reason. The end-of-turn judgement of an
         utterance open across the end was made on private audio, so it is made again."""
         self._end_of_turn_asked = self._complete = False
+        self._queue_merger_barrier("privacy")
+
+    def _queue_merger_barrier(self, kind: str) -> None:
+        """Audio-owner event, ordered after all finalized results heard before it.
+
+        A held result can be absent from the merger for the whole privacy interval
+        or input stall. Carry its boundary with it instead of settling an empty merger.
+        Host callbacks stay outside the lifecycle lock.
+        """
+        with self._recovery_lock:
+            if self.closed:
+                return
+            if self._waiting:
+                tail = self._waiting[-1]
+                if tail.barrier_after != "privacy":
+                    tail.barrier_after = kind
+                return
+        self._apply_merger_barrier(kind)
+
+    def _apply_merger_barrier(self, kind: str | None) -> None:
+        if kind is None or self.closed:
+            return
+        if kind == "flush":
+            self._merger.flush()
+            return
         spans = self._merger.held_spans()
         if not spans:
             return
@@ -1431,7 +1709,7 @@ class LiveProcessor:
     def _renew_diarizer(self) -> None:
         offset = self._received_ms
         self._end_reached_ms = None
-        if self._utterance or self._merger.holding:
+        if self._utterance or self._merger.holding or self._waiting:
             # Forced mid-turn (round 21): the old diarizer's labels for it must not cross over.
             self._unlabelled_before_ms = offset
         old, self._diarizer = (
@@ -1447,6 +1725,13 @@ class LiveProcessor:
             self.on_speakers_renewed()
 
     def _frame(self, frame: bytes) -> None:
+        if self.config.private is not None:
+            private = self._heard_private(self._received_ms, self._received_ms + 20)
+            if private != self._frame_private:
+                # Observe privacy starts as well as ends on the received-audio clock.
+                # No frame between toggles means no private audio and no new text.
+                self._queue_merger_barrier("privacy")
+                self._frame_private = private
         if self._private_until is not None:
             frame = self._private_cutoff(frame)
         # Renewed only once the privacy end is reached (#242 round 20): the controller counts a
@@ -1456,7 +1741,7 @@ class LiveProcessor:
         if (
             self._speaker_reset
             and (
-                (not self._utterance and not self._merger.holding)
+                (not self._utterance and not self._merger.holding and not self._waiting)
                 or (
                     self._end_reached_ms is not None
                     and self._received_ms - self._end_reached_ms >= SPEAKER_RENEWAL_LIMIT_MS
@@ -1472,10 +1757,11 @@ class LiveProcessor:
         rms = math.sqrt(sum(value * value for value in values) / len(values)) / 32768
         voiced = rms >= self.config.energy_threshold
         if voiced and not self._utterance:
+            self._voice_start = frame_start
             self._utterance_start = frame_start - len(self._pre_roll) * 20
             self._utterance.extend(b"".join(self._pre_roll))
             self._pre_roll.clear()
-            if self._merger.holding:
+            if self._merger.holding and not self._waiting:
                 # Followed by detected speech, whether or not it yields text (#96).
                 self._merger.heard(frame_start)
         if self._utterance or voiced:
@@ -1492,7 +1778,7 @@ class LiveProcessor:
                 self._finalize_when_attributed()
         else:
             self._pre_roll.append(frame)
-        if self._merger.holding:
+        if self._merger.holding and not self._waiting:
             self._merger.due(self._received_ms, self._utterance_start if self._utterance else None)
 
     def release_pending(self) -> None:
@@ -1500,7 +1786,8 @@ class LiveProcessor:
         if self.closed or self.failed:
             return
         try:
-            self._merger.flush()
+            self._drain_results()
+            self._queue_merger_barrier("flush")
         except Exception:
             self.failed = True
             self.close()
@@ -1593,30 +1880,232 @@ class LiveProcessor:
         _check_timeline(timeline, self._received_ms, self._timeline_limit)
         pcm = bytes(self._utterance)
         offset = self._utterance_start
-        self._utterance.clear()
-        self._pre_roll.clear()
         before = (self.skipped_segments, self.skipped_utterances)
         try:
             units = self._transcriber.transcribe(pcm, self._register_asr)
         finally:
             self._asr_process = None
+        window = getattr(self._transcriber, "_window", None)
+        if isinstance(window, _RecognizerWindow):
+            # Metadata/text belong only to this finalization, including private windows.
+            self._transcriber._window = None
+        else:
+            window = None
         if self.closed:
             raise LiveAudioError("Audio session was stopped")
-        provenance = getattr(self._diarizer, "speaker_provenance", "diarization-timeline")
         self._utterances += 1
-        checked = _checked_units(units, len(pcm) // BYTES_PER_MS)
-        if checked is None:
-            self._skipped_utterances += 1
-        skipped = self.skipped_segments - before[0]
-        suppressed = self.skipped_utterances > before[1]
-        private = (skipped or suppressed) and self._heard_private(
-            offset, offset + len(pcm) // BYTES_PER_MS
+        packet = _FinalizedWindow(
+            pcm,
+            offset,
+            self._received_ms,
+            self._voice_start,
+            self._utterances,
+            [
+                dict(segment)
+                for segment in timeline
+                if segment["start_ms"] <= offset + len(pcm) // BYTES_PER_MS
+                and segment["end_ms"] >= offset
+            ],
+            getattr(self._diarizer, "speaker_provenance", "diarization-timeline"),
+            complete,
+            units,
+            window,
+            before,
+            len(pcm) // BYTES_PER_MS,
+            bool(timeline),
+        )
+        self._utterance.clear()
+        self._pre_roll.clear()
+        self._drain_results()
+        self._queue_window(packet)
+
+    def _queue_window(self, packet: _FinalizedWindow) -> None:
+        queued = False
+        with self._recovery_lock:
+            if self.closed:
+                packet.release()
+                return
+            overflow = bool(self._waiting and self._waiting[-1].overflow)
+            invalid = (
+                packet.window is not None and not packet.window.units and packet.window.rejected
+            )
+            if not overflow and invalid and len(self._recoveries) < ASR_RECOVERY_WINDOWS:
+                packet.retry_pending = True
+                self._recoveries.append(packet)
+            elif not overflow:
+                if invalid:
+                    self._lose_window(packet, reason=5, compact=True)
+                held = [entry for entry in self._waiting if not entry.retry_pending]
+                overflow = bool(self._waiting) and (
+                    len(held) >= ASR_HELD_WINDOWS
+                    or sum(entry.held_bytes() for entry in held) + packet.held_bytes()
+                    > ASR_HELD_BYTES
+                )
+            if not overflow and (self._waiting or packet.retry_pending):
+                self._waiting.append(packet)
+                queued = True
+        if overflow:
+            # The privacy callback may take a host lock: never invoke it while holding
+            # the lifecycle lock that Stop needs.
+            packet.private_loss = self._heard_private(
+                packet.offset, packet.offset + packet.duration_ms
+            )
+            with self._recovery_lock:
+                if self.closed:
+                    packet.release()
+                    return
+                self._append_overflow(packet)
+        elif queued:
+            self._drain_results()
+        else:
+            self._commit_window(packet)
+
+    def _lose_window(self, packet: _FinalizedWindow, *, reason: int, compact: bool) -> None:
+        window = packet.window
+        if window is None:
+            window = _RecognizerWindow([], {0})
+        reasons = list(window.reasons)
+        if reason != 5 or not reasons[5]:
+            reasons[reason] += 1
+        packet.window = replace(window, units=[], gaps={0}, reasons=tuple(reasons))
+        packet.units = []
+        packet.retry_pending = False
+        if compact:
+            packet.pcm = b""
+            packet.timeline = []
+
+    def _append_overflow(self, packet: _FinalizedWindow) -> None:
+        self._lose_window(packet, reason=5, compact=True)
+        if self._waiting and self._waiting[-1].overflow:
+            gap = self._waiting[-1]
+            gap.duration_ms = packet.offset + packet.duration_ms - gap.offset
+            gap.through_ms = packet.through_ms
+            gap.last_number = packet.number
+            gap.loss_count += 1
+            gap.private_loss |= packet.private_loss
+            gap.window.reasons = tuple(
+                a + b for a, b in zip(gap.window.reasons, packet.window.reasons)
+            )
+            gap.window.segments += packet.window.segments
+            gap.window.elapsed_ms += packet.window.elapsed_ms
+        else:
+            packet.overflow = True
+            self._waiting.append(packet)
+
+    def _expire_recovery_locked(self, recovery: _WindowRecovery) -> None:
+        packet = recovery.packet
+        if packet.retry_pending:
+            self._lose_window(packet, reason=4, compact=False)
+            packet.window.retried = True
+            packet.window.elapsed_ms += max(0, round((time.monotonic() - recovery.started) * 1000))
+
+    def _start_recovery_locked(self) -> None:
+        if self.closed or self._recovery is not None or not self._recoveries:
+            return
+        recovery = _WindowRecovery(
+            self.config, self._recoveries[0], self._recovery_lock, self._recovery_shutdown
+        )
+        self._recovery = recovery
+        recovery.start()
+
+    def _drain_results(self, *, wait: bool = False) -> None:
+        while True:
+            with self._recovery_lock:
+                if self.closed:
+                    return
+                recovery = self._recovery
+            if wait and recovery is not None:
+                # Only EOF waits. No joins, waits or host callbacks under the lock.
+                recovery.done.wait(max(0.0, recovery.expires - time.monotonic()))
+            expired = None
+            with self._recovery_lock:
+                if self.closed:
+                    return
+                if recovery is not None:
+                    if recovery.done.is_set():
+                        packet = recovery.packet
+                        if packet.retry_pending:
+                            if recovery.result is not None:
+                                packet.window = recovery.result
+                                packet.units = recovery.result.units
+                                packet.retry_pending = False
+                            else:
+                                self._lose_window(packet, reason=4, compact=False)
+                        assert self._recoveries[0] is packet
+                        self._recoveries.popleft()
+                        self._recovery = None
+                    elif time.monotonic() >= recovery.expires:
+                        self._expire_recovery_locked(recovery)
+                        expired = recovery
+                self._start_recovery_locked()
+                ready = []
+                while self._waiting and not self._waiting[0].retry_pending:
+                    ready.append(self._waiting.popleft())
+                pending = any(packet.retry_pending for packet in self._recoveries)
+                active = self._recovery
+            if expired is not None:
+                expired.cancel()
+            for packet in ready:
+                self._commit_window(packet)
+            if not wait or not pending:
+                return
+            if active.cancelled.is_set() and not active.done.is_set():
+                if not active.done.wait(ASR_CLEANUP_SECONDS):
+                    raise LiveAudioError("Local recovery worker could not stop")
+
+    def _commit_window(self, packet: _FinalizedWindow) -> None:
+        self._publish_window(packet)
+        self._apply_merger_barrier(packet.barrier_after)
+
+    def _publish_window(self, packet: _FinalizedWindow) -> None:
+        if self.closed:
+            packet.release()
+            return
+        pcm, offset, timeline = packet.pcm, packet.offset, packet.timeline
+        window, complete, provenance = packet.window, packet.complete, packet.provenance
+        checked = _checked_units(packet.units, packet.duration_ms)
+        if window is not None:
+            skipped = window.rejected
+            self._skipped_segments += skipped
+            suppressed = checked is None or (
+                not checked and bool(window.rejected or window.retried or window.reasons[5])
+            )
+            self._skipped_utterances += packet.loss_count if suppressed else 0
+        else:
+            if checked is None:
+                self._skipped_utterances += 1
+            skipped = self.skipped_segments - packet.before[0]
+            suppressed = self.skipped_utterances > packet.before[1]
+        private = (skipped or suppressed) and (
+            packet.private_loss or self._heard_private(offset, offset + packet.duration_ms)
         )
         if private:
-            # Taken out of the session's totals too, not only its note (Codex P2 on #242).
             self._private_skipped_segments += skipped
-            self._private_skipped_utterances += 1 if suppressed else 0
-        if (skipped or suppressed) and self.config.report is not None and not private:
+            self._private_skipped_utterances += packet.loss_count if suppressed else 0
+        if self._merger.holding:
+            self._merger.heard(packet.voice_start)
+        if (
+            window is not None
+            and (window.repaired or window.rejected or window.retried or window.reasons[5])
+            and not private
+        ):
+            outcome = "lost" if suppressed else "redecoded" if window.retried else "salvaged"
+            # Fixed tokens and numbers only. The tool's report sink adds `rightyo:` on stderr.
+            extent = (
+                f" last_window_id={packet.last_number} windows_lost={packet.loss_count}"
+                if packet.loss_count > 1
+                else ""
+            )
+            self._diagnostic(
+                f"asr_window outcome={outcome} window_id={packet.number}{extent}"
+                f" start_ms={offset} end_ms={offset + packet.duration_ms}"
+                f" segments={window.segments} retry_segments={window.retry_segments}"
+                f" units={len(window.units)} repaired={window.repaired} rejected={window.rejected}"
+                f" reasons={','.join(map(str, window.reasons))}"
+                f" asr_elapsed_ms={window.elapsed_ms}",
+                span=(offset, offset + packet.duration_ms),
+            )
+        elif (skipped or suppressed) and self.config.report is not None and not private:
             # Content-free: counts only, never recognizer text or timestamps. A failing
             # diagnostic channel never ends the session.
             segments = f"{skipped} recognizer segment(s) with unusable timestamps"
@@ -1634,10 +2123,44 @@ class LiveProcessor:
             # one ("Do not stop." published as "Do stop."): release it on its own now.
             self._merger.flush()
             return
-        units = checked
-        # Units start at or after `offset`; a segment ending by then overlaps none of them,
-        # so attribution scans only this utterance's part of the timeline.
-        relevant = [segment for segment in timeline if segment["end_ms"] > offset]
+        gaps = window.gaps if window is not None else set()
+        cuts = sorted({0, len(checked)} | gaps)
+        for left, right in zip(cuts, cuts[1:]):
+            if left in gaps:
+                self._merger.flush()
+            self._publish_units(
+                checked[left:right],
+                timeline,
+                offset,
+                pcm,
+                provenance,
+                number=packet.number,
+                timeline_present=packet.timeline_present,
+                complete=complete and right == len(checked) and right not in gaps,
+                loss_before=left in gaps,
+                loss_after=right in gaps,
+            )
+        if len(checked) in gaps:
+            self._merger.flush()
+        self._merger.due(packet.through_ms, None)
+
+    def _publish_units(
+        self,
+        units: list[dict[str, Any]],
+        timeline: list[dict[str, Any]],
+        offset: int,
+        pcm: bytes,
+        provenance: str,
+        *,
+        number: int,
+        timeline_present: bool,
+        complete: bool,
+        loss_before: bool = False,
+        loss_after: bool = False,
+    ) -> None:
+        """Attribute one uninterrupted run; neither edge inference nor merging crosses loss."""
+        # Touching segments overlap no duration, but still block edge inference.
+        relevant = [segment for segment in timeline if segment["end_ms"] >= offset]
         attributed = []
         for unit in units:
             start, end = unit["start_ms"] + offset, unit["end_ms"] + offset
@@ -1668,13 +2191,35 @@ class LiveProcessor:
                     entry[3] = label
         inferred: set[int] = set()
         if self.config.edge_attribution_ms and provenance == "diarization-timeline":
-            inferred = _attribute_edges(attributed, relevant, self.config.edge_attribution_ms)
+            # Edge inference may use evidence only inside this uninterrupted run.
+            # Boundary-touching segments still block a competing label. At a loss,
+            # evidence entirely on its other side cannot supply that label itself.
+            # Keep strict attribution/overlap checks on the original timeline.
+            run_start, run_end = attributed[0][1], attributed[-1][2]
+            edges = [
+                dict(
+                    segment,
+                    start_ms=max(run_start, segment["start_ms"]),
+                    end_ms=min(run_end, segment["end_ms"]),
+                )
+                for segment in relevant
+                if segment["start_ms"] <= run_end and segment["end_ms"] >= run_start
+            ]
+            evidence = [
+                segment
+                for segment in edges
+                if (not loss_before or segment["end_ms"] > run_start)
+                and (not loss_after or segment["start_ms"] < run_end)
+            ]
+            inferred = _attribute_edges(
+                attributed, evidence, self.config.edge_attribution_ms, blockers=edges
+            )
         groups: list[dict[str, Any]] = []
         for index, (unit, start, end, speaker, overlap) in enumerate(attributed):
             if speaker is not None and provenance == "diarization-utterance":
                 # Per-request labels are namespaced by utterance so that equal labels
                 # from independent requests can never be merged into one participant.
-                speaker = utterance_scoped_speaker(self._utterances, speaker)
+                speaker = utterance_scoped_speaker(number, speaker)
             if groups and (groups[-1]["speaker"], groups[-1]["overlap"]) == (speaker, overlap):
                 groups[-1]["text"] += unit["text"]
                 groups[-1]["end_ms"] = max(groups[-1]["end_ms"], end)
@@ -1694,7 +2239,7 @@ class LiveProcessor:
         kept = [group for group in groups if group["text"].strip()]
         for index, group in enumerate(kept):
             group["text"] = group["text"].strip()
-            group["speaker_provenance"] = provenance if timeline else "unknown"
+            group["speaker_provenance"] = provenance if timeline_present else "unknown"
             if self.config.on_labelled_spans is not None and provenance == "diarization-timeline":
                 # Only the label's own, unoverlapped timeline audio (#148); joined turns
                 # carry the union of their fragments' pieces (see `TurnMerger`).
@@ -1721,6 +2266,8 @@ class LiveProcessor:
 
     def _emit(self, group: dict[str, Any], private_pcm: memoryview | None = None) -> None:
         """Number and emit one finalized (possibly joined) turn; ids follow emission order."""
+        if self.closed:
+            return
         self._counter += 1
         gap = group.pop("post_turn_gap", None)
         inferred = group.pop("inferred", False) is True
@@ -1769,6 +2316,7 @@ class LiveProcessor:
             # diarizer must not send audio that no turn will use.
             if self._utterance:
                 self._finalize(self._diarizer.finish())
+            self._drain_results(wait=True)
             self._merger.flush()
         except Exception:
             self.failed = True
@@ -1777,24 +2325,44 @@ class LiveProcessor:
             self.close()
 
     def _register_asr(self, process: subprocess.Popen) -> None:
-        self._asr_process = process
-        if self.closed:
+        with self._recovery_lock:
+            stopped = self.closed
+            if not stopped:
+                self._asr_process = process
+        if stopped:
             _terminate(process)
             raise LiveAudioError("Audio session was stopped")
 
     def close(self) -> None:
-        if self.closed:
-            return
-        self.closed = True
-        if self._asr_process is not None:
-            _terminate(self._asr_process)
-        # Cancellation discards a turn still held for a continuation, like the open
-        # utterance; `finish` and `release_pending` emit it instead.
-        self._merger.discard()
-        self._partial.clear()
-        self._pre_roll.clear()
-        self._utterance.clear()
-        self._diarizer.close()
+        with self._recovery_lock:
+            first = not self.closed
+            self.closed = True
+            self._recovery_shutdown.set()
+            recovery = self._recovery
+            process = self._asr_process if first else None
+            self._asr_process = None
+            for packet in (*self._waiting, *self._recoveries):
+                packet.release()
+            self._waiting.clear()
+            self._recoveries.clear()
+        # Startup/publication cannot race this snapshot. Native cleanup and worker
+        # joins must stay outside the lock needed by registration and the finalizer.
+        try:
+            if recovery is not None:
+                recovery.cancel()
+                recovery.join()
+            if process is not None:
+                _terminate(process)
+        finally:
+            with self._recovery_lock:
+                if recovery is not None and recovery.done.is_set() and self._recovery is recovery:
+                    self._recovery = None
+            if first:
+                self._merger.discard()
+                self._partial.clear()
+                self._pre_roll.clear()
+                self._utterance.clear()
+                self._diarizer.close()
 
 
 if __name__ == "__main__":

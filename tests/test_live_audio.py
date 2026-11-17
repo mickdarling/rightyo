@@ -748,43 +748,58 @@ class ConservativeAlignmentTests(unittest.TestCase):
             self.assertNotIn("private transcript", str(caught.exception))
             self.assertNotIn(json.dumps(bad), str(caught.exception))
 
-    def test_an_unusable_segment_suppresses_the_whole_utterance(self):
-        # #78: publishing the other segments could invert meaning ("Do stop."), and
-        # dropping the last one truncates it; the caller suppresses the utterance.
-        for name, start, end in (
-            ("negative start", -1, 20),
-            ("zero length", 300, 300),
-            ("zero length at the end of the audio", 1000, 1000),
-            ("reversed", 150, 100),
-            ("starts after the received audio", 1001, 1100),
-            ("ends past the padding", 300, 1000 + 1001),
-            ("float offsets", 300.0, 400),
-            ("NaN offsets", float("nan"), 400),
-            ("missing offsets", None, None),
+    def test_an_unusable_segment_keeps_the_others_in_source_order(self):
+        # #285 supersedes the whole-window suppression in #78; session safety remains.
+        for start, end in (
+            (-1, 20),
+            (150, 100),
+            (1001, 1100),
+            (300, 2001),
+            (300.0, 400),
+            (float("nan"), 400),
+            (None, None),
         ):
-            for position in ("middle", "final"):
-                with self.subTest(case=name, position=position):
-                    bad = {"text": " not", "offsets": {"from": start, "to": end}}
-                    value = document(0, 300, " Do")
-                    tail = {"text": " stop.", "offsets": {"from": 300, "to": 800}}
-                    segments = [bad, tail] if position == "middle" else [tail, bad]
-                    value["transcription"].extend(segments)
-                    self.assertEqual(_counted_units(value, 1000), (None, 1))
+            for position in (0, 1, 2):
+                with self.subTest(start=start, end=end, position=position):
+                    value = document(0, 300, " First")
+                    value["transcription"].append(
+                        {"text": " last.", "offsets": {"from": 300, "to": 800}}
+                    )
+                    value["transcription"].insert(
+                        position, {"text": " missing", "offsets": {"from": start, "to": end}}
+                    )
+                    self.assertEqual(
+                        _counted_units(value, 1000),
+                        (
+                            [
+                                {"text": " First", "start_ms": 0, "end_ms": 300},
+                                {"text": " last.", "start_ms": 300, "end_ms": 800},
+                            ],
+                            1,
+                        ),
+                    )
 
-    def test_a_zero_length_segment_with_text_suppresses_the_utterance(self):
-        # It cannot be attributed to a speaker, so keeping it would split "Do not stop."
-        # into separately judged "Do" / "not" / "stop." turns.
-        value = document(0, 300, " Do")
+    def test_zero_length_segments_keep_text_without_inventing_a_duration(self):
+        value = document(0, 300, " First")
         value["transcription"] += [
-            {"text": " not", "offsets": {"from": 300, "to": 300}},
-            {"text": " stop.", "offsets": {"from": 300, "to": 800}},
+            {"text": " point", "offsets": {"from": 300, "to": 300}},
+            {"text": " last.", "offsets": {"from": 300, "to": 800}},
         ]
-        self.assertEqual(_counted_units(value, 1000), (None, 1))
-        # A blank zero-length segment carries no words and is ignored, as before.
-        blank = document(0, 300, " Do")
+        self.assertEqual(
+            _counted_units(value, 1000),
+            (
+                [
+                    {"text": " First", "start_ms": 0, "end_ms": 300},
+                    {"text": " point", "start_ms": 300, "end_ms": 300},
+                    {"text": " last.", "start_ms": 300, "end_ms": 800},
+                ],
+                0,
+            ),
+        )
+        blank = document(0, 300, " First")
         blank["transcription"].append({"text": " ", "offsets": {"from": 300, "to": 300}})
         self.assertEqual(
-            _counted_units(blank, 1000), ([{"text": " Do", "start_ms": 0, "end_ms": 300}], 0)
+            _counted_units(blank, 1000), ([{"text": " First", "start_ms": 0, "end_ms": 300}], 0)
         )
 
     def test_out_of_order_word_timing_falls_back_to_the_whole_segment(self):
@@ -1038,8 +1053,8 @@ class ConservativeAlignmentTests(unittest.TestCase):
                     on_inferred=inferred.append,
                     edge_attribution_ms=400,
                 )
-                processor.on_speakers_renewed = lambda turns=turns, renewed=renewed: (
-                    renewed.append(len(turns))
+                processor.on_speakers_renewed = lambda turns=turns, renewed=renewed: renewed.append(
+                    len(turns)
                 )
                 for _ in range(lead_frames):
                     processor.push_pcm16(VOICE)
@@ -1075,16 +1090,12 @@ class ConservativeAlignmentTests(unittest.TestCase):
         path = Path(directory.name) / "supplied-local-runtime"
         path.touch()
         config = LiveConfig("skip-test", path, path, path, path, provenance="causal-replay")
-        bad = document(0, 60, " Do")
-        bad["transcription"] += [
-            {"text": " not", "offsets": {"from": 60, "to": 60}},  # zero-length segment
-            {"text": " stop.", "offsets": {"from": 60, "to": 160}},
-        ]
+        bad = document(-100, 60, " Missing fixture.")
         good = document(0, 160, " Do not stop.")
         turns, reports = [], []
         with (
             patch("rightyo.live_audio._Diarizer", FakeDiarizer),
-            patch("rightyo.live_audio._transcribe", side_effect=[bad, good]),
+            patch("rightyo.live_audio._transcribe", side_effect=[bad, bad, good]),
         ):
             processor = LiveProcessor(
                 LiveConfig(**{**config.__dict__, "report": reports.append}), turns.append
@@ -1094,25 +1105,25 @@ class ConservativeAlignmentTests(unittest.TestCase):
                     processor.push_pcm16(VOICE)
                 for _ in range(72):
                     processor.push_pcm16(SILENCE)
+                recovery = processor._recovery
+                if recovery is not None:
+                    self.assertTrue(recovery.done.wait(3))
+                    processor._drain_results()
             processor.finish()
         self.assertFalse(processor.failed)
         # Nothing from the suppressed utterance; the next valid one is published whole.
         self.assertEqual([t.text for t in turns], ["Do not stop."])
         self.assertGreater(turns[0].start_ms, 1000)  # From the second utterance.
-        self.assertEqual(processor.skipped_segments, 1)
+        self.assertEqual(processor.skipped_segments, 2)
         self.assertEqual(processor.skipped_utterances, 1)
-        self.assertEqual(
-            reports,
-            [
-                "suppressed 1 utterance with invalid or out-of-order recognizer timestamps "
-                "(1 recognizer segment(s) with unusable timestamps); the session continues"
-            ],
-        )
+        self.assertEqual(len(reports), 1)
+        self.assertIn("asr_window outcome=lost window_id=1 start_ms=0 end_ms=1640", reports[0])
+        self.assertIn("rejected=2 reasons=0,2,0,0,0,0", reports[0])
         # Heard in privacy (hailing-station #735 S-1): counted, never reported.
         turns, reports = [], []
         with (
             patch("rightyo.live_audio._Diarizer", FakeDiarizer),
-            patch("rightyo.live_audio._transcribe", side_effect=[bad, good]),
+            patch("rightyo.live_audio._transcribe", side_effect=[bad, bad, good]),
         ):
             processor = LiveProcessor(
                 LiveConfig(
@@ -1129,6 +1140,10 @@ class ConservativeAlignmentTests(unittest.TestCase):
                     processor.push_pcm16(VOICE)
                 for _ in range(72):
                     processor.push_pcm16(SILENCE)
+                recovery = processor._recovery
+                if recovery is not None:
+                    self.assertTrue(recovery.done.wait(3))
+                    processor._drain_results()
             processor.finish()
         # Nor counted in the session's totals, which the terminal event reports.
         self.assertEqual((processor.skipped_segments, processor.skipped_utterances), (0, 0))

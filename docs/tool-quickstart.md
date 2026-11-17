@@ -85,16 +85,86 @@ the descriptor directly, so interpreter shutdown no longer aborts on the stdin b
 Unusable recognizer timestamps no longer end the session
 ([#78](https://github.com/mickdarling/rightyo/issues/78)):
 
-- whisper.cpp only: a segment that overruns by at most the CLI's one second of padding is
-  clamped, as before. If a segment's word timings are out of order, its whole text is kept
-  as one unit with the segment's own valid timing. A segment with text whose own offsets
-  are unusable suppresses the whole utterance. Unusable means not integers, negative,
-  reversed, zero-length, starting at or after the end of the received audio, or ending
-  more than that padding past it. A zero-length segment can't be attributed to a speaker,
-  so keeping it would split the utterance into separately judged turns. The segment is
-  counted in `skipped_segments`, and the utterance in `skipped_utterances`. Zero-length
-  word units inside a valid segment are unchanged
-  ([#95](https://github.com/mickdarling/rightyo/issues/95)).
+- whisper.cpp only ([#285](https://github.com/mickdarling/rightyo/issues/285)): retain
+  the bounded PCM window through validation. Keep usable segments in source order with
+  their times, dropping only unrepairable segments. Clamp end padding of at most 1,000 ms
+  to received audio, preserving the pinned CLI's existing padding allowance. Repair
+  reversals and neighbour-order jitter of at most 20 ms (two timestamp ticks, one PCM
+  frame); larger reversals, negative or non-integer offsets, and onsets beyond the window
+  are rejected. Zero-duration text stays at a point, without direct speaker evidence;
+  zero-duration word units remain valid
+  ([#95](https://github.com/mickdarling/rightyo/issues/95)). Inconsistent token timing falls
+  back to whole-segment text/times, including when token detail backtracks between valid
+  overlapping segments. Neither turn merging nor edge attribution crosses dropped text.
+  If no text survives, enqueue one local background re-decode with the same PCM and
+  executable/model. Four recovery slots include the active/cancelling worker and queued
+  windows. One worker runs retries serially, each with its own `min(timeout_seconds, 5)`
+  decode deadline starting when it launches, plus existing bounded cleanup. A busy worker
+  does not discard a newer recoverable window. Only when all four slots are full does
+  the newest invalid window lose its retry, with an ordered, content-free gap diagnostic.
+  Later completed results wait in input order. They never cancel an earlier recovery;
+  cancellation is reserved for that recovery's own deadline or session shutdown.
+  Four serial recoveries can occupy 4 x (5 s decode + 6 s cleanup) = 44 configured
+  seconds. At the fastest supported endpoint (20 ms voice + 20 ms silence), 44,000 / 40
+  gives a 1,100-window result hold. An independent 16 MiB logical payload budget charges
+  PCM plus conservative text/timeline entry costs. These limits protect accelerated
+  replay or overload too: refuse newest results, never cancel older recovery. Consecutive
+  overflow is stored as one tail gap with id range, bounds and loss count, so even loss
+  metadata stays bounded. Mixed/private overflow is withheld conservatively. No text
+  from later windows is emitted ahead of an unresolved earlier recovery.
+  Each recovery window is at most 15,020 ms (15 s maximum plus one PCM frame of rounding):
+  four x 15,020 x 32 bytes/ms = 1,922,560 PCM bytes (nominal 15 s windows: 1,920,000).
+  Completed results use at most the separate 16 MiB logical budget and 1,100 slots,
+  plus one compact overflow record. Timeline snapshots retain overlapping or touching spans,
+  preserving the original timeline-presence/provenance signal. The active window and
+  snapshot, pre-roll/chunk, native WAV/response staging and pending-window metadata are
+  separately bounded. At most two local recognizer processes overlap per processor;
+  native model memory and sustained throughput remain unvalidated.
+  The first decode uses the configured timeout unchanged from the base: default 30 s,
+  up to 120 s. It remains synchronous. Its input-path subprocess blocking budget is the
+  configured timeout plus existing cleanup (2 s terminate + 2 s kill/reap + 2 s feeder
+  join, at most 6 s), with setup/validation and OS scheduling overhead. That is nominally
+  36 s at default or 126 s at the maximum, potentially exceeding the default 32 s capture
+  queue; this is a pre-existing limitation, not a queue-safety guarantee. The background
+  retry adds no wait to this input path. Moving first-pass decoding off the input path is
+  a separate follow-up. EOF alone drains queued recoveries, each with its own deadline;
+  Stop cancels/discards. Worker construction, publication-before-start and the closed
+  flag share one lifecycle lock, so Stop cannot miss a starting worker or start another
+  once closing begins. Stop takes the reference under that lock, then cancels/reaps/joins
+  outside it; no native wait or host callback holds the lock. Late recovery results are
+  discarded and owned PCM/text are released. `buffered_audio_bytes` includes worker-held
+  PCM until release even after the input queues are cleared. A repeated Stop can finish
+  a pending join without repeating backend teardown. Shutdown joins have a bounded retry
+  timeout plus cleanup allowance; if still finishing, ownership/accounting remain visible
+  until cleanup completes. No network fallback is used. Rejected segments from both
+  attempts count in `skipped_segments`; wholly lost windows count in `skipped_utterances`.
+  Touching speaker segments remain blocking evidence at both edges of an uninterrupted
+  text run. Evidence on the other side of a dropped-text boundary cannot supply a label
+  or extend the edge-inference slack, even when it touches that boundary.
+  Merger boundaries also follow delayed results: one internal barrier token on each
+  queued window settles the merger after that window and before the next one. Repeated
+  barriers at the same queue position coalesce (privacy settlement subsumes a flush),
+  so they add no queue slots and cannot grow without bound. They add no host wire keys.
+  The merger-event audit is:
+  - Privacy start/end: transitions observed on the received-frame clock carry a privacy
+    settlement; the explicit privacy-end cutoff carries it too. Public held pieces are
+    flushed separately, private/unknown pieces discarded under the existing privacy
+    policy. While privacy is still on, acceptance still treats every turn as private.
+    Empty toggles with no audio or intervening text need no additional boundary.
+  - Speaker forget: the existing privacy-end/reset cutoff carries the settlement;
+    publisher/runner/identifier permission revocation remains immediate. Diarizer
+    renewal does not flush the merger; its existing stale-label watermark still
+    removes old label evidence when delayed text is eventually emitted.
+  - Input stall / `release_pending`: carry a flush after the queued prefix, even when
+    its recovery has not finished. Later text cannot join across that stall.
+  - Meeting/media toggles: neither touches the merger or flushes it; no merger event
+    is added. Their existing downstream policy checks remain immediate.
+  - Normal EOF: drain ordered results and their barriers, then flush. Stop/error:
+    cancel and discard all queued results and barriers. Session-budget release uses
+    `release_pending`; subsequent cancellation still discards unfinished recovery.
+  - Lost segments/windows: their existing flushes remain inside their ordered result.
+    Speech-onset and elapsed-gap observations are replayed with each result's stream
+    times; per-frame merger advancement remains paused behind waiting results.
 - Every backend: the units an utterance produces are then checked together. If any unit
   has timestamps that are not integers, NaN, negative, reversed, past the utterance, or
   earlier than the unit before it, the whole utterance is suppressed. No turn is
@@ -104,10 +174,18 @@ Unusable recognizer timestamps no longer end the session
   units in order, such as punctuation, are valid.
 
 The session keeps listening, and the next valid utterance is published as usual. Each
-affected utterance writes a count-only notice to stderr, never recognizer text. The
-terminal session event of a live session carries `skipped_segments` and
-`skipped_utterances` only when they are nonzero. A malformed recognizer result structure
-still ends the session with `error`.
+salvaged, re-decoded or lost Whisper window reports a content-free `rightyo: asr_window`
+line on stderr: window id, stream bounds in ms, original/retry segment counts, retained
+unit and repair/rejection counts, numeric rejection counts, and total ASR elapsed ms.
+The six `reasons` counts are ordered: type, bounds, reversal, order, retry failure or
+malformed retry/deadline, retry queue or completed-result hold full. Overflow ranges add
+`last_window_id` and `windows_lost` on stderr only. Recognizer text, audio and paths are
+never included. As before, diagnostics
+and public loss counters are withheld for private windows. Other backends retain their
+count-only suppression notice. The terminal session event still carries `skipped_segments`
+and `skipped_utterances` only when nonzero; host event keys are unchanged. A malformed
+initial recognizer result structure still ends the session with `error`; a failed or
+malformed recovery attempt is contained to its already unusable window.
 
 Repeatable `--name` flags (for example `--name "Hailing Station" --name computer`) declare
 the forms of address the system answers to for `listen`, `tool-replay` and `prototype`. They
