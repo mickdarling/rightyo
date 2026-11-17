@@ -1,14 +1,16 @@
 """#285: authored recognizer documents and synthetic PCM, without native inference."""
 
 import io
+import json
 import re
+import subprocess
 import tempfile
 import threading
 import unittest
 from contextlib import redirect_stderr
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from test_edge_attribution import Timeline
 from test_live_audio import SILENCE, VOICE, FakeDiarizer
@@ -324,14 +326,43 @@ class WhisperWindowRecoveryTests(unittest.TestCase):
             )
             self.assertEqual([u["text"] for u in window.units], texts)
 
-    def test_literal_five_second_retry_and_twelve_second_first_decode_deadlines(self):
+    def test_configured_first_decode_timeout_and_literal_five_second_retry_deadline(self):
         processor, turns, _reports = self.processor(timeout_seconds=120)
         with patch("rightyo.live_audio._transcribe", side_effect=[doc(BAD), doc(GOOD)]) as decode:
             self.feed(processor)
             processor.finish()
         self.assertEqual(
-            [call.args[0].timeout_seconds for call in decode.call_args_list], [12.0, 5.0]
+            [call.args[0].timeout_seconds for call in decode.call_args_list], [120.0, 5.0]
         )
+        self.assertEqual([t.text for t in turns], ["RECOVERED_FIXTURE"])
+
+    def test_default_first_decode_allows_thirteen_second_synthetic_child(self):
+        processor, turns, _reports = self.processor()
+        clock = [100.0]
+        child = Mock(args=["authored-local-asr"], stdin=io.BytesIO(), stdout=io.BytesIO())
+        child.poll.return_value = 0
+        child.wait.return_value = 0
+
+        def read(process, deadline):
+            self.assertIs(process, child)
+            clock[0] += 13.0  # scaled child runtime, no real 13 s sleep or model
+            if clock[0] > deadline:
+                raise subprocess.TimeoutExpired(child.args, 13.0)
+            return json.dumps(doc(GOOD)).encode()
+
+        with (
+            patch("rightyo.live_audio.recognizer_dir", return_value="/var/empty"),
+            patch("rightyo.live_audio.subprocess.Popen", return_value=child),
+            patch("rightyo.live_audio._bounded_stdout", side_effect=read),
+            patch("rightyo.live_audio.time.monotonic", side_effect=lambda: clock[0]),
+        ):
+            try:
+                self.feed(processor)  # exercise the real CLI deadline/wait path with a fake child
+                processor.finish()
+            except LiveAudioError:
+                self.fail("configured 30-second first decode rejected a 13-second synthetic child")
+        self.assertEqual(processor.config.timeout_seconds, 30)
+        self.assertEqual(child.wait.call_args.kwargs["timeout"], 17.0)
         self.assertEqual([t.text for t in turns], ["RECOVERED_FIXTURE"])
 
     def test_zero_length_at_exact_audio_end_is_kept_without_a_speaker_or_retry(self):
@@ -432,7 +463,7 @@ class WhisperWindowRecoveryTests(unittest.TestCase):
         )
         self.assertEqual([t.utterance_id for t in turns], ["live-1", "live-2"])
 
-    def test_newer_invalid_window_skips_retry_behind_the_one_pending_recovery(self):
+    def test_two_invalid_windows_queue_and_both_recover_in_order(self):
         processor, turns, reports, entered, release, first, retries, decode = self.blocked_retry(
             later_bad=True
         )
@@ -441,48 +472,121 @@ class WhisperWindowRecoveryTests(unittest.TestCase):
                 self.feed(processor)
                 self.assertTrue(entered.wait(2))
                 self.feed(processor)
-                processor.release_pending()  # a stalled source must not bypass the hold
+                processor.release_pending()
                 self.assertEqual((len(first), len(retries)), (2, 1))
-                self.assertEqual(turns, [])
-                self.assertEqual(reports, [])
+                self.assertEqual(len(processor._recoveries), 2)
+                self.assertEqual((turns, reports), ([], []))
             finally:
                 release.set()
             processor.finish()
-        self.assertEqual([t.text for t in turns], ["RECOVERED_FIXTURE"])
-        self.assertEqual(processor.skipped_utterances, 1)
+        self.assertEqual(len(retries), 2)
+        self.assertEqual(
+            [(t.text, t.start_ms) for t in turns],
+            [("RECOVERED_FIXTURE", 20), ("RECOVERED_FIXTURE", 1660)],
+        )
+        self.assertEqual(processor.skipped_utterances, 0)
         self.assertEqual(len(reports), 2)
-        self.assertIn("outcome=redecoded window_id=1", reports[0])
-        self.assertIn("outcome=lost window_id=2 start_ms=1640 end_ms=3280", reports[1])
-        self.assertIn("reasons=0,1,0,0,0,1", reports[1])
+        self.assertTrue(all("outcome=redecoded" in report for report in reports))
+        self.assertIn("window_id=1", reports[0])
+        self.assertIn("window_id=2", reports[1])
         self.assertNotIn("UNUSABLE_FIXTURE", " ".join(reports))
 
-    def test_hold_bound_resolves_oldest_loss_and_keeps_every_newer_good_result(self):
+    def test_recoverable_oldest_and_three_good_windows_are_all_retained(self):
         processor, turns, reports, entered, release, first, retries, decode = self.blocked_retry()
-        recovery = None
         with patch("rightyo.live_audio._transcribe", side_effect=decode):
             try:
                 self.feed(processor)
                 self.assertTrue(entered.wait(2))
                 recovery = processor._recovery
-                for count in (2, 3):
+                for count in (2, 3, 4):
                     self.feed(processor)
                     self.assertEqual(len(processor._waiting), count)
+                    self.assertFalse(recovery.cancelled.is_set())
                     self.assertEqual(turns, [])
-                self.feed(processor)
-                self.assertEqual(len(processor._waiting), 0)
-                self.assertTrue(recovery.cancelled.is_set())
-                self.assertEqual([t.text for t in turns], ["LATER_FIXTURE"] * 3)
-                self.assertEqual([t.start_ms for t in turns], [1660, 3300, 4940])
                 self.assertEqual((len(first), len(retries)), (4, 1))
-                self.assertLessEqual(processor.buffered_audio_bytes, 1640 * 32)
-                self.assertIn("outcome=lost window_id=1", reports[0])
-                self.assertIn("reasons=0,1,0,0,0,1", reports[0])
+                self.assertEqual(processor.buffered_audio_bytes, 4 * 1640 * 32)
             finally:
                 release.set()
-            self.assertTrue(recovery.done.wait(2))
             processor.finish()
-        self.assertEqual(len(turns), 3)  # late recovery cannot resurrect cancelled text
+        self.assertEqual([t.text for t in turns], ["RECOVERED_FIXTURE"] + ["LATER_FIXTURE"] * 3)
+        self.assertEqual([t.start_ms for t in turns], [20, 1660, 3300, 4940])
+        self.assertEqual(processor.skipped_utterances, 0)
+        self.assertEqual(len(reports), 1)
+        self.assertIn("outcome=redecoded window_id=1", reports[0])
         self.assertEqual(processor.buffered_audio_bytes, 0)
+
+    def test_four_recovery_slots_drop_only_the_newest_when_full(self):
+        processor, turns, reports, entered, release, first, retries, decode = self.blocked_retry(
+            later_bad=True
+        )
+        with patch("rightyo.live_audio._transcribe", side_effect=decode):
+            try:
+                self.feed(processor)
+                self.assertTrue(entered.wait(2))
+                recovery = processor._recovery
+                for _ in range(4):
+                    self.feed(processor)
+                self.assertEqual(len(processor._recoveries), 4)
+                self.assertEqual(len(retries), 1)
+                self.assertFalse(recovery.cancelled.is_set())
+                self.assertEqual((turns, reports), ([], []))
+            finally:
+                release.set()
+            processor.finish()
+        self.assertEqual((len(first), len(retries)), (5, 4))
+        self.assertEqual([t.text for t in turns], ["RECOVERED_FIXTURE"] * 4)
+        self.assertEqual([t.start_ms for t in turns], [20, 1660, 3300, 4940])
+        self.assertEqual(processor.skipped_utterances, 1)
+        self.assertEqual(len(reports), 5)
+        self.assertTrue(all("outcome=redecoded" in report for report in reports[:4]))
+        self.assertIn("outcome=lost window_id=5 start_ms=6560 end_ms=8200", reports[4])
+        self.assertIn("reasons=0,1,0,0,0,1", reports[4])
+        self.assertEqual(processor.buffered_audio_bytes, 0)
+
+    def test_result_hold_overflow_never_cancels_the_older_recovery(self):
+        processor, turns, reports, entered, release, _first, _retries, decode = self.blocked_retry()
+        with (
+            patch("rightyo.live_audio._transcribe", side_effect=decode),
+            patch("rightyo.live_audio.ASR_HELD_WINDOWS", 1),
+        ):
+            try:
+                self.feed(processor)
+                self.assertTrue(entered.wait(2))
+                recovery = processor._recovery
+                for _ in range(3):
+                    self.feed(processor)
+                self.assertFalse(recovery.cancelled.is_set())
+                self.assertEqual(len(processor._waiting), 3)  # recovery, one good, tail gap
+                self.assertEqual(processor._waiting[-1].loss_count, 2)
+                self.assertEqual((turns, reports), ([], []))
+            finally:
+                release.set()
+            processor.finish()
+        self.assertEqual([t.text for t in turns], ["RECOVERED_FIXTURE", "LATER_FIXTURE"])
+        self.assertEqual(processor.skipped_utterances, 2)
+        self.assertIn("window_id=3 last_window_id=4 windows_lost=2", reports[1])
+        self.assertIn("start_ms=3280 end_ms=6560", reports[1])
+
+    def test_result_payload_bound_preserves_oldest_and_reports_only_tail_loss(self):
+        processor, turns, reports, entered, release, _first, _retries, decode = self.blocked_retry()
+        with (
+            patch("rightyo.live_audio._transcribe", side_effect=decode),
+            patch("rightyo.live_audio.ASR_HELD_BYTES", 1),
+        ):
+            try:
+                self.feed(processor)
+                self.assertTrue(entered.wait(2))
+                recovery = processor._recovery
+                self.feed(processor)
+                self.assertFalse(recovery.cancelled.is_set())
+                self.assertEqual(len(processor._waiting), 2)
+                self.assertEqual(processor._waiting[-1].pcm, b"")
+            finally:
+                release.set()
+            processor.finish()
+        self.assertEqual([t.text for t in turns], ["RECOVERED_FIXTURE"])
+        self.assertEqual(processor.skipped_utterances, 1)
+        self.assertIn("outcome=lost window_id=2", reports[1])
 
     def test_expired_retry_resolves_loss_without_waiting_for_the_blocked_worker(self):
         processor, turns, reports, entered, release, _first, _retries, decode = self.blocked_retry()

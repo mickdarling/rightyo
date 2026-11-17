@@ -48,14 +48,16 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 ASR_END_PADDING_MS = 1000
 # Two 10 ms whisper timestamp ticks (one PCM frame): tolerate rounding jitter only.
 ASR_TIMING_JITTER_MS = 20
-# Default capture capacity is 160 * 200 ms = 32 s. Even including both runs' bounded
-# cleanup (terminate 2 s + kill/reap 2 s + feeder join 2 s each), 12 + 5 + 6 + 6 =
-# 29 s leaves 3 s of headroom. Recovery never waits on the input consumer at all.
-ASR_FIRST_DECODE_SECONDS = 12.0
+# Recovery alone is asynchronous and bounded. The first decode retains its configured
+# timeout, including the base's pre-existing synchronous input-path blocking.
 ASR_REDECODE_SECONDS = 5.0
-ASR_CLEANUP_SECONDS = 6.0
-# At most two completed windows wait behind the single pending recovery.
-ASR_HELD_WINDOWS = 2
+ASR_CLEANUP_SECONDS = 6.0  # terminate 2 s + kill/reap 2 s + feeder join 2 s
+ASR_RECOVERY_WINDOWS = 4  # includes the active/cancelling worker's window
+# Four serial jobs can take 4 * (5 + 6) = 44 s. The fastest endpoint is a 20 ms
+# voice frame plus 20 ms silence, so 44,000 / 40 = 1,100 completed windows.
+ASR_HELD_WINDOWS = 1100
+# Independent payload guard: PCM plus conservative charges for text/timeline entries.
+ASR_HELD_BYTES = 16 * 1024 * 1024
 MAX_SPEAKER = 702  # "Speaker A" .. "Speaker ZZ"; native streams use 1..8
 # A diarizer renewal deferred past an open utterance or held turn is forced this long after the
 # privacy end is reached (#242 round 21), so steady speech cannot keep the old one in use.
@@ -1047,7 +1049,7 @@ class _RecognizerWindow:
     gaps: set[int]  # unit indices before/after unresolved text, including 0 and len(units)
     segments: int = 0
     repaired: int = 0
-    # 1=type, 2=bounds, 3=reversal, 4=order, 5=retry failure, 6=retry busy/hold bound.
+    # 1=type, 2=bounds, 3=reversal, 4=order, 5=retry failure/deadline, 6=queue/hold full.
     reasons: tuple[int, ...] = (0, 0, 0, 0, 0, 0)
     retry_segments: int = 0
     retried: bool = False
@@ -1202,10 +1204,7 @@ class WhisperCppTranscriber:
         started = time.monotonic()
         duration = len(pcm) // BYTES_PER_MS
         self._window = None
-        config = replace(
-            self.config, timeout_seconds=min(self.config.timeout_seconds, ASR_FIRST_DECODE_SECONDS)
-        )
-        document = _transcribe(config, pcm, register)
+        document = _transcribe(self.config, pcm, register)
         window = _recognizer_window(document, duration)
         window.elapsed_ms = max(0, round((time.monotonic() - started) * 1000))
         self._window = window
@@ -1226,6 +1225,23 @@ class _FinalizedWindow:
     units: Any
     window: _RecognizerWindow | None
     before: tuple[int, int]
+    duration_ms: int
+    timeline_present: bool
+    retry_pending: bool = False
+    overflow: bool = False
+    loss_count: int = 1
+    last_number: int = 0
+    private_loss: bool = False
+
+    def held_bytes(self) -> int:
+        # A logical admission budget, not a claim about a native model's RSS.
+        return (
+            1024
+            + len(self.pcm)
+            + 512 * len(self.timeline)
+            + sum(512 + 4 * len(unit["text"]) for unit in self.units)
+            + (512 * len(self.window.gaps) if self.window is not None else 0)
+        )
 
 
 class _WindowRecovery:
@@ -1246,8 +1262,8 @@ class _WindowRecovery:
         )
         self.started = time.monotonic()
         self.expires = self.started + self.config.timeout_seconds + ASR_CLEANUP_SECONDS
-        # Snapshot evidence before starting: pressure cancellation may resolve the packet
-        # as lost while the worker still owns its bounded local process.
+        # Snapshot evidence before starting: deadline/shutdown cancellation can resolve
+        # the packet while the worker still owns its bounded local process.
         assert packet.window is not None
         initial = replace(packet.window)
         self.thread = threading.Thread(
@@ -1424,6 +1440,7 @@ class LiveProcessor:
         self._skipped_utterances = 0
         self._skipped_segments = 0
         self._waiting: deque[_FinalizedWindow] = deque()
+        self._recoveries: deque[_FinalizedWindow] = deque()
         self._recovery: _WindowRecovery | None = None
         self._voice_start = 0
         # Of those, the ones from utterances heard in privacy (hailing-station #735 S-1): kept
@@ -1480,10 +1497,11 @@ class LiveProcessor:
     @property
     def buffered_audio_bytes(self) -> int:
         held = sum(len(packet.pcm) for packet in self._waiting)
-        if self._recovery is not None and not any(
-            packet is self._recovery.packet for packet in self._waiting
-        ):
-            held += len(self._recovery.packet.pcm)
+        held += sum(
+            len(packet.pcm)
+            for packet in self._recoveries
+            if not any(packet is waiting for waiting in self._waiting)
+        )
         return len(self._partial) + len(self._utterance) + sum(map(len, self._pre_roll)) + held
 
     def push_pcm16(self, pcm: bytes) -> None:
@@ -1775,105 +1793,172 @@ class LiveProcessor:
             self._received_ms,
             self._voice_start,
             self._utterances,
-            [dict(segment) for segment in timeline],
+            [
+                dict(segment)
+                for segment in timeline
+                if segment["start_ms"] < offset + len(pcm) // BYTES_PER_MS
+                and segment["end_ms"] > offset
+            ],
             getattr(self._diarizer, "speaker_provenance", "diarization-timeline"),
             complete,
             units,
             window,
             before,
+            len(pcm) // BYTES_PER_MS,
+            bool(timeline),
         )
         self._utterance.clear()
         self._pre_roll.clear()
         self._drain_results()
-        if len(self._waiting) >= 1 + ASR_HELD_WINDOWS:
-            # The hold is full: resolve the oldest recovery as lost, never discard a
-            # newer good result or wait for the recovery worker on the input path.
-            self._abandon_recovery()
-            self._drain_results()
-        if window is not None and not window.units and window.rejected:
-            if self._recovery is None:
-                self._waiting.append(packet)
-                self._recovery = _WindowRecovery(self.config, packet)
+        if self._waiting and self._waiting[-1].overflow:
+            # Keep overload loss metadata bounded too: once the result hold fills,
+            # later windows join its tail gap until all preceding results resolve.
+            self._append_overflow(packet)
+            return
+        invalid = window is not None and not window.units and window.rejected
+        if invalid and len(self._recoveries) < ASR_RECOVERY_WINDOWS:
+            packet.retry_pending = True
+            self._recoveries.append(packet)
+        else:
+            if invalid:
+                # Only the newest is refused when all four recovery slots are occupied.
+                self._lose_window(packet, reason=5, compact=True)
+            held = [entry for entry in self._waiting if not entry.retry_pending]
+            if self._waiting and (
+                len(held) >= ASR_HELD_WINDOWS
+                or sum(entry.held_bytes() for entry in held) + packet.held_bytes() > ASR_HELD_BYTES
+            ):
+                self._append_overflow(packet)
                 return
-            # One worker (including a cancelling worker) already owns the retry slot.
-            window.reasons = (*window.reasons[:5], window.reasons[5] + 1)
-        if self._waiting:
+        if self._waiting or packet.retry_pending:
             self._waiting.append(packet)
+            self._drain_results()
         else:
             self._commit_window(packet)
 
+    def _lose_window(self, packet: _FinalizedWindow, *, reason: int, compact: bool) -> None:
+        window = packet.window
+        if window is None:
+            window = _RecognizerWindow([], {0})
+        reasons = list(window.reasons)
+        if reason != 5 or not reasons[5]:
+            reasons[reason] += 1
+        packet.window = replace(window, units=[], gaps={0}, reasons=tuple(reasons))
+        packet.units = []
+        packet.retry_pending = False
+        if compact:
+            packet.pcm = b""
+            packet.timeline = []
+
+    def _append_overflow(self, packet: _FinalizedWindow) -> None:
+        self._lose_window(packet, reason=5, compact=True)
+        packet.private_loss = self._heard_private(packet.offset, packet.offset + packet.duration_ms)
+        if self._waiting and self._waiting[-1].overflow:
+            gap = self._waiting[-1]
+            gap.duration_ms = packet.offset + packet.duration_ms - gap.offset
+            gap.through_ms = packet.through_ms
+            gap.last_number = packet.number
+            gap.loss_count += 1
+            gap.private_loss |= packet.private_loss
+            gap.window.reasons = tuple(
+                a + b for a, b in zip(gap.window.reasons, packet.window.reasons)
+            )
+            gap.window.segments += packet.window.segments
+            gap.window.elapsed_ms += packet.window.elapsed_ms
+        else:
+            packet.overflow = True
+            self._waiting.append(packet)
+
     def _abandon_recovery(self) -> None:
+        # Called only at this job's own deadline, never because later results arrived.
         recovery = self._recovery
         if recovery is None:
             return
         recovery.cancel()
         packet = recovery.packet
-        if self._waiting and self._waiting[0] is packet:
-            window = packet.window
-            assert window is not None
-            window.retried = True
-            window.reasons = (*window.reasons[:5], window.reasons[5] + 1)
-            window.elapsed_ms += max(0, round((time.monotonic() - recovery.started) * 1000))
-            self._waiting.popleft()
-            self._commit_window(packet)
+        if packet.retry_pending:
+            self._lose_window(packet, reason=4, compact=False)
+            packet.window.retried = True
+            packet.window.elapsed_ms += max(0, round((time.monotonic() - recovery.started) * 1000))
 
     def _drain_results(self, *, wait: bool = False) -> None:
-        recovery = self._recovery
-        if recovery is not None:
-            if wait and self._waiting:
-                # Only EOF waits. Live push/release calls never wait for recognition.
-                recovery.done.wait(max(0.0, recovery.expires - time.monotonic()))
-            if recovery.done.is_set():
-                if self._waiting and self._waiting[0] is recovery.packet:
+        while not self.closed:
+            recovery = self._recovery
+            if recovery is not None:
+                if wait:
+                    # Only EOF waits; each queued job gets its own deadline at launch.
+                    recovery.done.wait(max(0.0, recovery.expires - time.monotonic()))
+                if recovery.done.is_set():
                     packet = recovery.packet
-                    if recovery.result is not None:
-                        packet.window = recovery.result
-                        packet.units = recovery.result.units
-                    else:
-                        self._abandon_recovery()
-                self._recovery = None
-            elif time.monotonic() >= recovery.expires:
-                self._abandon_recovery()
-        while self._waiting and not self.closed:
-            if self._recovery is not None and self._waiting[0] is self._recovery.packet:
-                break
-            self._commit_window(self._waiting.popleft())
+                    if packet.retry_pending:
+                        if recovery.result is not None:
+                            packet.window = recovery.result
+                            packet.units = recovery.result.units
+                            packet.retry_pending = False
+                        else:
+                            self._lose_window(packet, reason=4, compact=False)
+                    assert self._recoveries[0] is packet
+                    self._recoveries.popleft()
+                    self._recovery = None
+                elif time.monotonic() >= recovery.expires:
+                    self._abandon_recovery()
+            if self._recovery is None and self._recoveries:
+                self._recovery = _WindowRecovery(self.config, self._recoveries[0])
+            while self._waiting and not self.closed and not self._waiting[0].retry_pending:
+                self._commit_window(self._waiting.popleft())
+            if not wait or not any(packet.retry_pending for packet in self._recoveries):
+                return
+            recovery = self._recovery
+            if recovery.cancelled.is_set() and not recovery.done.is_set():
+                # A broken local worker must not spin or grow a replacement pool. At
+                # EOF, allow one bounded cleanup grace then fail the session explicitly.
+                if not recovery.done.wait(ASR_CLEANUP_SECONDS):
+                    raise LiveAudioError("Local recovery worker could not stop")
 
     def _commit_window(self, packet: _FinalizedWindow) -> None:
         pcm, offset, timeline = packet.pcm, packet.offset, packet.timeline
         window, complete, provenance = packet.window, packet.complete, packet.provenance
-        checked = _checked_units(packet.units, len(pcm) // BYTES_PER_MS)
+        checked = _checked_units(packet.units, packet.duration_ms)
         if window is not None:
             skipped = window.rejected
             self._skipped_segments += skipped
             suppressed = checked is None or (
-                not checked and bool(window.rejected or window.retried)
+                not checked and bool(window.rejected or window.retried or window.reasons[5])
             )
-            self._skipped_utterances += int(suppressed)
+            self._skipped_utterances += packet.loss_count if suppressed else 0
         else:
             if checked is None:
                 self._skipped_utterances += 1
             skipped = self.skipped_segments - packet.before[0]
             suppressed = self.skipped_utterances > packet.before[1]
-        private = (skipped or suppressed) and self._heard_private(
-            offset, offset + len(pcm) // BYTES_PER_MS
+        private = (skipped or suppressed) and (
+            packet.private_loss or self._heard_private(offset, offset + packet.duration_ms)
         )
         if private:
             self._private_skipped_segments += skipped
-            self._private_skipped_utterances += int(suppressed)
+            self._private_skipped_utterances += packet.loss_count if suppressed else 0
         if self._merger.holding:
             self._merger.heard(packet.voice_start)
-        if window is not None and (window.repaired or window.rejected or window.retried):
+        if (
+            window is not None
+            and (window.repaired or window.rejected or window.retried or window.reasons[5])
+            and not private
+        ):
             outcome = "lost" if suppressed else "redecoded" if window.retried else "salvaged"
             # Fixed tokens and numbers only. The tool's report sink adds `rightyo:` on stderr.
+            extent = (
+                f" last_window_id={packet.last_number} windows_lost={packet.loss_count}"
+                if packet.loss_count > 1
+                else ""
+            )
             self._diagnostic(
-                f"asr_window outcome={outcome} window_id={packet.number}"
-                f" start_ms={offset} end_ms={offset + len(pcm) // BYTES_PER_MS}"
+                f"asr_window outcome={outcome} window_id={packet.number}{extent}"
+                f" start_ms={offset} end_ms={offset + packet.duration_ms}"
                 f" segments={window.segments} retry_segments={window.retry_segments}"
                 f" units={len(window.units)} repaired={window.repaired} rejected={window.rejected}"
                 f" reasons={','.join(map(str, window.reasons))}"
                 f" asr_elapsed_ms={window.elapsed_ms}",
-                span=(offset, offset + len(pcm) // BYTES_PER_MS),
+                span=(offset, offset + packet.duration_ms),
             )
         elif (skipped or suppressed) and self.config.report is not None and not private:
             # Content-free: counts only, never recognizer text or timestamps. A failing
@@ -1905,6 +1990,7 @@ class LiveProcessor:
                 pcm,
                 provenance,
                 number=packet.number,
+                timeline_present=packet.timeline_present,
                 complete=complete and right == len(checked) and right not in gaps,
             )
         if len(checked) in gaps:
@@ -1920,6 +2006,7 @@ class LiveProcessor:
         provenance: str,
         *,
         number: int,
+        timeline_present: bool,
         complete: bool,
     ) -> None:
         """Attribute one uninterrupted run; neither edge inference nor merging crosses loss."""
@@ -1994,7 +2081,7 @@ class LiveProcessor:
         kept = [group for group in groups if group["text"].strip()]
         for index, group in enumerate(kept):
             group["text"] = group["text"].strip()
-            group["speaker_provenance"] = provenance if timeline else "unknown"
+            group["speaker_provenance"] = provenance if timeline_present else "unknown"
             if self.config.on_labelled_spans is not None and provenance == "diarization-timeline":
                 # Only the label's own, unoverlapped timeline audio (#148); joined turns
                 # carry the union of their fragments' pieces (see `TurnMerger`).
@@ -2091,6 +2178,7 @@ class LiveProcessor:
             self._recovery.cancel()
             self._recovery = None
         self._waiting.clear()
+        self._recoveries.clear()
         if self._asr_process is not None:
             _terminate(self._asr_process)
         # Cancellation discards a turn still held for a continuation, like the open

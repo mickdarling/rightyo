@@ -96,30 +96,40 @@ Unusable recognizer timestamps no longer end the session
   ([#95](https://github.com/mickdarling/rightyo/issues/95)). Inconsistent token timing falls
   back to whole-segment text/times, including when token detail backtracks between valid
   overlapping segments. Neither turn merging nor edge attribution crosses dropped text.
-  If no text survives, schedule one local background re-decode with the same PCM and
-  executable/model. Its decode deadline is 5 seconds (or the configured timeout if shorter).
-  Ingestion never waits for this recovery worker. Results publish on the input owner in
-  window order: at most two completed windows wait behind one recovery. A newer invalid
-  window skips its retry while that slot is occupied and receives a loss diagnostic in
-  order. If a third later window arrives, cancel/resolve the older recovery as lost,
-  release the two held results, then publish the new result. This preserves newer good
-  text and the loss barrier without an unbounded output backlog. Stop cancels/discards;
-  EOF alone waits, at most the retry's remaining deadline plus bounded cleanup.
-  The first local decode is capped at 12 seconds (or the configured timeout if shorter).
-  Default capture holds 160 chunks of 200 ms = 32 seconds. Conservatively allowing both
-  runs their existing cleanup (2 s terminate + 2 s kill/reap + 2 s feeder join each),
-  12 + 5 + 6 + 6 = 29 seconds leaves 3 seconds of capture headroom; a 29-second first
-  decode is no longer permitted. The retry's time is also off the ingestion path.
-  These are configured bounds, not a sustained-throughput or OS scheduling guarantee;
-  smaller custom capture queues need their own budget. No network fallback is used.
-  Retention is bounded by one pending window plus two completed windows and one active
-  window: four window slots (each at most `max_utterance_ms + 20` ms), plus a bounded
-  active PCM snapshot, pre-roll/input chunk, native WAV/response staging and per-window
-  timelines. At most two local recognizer processes can overlap (first decode and retry);
-  native model memory and sustained throughput remain unvalidated. A cancelled
-  worker still occupies the retry slot until it exits; it never publishes late events.
-  Rejected segments from both attempts count in `skipped_segments`; only wholly lost
-  windows count in `skipped_utterances`.
+  If no text survives, enqueue one local background re-decode with the same PCM and
+  executable/model. Four recovery slots include the active/cancelling worker and queued
+  windows. One worker runs retries serially, each with its own `min(timeout_seconds, 5)`
+  decode deadline starting when it launches, plus existing bounded cleanup. A busy worker
+  does not discard a newer recoverable window. Only when all four slots are full does
+  the newest invalid window lose its retry, with an ordered, content-free gap diagnostic.
+  Later completed results wait in input order. They never cancel an earlier recovery;
+  cancellation is reserved for that recovery's own deadline or session shutdown.
+  Four serial recoveries can occupy 4 x (5 s decode + 6 s cleanup) = 44 configured
+  seconds. At the fastest supported endpoint (20 ms voice + 20 ms silence), 44,000 / 40
+  gives a 1,100-window result hold. An independent 16 MiB logical payload budget charges
+  PCM plus conservative text/timeline entry costs. These limits protect accelerated
+  replay or overload too: refuse newest results, never cancel older recovery. Consecutive
+  overflow is stored as one tail gap with id range, bounds and loss count, so even loss
+  metadata stays bounded. Mixed/private overflow is withheld conservatively. No text
+  from later windows is emitted ahead of an unresolved earlier recovery.
+  Each recovery window is at most 15,020 ms (15 s maximum plus one PCM frame of rounding):
+  four x 15,020 x 32 bytes/ms = 1,922,560 PCM bytes (nominal 15 s windows: 1,920,000).
+  Completed results use at most the separate 16 MiB logical budget and 1,100 slots,
+  plus one compact overflow record. Timeline snapshots retain only overlapping spans,
+  preserving the original timeline-presence/provenance signal. The active window and
+  snapshot, pre-roll/chunk, native WAV/response staging and pending-window metadata are
+  separately bounded. At most two local recognizer processes overlap per processor;
+  native model memory and sustained throughput remain unvalidated.
+  The first decode uses the configured timeout unchanged from the base: default 30 s,
+  up to 120 s. It remains synchronous. Its input-path subprocess blocking budget is the
+  configured timeout plus existing cleanup (2 s terminate + 2 s kill/reap + 2 s feeder
+  join, at most 6 s), with setup/validation and OS scheduling overhead. That is nominally
+  36 s at default or 126 s at the maximum, potentially exceeding the default 32 s capture
+  queue; this is a pre-existing limitation, not a queue-safety guarantee. The background
+  retry adds no wait to this input path. Moving first-pass decoding off the input path is
+  a separate follow-up. EOF alone drains queued recoveries, each with its own deadline;
+  Stop cancels/discards. No network fallback is used. Rejected segments from both
+  attempts count in `skipped_segments`; wholly lost windows count in `skipped_utterances`.
 - Every backend: the units an utterance produces are then checked together. If any unit
   has timestamps that are not integers, NaN, negative, reversed, past the utterance, or
   earlier than the unit before it, the whole utterance is suppressed. No turn is
@@ -133,7 +143,9 @@ salvaged, re-decoded or lost Whisper window reports a content-free `rightyo: asr
 line on stderr: window id, stream bounds in ms, original/retry segment counts, retained
 unit and repair/rejection counts, numeric rejection counts, and total ASR elapsed ms.
 The six `reasons` counts are ordered: type, bounds, reversal, order, retry failure or
-malformed retry, retry unavailable (busy slot or output hold bound). Recognizer text, audio and paths are never included. As before, diagnostics
+malformed retry/deadline, retry queue or completed-result hold full. Overflow ranges add
+`last_window_id` and `windows_lost` on stderr only. Recognizer text, audio and paths are
+never included. As before, diagnostics
 and public loss counters are withheld for private windows. Other backends retain their
 count-only suppression notice. The terminal session event still carries `skipped_segments`
 and `skipped_utterances` only when nonzero; host event keys are unchanged. A malformed

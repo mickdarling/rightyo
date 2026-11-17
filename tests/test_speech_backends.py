@@ -255,9 +255,7 @@ class ProtocolAndSelectionTests(unittest.TestCase):
             register = Mock()
             units = WhisperCppTranscriber(config).transcribe(bytes(200 * BYTES_PER_MS), register)
         self.assertEqual(units, [{"text": " Hello.", "start_ms": 0, "end_ms": 150}])
-        self.assertEqual(
-            vars(transcribe.call_args.args[0]), vars(config) | {"timeout_seconds": 12.0}
-        )
+        self.assertIs(transcribe.call_args.args[0], config)
         self.assertIs(transcribe.call_args.args[2], register)
 
     def test_processor_uses_supplied_instances_or_factories_and_labels_turns(self):
