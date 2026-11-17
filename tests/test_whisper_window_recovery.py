@@ -2,6 +2,7 @@
 
 import io
 import json
+import queue
 import re
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from unittest.mock import Mock, patch
 from test_edge_attribution import Timeline
 from test_live_audio import SILENCE, VOICE, FakeDiarizer
 
+from rightyo.contracts import Addressing
 from rightyo.live_audio import (
     BYTES_PER_MS,
     LiveAudioError,
@@ -26,7 +28,9 @@ from rightyo.live_audio import (
     _recognizer_window,
     _WindowRecovery,
 )
+from rightyo.memory import TranscriptMemory
 from rightyo.tool import _stderr
+from rightyo.tool_events import SpeechEvents
 
 
 def segment(text, start, end):
@@ -396,7 +400,7 @@ class WhisperWindowRecoveryTests(unittest.TestCase):
             segment(" UNKNOWN", 200, 300),
             segment(" LOCAL", 1000, 1100),
         )
-        for before in ((), ((0, 150, 1),)):
+        for before in ((), ((0, 150, 1),), ((0, 200, 1),)):
             with self.subTest(before=before):
                 processor, turns, _reports = self.processor(
                     edge_attribution_ms=100, diarizer=Timeline(*before, (1000, 1150, 1))
@@ -408,6 +412,136 @@ class WhisperWindowRecoveryTests(unittest.TestCase):
                     [(t.text, t.speaker_id) for t in turns][1:],
                     [("UNKNOWN", None), ("LOCAL", "Speaker A")],
                 )
+
+    def test_touching_competing_speaker_blocks_edge_inference_at_both_run_edges(self):
+        for units, timeline, expected in (
+            (
+                doc(segment(" LABELLED", 0, 100), segment(" UNKNOWN", 200, 300)),
+                Timeline((0, 150, 1), (300, 400, 2)),
+                [("LABELLED", "Speaker A"), ("UNKNOWN", None)],
+            ),
+            (
+                doc(segment(" UNKNOWN", 100, 200), segment(" LABELLED", 300, 400)),
+                Timeline((0, 100, 2), (250, 400, 1)),
+                [("UNKNOWN", None), ("LABELLED", "Speaker A")],
+            ),
+            (
+                doc(segment(" LABELLED", 0, 100), segment(" UNKNOWN", 1540, 1640)),
+                Timeline((0, 150, 1), (1640, 1740, 2)),
+                [("LABELLED", "Speaker A"), ("UNKNOWN", None)],
+            ),
+        ):
+            with self.subTest(units=units):
+                processor, turns, _reports = self.processor(
+                    edge_attribution_ms=2000, diarizer=timeline
+                )
+                with patch("rightyo.live_audio._transcribe", return_value=units):
+                    self.feed(processor)
+                    processor.finish()
+                self.assertEqual([(t.text, t.speaker_id) for t in turns], expected)
+
+    def test_recovery_preserves_privacy_barriers_and_accepts_the_public_request(self):
+        from test_duck_mode import DuckControllerTests
+
+        for end_privacy in (True, False):
+            for recover_before_next in (True, False):
+                with self.subTest(end_privacy=end_privacy, early=recover_before_next):
+                    events = SpeechEvents()
+                    events.start(
+                        "window-replay", now_ms=0, addressing=Addressing(names=("Jarvis",))
+                    )
+                    events.drain()
+                    controller = DuckControllerTests.controller(
+                        self, constructor={"event_publisher": events}
+                    )
+                    controller._decision_status = "ready"
+                    work, memory, accepted = queue.Queue(), TranscriptMemory(), []
+                    processor, turns, _reports, entered, release, first, retries, decode = (
+                        self.blocked_retry(
+                            turn_merge_gap_ms=5000, private=controller._heard_private_span
+                        )
+                    )
+                    controller._processor = processor
+
+                    def accept(turn):
+                        turns.append(turn)
+                        accepted.append(
+                            controller._accept(controller._generation, work, memory, turn)
+                        )
+
+                    processor.on_turn = accept
+
+                    def feed(frames):
+                        for frame in frames:
+                            self.assertTrue(
+                                controller._feed(controller._generation, processor, frame, "stdin")
+                            )
+
+                    def responses(config, pcm, register):
+                        if config.timeout_seconds == 5.0 or not first:
+                            return decode(config, pcm, register)
+                        first.append(pcm)
+                        # Second window begins at 1640 (200 ms silent pre-roll).
+                        return doc(segment(" Jarvis, add the authored quokka.", 240, 400))
+
+                    with patch("rightyo.live_audio._transcribe", side_effect=responses):
+                        try:
+                            feed([VOICE] * 10 + [SILENCE] * 72)
+                            self.assertTrue(entered.wait(2))
+                            self.assertEqual(controller._received_ms, 1640)
+                            controller.duck(True)
+                            feed([SILENCE] * 10)
+                            self.assertEqual(controller._received_ms, 1840)
+                            if end_privacy:
+                                controller.duck(False)
+                            if recover_before_next:
+                                release.set()
+                                self.settle(processor)
+                                self.assertEqual(
+                                    [t.text for t in turns],
+                                    ["RECOVERED_FIXTURE"] if end_privacy else [],
+                                )
+                            feed([VOICE] * 10 + [SILENCE] * 72)
+                            self.assertEqual(turns if not recover_before_next else turns[1:], [])
+                        finally:
+                            release.set()
+                        processor.finish()
+                    self.assertEqual(len(retries), 1)
+                    self.assertEqual(
+                        [(t.start_ms, t.end_ms) for t in turns],
+                        [(20, 180), (1880, 2040)] if end_privacy else [(1880, 2040)],
+                    )
+                    # Existing fail-closed policy: while privacy is still on, even an
+                    # earlier public span is private at acceptance. Settle discards it;
+                    # the private continuation must still stand alone, never joined.
+                    self.assertEqual(accepted, [False, False] if end_privacy else [True])
+                    queued = [work.get_nowait() for _ in range(work.qsize())]
+                    self.assertEqual(queued, turns if end_privacy else [])
+                    public = [
+                        e["turn"]["text"] for e in events.drain() if e["type"] == "transcript"
+                    ]
+                    self.assertEqual(public, [t.text for t in queued])
+
+    def test_input_stall_barrier_waits_for_recovery_and_precedes_later_text(self):
+        processor, turns, _reports, entered, release, _first, _retries, decode = self.blocked_retry(
+            turn_merge_gap_ms=5000
+        )
+        with patch("rightyo.live_audio._transcribe", side_effect=decode):
+            try:
+                self.feed(processor)
+                self.assertTrue(entered.wait(2))
+                for _ in range(100):
+                    processor.release_pending()
+                self.assertEqual(len(processor._waiting), 1)
+                self.feed(processor)
+                self.assertEqual(turns, [])
+            finally:
+                release.set()
+            processor.finish()
+        self.assertEqual(
+            [(t.text, t.start_ms, t.end_ms) for t in turns],
+            [("RECOVERED_FIXTURE", 20, 180), ("LATER_FIXTURE", 1660, 1820)],
+        )
 
     def blocked_retry(self, *, later_bad=False, **options):
         processor, turns, reports = self.processor(**options)

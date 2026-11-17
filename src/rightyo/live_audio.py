@@ -730,7 +730,11 @@ def _attribute(
 
 
 def _attribute_edges(
-    attributed: list[list[Any]], timeline: list[dict[str, Any]], gap_ms: int
+    attributed: list[list[Any]],
+    timeline: list[dict[str, Any]],
+    gap_ms: int,
+    *,
+    blockers: list[dict[str, Any]] | None = None,
 ) -> set[int]:
     """Give unlabelled edge words the utterance's only labelled speaker, in place.
 
@@ -740,6 +744,8 @@ def _attribute_edges(
     exactly one labelled speaker; only for a word that overlaps no one and either touches
     segments of that speaker alone, or touches no segment and lies within `gap_ms` of one
     of that speaker's segments (timestamps running just past the segment's edge).
+    `blockers` can retain touching evidence across a run's loss boundary solely to
+    refuse a label; it cannot supply positive evidence or extend the inference slack.
     """
     inferred: set[int] = set()
     labels = {entry[3] for entry in attributed if entry[3] is not None}
@@ -757,11 +763,12 @@ def _attribute_edges(
             continue
         touching = {
             "Speaker " + _speaker_label(segment["speaker"])
-            for segment in timeline
+            for segment in (timeline if blockers is None else blockers)
             if segment["start_ms"] <= end and segment["end_ms"] >= start
         }
+        supported = any(seg_start <= end and seg_end >= start for seg_start, seg_end in own)
         near = any(max(start - seg_end, seg_start - end, 0) <= gap_ms for seg_start, seg_end in own)
-        if touching == {label} or (not touching and near):
+        if (touching == {label} and supported) or (not touching and near):
             entry[3] = label
             inferred.add(index)
     return inferred
@@ -1232,6 +1239,10 @@ class _FinalizedWindow:
     loss_count: int = 1
     last_number: int = 0
     private_loss: bool = False
+    # Ordered after this result, even if recovery has not resolved it yet. Adjacent
+    # barriers have no intervening text, so the stronger privacy settlement subsumes
+    # a plain flush. One token per bounded window; no separate growing event queue.
+    barrier_after: str | None = None
 
     def release(self) -> None:
         """Discard owned PCM/text evidence; safe to repeat during shutdown."""
@@ -1483,6 +1494,7 @@ class LiveProcessor:
         # the host thread and taken on the audio thread, both under `_private_lock`.
         self._private_until: int | None = None
         self._private_lock = threading.Lock()
+        self._frame_private = False
         # Where the last privacy end was reached (audio thread only), bounding a deferred renewal;
         # and, after a forced one, the renewal's offset: a turn starting before it is unlabelled.
         self._end_reached_ms: int | None = None
@@ -1651,6 +1663,31 @@ class LiveProcessor:
         released now, on its own, for the same reason. The end-of-turn judgement of an
         utterance open across the end was made on private audio, so it is made again."""
         self._end_of_turn_asked = self._complete = False
+        self._queue_merger_barrier("privacy")
+
+    def _queue_merger_barrier(self, kind: str) -> None:
+        """Audio-owner event, ordered after all finalized results heard before it.
+
+        A held result can be absent from the merger for the whole privacy interval
+        or input stall. Carry its boundary with it instead of settling an empty merger.
+        Host callbacks stay outside the lifecycle lock.
+        """
+        with self._recovery_lock:
+            if self.closed:
+                return
+            if self._waiting:
+                tail = self._waiting[-1]
+                if tail.barrier_after != "privacy":
+                    tail.barrier_after = kind
+                return
+        self._apply_merger_barrier(kind)
+
+    def _apply_merger_barrier(self, kind: str | None) -> None:
+        if kind is None or self.closed:
+            return
+        if kind == "flush":
+            self._merger.flush()
+            return
         spans = self._merger.held_spans()
         if not spans:
             return
@@ -1688,6 +1725,13 @@ class LiveProcessor:
             self.on_speakers_renewed()
 
     def _frame(self, frame: bytes) -> None:
+        if self.config.private is not None:
+            private = self._heard_private(self._received_ms, self._received_ms + 20)
+            if private != self._frame_private:
+                # Observe privacy starts as well as ends on the received-audio clock.
+                # No frame between toggles means no private audio and no new text.
+                self._queue_merger_barrier("privacy")
+                self._frame_private = private
         if self._private_until is not None:
             frame = self._private_cutoff(frame)
         # Renewed only once the privacy end is reached (#242 round 20): the controller counts a
@@ -1743,8 +1787,7 @@ class LiveProcessor:
             return
         try:
             self._drain_results()
-            if not self._waiting:
-                self._merger.flush()
+            self._queue_merger_barrier("flush")
         except Exception:
             self.failed = True
             self.close()
@@ -1860,8 +1903,8 @@ class LiveProcessor:
             [
                 dict(segment)
                 for segment in timeline
-                if segment["start_ms"] < offset + len(pcm) // BYTES_PER_MS
-                and segment["end_ms"] > offset
+                if segment["start_ms"] <= offset + len(pcm) // BYTES_PER_MS
+                and segment["end_ms"] >= offset
             ],
             getattr(self._diarizer, "speaker_provenance", "diarization-timeline"),
             complete,
@@ -2011,6 +2054,10 @@ class LiveProcessor:
                     raise LiveAudioError("Local recovery worker could not stop")
 
     def _commit_window(self, packet: _FinalizedWindow) -> None:
+        self._publish_window(packet)
+        self._apply_merger_barrier(packet.barrier_after)
+
+    def _publish_window(self, packet: _FinalizedWindow) -> None:
         if self.closed:
             packet.release()
             return
@@ -2090,6 +2137,8 @@ class LiveProcessor:
                 number=packet.number,
                 timeline_present=packet.timeline_present,
                 complete=complete and right == len(checked) and right not in gaps,
+                loss_before=left in gaps,
+                loss_after=right in gaps,
             )
         if len(checked) in gaps:
             self._merger.flush()
@@ -2106,11 +2155,12 @@ class LiveProcessor:
         number: int,
         timeline_present: bool,
         complete: bool,
+        loss_before: bool = False,
+        loss_after: bool = False,
     ) -> None:
         """Attribute one uninterrupted run; neither edge inference nor merging crosses loss."""
-        # Units start at or after `offset`; a segment ending by then overlaps none of them,
-        # so attribution scans only this utterance's part of the timeline.
-        relevant = [segment for segment in timeline if segment["end_ms"] > offset]
+        # Touching segments overlap no duration, but still block edge inference.
+        relevant = [segment for segment in timeline if segment["end_ms"] >= offset]
         attributed = []
         for unit in units:
             start, end = unit["start_ms"] + offset, unit["end_ms"] + offset
@@ -2142,6 +2192,8 @@ class LiveProcessor:
         inferred: set[int] = set()
         if self.config.edge_attribution_ms and provenance == "diarization-timeline":
             # Edge inference may use evidence only inside this uninterrupted run.
+            # Boundary-touching segments still block a competing label. At a loss,
+            # evidence entirely on its other side cannot supply that label itself.
             # Keep strict attribution/overlap checks on the original timeline.
             run_start, run_end = attributed[0][1], attributed[-1][2]
             edges = [
@@ -2151,9 +2203,17 @@ class LiveProcessor:
                     end_ms=min(run_end, segment["end_ms"]),
                 )
                 for segment in relevant
-                if segment["start_ms"] < run_end and segment["end_ms"] > run_start
+                if segment["start_ms"] <= run_end and segment["end_ms"] >= run_start
             ]
-            inferred = _attribute_edges(attributed, edges, self.config.edge_attribution_ms)
+            evidence = [
+                segment
+                for segment in edges
+                if (not loss_before or segment["end_ms"] > run_start)
+                and (not loss_after or segment["start_ms"] < run_end)
+            ]
+            inferred = _attribute_edges(
+                attributed, evidence, self.config.edge_attribution_ms, blockers=edges
+            )
         groups: list[dict[str, Any]] = []
         for index, (unit, start, end, speaker, overlap) in enumerate(attributed):
             if speaker is not None and provenance == "diarization-utterance":

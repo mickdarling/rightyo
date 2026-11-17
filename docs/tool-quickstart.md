@@ -115,7 +115,7 @@ Unusable recognizer timestamps no longer end the session
   Each recovery window is at most 15,020 ms (15 s maximum plus one PCM frame of rounding):
   four x 15,020 x 32 bytes/ms = 1,922,560 PCM bytes (nominal 15 s windows: 1,920,000).
   Completed results use at most the separate 16 MiB logical budget and 1,100 slots,
-  plus one compact overflow record. Timeline snapshots retain only overlapping spans,
+  plus one compact overflow record. Timeline snapshots retain overlapping or touching spans,
   preserving the original timeline-presence/provenance signal. The active window and
   snapshot, pre-roll/chunk, native WAV/response staging and pending-window metadata are
   separately bounded. At most two local recognizer processes overlap per processor;
@@ -138,6 +138,33 @@ Unusable recognizer timestamps no longer end the session
   timeout plus cleanup allowance; if still finishing, ownership/accounting remain visible
   until cleanup completes. No network fallback is used. Rejected segments from both
   attempts count in `skipped_segments`; wholly lost windows count in `skipped_utterances`.
+  Touching speaker segments remain blocking evidence at both edges of an uninterrupted
+  text run. Evidence on the other side of a dropped-text boundary cannot supply a label
+  or extend the edge-inference slack, even when it touches that boundary.
+  Merger boundaries also follow delayed results: one internal barrier token on each
+  queued window settles the merger after that window and before the next one. Repeated
+  barriers at the same queue position coalesce (privacy settlement subsumes a flush),
+  so they add no queue slots and cannot grow without bound. They add no host wire keys.
+  The merger-event audit is:
+  - Privacy start/end: transitions observed on the received-frame clock carry a privacy
+    settlement; the explicit privacy-end cutoff carries it too. Public held pieces are
+    flushed separately, private/unknown pieces discarded under the existing privacy
+    policy. While privacy is still on, acceptance still treats every turn as private.
+    Empty toggles with no audio or intervening text need no additional boundary.
+  - Speaker forget: the existing privacy-end/reset cutoff carries the settlement;
+    publisher/runner/identifier permission revocation remains immediate. Diarizer
+    renewal does not flush the merger; its existing stale-label watermark still
+    removes old label evidence when delayed text is eventually emitted.
+  - Input stall / `release_pending`: carry a flush after the queued prefix, even when
+    its recovery has not finished. Later text cannot join across that stall.
+  - Meeting/media toggles: neither touches the merger or flushes it; no merger event
+    is added. Their existing downstream policy checks remain immediate.
+  - Normal EOF: drain ordered results and their barriers, then flush. Stop/error:
+    cancel and discard all queued results and barriers. Session-budget release uses
+    `release_pending`; subsequent cancellation still discards unfinished recovery.
+  - Lost segments/windows: their existing flushes remain inside their ordered result.
+    Speech-onset and elapsed-gap observations are replayed with each result's stream
+    times; per-frame merger advancement remains paused behind waiting results.
 - Every backend: the units an utterance produces are then checked together. If any unit
   has timestamps that are not integers, NaN, negative, reversed, past the utterance, or
   earlier than the unit before it, the whole utterance is suppressed. No turn is
