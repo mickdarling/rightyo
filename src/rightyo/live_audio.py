@@ -174,6 +174,9 @@ class LiveConfig:
     # was partly inferred (edge attribution or tail join), so roles can withhold owner
     # authority from it (#137) without changing the `Turn` contract.
     on_inferred: Callable[[str], None] | None = None
+    # Internal #292 fact: leading diarized characters in published text, or None when
+    # its first word is inferred/unknown. Called before on_turn; never a wire key.
+    on_diarized_head: Callable[[str, int | None], None] | None = None
     # Called with (utterance_id, spans) just before `on_turn` for each `diarization-timeline`
     # turn, where `spans` are the `(start_ms, end_ms)` stream-time pieces of the turn's span
     # that the diarizer timeline gave the turn's own label and no other speaker (#148), so
@@ -276,6 +279,8 @@ class LiveConfig:
             raise LiveAudioError("Invalid post-turn gap observer")
         if self.on_inferred is not None and not callable(self.on_inferred):
             raise LiveAudioError("Invalid inferred-label observer")
+        if self.on_diarized_head is not None and not callable(self.on_diarized_head):
+            raise LiveAudioError("Invalid diarized-head observer")
         if self.on_labelled_spans is not None and not callable(self.on_labelled_spans):
             raise LiveAudioError("Invalid labelled-span observer")
         if self.turn_break is not None and not callable(self.turn_break):
@@ -2220,13 +2225,23 @@ class LiveProcessor:
                 # Per-request labels are namespaced by utterance so that equal labels
                 # from independent requests can never be merged into one participant.
                 speaker = utterance_scoped_speaker(number, speaker)
+            diarized = (
+                index not in inferred
+                and speaker is not None
+                and not overlap
+                and provenance == "diarization-timeline"
+            )
             if groups and (groups[-1]["speaker"], groups[-1]["overlap"]) == (speaker, overlap):
+                group = groups[-1]
+                if diarized and group["diarized_head"] == len(group["text"]):
+                    group["diarized_head"] += len(unit["text"])
                 groups[-1]["text"] += unit["text"]
                 groups[-1]["end_ms"] = max(groups[-1]["end_ms"], end)
             else:
                 groups.append(
                     {
                         "text": unit["text"],
+                        "diarized_head": len(unit["text"]) if diarized else None,
                         "start_ms": start,
                         "end_ms": end,
                         "speaker": speaker,
@@ -2238,7 +2253,14 @@ class LiveProcessor:
                 groups[-1]["inferred"] = True
         kept = [group for group in groups if group["text"].strip()]
         for index, group in enumerate(kept):
+            head = group["diarized_head"]
+            leading = len(group["text"]) - len(group["text"].lstrip())
             group["text"] = group["text"].strip()
+            group["diarized_head"] = (
+                min(len(group["text"]), head - leading)
+                if head is not None and head > leading
+                else None
+            )
             group["speaker_provenance"] = provenance if timeline_present else "unknown"
             if self.config.on_labelled_spans is not None and provenance == "diarization-timeline":
                 # Only the label's own, unoverlapped timeline audio (#148); joined turns
@@ -2272,10 +2294,11 @@ class LiveProcessor:
         gap = group.pop("post_turn_gap", None)
         inferred = group.pop("inferred", False) is True
         spans = group.pop("labelled_spans", None)
+        head = group.pop("diarized_head", None)
         if group["start_ms"] < self._unlabelled_before_ms:
             # Under way at a forced renewal (round 21): labelled, wholly or partly, by the old
             # diarizer, or joined to its label, so published unlabelled with no label evidence.
-            group["speaker"], inferred, spans = None, False, None
+            group["speaker"], inferred, spans, head = None, False, None, None
         turn = Turn(
             session_id=self.config.session_id,
             utterance_id=f"live-{self._counter}",
@@ -2294,6 +2317,8 @@ class LiveProcessor:
             self.config.on_post_turn_gap(turn.utterance_id, gap)
         if inferred and self.config.on_inferred is not None:
             self.config.on_inferred(turn.utterance_id)
+        if self.config.on_diarized_head is not None:
+            self.config.on_diarized_head(turn.utterance_id, head)
         if spans is not None and self.config.on_labelled_spans is not None:
             self.config.on_labelled_spans(turn.utterance_id, tuple(spans))
         if private_pcm is not None:

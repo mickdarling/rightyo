@@ -369,9 +369,20 @@ def _starts_named(text, addressing):
     """Whether a turn opens with our name or variant (#735), after only the leading
     edge words and optional address allowed by privacy entry. Never a mid-sentence name.
     """
+    return _starts_named_end(text, addressing) is not None
+
+
+def _starts_named_end(text, addressing):
+    """End offset of an opening name in the original text, including leading edge words.
+
+    Use the same word normalization as `_privacy_words`, retaining original offsets
+    before lower/casefold can expand Unicode characters (#292).
+    """
     if addressing is None:
-        return False
-    words = _privacy_words(text, ())
+        return None
+    cleaned = "".join(c if c.isalnum() or c == "'" else " " for c in text.replace("\u2019", "'"))
+    tokens = list(re.finditer(r"\S+", cleaned))
+    words = [token.group().lower() for token in tokens]
     at = 0
     starts = {at}
     while at < len(words) and words[at] in PRIVACY_EDGE:
@@ -390,17 +401,22 @@ def _starts_named(text, addressing):
     }
     named_keys.discard("")
     if not named_keys:
-        return False
+        return None
     # A name may be split anywhere ("Righty O"), so each character can be a word.
     # Drop apostrophe-only words after locating starts; they add no name characters.
     word_keys = [key(word) for word in words]
     starts = {sum(bool(word) for word in word_keys[:at]) for at in starts}
+    ends = [token.end() for token, word in zip(tokens, word_keys) if word]
     words = [word for word in word_keys if word]
     max_width = max(map(len, named_keys))
-    return any(
-        "".join(words[at : at + width]) in named_keys
-        for at in starts
-        for width in range(1, min(max_width, len(words) - at) + 1)
+    return min(
+        (
+            ends[at + width - 1]
+            for at in starts
+            for width in range(1, min(max_width, len(words) - at) + 1)
+            if "".join(words[at : at + width]) in named_keys
+        ),
+        default=None,
     )
 
 
@@ -573,6 +589,7 @@ class SpeechEvents:
         # they keep their role for attention and precedence, never for owner authority.
         # Utterance id -> turn end, pruned by retention like the other per-turn state.
         self._inferred = {}
+        self._diarized_heads = {}
         self._open = {}
         # Pending non-owner turns an owner superseded before their decisions arrived,
         # mapped to the owner's utterance: their late decisions never emit a request.
@@ -881,6 +898,7 @@ class SpeechEvents:
             self._decided.clear()
             self._roles.clear()
             self._inferred.clear()
+            self._diarized_heads.clear()
             self._media_turns.clear()
             self._meeting_turns.clear()
             self._meeting_ask_anywhere = meeting_ask_anywhere
@@ -1029,6 +1047,9 @@ class SpeechEvents:
             for key, end_ms in list(self._inferred.items()):
                 if end_ms <= cutoff:
                     del self._inferred[key]
+            for key, (end_ms, _head) in list(self._diarized_heads.items()):
+                if end_ms <= cutoff:
+                    del self._diarized_heads[key]
             for key, end_ms in list(self._media_turns.items()):
                 if end_ms <= cutoff:
                     del self._media_turns[key]
@@ -1120,8 +1141,11 @@ class SpeechEvents:
             self._owner_voice_state = state
             self._emit("owner_voice", state=state)
 
-    def transcript(self, turn, now_ms, *, expect_decision=True, inferred=False):
+    def transcript(self, turn, now_ms, *, expect_decision=True, inferred=False, diarized_head=None):
         """Emit one final turn; `inferred` marks a speaker label partly inferred (#137).
+
+        `diarized_head` is the leading diarized run's character length in `turn.text`
+        (#292), internal only. Missing or invalid evidence fails closed at the new bar.
 
         An inferred turn (edge-attributed words or a tail join) keeps its role for
         attention and precedence, but never exercises owner or trusted authority:
@@ -1196,6 +1220,8 @@ class SpeechEvents:
                 role = "unknown"
             if inferred and role is not None:
                 self._inferred[turn.utterance_id] = turn.end_ms
+            if type(diarized_head) is int and 0 < diarized_head <= len(turn.text):
+                self._diarized_heads[turn.utterance_id] = (turn.end_ms, diarized_head)
             if self._media:
                 self._media_turns[turn.utterance_id] = turn.end_ms
             if self._meeting:
@@ -1887,7 +1913,30 @@ class SpeechEvents:
         """Whether meeting mode rejects this turn if considered for attention."""
         return self._meeting_for(turn) and not self._meeting_attends(turn, authority)
 
-    def _attention_blocked(self, turn, authority):
+    def _owner_vocative_bar(self, turn, role):
+        """Content-free result for #292; this grants attention only, never authority."""
+        try:
+            if role != "owner":
+                return "not_owner"
+            check = getattr(self._priority, "enrolled_owner", None)
+            if (
+                not self._voiceprinted(turn)
+                or self._current_role(turn, role) != "owner"
+                or not callable(check)
+                or check(turn) is not True
+            ):
+                return "not_voiceprinted"
+            end = _starts_named_end(turn.text, self._addressing)
+            if end is None:
+                return "not_vocative"
+            head = self._diarized_heads.get(turn.utterance_id)
+            if head is None or head[0] != turn.end_ms:
+                return "head_unknown"
+            return "owner_vocative" if end <= head[1] else "name_inferred"
+        except Exception:  # noqa: BLE001 - attribution failures never grant attention
+            return "head_unknown"
+
+    def _attention_blocked(self, turn, authority, role=None):
         """The rejecting bar: explicit meeting, media, then automatic meeting, or None.
 
         Every promotion (meeting's and #251's) goes through this, so no promotion attends
@@ -1898,13 +1947,21 @@ class SpeechEvents:
         if self._media_blocks(turn, authority):
             return "media"
         if self._others_present(turn) and not self._meeting_attends(turn, authority):
-            return "others_present"
+            reason = self._owner_vocative_bar(turn, role)
+            passed = reason == "owner_vocative"
+            if role is not None and self._report is not None:
+                # The tool report sink adds `rightyo:` on stderr; no words or labels.
+                with contextlib.suppress(Exception):
+                    self._report(f"attention_{'passed' if passed else 'blocked'} reason={reason}")
+            if not passed:
+                return "others_present"
         return None
 
     def _meeting_promote(self, turn, authority, decision, evidence):
         """Explicit or automatic meeting: owner + name anywhere beats only abstention,
         never ignore/another agent. Inferred labels carry no authority.
         Kept separate from #251's start-of-turn promotion; an attend needs no promotion.
+        No #292 role argument: ask-anywhere continues to require full owner authority.
         """
         mode = (
             "meeting"
@@ -2715,7 +2772,7 @@ class SpeechEvents:
                 # a follow-up or an acknowledgement here, and it ends this assistant's
                 # conversation with them below. Naming this assistant too keeps it ours.
                 evidence["label"] = "ignore"
-            blocked = self._attention_blocked(turn, authority)
+            blocked = self._attention_blocked(turn, authority, current)
             if evidence["label"] == "attend" and blocked is not None:
                 # Shared meeting/media/others-present bars apply to direct attends too.
                 # Like media, only an attend is relabeled:
@@ -2740,7 +2797,7 @@ class SpeechEvents:
                 and self._named_owner(turn, current)
             )
             if named_owner:
-                blocked = self._attention_blocked(turn, authority)
+                blocked = self._attention_blocked(turn, authority, current)
                 if blocked is not None:
                     # A promotion faces the same meeting and media gates as a provider-labeled
                     # attend; those gates relabel only an attend, so this check is the one

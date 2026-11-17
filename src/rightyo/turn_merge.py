@@ -433,12 +433,27 @@ class TurnMerger:
                 joined["start_ms"] = wake["start_ms"]
                 # The name's speaker is inferred from the continuation: no owner authority.
                 joined["inferred"] = True
+                joined["diarized_head"] = None
                 self.offer(joined, complete=complete)
                 return
         elif self._continues(fragment):
             held = self._held
             joined = self._join_text(held["text"], fragment["text"], self._held_complete)
             complete = complete and not self._looks_unfinished(joined)
+            if "diarized_head" in held or "diarized_head" in fragment:
+                head, tail = held.get("diarized_head"), fragment.get("diarized_head")
+                if joined != held["text"] + " " + fragment["text"]:
+                    # Restart collapse can replace the name-bearing prefix: unknown.
+                    head = None
+                elif (
+                    head == len(held["text"])
+                    and type(tail) is int
+                    and 0 < tail <= len(fragment["text"])
+                    and fragment["speaker"] is not None
+                ):
+                    head += 1 + tail
+                # An inferred/unlabelled tail never extends the diarized head (#292).
+                held["diarized_head"] = head
             if fragment["speaker"] is None or fragment.get("inferred"):
                 # A tail join, or a piece with edge-attributed words: the joined turn's
                 # label is partly inferred, which roles must know (#137). Absent otherwise.
