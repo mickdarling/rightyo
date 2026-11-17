@@ -718,6 +718,7 @@ class PrototypeController:
         self._turn_gaps: dict[str, dict[str, Any]] = {}
         # Turns whose speaker label was partly inferred, until published (#137).
         self._inferred_turns: set[str] = set()
+        self._diarized_heads: dict[str, int | None] = {}
         # Each turn's own-label timeline pieces, until the identifier takes them (#148).
         self._turn_spans: dict[str, tuple[tuple[int, int], ...]] = {}
         # The session's live identification role provider, or None (#137 step 4b).
@@ -988,6 +989,7 @@ class PrototypeController:
             self._decisions = {}
             self._turn_gaps = {}
             self._inferred_turns = set()
+            self._diarized_heads = {}
             self._turn_spans = {}
             self._pending = self._requests = self._received_ms = 0
             self._received_bytes = 0
@@ -1089,9 +1091,15 @@ class PrototypeController:
                 memory.append(turn)
             inferred = turn.utterance_id in self._inferred_turns
             self._inferred_turns.discard(turn.utterance_id)
+            head = self._diarized_heads.pop(turn.utterance_id, None)
             if self._events is not None:
-                # Passed only when set, so publishers without live roles see no change.
-                self._publish("transcript", turn, **({"inferred": True} if inferred else {}))
+                # Internal attribution only; it never enters a host-decoded object.
+                self._publish(
+                    "transcript",
+                    turn,
+                    **({"inferred": True} if inferred else {}),
+                    **({"diarized_head": head} if head is not None else {}),
+                )
             if self._decision_status == "off" or self._decision_cancel.is_set() or ducked:
                 return ducked
             try:
@@ -1232,6 +1240,13 @@ class PrototypeController:
                 return
             # Called just before the same turn is accepted, so this holds at most one id.
             self._inferred_turns.add(utterance_id)
+
+    def _observe_diarized_head(self, generation: int, utterance_id: str, head: int | None) -> None:
+        """Keep #292's content-free attribution fact until the immediate accept."""
+        with self._lock:
+            if generation != self._generation or self._stop.is_set():
+                return
+            self._diarized_heads[utterance_id] = head
 
     def _observe_spans(
         self, generation: int, utterance_id: str, spans: tuple[tuple[int, int], ...]
@@ -1399,6 +1414,9 @@ class PrototypeController:
                     ),
                     on_inferred=lambda utterance_id: self._observe_inferred(
                         generation, utterance_id
+                    ),
+                    on_diarized_head=lambda utterance_id, head: self._observe_diarized_head(
+                        generation, utterance_id, head
                     ),
                     # Only with an identifier to use them (#148); None computes nothing.
                     on_labelled_spans=(
@@ -1819,6 +1837,7 @@ class PrototypeController:
             # Per-turn notes observed before an accept that the stop cut off (#735 S-1).
             self._turn_gaps.clear()
             self._inferred_turns.clear()
+            self._diarized_heads.clear()
             self._turn_spans.clear()
             self._pending = self._received_ms = 0
             self._received_bytes = 0

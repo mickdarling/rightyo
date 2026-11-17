@@ -12,6 +12,7 @@ from rightyo.contracts import (
     Addressing,
     ContractError,
     Conversation,
+    Dismissal,
     SpeakerPriority,
 )
 from rightyo.live_speaker_id import EnrolledRoles
@@ -393,6 +394,256 @@ class OthersCueTests(unittest.TestCase):
             raw.pop("version")
             self.assertEqual(Conversation.from_dict(raw), mode)
             self.assertEqual("cue_when_others_ms" in raw, bool(value))
+
+
+class OwnerVocativeBarTests(unittest.TestCase):
+    """#292: authored words and fixed bindings, never live voice evidence."""
+
+    def prepare(self, *, priority=None, meeting=False, media=False, ask_anywhere=True):
+        self.bindings = {"Speaker A": ("bound", "owner"), "Speaker B": ("bound", "guest")}
+        if priority is None:
+            priority = EnrolledRoles(
+                SpeakerPriority(owners=("owner",), stop_phrases=("Jarvis stop",))
+            )
+            priority.source = SimpleNamespace(binding=self.bindings.get)
+        self.notes = []
+        self.events = SpeechEvents(report=self.notes.append)
+        self.events.start(
+            SESSION,
+            now_ms=0,
+            conversation=MODE,
+            addressing=NAMES,
+            priority=priority,
+            dismissal=Dismissal(),
+            meeting_ask_anywhere=ask_anywhere,
+        )
+        # An earlier guest request is delivered before others-present can bar it.
+        guest = turn(
+            "guest",
+            0,
+            900,
+            "Jarvis, sort the authored list",
+            "Speaker B",
+            provenance="diarization-timeline",
+        )
+        self.events.transcript(guest, 900)
+        self.events.decision(decided(guest, "attend"), 1000)
+        owner = turn(
+            "owner", 1000, 1200, "Jarvis, open the authored list", provenance="diarization-timeline"
+        )
+        self.events.transcript(owner, 1200, inferred=True)
+        self.events.decision(decided(owner, "attend"), 1250)
+        other = turn(
+            "other",
+            1300,
+            1500,
+            "An authored observation",
+            "Speaker B",
+            provenance="diarization-timeline",
+        )
+        self.events.transcript(other, 1500, expect_decision=False)
+        self.events.meeting(meeting)
+        self.events.media(media)
+        self.events.drain()
+        self.notes.clear()
+
+    def accept(
+        self, *, text="Jarvis, open the authored folder", head=6, speaker="Speaker A", inferred=True
+    ):
+        self.current = turn("current", 2000, 2900, text, speaker, provenance="diarization-timeline")
+        self.events.transcript(self.current, 2900, inferred=inferred, diarized_head=head)
+
+    def decide(self, label="attend", **options):
+        self.events.decision(decided(self.current, label, **options), 3000)
+        self.output = self.events.drain()
+        self.evidence = next(e["decision"] for e in self.output if e["type"] == "attention")
+        return [e for e in self.output if e["type"] == "request"]
+
+    def test_owner_vocative_with_inferred_tail_attends(self):
+        self.prepare()
+        self.accept()
+        self.assertEqual(len(self.decide()), 1)
+        self.assertEqual(self.evidence["label"], "attend")
+        self.assertNotIn("others_present", self.evidence)
+        self.assertIn("attention_passed reason=owner_vocative", self.notes)
+        self.assertFalse(any(e["type"] == "override" for e in self.output))
+
+    def test_owner_vocative_with_inferred_tail_promotes_via_named_owner(self):
+        for anywhere in (False, True):
+            with self.subTest(ask_anywhere=anywhere):
+                self.prepare(ask_anywhere=anywhere)
+                self.accept()
+                self.assertEqual(len(self.decide("uncertain", recipient="unknown")), 1)
+                self.assertIn("attention_promoted reason=named_owner", self.notes)
+                self.assertNotIn("others_present", self.evidence)
+                # Ask-anywhere itself never gains authority from the new exception.
+                self.assertEqual(self.evidence["recipient_kind"], "unknown")
+
+    def test_guest_vocative_is_held(self):
+        self.prepare()
+        self.accept(speaker="Speaker B")
+        self.assertEqual(self.decide(), [])
+        self.assertIs(self.evidence["others_present"], True)
+
+    def test_inferred_name_and_unknown_head_are_held(self):
+        for head, reason in ((None, "head_unknown"), (0, "head_unknown"), (3, "name_inferred")):
+            for label in ("attend", "uncertain"):
+                with self.subTest(head=head, label=label):
+                    self.prepare()
+                    self.accept(head=head)
+                    self.assertEqual(self.decide(label), [])
+                    self.assertIs(self.evidence["others_present"], True)
+                    self.assertIn(f"attention_blocked reason={reason}", self.notes)
+
+    def test_inferred_mid_sentence_name_stays_held(self):
+        self.prepare()
+        self.accept(text="I told Jarvis about the authored folder", head=13)
+        self.assertEqual(self.decide(), [])
+        self.assertIs(self.evidence["others_present"], True)
+
+    def test_configured_owner_with_inferred_tail_stays_held(self):
+        self.prepare(priority=OWNER)
+        self.accept()
+        self.assertEqual(self.decide(), [])
+        self.assertIs(self.evidence["others_present"], True)
+        self.assertIn("attention_blocked reason=not_voiceprinted", self.notes)
+
+    def test_name_end_includes_leading_words_split_name_and_unicode_offsets(self):
+        from rightyo.tool_events import _starts_named, _starts_named_end
+
+        for name, text, end in (
+            ("Jarvis", "um, hey Jarvis, open it", 14),
+            ("RightyO", "okay, Righty O, open it", 14),
+            ("R2D2", "R2-D2, open it", 5),
+            ("SS", "ẞ, open it", 1),
+            ("Okay", "Okay, open it", 4),
+        ):
+            for head in (end - 1, end):
+                with self.subTest(name=name, head=head):
+                    self.prepare()
+                    self.events._addressing = Addressing.from_names([name])
+                    self.accept(text=text, head=head)
+                    self.assertTrue(_starts_named(text, self.events._addressing))
+                    self.assertEqual(_starts_named_end(text, self.events._addressing), end)
+                    self.assertEqual(len(self.decide()), int(head == end))
+
+    def test_invalid_head_and_changed_binding_fail_closed(self):
+        for head in (True, -1, 1.5, "6", 10000):
+            with self.subTest(head=head):
+                self.prepare()
+                self.accept(head=head)
+                self.assertEqual(self.decide(), [])
+        for binding in (None, ("bound", "guest"), ("tentative", "owner")):
+            with self.subTest(binding=binding):
+                self.prepare()
+                self.accept()
+                self.bindings["Speaker A"] = binding
+                self.assertEqual(self.decide(), [])
+
+    def test_meeting_and_media_still_hold_the_same_vocative(self):
+        for meeting, media, reason in ((True, False, "meeting"), (False, True, "media")):
+            for label in ("attend", "uncertain"):
+                with self.subTest(meeting=meeting, media=media, label=label):
+                    self.prepare(meeting=meeting, media=media)
+                    self.accept()
+                    self.assertEqual(self.decide(label), [])
+                    self.assertIs(self.evidence[reason], True)
+                    self.assertNotIn("attention_passed reason=owner_vocative", self.notes)
+
+    def test_passing_the_bar_grants_no_stop_override_or_dismissal_authority(self):
+        self.prepare()
+        self.accept(text="Jarvis, stop.")
+        self.assertEqual(self.decide(), [])  # only playback dismissal, no owner stop
+        self.assertIn("attention_passed reason=owner_vocative", self.notes)
+        stop = next(e for e in self.output if e["type"] == "dismiss")
+        self.assertEqual(stop["scope"], ["playback"])
+        self.assertEqual(stop["withdrawn_request_ids"], [])
+        self.assertFalse(any(e["type"] == "override" for e in self.output))
+        self.assertIn(SESSION + ":guest", self.events._delivered)
+        self.events.drain()
+        dismissal = turn(
+            "dismissal", 4000, 4900, "Jarvis, that's enough.", provenance="diarization-timeline"
+        )
+        self.events.transcript(dismissal, 4900, inferred=True, diarized_head=6)
+        judged = decided(dismissal, "uncertain")
+        judged = replace(
+            judged,
+            decision=replace(
+                judged.decision,
+                dismissal="disengage",
+                dismissal_choice="disengage",
+                dismissal_confidence=0.99,
+            ),
+        )
+        engaged = dict(self.events._engaged)
+        self.events.decision(judged, 5000)
+        output = self.events.drain()
+        dismiss = next(e for e in output if e["type"] == "dismiss")
+        self.assertEqual(dismiss["scope"], ["playback"])
+        self.assertEqual(dismiss["withdrawn_request_ids"], [])
+        self.assertNotIn("cooldown_until_ms", dismiss)
+        self.assertEqual(self.events._engaged, engaged)
+        self.assertFalse(any(e["type"] == "override" for e in output))
+
+    def test_diagnostics_are_content_free_and_internal_fact_never_leaks(self):
+        import json
+
+        for head, speaker in (
+            (6, "Speaker A"),
+            (None, "Speaker A"),
+            (2, "Speaker A"),
+            (6, "Speaker B"),
+        ):
+            with self.subTest(head=head, speaker=speaker):
+                self.prepare()
+                self.accept(head=head, speaker=speaker)
+                self.decide()
+                notes = " ".join(self.notes)
+                for private in ("Jarvis", "Speaker A", "Speaker B", self.current.text, "folder"):
+                    self.assertNotIn(private, notes)
+                self.assertNotIn("diarized_head", json.dumps(self.output))
+
+    def test_prototype_passes_the_internal_fact_and_ignores_stale_generations(self):
+        import queue
+        from pathlib import Path
+
+        from rightyo.memory import TranscriptMemory
+        from rightyo.prototype import PrototypeConfig, PrototypeController
+
+        self.prepare()
+        config = PrototypeConfig(*(Path("unused-authored-asset") for _ in range(5)))
+        controller = PrototypeController(config, event_publisher=self.events)
+        self.addCleanup(controller.close)
+        controller._decision_status = "ready"
+        current = turn(
+            "current",
+            2000,
+            2900,
+            "Jarvis, open the authored folder",
+            provenance="diarization-timeline",
+        )
+        controller._observe_diarized_head(-1, current.utterance_id, 1000)
+        self.assertFalse(controller._diarized_heads)
+        controller._observe_inferred(0, current.utterance_id)
+        controller._observe_diarized_head(0, current.utterance_id, 6)
+        controller._accept(0, queue.Queue(), TranscriptMemory(), current)
+        self.assertFalse(controller._diarized_heads)
+        self.current = current
+        self.assertEqual(len(self.decide()), 1)
+        self.assertIn("attention_passed reason=owner_vocative", self.notes)
+        self.assertFalse(any(e["type"] == "override" for e in self.output))
+
+    def test_head_fact_expires_and_new_session_clears_it(self):
+        self.prepare()
+        self.accept()
+        self.assertTrue(self.events._diarized_heads)
+        self.events.expire(303000)
+        self.assertFalse(self.events._diarized_heads)
+        self.events.end("stopped", 303001)
+        self.events.drain()
+        self.events._diarized_heads["stale"] = (303000, 6)
+        self.events.start("new-session", now_ms=0)
+        self.assertFalse(self.events._diarized_heads)
 
 
 class OthersPresentSnapshotTests(unittest.TestCase):

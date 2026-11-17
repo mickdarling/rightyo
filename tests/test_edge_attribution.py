@@ -215,5 +215,132 @@ class EdgeAttributionTests(unittest.TestCase):
             self.assertIn("speaker roles", str(error.exception))
 
 
+class DiarizedHeadTests(unittest.TestCase):
+    """#292's internal fact follows scripted words through attribution and publication."""
+
+    def run_head(self, units, timeline, *, edges=0, tail=0, renewal=0):
+        turns, heads, inferred = [], {}, []
+
+        def accept(turn):
+            self.assertIn(turn.utterance_id, heads)  # observer runs before publication
+            turns.append(turn)
+
+        processor = LiveProcessor(
+            LiveConfig(
+                "head-test",
+                provenance="causal-replay",
+                transcriber=units,
+                diarizer=timeline,
+                edge_attribution_ms=edges,
+                tail_join_ms=tail,
+                turn_merge_gap_ms=1000 if tail else 0,
+                on_diarized_head=lambda uid, head: heads.update({uid: head}),
+                on_inferred=inferred.append,
+            ),
+            accept,
+        )
+        self.addCleanup(processor.close)
+        processor._unlabelled_before_ms = renewal
+        for offset in range(0, len(SPEECH), FRAME_BYTES * 10):
+            processor.push_pcm16(SPEECH[offset : offset + FRAME_BYTES * 10])
+        processor.finish()
+        self.assertEqual(len(turns), 1)
+        return turns[0], heads[turns[0].utterance_id], inferred
+
+    def test_all_diarized_and_leading_whitespace_stripped(self):
+        current, head, inferred = self.run_head(
+            Units(("   Jarvis,", 0, 300), (" open it. ", 700, 900)),
+            Timeline((0, 1000, 1)),
+        )
+        self.assertEqual(current.text, "Jarvis, open it.")
+        self.assertEqual(head, len(current.text))
+        self.assertEqual(inferred, [])
+
+    def test_edge_inferred_tail_preserves_only_the_diarized_head(self):
+        current, head, inferred = self.run_head(
+            Units(("   Jarvis,", 0, 300), (" open it.", 700, 900)),
+            Timeline((0, 500, 1)),
+            edges=500,
+        )
+        self.assertEqual(current.text, "Jarvis, open it.")
+        self.assertEqual(head, len("Jarvis,"))
+        self.assertEqual(inferred, [current.utterance_id])
+
+    def test_edge_inferred_first_word_has_no_diarized_head(self):
+        current, head, inferred = self.run_head(
+            Units(("   Jarvis,", 0, 100), (" open it.", 300, 900)),
+            Timeline((200, 1000, 1)),
+            edges=500,
+        )
+        self.assertIsNone(head)
+        self.assertEqual(inferred, [current.utterance_id])
+
+    def test_tail_join_preserves_the_diarized_head(self):
+        current, head, inferred = self.run_head(
+            Units(("   Jarvis,", 0, 300), (" open it.", 700, 900)),
+            Timeline((0, 500, 1)),
+            tail=500,
+        )
+        self.assertEqual(current.text, "Jarvis, open it.")
+        self.assertEqual(head, len("Jarvis,"))
+        self.assertEqual(inferred, [current.utterance_id])
+
+    def test_forced_renewal_has_no_diarized_head(self):
+        current, head, inferred = self.run_head(
+            Units((" Jarvis, open it.", 0, 900)),
+            Timeline((0, 1000, 1)),
+            renewal=100,
+        )
+        self.assertIsNone(current.speaker_id)
+        self.assertIsNone(head)
+        self.assertEqual(inferred, [])
+
+    def test_merging_extends_only_an_unbroken_diarized_prefix(self):
+        from test_turn_merge import fragment
+
+        from rightyo.turn_merge import TurnMerger
+
+        for head, tail_head, expected in ((6, 1, 8), (None, 1, None), (3, 1, 3), (6, None, 6)):
+            with self.subTest(head=head, tail_head=tail_head):
+                emitted = []
+                merger = TurnMerger(2000, 24000, emitted.append)
+                merger.offer({**fragment("Righty", 0, 300), "diarized_head": head})
+                merger.offer({**fragment("O", 700, 900), "diarized_head": tail_head})
+                merger.flush()
+                self.assertEqual(emitted[0]["text"], "Righty O")
+                self.assertEqual(emitted[0]["diarized_head"], expected)
+
+    def test_wake_join_and_restart_collapse_fail_closed(self):
+        from test_turn_merge import fragment
+
+        from rightyo.turn_merge import TurnMerger
+
+        emitted = []
+        merger = TurnMerger(
+            2000,
+            24000,
+            emitted.append,
+            wake_word=lambda text: text == "Jarvis",
+            owner=lambda piece: True,
+        )
+        merger.offer({**fragment("Jarvis", 0, 300, speaker=None), "diarized_head": None})
+        merger.offer({**fragment("open it", 700, 900), "diarized_head": 7})
+        merger.flush()
+        self.assertIsNone(emitted[0]["diarized_head"])
+        emitted.clear()
+        merger = TurnMerger(
+            2000, 24000, emitted.append, complete_hold_ms=1000, collapse_restarts=True
+        )
+        text = "Jarvis open the folder"
+        merger.offer({**fragment(text, 0, 300), "diarized_head": len(text)}, complete=True)
+        merger.offer({**fragment(text + " now", 700, 900), "diarized_head": None})
+        merger.flush()
+        self.assertIsNone(emitted[0]["diarized_head"])
+
+    def test_bad_observer_is_rejected(self):
+        with self.assertRaises(LiveAudioError):
+            LiveConfig("x", transcriber=Units(), diarizer=Timeline(), on_diarized_head=True)
+
+
 if __name__ == "__main__":
     unittest.main()
