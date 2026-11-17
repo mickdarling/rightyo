@@ -1,10 +1,43 @@
 # RightyO
 
-A compact audio attention system: recognize when speech is addressed to the system, then transcribe that speech and emit the text.
+RightyO decides when speech is meant for an assistant. It listens to a live room,
+transcribes each finished turn, works out who spoke, and decides whether the turn
+was addressed to the system. Only then does it hand on a request. Everything else
+stays context.
 
-**Status:** a transcript-first experiment MVP, with local whisper.cpp file transcription, explicit local Nemotron 3 diarization or imported anonymous speaker timelines, mock decisions and opt-in Jev decisions. An explicit local Mac microphone lab is available; no trained attention model is included. Project name: **RightyO**; repository/package spelling: **rightyo**.
+**Status:** RightyO is in daily use as the hands-free speech front end of
+[Hailing Station](https://github.com/mickdarling/hailing-station), on a Mac.
 
-The first experiment transcribes locally and asks Jev whether the completed turn addresses the system and who its recipient is. Speaker A/B labels are sufficient initially; diarization alone cannot establish the addressee. This quickly tests whether existing models solve the product problem. A frozen audio encoder, compact attention head and gated decoder remain conditional research directions after quality and compute measurements justify them.
+What runs today:
+
+- **Live listening:** microphone audio streamed from a phone or Mac to a Mac host,
+  with local [whisper.cpp](https://github.com/ggml-org/whisper.cpp) transcription and
+  a local end-of-turn model.
+- **Who spoke:** local speaker diarization, plus optional on-device voice enrollment
+  that recognizes the owner and trusted speakers. Voiceprints never leave the machine.
+- **Was it meant for the assistant:** a decision model (Jev, opt-in and hosted, given
+  text only) reads each finished turn in context. It labels the turn `attend`,
+  `ignore` or `uncertain` and names the likely recipient.
+- **Conversation rules on top:**
+  - follow-ups without repeating the name;
+  - natural "stop" and "never mind" dismissals;
+  - meeting, media and privacy modes, which hold back or exclude speech.
+- **For hosts:** a versioned JSONL event stream, with a contract test against Hailing
+  Station's decoder so the two stay in step.
+
+What is still experimental:
+
+- **Audio attention:** there is no trained attention model yet. Addressee decisions
+  come from a general text model over transcripts. The audio-first design (a frozen
+  encoder, a small attention head and a gated decoder; see
+  [architecture](docs/architecture.md)) is still a research direction. It waits on
+  measured quality and cost.
+- **Quality:** decisions and transcription quality are not yet benchmarked on a
+  public evaluation set. Live behavior is tuned from the author's own use.
+- **Platform:** a Mac host with separately provisioned local models. There is no
+  packaged release and no mobile on-device deployment.
+
+Project name: **RightyO**; repository/package spelling: **rightyo**.
 
 ## Try the microphone lab
 
@@ -125,9 +158,16 @@ Audio recordings, transcripts from real conversations, credentials, and download
 
 ## Relationship to Hailing Station
 
-[Hailing Station](https://github.com/mickdarling/hailing-station) is a possible downstream consumer of the attended transcript. Its host remains responsible for programmatic routing, target selection, and output handling. RightyO can also serve other consumers. Multi-host negotiation and automatic tool/session selection are outside this project's first scope.
+[Hailing Station](https://github.com/mickdarling/hailing-station) runs RightyO as its live
+ambient-listening pipeline. Its host daemon streams device audio to a RightyO child process
+and reads the JSONL events. It then routes attended requests to the chosen agent session and
+plays replies. Routing, target selection, replies and tool execution stay in the host.
+RightyO only decides what was said, who said it and whether it was meant for the assistant.
+Other hosts can consume the same event stream. Hailing Station's tap-to-talk path still uses
+on-device speech recognition and does not go through RightyO.
 
-Jev's documented input is text only. It can be evaluated as a transcript-based comparison baseline, but cannot directly implement this audio-before-transcription attention detector. See [research notes](docs/research.md).
+Jev's input is text only. It serves as the working transcript-based decision layer and as the
+baseline that any future audio attention model has to beat. See [research notes](docs/research.md).
 
 ## License
 
