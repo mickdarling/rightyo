@@ -337,7 +337,7 @@ class PrivateExitTests(unittest.TestCase):
         self.assertEqual(work.qsize(), 0)
         self.assertEqual(retained, [audio((VOICE, 200))])
 
-    def test_bare_jarvis_uses_only_binding_and_zeroes_audio_without_a_score_or_log(self):
+    def test_name_fragment_uses_binding_or_its_own_voice_and_zeroes_audio(self):
         for identity in (None, "guest", "owner"):
             with self.subTest(binding=identity):
                 harness = self.harness()
@@ -354,33 +354,33 @@ class PrivateExitTests(unittest.TestCase):
                         harness.shadow, "exit_score", wraps=harness.shadow.exit_score
                     ) as score,
                 ):
-                    old = self.hear(controller, "Jarvis")
-                    voice.assert_not_called()
-                    score.assert_not_called()
+                    old = self.hear(
+                        controller, "Jarvis", f0=GUEST_F0 if identity == "guest" else OWNER_F0
+                    )
+                    self.assertEqual(voice.call_count, int(identity != "owner"))
+                    self.assertEqual(score.call_count, int(identity != "owner"))
                 self.assertTrue(old)
                 self.assertFalse(any(old))
                 self.assertFalse(controller._private_sentence.pcm)
                 self.assertEqual(events.drain(), [])
-                self.assertEqual(harness.embedder.calls, 0)
-                self.assertFalse(any("score=" in line for line in harness.lines))
-                self.assertEqual(events._private_name_end, 1000 if identity == "owner" else None)
+                self.assertEqual(harness.embedder.calls, int(identity != "owner"))
+                self.assertEqual(events._private_name_end, None if identity == "guest" else 1000)
                 self.assertEqual(
-                    events._private_counts["exit_name_refused"], int(identity != "owner")
+                    events._private_counts["exit_name_refused"], int(identity == "guest")
                 )
 
-    def test_unbound_name_cannot_start_a_split_exit_even_with_owner_audio(self):
+    def test_unbound_owner_split_exit_checks_each_fragments_audio(self):
         harness = self.harness()
         controller, events, _roles = self.controller(harness)
         with patch.object(harness.shadow, "exit_score", wraps=harness.shadow.exit_score) as score:
             first = self.hear(controller, "Unit", f0=OWNER_F0)
             self.hear(controller, "privacy off", start=1100, f0=OWNER_F0)
-            score.assert_not_called()
+            self.assertEqual(score.call_count, 2)
         self.assertFalse(any(first))
-        self.assertEqual(harness.embedder.calls, 0)
-        self.assertEqual(events.drain(), [])
-        self.assertEqual(events._private_counts["exit_name_refused"], 1)
-        self.assertEqual(events._private_counts["exit_refused_unbound"], 1)
-        self.assertEqual(events._private_counts["exit_unnamed"], 1)
+        self.assertEqual(harness.embedder.calls, 2)
+        self.assertEqual([event.get("action") for event in events.drain()], ["exit"])
+        self.assertEqual(events._private_counts["exit_name_refused"], 0)
+        self.assertEqual(events._private_counts["exit_unnamed"], 0)
 
     def test_split_name_requires_binding_and_scores_only_the_completing_turn(self):
         for f0, allowed in ((OWNER_F0, True), (GUEST_F0, False)):

@@ -5,15 +5,17 @@ import io
 import queue
 import threading
 import unittest
+from array import array
 from dataclasses import replace
 from unittest.mock import Mock, patch
 
 import test_duck_mode as duck
 from test_live_audio import SILENCE, VOICE, FakeDiarizer
 from test_live_speaker_id import Harness, ScriptedEmbedder, settings, tone, unit, wait_for
+from test_whisper_window_recovery import BAD, GOOD, doc
 
 from rightyo.contracts import SpeakerPriority
-from rightyo.live_audio import LiveConfig, LiveProcessor
+from rightyo.live_audio import LiveConfig, LiveProcessor, _recognizer_window
 from rightyo.live_speaker_id import EnrolledRoles, EntryScore, LabelState
 from rightyo.memory import TranscriptMemory
 from rightyo.tool import _stderr
@@ -79,6 +81,276 @@ class PrivacyMinimumTests(unittest.TestCase):
             controller._feed(
                 controller._generation, processor, pcm[offset : offset + 640], "demo", shadow
             )
+
+    def test_empty_privacy_interval_preserves_and_publishes_public_prefix(self):
+        c, e, s, p, notes, units = self.arrange()
+        self.feed(c, p, VOICE * 10, s)
+        public = bytes(p._utterance)
+        c.duck(True)
+        self.assertEqual(bytes(p._utterance), public)
+        c.duck(False)
+        e.drain()
+        self.feed(c, p, SILENCE, s)
+        self.assertEqual(bytes(p._utterance[: len(public)]), public)
+        self.feed(c, p, SILENCE * 72, s)
+        p.finish()
+        self.assertEqual(bytes(units.audio[0][: len(public)]), public)
+        self.assertEqual(
+            [event["turn"]["text"] for event in e.drain() if event["type"] == "transcript"],
+            ["Authored sentence."],
+        )
+        self.assertIn("forget=skipped", notes[-1])
+
+    def test_any_nonzero_private_sample_requires_full_forget(self):
+        for samples in ([100] * 320, [0] * 319 + [1]):
+            with self.subTest(nonzero=sum(value != 0 for value in samples)):
+                c, e, s, p, notes, _ = self.arrange()
+                quiet = array("h", samples).tobytes()
+                c.duck(True)
+                with patch.object(p, "_diarizer_frame", side_effect=lambda pcm, private: pcm):
+                    self.feed(c, p, quiet, s)
+                self.assertEqual(p._diarizer.frames, [quiet])
+                self.assertEqual(e._private_counts["discarded"], 0)
+                c.duck(False)
+                self.assertTrue(p._speaker_reset)
+                self.assertGreater(s.epoch, 0)
+                self.assertIn(
+                    "diarizer_private_frames=1 forget=full reason=private_frames", notes[-1]
+                )
+
+    def test_stop_cancels_promptly_while_exit_races_a_stalled_native_push(self):
+        c, e, s, p, notes, _ = self.arrange()
+        c.duck(True)
+        entered, release = threading.Event(), threading.Event()
+        exit_started, stopped = threading.Event(), threading.Event()
+        errors = []
+        original_push = p._diarizer.push
+
+        def slow_push(pcm):
+            entered.set()
+            if not release.wait(3):
+                raise AssertionError("test did not release native push")
+            original_push(pcm)
+
+        def feed():
+            try:
+                self.feed(c, p, SILENCE, s)
+            except Exception as error:
+                errors.append(error)
+
+        def exit_privacy():
+            exit_started.set()
+            c.duck(False)
+
+        def stop():
+            c.stop()
+            stopped.set()
+
+        with patch.object(p._diarizer, "push", side_effect=slow_push):
+            workers = [threading.Thread(target=fn) for fn in (feed, exit_privacy, stop)]
+            workers[0].start()
+            try:
+                self.assertTrue(entered.wait(1))
+                workers[1].start()
+                self.assertTrue(exit_started.wait(1))
+                wait_for(lambda: not e.ducked)
+                workers[2].start()
+                self.assertTrue(stopped.wait(0.2), "Stop waited for native push")
+                self.assertTrue(c._stop.is_set())
+                self.assertTrue(c._decision_cancel.is_set())
+            finally:
+                release.set()
+                for worker in workers:
+                    if worker.ident is not None:
+                        worker.join(3)
+        self.assertEqual(errors, [])
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertIn("forget=full reason=privacy_unknown", notes[-1])
+
+    def test_exit_discards_private_recovery_inputs_results_and_held_units(self):
+        for queued_retry in (False, True):
+            with self.subTest(queued_retry=queued_retry):
+                c, e, s, p, notes, units = self.arrange()
+                entered, release = threading.Event(), threading.Event()
+                decoded, borrowed = [], []
+
+                def decode(pcm, register=None):
+                    decoded.append(True)
+                    units._window = _recognizer_window(
+                        doc(BAD if len(decoded) == 1 or queued_retry else GOOD), len(pcm) // 32
+                    )
+                    return units._window.units
+
+                def retry(_config, pcm, _register):
+                    borrowed.append(pcm)
+                    entered.set()
+                    if not release.wait(3):
+                        raise AssertionError("test did not release recovery")
+                    return doc(GOOD)
+
+                units.transcribe = decode
+                with patch("rightyo.live_audio._transcribe", side_effect=retry):
+                    c.duck(True)
+                    try:
+                        self.feed(c, p, VOICE * 10 + SILENCE * 72, s)
+                        self.assertTrue(entered.wait(1))
+                        recovery = p._recovery
+                        self.feed(c, p, VOICE * 10 + SILENCE * 72, s)
+                        held = list(p._waiting)
+                        self.assertEqual(len(held), 2)
+                        self.assertTrue(any(recovery.pcm))
+                        c.duck(False)
+                        self.assertTrue(recovery.cancelled.is_set())
+                        self.assertFalse(any(recovery.pcm))
+                        self.assertFalse(any(borrowed[0]))
+                        self.assertTrue(all(not w.pcm and not w.units for w in held))
+                        self.assertIsNone(recovery.result)
+                        self.assertIn("forget=full reason=privacy_unknown", notes[-1])
+                    finally:
+                        release.set()
+                        if p._recovery is not None:
+                            self.assertTrue(p._recovery.done.wait(3))
+                            p._drain_results()
+                    self.assertIsNone(recovery.result)
+                    e.drain()
+                    units.transcribe = lambda *_: [
+                        {"start_ms": 200, "end_ms": 400, "text": "Authored public sentence."}
+                    ]
+                    self.feed(c, p, VOICE * 10 + SILENCE * 72, s)
+                    p.finish()
+                self.assertEqual(len(borrowed), 1)
+                self.assertEqual(
+                    [x["turn"]["text"] for x in e.drain() if x["type"] == "transcript"],
+                    ["Authored public sentence."],
+                )
+
+    def test_exit_before_window_registration_refuses_late_private_decode(self):
+        c, e, s, p, _, units = self.arrange()
+        c.duck(True)
+        e.drain()
+        finalize = p._finalize
+
+        def off_before_registration(timeline, complete=False):
+            # All private frames are audited, but no finalized packet exists yet.
+            c.duck(False)
+            finalize(timeline, complete)
+
+        with patch.object(p, "_finalize", side_effect=off_before_registration):
+            self.feed(c, p, VOICE * 10 + SILENCE * 72, s)
+        self.assertEqual(units.audio, [])
+        self.assertEqual(e.drain(), [])
+        self.assertTrue(all(not w.pcm and not w.units for w in p._waiting))
+        self.feed(c, p, VOICE * 10 + SILENCE * 72, s)
+        p.finish()
+        self.assertEqual(len(units.audio), 1)
+        self.assertEqual(
+            [x["turn"]["text"] for x in e.drain() if x["type"] == "transcript"],
+            ["Authored sentence."],
+        )
+
+    def test_exit_clears_completed_recovery_result_before_its_ordered_release(self):
+        c, e, s, p, _, units = self.arrange()
+        units.transcribe = lambda *_: []
+        units._window = _recognizer_window(doc(BAD), 1640)
+        c.duck(True)
+        e.drain()
+        release = threading.Event()
+
+        def retry(*_):
+            release.wait(3)
+            return doc(GOOD)
+
+        with patch("rightyo.live_audio._transcribe", side_effect=retry):
+            try:
+                self.feed(c, p, VOICE * 10 + SILENCE * 72, s)
+                recovery = p._recovery
+            finally:
+                release.set()
+            # No more audio: leave the completed result in the worker's result slot.
+            self.assertTrue(recovery.done.wait(3))
+            result = recovery.result
+            self.assertTrue(bool(result.units))
+            packet_pcm = recovery.packet.pcm
+            c.duck(False)
+            self.assertFalse(bool(result.units))
+            self.assertIsNone(recovery.result)
+            self.assertFalse(any(packet_pcm))
+            self.assertTrue(all(not w.units and not w.pcm for w in p._waiting))
+            p._drain_results()
+        self.assertEqual(e.drain(), [])
+
+    def test_cutoff_preserves_public_prefix_and_silences_only_private_samples(self):
+        c, e, s, p, _, _ = self.arrange()
+        self.feed(c, p, VOICE * 10, s)
+        public = bytes(p._utterance)
+        c.duck(True)
+        self.assertEqual(bytes(p._utterance), public)
+        self.feed(c, p, VOICE * 10, s)
+        c.duck(False)
+        self.feed(c, p, SILENCE, s)
+        self.assertEqual(bytes(p._utterance[: len(public)]), public)
+        self.assertFalse(any(p._utterance[len(public) :]))
+
+    def test_entry_discards_recovery_window_spanning_the_on_boundary(self):
+        c, e, s, p, _, units = self.arrange()
+        entered, release = threading.Event(), threading.Event()
+        units.transcribe = lambda *_: []
+        units._window = _recognizer_window(doc(BAD), 1640)
+
+        def retry(*_):
+            entered.set()
+            release.wait(3)
+            return doc(GOOD)
+
+        with patch("rightyo.live_audio._transcribe", side_effect=retry):
+            try:
+                self.feed(c, p, VOICE * 10 + SILENCE * 72, s)
+                self.assertTrue(entered.wait(1))
+                recovery = p._recovery
+                # Exercise the processor boundary at a sample inside the held window.
+                p.begin_privacy(100 * 32)
+                self.assertTrue(recovery.cancelled.is_set())
+                self.assertFalse(any(recovery.pcm))
+                self.assertFalse(recovery.packet.units)
+            finally:
+                release.set()
+                if p._recovery is not None:
+                    self.assertTrue(p._recovery.done.wait(3))
+                    p._drain_results()
+        self.assertEqual(e.drain(), [])
+
+    def test_processor_split_exit_authenticates_both_unlabelled_fragments(self):
+        for scores, allowed in (((0.9, 0.9), True), ((0.1,), False), ((0.9, 0.1), False)):
+            with self.subTest(scores=scores):
+                c, e, s, p, _, units = self.arrange()
+                s._labels["Speaker A"] = LabelState(state="bound", identity="owner", seconds=4)
+                c._enrolled_roles.exit_audio = c._private_sentence
+                s.exit_score = Mock(side_effect=[EntryScore(n, None, 0, "scored") for n in scores])
+                phrases = iter(("Jarvis", "privacy off"))
+                units.transcribe = lambda *_: [
+                    {"start_ms": 0, "end_ms": 200, "text": next(phrases)}
+                ]
+                p.config = replace(
+                    p.config,
+                    on_private_turn_audio=lambda t, pcm: c._private_turn_audio(
+                        c._generation, t, pcm
+                    ),
+                )
+                turns = []
+                on_turn = p.on_turn
+                p.on_turn = lambda t: (turns.append(t), on_turn(t))
+                c.duck(True)
+                e.drain()
+                self.feed(c, p, VOICE * 10 + SILENCE * 72, s)
+                self.assertEqual(e._private_name_end is not None, scores[0] > 0.5)
+                self.assertFalse(bool(c._private_sentence.pcm))
+                self.feed(c, p, VOICE * 10 + SILENCE * 72, s)
+                self.assertEqual("exit" in [x.get("action") for x in e.drain()], allowed)
+                self.assertEqual(s.exit_score.call_count, len(scores))
+                self.assertTrue(all(t.speaker_id is None for t in turns))
+                if len(scores) == 2:
+                    self.assertFalse(bool(c._private_sentence.pcm))
+                self.assertEqual(s.offered, 0)
 
     def test_silent_privacy_keeps_every_public_label_state_and_next_owner_role(self):
         c, e, s, p, notes, _ = self.arrange()
@@ -149,7 +421,7 @@ class PrivacyMinimumTests(unittest.TestCase):
         self.assertEqual(s.binding("Speaker A"), ("bound", "owner"))
         self.assertIs(p._diarizer, native)
         self.assertEqual(s.epoch, 0)
-        self.assertIn("diarizer_private_voiced=0 forget=skipped", notes[-1])
+        self.assertIn("diarizer_private_frames=0 forget=skipped", notes[-1])
         self.assertTrue(units.audio)  # local private ASR remains the exit-phrase path
 
     def test_engagement_and_nameless_follow_up_survive_privacy(self):
@@ -182,7 +454,7 @@ class PrivacyMinimumTests(unittest.TestCase):
         self.assertGreater(s.epoch, 0)
         self.assertTrue(e._labels_renewed)
         self.assertIn(
-            "discarded=0 diarizer_private_voiced=1 forget=full reason=private_voiced", notes[-1]
+            "discarded=0 diarizer_private_frames=1 forget=full reason=private_frames", notes[-1]
         )
 
     def test_unknown_or_raising_predicate_fails_closed_even_with_substitution(self):
@@ -238,7 +510,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                 p.finish()
                 self.assertEqual(native.frames, [bytes(len(tail)) if substitute else tail])
                 c.duck(False)
-                self.assertIn("diarizer_private_voiced=" + str(int(not substitute)), notes[-1])
+                self.assertIn("diarizer_private_frames=" + str(int(not substitute)), notes[-1])
                 self.assertEqual(s.epoch > 0, not substitute)
 
     def test_exit_with_an_unaudited_frame_in_flight_renews_fail_closed(self):
@@ -510,7 +782,7 @@ class PrivacyMinimumTests(unittest.TestCase):
             c.duck(False)
         self.assertRegex(
             output.getvalue().splitlines()[-1],
-            r"^rightyo: privacy off: discarded=1 diarizer_private_voiced=0 forget=skipped$",
+            r"^rightyo: privacy off: discarded=1 diarizer_private_frames=0 forget=skipped$",
         )
         self.assertNotIn("Authored", output.getvalue())
         self.assertNotIn("Speaker", output.getvalue())

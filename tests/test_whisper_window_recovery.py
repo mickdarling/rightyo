@@ -194,7 +194,9 @@ class WhisperWindowRecoveryTests(unittest.TestCase):
             processor.finish()
         self.assertEqual(decode.call_count, 2)
         first, retry = decode.call_args_list
-        self.assertIs(first.args[1], retry.args[1])
+        # Recovery owns wipeable PCM; it must retry the exact samples, even when
+        # the replaceable initial transcriber required an immutable bytes input.
+        self.assertEqual(first.args[1], retry.args[1])
         self.assertTrue(callable(first.args[2]))
         self.assertTrue(callable(retry.args[2]))  # separate, cancellable process ownership
         self.assertEqual(first.args[0].whisper_executable, retry.args[0].whisper_executable)

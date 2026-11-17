@@ -1652,12 +1652,9 @@ class SpeechEvents:
         # matched at all (#242 round 23, see `transcript`): one heard in an earlier private
         # period and released late can never end this one, answer its status or be counted.
         if "name" in kinds:
-            # A name alone is not an exit: only an existing owner binding may accept
-            # the fragment. Never voice-score its audio, and erase it after the check.
-            try:
-                allowed, reason = self._binding_exit_check(turn, inferred)
-            finally:
-                self._clear_exit_audio()
+            # Authenticate both split fragments independently. Private processor turns
+            # are unlabelled: only their own isolated voice can authenticate them.
+            allowed, reason = self._exit_check(turn, inferred)
             if allowed:
                 self._private_name_end = turn.end_ms
             else:

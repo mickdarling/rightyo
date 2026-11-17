@@ -1987,6 +1987,9 @@ class PrototypeController:
                 if on and self._events.ducked is not True:
                     # #242 round 27: where this privacy interval starts, in stream bytes.
                     self._private_from_bytes = self._received_bytes
+                    begin = getattr(getattr(self, "_processor", None), "begin_privacy", None)
+                    if callable(begin):
+                        begin(self._received_bytes)
                 # At least the end of every piece received so far, held ones included. Every
                 # applied on, a redundant one included, is acked (#735 S-8): audio received
                 # after the ack's `at_ms` falls inside the span.
@@ -2017,7 +2020,7 @@ class PrototypeController:
                             and (
                                 result[1] is None
                                 or type(result[1]) is str
-                                and result[1] in {"private_voiced", "privacy_unknown"}
+                                and result[1] in {"private_frames", "privacy_unknown"}
                             )
                         ):
                             count, reason = result
@@ -2031,7 +2034,7 @@ class PrototypeController:
                         with contextlib.suppress(Exception):
                             self.report(
                                 f"privacy off: discarded={discarded} "
-                                f"diarizer_private_voiced={count} "
+                                f"diarizer_private_frames={count} "
                                 + (f"forget=full reason={reason}" if reason else "forget=skipped")
                             )
 

@@ -8,13 +8,17 @@ Remote audio must use authenticated encrypted transport and an authorized source
 
 In privacy mode, the local tool retains at most one finalized sentence's PCM in a
 mutable RAM buffer (10 s / 320,000 bytes at mono 16 kHz s16le), exclusively to check a
-complete named exit phrase. Name-only fragments use the existing owner-binding check
-and are never voice-scored. Oversized or incomplete sentences refuse the voice check.
+named exit phrase or either fragment of a split exit. Each fragment must independently
+pass the owner check; unlabelled private processor turns use only their isolated voice.
+Oversized or incomplete sentences refuse the voice check.
 Replacement, every exit-check outcome, privacy changes, speaker forget, Stop and session
 teardown overwrite this buffer with zeros before release. Private audio never enters
 speaker binding/accumulation, disk, logs or hosted speech; only fixed diagnostic tokens
 and the exit score number may be reported. Local ASR still assembles the current
 utterance in bounded memory. See [the exact retention contract](docs/tool-api.md#audio-and-logs).
+Local ASR recovery also has bounded queued windows. Privacy boundaries zero owned
+mutable recovery PCM, drop intersecting held text/results, and cancel private retries;
+an unaccountable in-flight decoder copy requires full speaker forget.
 
 Retained while private: the single rolling buffer holding the most recent finalized
 private turn, in RAM, zeroed on overwrite, after any exit check and at privacy-off or
