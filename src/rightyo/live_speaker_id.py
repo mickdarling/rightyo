@@ -692,10 +692,13 @@ class ShadowSpeakerId:
             )
             if epoch > 0 and state.state != "bound":
                 # Renewal changes labels, not enrollment. The first independently scored
-                # public turn can bind without the accumulated-duration requirement.
+                # public turn can bind with accumulated evidence, without the duration minimum.
                 best = min(turn_scores, key=lambda key: (-turn_scores[key], key))
-                if turn_scores[best] >= self.settings.bind_threshold:
-                    state.state, state.identity, state.score = "bound", best, turn_scores[best]
+                if (
+                    turn_scores[best] >= self.settings.bind_threshold
+                    and state.scores.get(best, -1.0) >= self.settings.bind_threshold
+                ):
+                    state.state, state.identity, state.score = "bound", best, state.scores[best]
             if previous is None or (previous.state, previous.identity) != (
                 state.state,
                 state.identity,

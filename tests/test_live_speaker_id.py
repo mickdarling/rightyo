@@ -276,6 +276,56 @@ class ShadowTests(unittest.TestCase):
         wait_for(lambda: harness.shadow.binding("Speaker A") == ("bound", "owner"))
         harness.shadow.close(drain=True)
 
+    def accumulated_sequence(self, scores, *, renewed, seconds=2.0):
+        vectors = [unit(score, 0, math.sqrt(1 - score * score)) for score in scores]
+        harness = Harness(ScriptedEmbedder(vectors), entries=ENTRIES[:1])
+        harness.shadow.start()
+        try:
+            if renewed:
+                harness.shadow.forget()
+            for count in range(1, len(scores) + 1):
+                harness.speak(seconds)
+                wait_for(lambda: harness.shadow.scored == count)
+        finally:
+            harness.shadow.close(drain=True)
+        return harness, [Harness.fields(line) for line in harness.notes()]
+
+    def test_fresh_post_renewal_label_rebinds_at_the_bind_threshold(self):
+        for score in (0.60, 0.75):
+            with self.subTest(score=score):
+                harness, notes = self.accumulated_sequence([score], renewed=True)
+                self.assertEqual(harness.shadow.binding("Speaker A"), ("bound", "owner"))
+                self.assertEqual(notes[0]["acc_score"], f"{score:.3f}")
+                self.assertLess(harness.shadow._labels["Speaker A"].seconds, 3.0)
+
+    def test_post_renewal_rebind_needs_accumulated_evidence(self):
+        scores = [0.30, 0.30, 0.30, 0.75]
+        baseline, before = self.accumulated_sequence(scores, renewed=False)
+        harness, after = self.accumulated_sequence(scores, renewed=True)
+        state = harness.shadow._labels["Speaker A"]
+        self.assertLess(state.scores["owner"], 0.45)
+        self.assertEqual(state.state, "unknown")
+        self.assertEqual(state.state, baseline.shadow._labels["Speaker A"].state)
+        self.assertEqual([n["state"] for n in after], [n["state"] for n in before])
+        self.assertEqual(harness.shadow._bound_ids, set())
+
+    def test_mixed_post_renewal_label_keeps_epoch_zero_accumulated_evidence(self):
+        scores = [0.30, 0.75] * 4
+        _, before = self.accumulated_sequence(scores, renewed=False)
+        harness, after = self.accumulated_sequence(scores, renewed=True)
+        self.assertEqual([n["state"] for n in after], [n["state"] for n in before])
+        self.assertEqual(after[-1]["state"], "tentative")
+        self.assertEqual(harness.shadow._bound_ids, set())
+
+    def test_post_renewal_rebind_diagnostic_reports_accumulated_evidence(self):
+        harness, notes = self.accumulated_sequence([0.50, 0.75], renewed=True, seconds=1.2)
+        state = harness.shadow._labels["Speaker A"]
+        self.assertEqual(state.state, "bound")
+        self.assertLess(state.seconds, harness.shadow.settings.bind_min_seconds)
+        self.assertAlmostEqual(state.score, state.scores["owner"])
+        self.assertEqual(notes[-1]["acc_score"], f"{state.scores['owner']:.3f}")
+        self.assertNotEqual(notes[-1]["acc_score"], notes[-1]["turn_score"])
+
     def test_forget_restarts_the_owner_voice_evidence(self):
         # #242 round 18: seconds scored before the forget, kept without the owner binding
         # they produced, would soon report the recognised owner as unrecognised.
