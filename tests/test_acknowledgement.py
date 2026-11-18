@@ -174,10 +174,10 @@ class AcknowledgementEventTests(SessionHarness, unittest.TestCase):
         self.assertIs(request["acknowledge"], True)
 
     def test_a_low_confidence_follow_up_gets_no_ack(self):
-        # Live evidence (#132): "Okay, great." as a follow-up, confidence 0.22.
+        # Authored non-courtesy follow-up: courtesy alone is refused before ack (#296).
         self.start(conversation=Conversation(window_ms=10000))
         self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend", 0.92)
-        request = self.say(turn("t2", 2000, 2600, "Okay, great."), "uncertain", 0.22, 0.45)
+        request = self.say(turn("t2", 2000, 2600, "And tomorrow?"), "uncertain", 0.22, 0.45)
         self.assertIs(request["decision"]["follow_up"], True)
         self.assertIs(request["acknowledge"], False)
         self.assertEqual(
@@ -210,12 +210,12 @@ class AcknowledgementEventTests(SessionHarness, unittest.TestCase):
     def test_notes_never_carry_transcript_text_or_ids(self):
         self.start(conversation=Conversation(window_ms=10000))
         self.say(turn("t1", 0, 900, "Haili, what time is it?"), "attend", 0.92)
-        self.say(turn("t2", 2000, 2600, "Okay, great."), "uncertain", 0.22, 0.45)
+        self.say(turn("t2", 2000, 2600, "And tomorrow?"), "uncertain", 0.22, 0.45)
         # Two acknowledgement notes, then the follow-up note, written after its request (#153).
         self.assertEqual(len(self.notes), 3)
         self.assertTrue(self.notes[2].startswith("follow_up "))
         for note in self.notes:
-            for content in ("Haili", "time", "great", "t1", "t2", SESSION, "Speaker"):
+            for content in ("Haili", "time", "tomorrow", "t1", "t2", SESSION, "Speaker"):
                 self.assertNotIn(content, note)
 
     def test_unattended_turns_produce_no_note(self):

@@ -592,9 +592,20 @@ class Conversation:
         request, means it is no closing. Nor is a turn that ends as a question: a bare
         "That's it?" is surprise, not a goodbye.
         """
+        return True in self._closing_parse(text)
+
+    def is_courtesy_only(self, text: str) -> bool:
+        """Whether a non-question turn contains only courtesies and no closing (#296)."""
+        parsed = self._closing_parse(text)
+        return False in parsed and True not in parsed
+
+    def _closing_parse(self, text: str) -> set[bool]:
+        """Parse courtesy/closing units; each result says whether a closing was seen."""
         if _QUESTION_END.search(text):
-            return False
+            return set()
         words = tuple(normalize_phrase(text).split())
+        if not words:
+            return set()
         phrases = {tuple(normalize_phrase(phrase).split()) for phrase in self.closing_phrases}
         units = [(unit, False) for unit in _COURTESY] + [(unit, True) for unit in phrases]
         # reach[i]: whether words[:i] parses into units, and whether one was a closing phrase.
@@ -606,7 +617,7 @@ class Conversation:
             for unit, closing in units:
                 if words[index : index + len(unit)] == unit:
                     reach[index + len(unit)].update(seen or closing for seen in reach[index])
-        return True in reach[len(words)]
+        return reach[len(words)]
 
     @classmethod
     def from_dict(cls, raw: Any) -> Conversation:

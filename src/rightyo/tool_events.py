@@ -2614,6 +2614,13 @@ class SpeechEvents:
         if conversation.is_closing(turn.text):
             # A closing phrase ends the conversation; it is never a request of its own.
             return "closing"
+        if (
+            conversation.is_courtesy_only(turn.text)
+            and not self._named(turn)
+            and not self._question_pending(turn)
+        ):
+            # Courtesy alone is not a follow-up, even with appendix or cue waivers (#296).
+            return "courtesy"
         needs_cue = (
             not self._cue_waived(decision)
             and not follow_up_cued(turn.text, self._addressing)
@@ -2638,10 +2645,14 @@ class SpeechEvents:
         bar = self._conversation.cue_min_attend
         return bar is not None and decision.probabilities["attend"] >= bar
 
+    def _question_pending(self, turn):
+        """Whether the assistant's question is pending when this turn starts."""
+        asked = self._asked_at
+        return asked is not None and turn.start_ms >= asked
+
     def _answers_question(self, turn):
         """Whether a turn starting after a reply that asked the owner a question answers it."""
-        asked = self._asked_at
-        return asked is not None and turn.start_ms >= asked and answer_shaped(turn.text)
+        return self._question_pending(turn) and answer_shaped(turn.text)
 
     def _continues(self, turn, decision):
         """Whether the engaged speaker's own turn continues the exchange (#213): with
