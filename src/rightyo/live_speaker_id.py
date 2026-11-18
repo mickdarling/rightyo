@@ -401,7 +401,7 @@ class ShadowSpeakerId:
         self._epoch = 0
         # Binding changes invalidate cached authority without resetting label evidence or
         # discarding other queued public turns (the separate forget epoch's job).
-        self._binding_revision = 0
+        self._binding_revisions: dict[str, int] = {}
         self._epoch_lock = threading.Lock()
         self.scored_seconds = 0.0
         self._stop = threading.Event()  # discard pending work and exit
@@ -453,11 +453,13 @@ class ShadowSpeakerId:
     def binding_snapshot(self, label: str):
         """An atomic binding/revision snapshot; detects changes away and back too.
 
-        Only state/identity changes advance the revision, not new evidence for the same
-        binding. Never waits for inference; shares the brief bookkeeping lock.
+        Only this label's state/identity changes advance its revision, not another
+        label's binding or new evidence for the same binding. The forget epoch also
+        invalidates snapshots across renewal. Never waits for inference; shares the
+        brief bookkeeping lock.
         """
         with self._epoch_lock:
-            return self._binding_revision, self.binding(label)
+            return (self._epoch, self._binding_revisions.get(label, 0)), self.binding(label)
 
     def owner_evidence(self, owners) -> tuple[bool, bool, float]:
         """Owner-voice evidence for `owners` (rightyo#164); never waits on the worker.
@@ -647,7 +649,7 @@ class ShadowSpeakerId:
         without the bindings they produced, would soon report a recognised owner as not."""
         with self._epoch_lock:
             self._epoch += 1
-            self._binding_revision += 1
+            self._binding_revisions = {}
             self._labels = {}
             self._bound_ids = set()
             self.scored_seconds = 0.0
@@ -698,7 +700,7 @@ class ShadowSpeakerId:
                 state.state,
                 state.identity,
             ):
-                self._binding_revision += 1
+                self._binding_revisions[label] = self._binding_revisions.get(label, 0) + 1
             self._labels[label] = state
             self.scored += 1
             if state.state == "bound" and state.identity is not None:

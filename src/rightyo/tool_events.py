@@ -1229,15 +1229,16 @@ class SpeechEvents:
     def _binding_snapshot(self, turn):
         """Identity evidence only, never audio/text. Unknown providers fail closed.
 
-        Real speaker ID supplies a revision as well as the binding, so an owner -> guest
-        -> owner transition cannot reuse an old approval. Legacy adapters supply their
-        current binding; all approvals still require a fresh owner check at commit.
+        Real speaker ID supplies a per-label revision as well as the binding, so an
+        owner -> guest -> owner transition cannot reuse an old approval. Legacy adapters
+        supply their current binding, but cannot authorize a binding-derived exit.
         """
         try:
             source = getattr(self._priority, "source", None)
             snapshot = getattr(source, "binding_snapshot", None)
             if callable(snapshot):
-                evidence = snapshot(turn.speaker_id)
+                revision, binding = snapshot(turn.speaker_id)
+                evidence = (revision, binding)
             else:
                 lookup = getattr(source, "binding", None)
                 if not callable(lookup):
@@ -1247,8 +1248,12 @@ class SpeechEvents:
         except Exception:  # noqa: BLE001 - private exceptions may contain words
             return None
 
-    def _binding_unchanged(self, checks, turn):
-        return checks.binding is not None and checks.binding == self._binding_snapshot(turn)
+    def _binding_unchanged(self, checks, turn, *, require_revision=False):
+        return (
+            checks.binding is not None
+            and (not require_revision or checks.binding[3][0] is not None)
+            and checks.binding == self._binding_snapshot(turn)
+        )
 
     def _voice_checks_current(self, checks, turn, inferred):
         return (
@@ -1797,7 +1802,7 @@ class SpeechEvents:
         if outcome[0]:
             allowed, reason = self._binding_exit_check(turn, inferred)
             if checks.exit_origin == "binding":
-                if not allowed or not self._binding_unchanged(checks, turn):
+                if not allowed or not self._binding_unchanged(checks, turn, require_revision=True):
                     outcome = False, reason or "voice_unavailable"
             elif checks.exit_origin == "voice":
                 if not allowed and reason in {"inferred", "playback", "no_owner_check"}:

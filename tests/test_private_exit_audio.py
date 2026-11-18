@@ -205,6 +205,114 @@ class PrivateExitTests(unittest.TestCase):
                         check.assert_called_once()
                     self.assertEqual([event.get("action") for event in e.drain()], expected)
 
+    def unrelated_binding_during_approval(self, *, entry):
+        for change in ("bind", "unbind"):
+            with self.subTest(change=change):
+                vector = unit(0, 1, 0) if change == "bind" else unit(0, 0, 1)
+                h = self.harness(ScriptedEmbedder([vector] * 8))
+                c, e, _ = self.controller(h)
+                h.shadow._labels["Speaker A"] = LabelState(
+                    state="bound", identity="owner", seconds=4
+                )
+                if change == "unbind":
+                    h.shadow._labels["Speaker B"] = LabelState(state="bound", identity="guest")
+                before = h.shadow.binding_snapshot("Speaker A")
+                other_before = h.shadow.binding_snapshot("Speaker B")
+                if entry:
+                    c.duck(False)
+                    e.drain()
+                    c._observe_spans(c._generation, "live-40000", ((40000, 41000),))
+                prepare = e.prepare_transcript
+
+                def unrelated(*args, **kwargs):
+                    ticket = prepare(*args, **kwargs)
+                    self.assertTrue(ticket.entry if entry else ticket.exit[0])
+                    h.speak(4, speaker="Speaker B")
+                    wait_for(lambda: h.shadow.scored == 1)
+                    self.assertEqual(
+                        h.shadow.binding("Speaker B")[0], "bound" if change == "bind" else "unknown"
+                    )
+                    return ticket
+
+                with (
+                    patch.object(e, "prepare_transcript", side_effect=unrelated),
+                    patch.object(
+                        h.shadow, "entry_score", return_value=EntryScore(0.9, None, 0, "scored")
+                    ),
+                ):
+                    self.hear(c, "privacy mode" if entry else EXIT, start=40000, inferred=entry)
+                events = e.drain()
+                if entry:
+                    self.assertEqual(len(events), 1)
+                    self.assertEqual(events[0]["turn"]["role"], "owner")
+                    self.assertEqual(events[0].get("role_source"), "voiceprint_label")
+                else:
+                    self.assertEqual([event.get("action") for event in events], ["exit"])
+                self.assertEqual(h.shadow.binding_snapshot("Speaker A"), before)
+                self.assertNotEqual(h.shadow.binding_snapshot("Speaker B"), other_before)
+
+    def test_unrelated_binding_changes_preserve_owner_privacy_entry(self):
+        self.unrelated_binding_during_approval(entry=True)
+
+    def test_unrelated_binding_changes_preserve_owner_privacy_exit(self):
+        self.unrelated_binding_during_approval(entry=False)
+
+    def test_own_binding_revocation_drops_entry_authority(self):
+        h = self.harness(ScriptedEmbedder([unit(0, 1, 0)] * 8))
+        c, e, _ = self.controller(h)
+        c.duck(False)
+        e.drain()
+        h.shadow._labels["Speaker A"] = LabelState(state="bound", identity="owner", seconds=4)
+        c._observe_spans(c._generation, "live-40000", ((40000, 41000),))
+        prepare = e.prepare_transcript
+
+        def revoked(*args, **kwargs):
+            ticket = prepare(*args, **kwargs)
+            self.assertTrue(ticket.entry)
+            h.speak(4)
+            wait_for(lambda: h.shadow.scored == 1)
+            self.assertEqual(h.shadow.binding("Speaker A"), ("bound", "guest"))
+            return ticket
+
+        with (
+            patch.object(e, "prepare_transcript", side_effect=revoked),
+            patch.object(h.shadow, "entry_score", return_value=EntryScore(0.9, None, 0, "scored")),
+        ):
+            self.hear(c, "privacy mode", start=40000, inferred=True)
+        events = e.drain()
+        self.assertEqual(len(events), 1)
+        self.assertNotIn("role_source", events[0])
+
+    def test_binding_exit_without_a_revision_fails_closed(self):
+        for missing in ("adapter", "ticket"):
+            with self.subTest(missing=missing):
+                h = self.harness()
+                c, e, _ = self.controller(h)
+                h.shadow._labels["Speaker A"] = LabelState(state="bound", identity="owner")
+                prepare = e.prepare_transcript
+
+                def no_revision(*args, **kwargs):
+                    ticket = prepare(*args, **kwargs)
+                    self.assertEqual(ticket.exit_origin, "binding")
+                    return replace(
+                        ticket, binding=(*ticket.binding[:3], (None, ticket.binding[3][1]))
+                    )
+
+                with (
+                    patch.object(
+                        h.shadow,
+                        "binding_snapshot",
+                        None if missing == "adapter" else h.shadow.binding_snapshot,
+                    ),
+                    patch.object(
+                        e,
+                        "prepare_transcript",
+                        side_effect=no_revision if missing == "ticket" else prepare,
+                    ),
+                ):
+                    self.hear(c)
+                self.assertEqual(e.drain(), [])
+
     def test_binding_revision_invalidates_rebound_exit_and_entry_evidence(self):
         # Use the actual worker to change owner -> guest -> owner. Comparing only the
         # final binding tuple would wrongly accept the evidence from before both changes.

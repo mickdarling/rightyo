@@ -102,6 +102,10 @@ class Bindings:
     def binding(self, label):
         return self.labels.get(label)
 
+    def binding_snapshot(self, label):
+        # Static authored bindings: no asynchronous scoring worker in this stand-in.
+        return 0, self.binding(label)
+
 
 class Checked(Bindings):
     """`Bindings` with a privacy-entry voice check that scores every turn's own pieces
