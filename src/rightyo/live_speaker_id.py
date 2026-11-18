@@ -23,9 +23,8 @@ gives a bound label its enrolled identifier's configured role; it never waits fo
 Embedding runs on a dedicated worker thread behind a small bounded queue, never on the
 audio thread: when the worker is busy, a turn is dropped and counted. A worker that fails
 is reported once and switches shadow identification off for the rest of the session; the
-normal shadow scoring stays asynchronous. Initial public binding candidates may wait up
-to 300 ms for their own score; after renewal they wait until scoring finishes, as before.
-Privacy controls and Stop remain responsive. Audio is never
+normal live scoring stays asynchronous. After a renewal, unbound roles wait for their
+own score before publication; privacy controls and Stop remain responsive. Audio is never
 written: the ring holds at most `RING_MS` of PCM in memory by default
 (`audio_retention.speaker_ring_seconds` sets it, #226) and is cleared when the session ends.
 
@@ -73,7 +72,6 @@ QUEUE_SIZE = 4
 # a check not done by then refuses, the safe failure. At most this many wait at once.
 ENTRY_CHECK_TIMEOUT_S = 2.0
 ENTRY_CHECKS = 4
-PUBLIC_SCORE_WAIT_S = 0.3
 PRIVATE_TURN_MAX_BYTES = 10 * SAMPLE_RATE * 2
 
 
@@ -360,14 +358,8 @@ def _default_entries(settings: SpeakerIdConfig) -> list[dict[str, Any]]:
     return Store(settings.store).entries()[0]
 
 
-class _ScoringDone(threading.Event):
-    """One queue item's completion and its own new binding, never a later turn's."""
-
-    binding = None
-
-
 class ShadowSpeakerId:
-    """Per-session identification; asynchronous unless `turn(wait=True)` is requested."""
+    """Per-session identification; ordinary `audio` and `turn` calls never block or raise."""
 
     def __init__(
         self,
@@ -388,7 +380,7 @@ class ShadowSpeakerId:
         self._report_to = report
         self._embedder_factory = embedder_factory
         self._entries = entries
-        self._queue: queue.Queue[tuple[int, str, int, int, bytes, _ScoringDone | None]] = (
+        self._queue: queue.Queue[tuple[int, str, int, int, bytes, threading.Event | None]] = (
             queue.Queue(maxsize=queue_size)
         )
         # Privacy-entry voice checks (#735), taken before queued turns: a caller waits on one.
@@ -508,14 +500,13 @@ class ShadowSpeakerId:
 
     def turn(
         self, turn, *, inferred: bool = False, spans=None, epoch: int | None = None, wait=False
-    ):
+    ) -> None:
         """Queue one finalized turn for scoring; never raises.
 
-        `wait` finishes an unbound public turn's own scoring after renewal; at epoch zero
-        only a possible binding turn waits, for at most PUBLIC_SCORE_WAIT_S. Returns its
-        revision/binding snapshot only if this item created a bind;
-        timeout, failure, discard or insufficient speech returns None. Shadow scoring
-        remains asynchronous. No waiting for inferred, overlap or unscorable turns.
+        `wait` is used only for unbound public roles after a renewal: finish this turn's
+        scoring before its role is first published. The embedder owns its request timeout;
+        worker failure/discard also releases the waiter.
+        Normal shadow scoring remains asynchronous.
 
         `spans` are the `(start_ms, end_ms)` stream-time pieces of the turn's span that the
         diarizer timeline gave the turn's own label and no other speaker (#148). Only that
@@ -566,38 +557,17 @@ class ShadowSpeakerId:
             if not pcm:
                 return
             try:
-                can_wait = False
-                if wait and not inferred:
-                    seconds = min(len(speech(_samples(pcm))) / SAMPLE_RATE, MAX_VERIFY_SECONDS)
-                    state = self._labels.get(turn.speaker_id)
-                    can_wait = seconds >= self.settings.min_turn_seconds and (
-                        epoch > 0
-                        or self.settings.single_turn_bind_threshold is not None
-                        or state is None
-                        or state.state == "tentative"
-                        or (
-                            state.seconds + seconds >= self.settings.bind_min_seconds
-                            and state.score is not None
-                            and state.score >= self.settings.tentative_threshold
-                        )
-                    )
-                done = _ScoringDone() if can_wait else None
+                done = threading.Event() if wait else None
                 self._queue.put_nowait(
                     (epoch, turn.speaker_id, turn.end_ms - turn.start_ms, labelled_ms, pcm, done)
                 )
                 if done is not None:
-                    if epoch > 0:
-                        while not done.wait(0.05):
-                            # Admission can race the worker's final drain. Never leave a
-                            # late enqueue waiting on a worker that has already exited.
-                            if self._off.is_set() or self._stop.is_set():
-                                self._discard_queue()
-                                return
-                        return done.binding
-                    if done.wait(PUBLIC_SCORE_WAIT_S):
-                        return done.binding
-                if self._off.is_set() or self._stop.is_set():
-                    self._discard_queue()
+                    while not done.wait(0.05):
+                        # Admission can race the worker's final drain. Never leave a
+                        # late enqueue waiting on a worker that has already exited.
+                        if self._off.is_set() or self._stop.is_set():
+                            self._discard_queue()
+                            return
             except queue.Full:
                 self.dropped += 1
                 if self.dropped == 1:
@@ -654,9 +624,7 @@ class ShadowSpeakerId:
                 try:
                     if self._stop.is_set():
                         break
-                    result = self._score(embedder, prints, *item[:-1])
-                    if item[-1] is not None:
-                        item[-1].binding = result
+                    self._score(embedder, prints, *item[:-1])
                 finally:
                     if item[-1] is not None:
                         item[-1].set()
@@ -746,9 +714,6 @@ class ShadowSpeakerId:
                 state.identity,
             ):
                 self._binding_revisions[label] = self._binding_revisions.get(label, 0) + 1
-            result = None
-            if state.state == "bound" and (previous is None or previous.state != "bound"):
-                result = ((epoch, self._binding_revisions[label]), (state.state, state.identity))
             self._labels[label] = state
             self.scored += 1
             if state.state == "bound" and state.identity is not None:
@@ -763,7 +728,6 @@ class ShadowSpeakerId:
             f" acc_s={state.seconds:.1f} state={state.state} id={state.identity}{self._route}"
             f" bind={rule}"
         )
-        return result
 
     def entry_score(self, start_ms: int, end_ms: int, spans, owners) -> EntryScore:
         """A privacy-entry voice check (hailing-station #735, rightyo#250): the turn's own
@@ -1035,7 +999,6 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         # The latest turn's own-label pieces, as (utterance id, spans), for `entry_voice`.
         self._spans = None
         self.exit_audio: PrivateTurnAudio | None = None
-        self._publication = None  # utterance id, before snapshot, own scoring result; no text
 
     def clear_exit_audio(self) -> None:
         if self.exit_audio is not None:
@@ -1069,32 +1032,10 @@ class EnrolledRoles(ConfiguredPriorityProvider):
 
     def role_for(self, turn) -> str:
         self._resolved = None
-        publication = self._publication
-        if publication is not None and publication[0] == turn.utterance_id:
-            _, before, scored = publication
-            binding = None
-            try:
-                current = self.source.binding_snapshot(turn.speaker_id)
-                if current[0][0] == before[0][0]:
-                    binding = before[1]
-                    if scored is not None and current == scored:
-                        binding = scored[1]
-            except Exception:  # noqa: BLE001 - failed or renewed evidence cannot upgrade
-                pass
-            role, binding = self._lookup(turn, publication_binding=(binding,))
-        else:
-            role, binding = self._lookup(turn)
+        role, binding = self._lookup(turn)
         if binding is not None:
             self._resolved = (turn.utterance_id, turn.speaker_id, binding)
         return role
-
-    def note_publication(self, turn, before, scored) -> None:
-        """Freeze an unbound turn's initial evidence, upgrading only on its own bind.
-
-        Revalidated at role resolution against both epoch and binding revision. A timeout
-        keeps the initial role even if a later queued turn binds before publication.
-        """
-        self._publication = (turn.utterance_id, before, scored)
 
     def role_of(self, turn) -> str:
         """The role `role_for` would give `turn` now, without recording the binding.
@@ -1198,7 +1139,7 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         except Exception:  # noqa: BLE001 - diagnostics never fail the session
             return "error"
 
-    def _lookup(self, turn, *, publication_binding=None) -> tuple[str, tuple | None]:
+    def _lookup(self, turn) -> tuple[str, tuple | None]:
         """A turn's role and the binding it came from (None when no binding was used)."""
         label = turn.speaker_id
         if label is None:
@@ -1211,9 +1152,7 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         if source is None or turn.overlap or turn.speaker_provenance != "diarization-timeline":
             return "unknown", None
         try:
-            binding = (
-                source.binding(label) if publication_binding is None else publication_binding[0]
-            )
+            binding = source.binding(label)
         except Exception:  # noqa: BLE001 - identification never fails the session
             binding = None
         if binding is None:

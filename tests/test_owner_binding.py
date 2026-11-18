@@ -2,18 +2,14 @@
 
 import math
 import queue
-import threading
-import time
 import unittest
-from dataclasses import replace
-from unittest.mock import patch
 
 import test_duck_mode as duck
-from test_enrolled_roles import OWNER_ID, SESSION, HaildModel, decided, turn
+from test_enrolled_roles import OWNER_ID, SESSION, turn
 from test_live_speaker_id import ENTRIES, Harness, ScriptedEmbedder, settings, tone, wait_for
 
 from rightyo.contracts import Addressing, ContractError, Conversation
-from rightyo.live_speaker_id import PUBLIC_SCORE_WAIT_S, EnrolledRoles, LabelState
+from rightyo.live_speaker_id import EnrolledRoles
 from rightyo.memory import TranscriptMemory
 from rightyo.speaker_id import SpeakerIdConfig
 from rightyo.tool_events import SpeechEvents
@@ -139,11 +135,11 @@ class SingleTurnBindTests(unittest.TestCase):
         self.assertIsNone(SpeakerIdConfig.from_dict(raw).single_turn_bind_threshold)
 
 
-class BindingPublicationTests(unittest.TestCase):
-    def arrange(self, *, threshold=None, scores=(0.8,), gate=None, fail_on=None):
+class BaseBindingPublicationTests(unittest.TestCase):
+    def arrange(self, *, threshold=None, scores=(0.8,)):
         controller = duck.DuckControllerTests.controller(self)
         h = Harness(
-            ScriptedEmbedder([vector(s) for s in scores], gate=gate, fail_on=fail_on),
+            ScriptedEmbedder([vector(s) for s in scores]),
             config=settings(roles=True, single_turn_bind_threshold=threshold),
             entries=ENTRIES[:1],
         )
@@ -165,285 +161,42 @@ class BindingPublicationTests(unittest.TestCase):
         h.shadow.start()
         wait_for(lambda: bool(h.shadow._compared))
         self.addCleanup(h.shadow.close)
-        if gate is not None:
-            self.addCleanup(gate.set)
         return controller, events, h
 
-    def publish(self, c, h, current, *, inferred=False, spans=True):
+    def publish(self, c, h, current):
         h.shadow.audio(tone((current.end_ms - current.start_ms) / 1000))
-        if inferred:
-            c._inferred_turns.add(current.utterance_id)
-        if spans:
-            c._turn_spans[current.utterance_id] = ((current.start_ms, current.end_ms),)
+        c._turn_spans[current.utterance_id] = ((current.start_ms, current.end_ms),)
         c._diarized_heads[current.utterance_id] = len(current.text)
         c._turn(c._generation, queue.Queue(), TranscriptMemory(), h.shadow, current)
 
     def transcript(self, events):
         return next(e for e in events.drain() if e["type"] == "transcript")
 
-    def test_single_binding_turn_publishes_owner(self):
-        c, e, h = self.arrange(threshold=0.7)
-        current = turn("single", 0, 1500, "Jarvis, check the authored list")
-        self.publish(c, h, current)
+    def test_renewal_binding_turn_publishes_owner_as_on_base(self):
+        c, e, h = self.arrange(scores=(0.65,))
+        h.shadow.forget()
+        self.publish(c, h, turn("renewal", 0, 1500, "Jarvis, check the authored list"))
         transcript = self.transcript(e)
         self.assertEqual(transcript["turn"]["role"], "owner")
         self.assertEqual(transcript["role_source"], "voiceprint")
 
-    def test_accumulated_binding_turn_publishes_owner(self):
-        c, e, h = self.arrange(scores=(0.65, 0.65))
-        for index, expected in enumerate(("unknown", "owner")):
-            current = turn(
-                f"acc-{index}", index * 2000, (index + 1) * 2000, "Jarvis, check the authored list"
-            )
-            self.publish(c, h, current)
-            self.assertEqual(self.transcript(e)["turn"]["role"], expected)
-        self.assertEqual(h.fields(h.notes()[-1])["bind"], "accumulated")
-
-    def test_renewal_waits_past_300ms_for_its_own_binding(self):
-        gate = threading.Event()
-        c, e, h = self.arrange(scores=(0.65,), gate=gate)
-        h.shadow.forget()
-        # Synthetic embedding takes longer than the initial-epoch publication budget.
-        release = threading.Timer(PUBLIC_SCORE_WAIT_S + 0.2, gate.set)
-        self.addCleanup(release.cancel)
-        release.start()
-        before = time.monotonic()
-        self.publish(c, h, turn("renewal", 0, 1500, "Jarvis, check the authored list"))
-        self.assertGreater(time.monotonic() - before, PUBLIC_SCORE_WAIT_S)
-        self.assertEqual(self.transcript(e)["turn"]["role"], "owner")
-        self.assertEqual(h.fields(h.notes()[-1])["bind"], "rebind")
-
-    def test_renewal_late_enqueue_after_worker_drain_never_hangs(self):
-        for shutdown in ("off", "stop"):
-            with self.subTest(shutdown=shutdown):
-                c, e, h = self.arrange()
-                h.shadow.forget()
-                enqueue = h.shadow._queue.put_nowait
-                late_queued = threading.Event()
-
-                def late_enqueue(item):
-                    # Admission passed active, then the worker exited and drained before
-                    # this item reached the queue. There is nobody left to signal it.
-                    if shutdown == "off":
-                        h.shadow._off.set()
-                        h.shadow._closing.set()
-                        h.shadow._thread.join(1)
-                    else:
-                        h.shadow.close()
-                    self.assertFalse(h.shadow._thread.is_alive())
-                    enqueue(item)
-                    late_queued.set()
-
-                published = threading.Event()
-
-                def publish():
-                    try:
-                        self.publish(c, h, turn(shutdown, 0, 1500, "Authored renewal request"))
-                    finally:
-                        published.set()
-
-                with patch.object(h.shadow._queue, "put_nowait", side_effect=late_enqueue):
-                    caller = threading.Thread(target=publish, daemon=True)
-                    caller.start()
-                    try:
-                        self.assertTrue(published.wait(1), "renewal waiter hung after final drain")
-                        self.assertTrue(late_queued.is_set())
-                        self.assertTrue(h.shadow._queue.empty())
-                        self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
-                    finally:
-                        h.shadow._discard_queue()
-                        caller.join(1)
-
-    def test_settled_participant_without_single_threshold_publishes_without_waiting(self):
-        gate = threading.Event()
-        c, e, h = self.arrange(scores=(0.4,), gate=gate)
-        # Obtain a real committed unknown state from authored audio and a scripted score.
-        gate.set()
-        h.shadow.audio(tone(3))
-        h.shadow.turn(turn("settle", 0, 3000, "These are authored guest words"), spans=((0, 3000),))
-        wait_for(lambda: h.shadow.scored == 1)
-        self.assertEqual(h.shadow.binding("Speaker A"), ("unknown", "owner"))
-        gate.clear()
-        before = time.monotonic()
-        with patch("rightyo.live_speaker_id._ScoringDone.wait") as waiting:
-            self.publish(c, h, turn("settled", 3000, 4500, "These are more authored words"))
-        self.assertLess(time.monotonic() - before, PUBLIC_SCORE_WAIT_S)
-        waiting.assert_not_called()
-        self.assertEqual(self.transcript(e)["turn"]["role"], "participant")
-        wait_for(lambda: h.embedder.calls == 2)
-        self.assertEqual(h.shadow.scored, 1)  # Publication preceded the slow embedding.
-
-    def test_initial_wait_eligibility_uses_state_duration_score_and_single_threshold(self):
-        for state, seconds, score, threshold, waits in (
-            ("tentative", 1.5, 0.65, None, True),
-            ("unknown", 3.0, 0.4, 0.7, True),
-            ("unknown", 1.5, 0.45, None, True),
-            ("unknown", 1.0, 0.45, None, False),
-            ("unknown", 3.0, 0.44, None, False),
-        ):
-            with self.subTest(state=state, seconds=seconds, score=score, threshold=threshold):
-                gate = threading.Event()
-                c, e, h = self.arrange(threshold=threshold, gate=gate)
-                # Immutable committed-state snapshots; synthetic bookkeeping only.
-                h.shadow._labels["Speaker A"] = LabelState(
-                    state=state, seconds=seconds, score=score, identity="owner"
-                )
-                before = time.monotonic()
-                self.publish(c, h, turn("candidate", 0, 1500, "Authored binding candidate"))
-                elapsed = time.monotonic() - before
-                if waits:
-                    self.assertGreaterEqual(elapsed, PUBLIC_SCORE_WAIT_S)
-                else:
-                    self.assertLess(elapsed, PUBLIC_SCORE_WAIT_S)
-                self.assertEqual(
-                    self.transcript(e)["turn"]["role"],
-                    "participant" if state == "unknown" and seconds >= 3 else "unknown",
-                )
-                gate.set()
-                wait_for(lambda: h.shadow.scored == 1)
-
-    def test_a_later_binding_never_rewrites_an_earlier_published_role(self):
-        c, e, h = self.arrange(scores=(0.65, 0.65))
-        first = turn("first", 0, 2000, "Jarvis, check the authored list")
-        self.publish(c, h, first)
-        original = self.transcript(e)
-        self.publish(c, h, turn("later", 2000, 4000, "Jarvis, check another authored list"))
-        self.assertEqual(self.transcript(e)["turn"]["role"], "owner")
-        e.decision(decided(first), 4100)
-        attention = next(item for item in e.drain() if item["type"] == "attention")
-        self.assertEqual(original["turn"]["role"], "unknown")
-        self.assertEqual(attention["decision"]["role"], "unknown")
-
-    def test_timeout_cannot_use_a_different_turns_bind_before_publication(self):
-        c, e, h = self.arrange(threshold=0.7)
-        current = turn("waiting", 0, 1500, "Jarvis, check the authored list")
-        accept = c._accept
-
-        def bind_later(*args):
-            # A DIFFERENT queued turn binds after the wait timed out, before role resolution.
-            h.shadow._score(h.embedder, {"owner": [1, 0, 0]}, 0, "Speaker A", 1500, 1500, tone(1.5))
-            return accept(*args)
-
-        with (
-            patch.object(h.shadow, "turn", return_value=None),
-            patch.object(c, "_accept", side_effect=bind_later),
-        ):
-            self.publish(c, h, current)
-        self.assertEqual(h.shadow.binding("Speaker A"), ("bound", "owner"))
-        self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
-
-    def test_inferred_binding_turn_is_not_upgraded_even_if_score_finishes_first(self):
-        c, e, h = self.arrange(threshold=0.7)
-        current = turn("tail-joined", 0, 1500, "Jarvis, check the authored list")
-        score = h.shadow.turn
-
-        def finish(*args, **kwargs):
-            result = score(*args, **{**kwargs, "inferred": False})
-            self.assertIsNotNone(result)
-            return result
-
-        with patch.object(h.shadow, "turn", side_effect=finish):
-            self.publish(c, h, current, inferred=True)
-        self.assertEqual(h.shadow.binding("Speaker A"), ("bound", "owner"))
-        self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
-
-    def test_scoring_timeout_and_error_publish_unknown(self):
-        for failure in ("timeout", "error"):
-            with self.subTest(failure=failure):
-                gate = threading.Event() if failure == "timeout" else None
-                c, e, h = self.arrange(
-                    threshold=0.7, gate=gate, fail_on=1 if failure == "error" else None
-                )
-                before = time.monotonic()
-                self.publish(c, h, turn(failure, 0, 1500, "Jarvis, check the authored list"))
-                elapsed = time.monotonic() - before
-                self.assertLess(elapsed, PUBLIC_SCORE_WAIT_S + 0.7)
-                self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
-                if gate is not None:
-                    gate.set()
-                    wait_for(lambda: h.shadow.scored == 1)
-                    self.assertEqual(e.drain(), [])
-
-    def test_epoch_or_revision_change_after_scoring_refuses_upgrade(self):
-        for change in ("forget", "revision"):
-            with self.subTest(change=change):
-                c, e, h = self.arrange(threshold=0.7)
-                accept = c._accept
-
-                def invalidate(*args):
-                    if change == "forget":
-                        h.shadow.forget()
-                    else:
-                        h.shadow._binding_revisions["Speaker A"] += 2
-                    return accept(*args)
-
-                with patch.object(c, "_accept", side_effect=invalidate):
-                    self.publish(c, h, turn(change, 0, 1500, "Jarvis, check the authored list"))
-                self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
-
-    def test_unscorable_turns_never_wait_and_guest_never_becomes_owner(self):
-        for case in ("short", "no-spans", "overlap", "provenance", "guest", "inferred"):
-            with self.subTest(case=case):
-                c, e, h = self.arrange(threshold=0.7, scores=(0.4,))
-                current = turn(
-                    case,
-                    0,
-                    690 if case == "short" else 1500,
-                    "Jarvis, check the authored list",
-                    overlap=case == "overlap",
-                )
-                if case == "provenance":
-                    current = replace(current, speaker_provenance="unknown")
-                with patch(
-                    "rightyo.live_speaker_id._ScoringDone.wait", return_value=False
-                ) as waiting:
-                    self.publish(
-                        c, h, current, spans=case != "no-spans", inferred=case == "inferred"
-                    )
-                    if case != "guest":
-                        waiting.assert_not_called()
-                    else:
-                        waiting.assert_called_once_with(PUBLIC_SCORE_WAIT_S)
-
-                self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
-
-    def test_an_enrolled_guest_binds_as_participant(self):
-        c, e, h = self.arrange(threshold=0.7)
-        h.shadow.close()
-        h = Harness(
-            ScriptedEmbedder([[0, 1, 0]]),
-            config=settings(roles=True, single_turn_bind_threshold=0.7),
-        )
-        c._enrolled_roles.source = h.shadow
-        c._shadow = h.shadow
-        h.shadow.start()
-        wait_for(lambda: bool(h.shadow._compared))
-        self.addCleanup(h.shadow.close)
-        self.publish(c, h, turn("guest", 0, 1500, "Jarvis, check the authored list", "Speaker B"))
-        self.assertEqual(h.shadow.binding("Speaker B"), ("bound", "guest"))
-        self.assertEqual(self.transcript(e)["turn"]["role"], "participant")
-
-    def test_authored_event_regressions(self):
+    def test_epoch_zero_binding_turn_keeps_its_pre_scoring_role(self):
         for single in (False, True):
             with self.subTest(single=single):
                 c, e, h = self.arrange(
-                    threshold=0.7 if single else None, scores=(0.704,) if single else (0.704, 0.627)
+                    threshold=0.7 if single else None, scores=(0.8,) if single else (0.65, 0.65)
                 )
-                output = e.drain()
-                fragment = turn("fragment", 0, 690, "Authored fragment", "Speaker B")
-                self.publish(c, h, fragment, spans=False)
-                output.extend(e.drain())
-                start = 690
                 for index in range(1 if single else 2):
                     current = turn(
-                        f"named-{index}", start, start + 1700, "Jarvis, check the authored list"
+                        f"initial-{index}",
+                        index * 2000,
+                        (index + 1) * 2000,
+                        "Jarvis, check the authored list",
                     )
                     self.publish(c, h, current)
-                    e.decision(decided(current), current.end_ms + 10)
-                    output.extend(e.drain())
-                    start += 1700
-                requests = [item for item in output if item["type"] == "request"]
-                self.assertEqual(requests[-1]["turn"]["utterance_id"], current.utterance_id)
-                self.assertEqual(requests[-1]["turn"]["role"], "owner")
-                self.assertNotIn("others_present", requests[-1]["decision"])
-                HaildModel(self).check(output)
+                    self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
+                    wait_for(lambda: h.shadow.scored == index + 1)
+                self.assertEqual(h.shadow.binding("Speaker A"), ("bound", "owner"))
+                self.assertEqual(
+                    h.fields(h.notes()[-1])["bind"], "single" if single else "accumulated"
+                )
