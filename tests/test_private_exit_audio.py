@@ -89,6 +89,195 @@ class PrivateExitTests(unittest.TestCase):
         )
         return old
 
+    def test_queued_public_guest_binding_revokes_each_private_exit_fragment(self):
+        # Reviewer probe: a public score was queued before privacy. It commits after
+        # preparation, before the private fragment commits, without a forget/reset.
+        for fragment in ("Unit", "privacy off", EXIT):
+            with self.subTest(fragment=fragment):
+                entered, release = threading.Event(), threading.Event()
+
+                class BlockingGuest(ScriptedEmbedder):
+                    def embed(self, pcm):
+                        entered.set()
+                        if not release.wait(3):
+                            raise AssertionError("public score not released")
+                        self.calls += 1
+                        return unit(0, 1, 0)
+
+                h = self.harness(BlockingGuest())
+                c, e, _ = self.controller(h)
+                c.duck(False)
+                h.shadow._labels["Speaker A"] = LabelState(
+                    state="bound", identity="owner", seconds=4, total=[4.0, 0.0, 0.0]
+                )
+                h.speak(20)
+                self.assertTrue(entered.wait(1))
+                c._received_ms = 20000
+                c._received_bytes = 20000 * 32
+                c.duck(True)
+                e.drain()
+                start = 20000
+                if fragment == "privacy off":
+                    self.hear(c, "Unit", start=start)
+                    self.assertEqual(e._private_name_end, 21000)
+                    start += 1000
+                epoch = h.shadow.epoch
+                commit = e._private
+
+                def revoke(*args):
+                    release.set()
+                    wait_for(lambda: h.shadow.binding("Speaker A") == ("bound", "guest"))
+                    return commit(*args)
+
+                try:
+                    with (
+                        patch.object(e, "_private", side_effect=revoke),
+                        patch.object(h.shadow, "exit_score", wraps=h.shadow.exit_score) as score,
+                    ):
+                        self.hear(c, fragment, start=start)
+                        score.assert_not_called()  # Only the cached binding had approved it.
+                finally:
+                    release.set()
+                self.assertEqual(h.shadow.epoch, epoch)
+                self.assertIsNone(e._private_name_end)
+                self.assertNotIn("exit", [event.get("action") for event in e.drain()])
+                self.assertFalse(c._private_sentence.pcm)
+
+    def test_binding_approval_requires_the_same_binding_and_known_origin_at_commit(self):
+        for change in ("unchanged", "unbound", "guest", "tentative", "other_owner", "origin"):
+            for fragment in ("Unit", "privacy off", EXIT):
+                with self.subTest(change=change, fragment=fragment):
+                    h = self.harness()
+                    c, e, roles = self.controller(h)
+                    h.shadow._labels["Speaker A"] = LabelState(state="bound", identity="owner")
+                    roles.priority = replace(OWNERS, owners=("owner", "other_owner"))
+                    if fragment == "privacy off":
+                        self.hear(c, "Unit")
+                    prepare = e.prepare_transcript
+
+                    def changed(*args, **kwargs):
+                        ticket = prepare(*args, **kwargs)
+                        if change == "origin":
+                            return replace(ticket, exit_origin=None)
+                        if change == "unbound":
+                            h.shadow._labels.clear()
+                        elif change in {"guest", "other_owner"}:
+                            h.shadow._labels["Speaker A"] = LabelState(
+                                state="bound", identity=change
+                            )
+                        elif change == "tentative":
+                            h.shadow._labels["Speaker A"] = LabelState(
+                                state="tentative", identity="owner"
+                            )
+                        return ticket
+
+                    with patch.object(e, "prepare_transcript", side_effect=changed):
+                        self.hear(c, fragment, start=1000)
+                    passed = change == "unchanged"
+                    self.assertEqual(
+                        e._private_name_end, 2000 if passed and fragment == "Unit" else None
+                    )
+                    self.assertEqual(
+                        [event.get("action") for event in e.drain()],
+                        ["exit"] if passed and fragment != "Unit" else [],
+                    )
+
+    def test_isolated_voice_result_is_not_replaced_by_a_new_binding(self):
+        for score, expected in ((0.9, ["exit"]), (0.0, [])):
+            for labelled in (True, False):
+                with self.subTest(score=score, labelled=labelled):
+                    h = self.harness()
+                    c, e, _ = self.controller(h)
+                    h.shadow._labels["Speaker A"] = LabelState(state="bound", identity="guest")
+                    candidate = replace(turn(0, 1000, "Speaker A" if labelled else None), text=EXIT)
+                    c._received_ms = 1000
+                    c._received_bytes = 32000
+                    c._private_turn_audio(c._generation, candidate, memoryview(tone(1)))
+
+                    def scored(*_):
+                        h.shadow._labels["Speaker A"] = LabelState(state="bound", identity="owner")
+                        return EntryScore(score, None, 0, "scored")
+
+                    with patch.object(h.shadow, "exit_score", side_effect=scored) as check:
+                        c._turn(
+                            c._generation, queue.Queue(), TranscriptMemory(), h.shadow, candidate
+                        )
+                        check.assert_called_once()
+                    self.assertEqual([event.get("action") for event in e.drain()], expected)
+
+    def test_binding_revision_invalidates_rebound_exit_and_entry_evidence(self):
+        # Use the actual worker to change owner -> guest -> owner. Comparing only the
+        # final binding tuple would wrongly accept the evidence from before both changes.
+        for entry in (False, True):
+            with self.subTest(entry=entry):
+
+                class SwitchingEmbedder(ScriptedEmbedder):
+                    vector = unit(0, 1, 0)
+
+                    def embed(self, pcm):
+                        self.calls += 1
+                        return self.vector
+
+                embedder = SwitchingEmbedder()
+                h = self.harness(embedder)
+                c, e, _ = self.controller(h)
+                h.shadow._labels["Speaker A"] = LabelState(state="bound", identity="owner")
+                before = h.shadow.binding_snapshot("Speaker A")
+                if entry:
+                    c.duck(False)
+                    e.drain()
+                    c._observe_spans(c._generation, "live-40000", ((40000, 41000),))
+                prepare = e.prepare_transcript
+
+                def rebound(*args, **kwargs):
+                    ticket = prepare(*args, **kwargs)
+                    h.speak(20)
+                    wait_for(lambda: h.shadow.scored == 1)
+                    self.assertEqual(h.shadow.binding("Speaker A"), ("bound", "guest"))
+                    # Remove accumulated evidence so the second public score can rebind.
+                    h.shadow._labels["Speaker A"] = LabelState(state="bound", identity="guest")
+                    embedder.vector = unit(1, 0, 0)
+                    h.speak(20)
+                    wait_for(lambda: h.shadow.scored == 2)
+                    self.assertEqual(h.shadow.binding("Speaker A"), ("bound", "owner"))
+                    return ticket
+
+                with (
+                    patch.object(e, "prepare_transcript", side_effect=rebound),
+                    patch.object(
+                        h.shadow, "entry_score", return_value=EntryScore(0.9, None, 0, "scored")
+                    ),
+                ):
+                    self.hear(c, "privacy mode" if entry else EXIT, start=40000, inferred=entry)
+                self.assertGreater(h.shadow.binding_snapshot("Speaker A")[0], before[0])
+                self.assertEqual(h.shadow.epoch, 0)
+                events = e.drain()
+                self.assertNotIn("exit", [event.get("action") for event in events])
+                if entry:
+                    self.assertEqual(len(events), 1)
+                    self.assertEqual(events[0]["turn"]["role"], "owner")
+                    self.assertNotIn("role_source", events[0])
+
+    def test_more_public_evidence_for_the_same_owner_does_not_revoke_an_exit(self):
+        h = self.harness(ScriptedEmbedder())
+        c, e, _ = self.controller(h)
+        h.shadow._labels["Speaker A"] = LabelState(state="bound", identity="owner", seconds=4)
+        before = h.shadow.binding_snapshot("Speaker A")
+        prepare = e.prepare_transcript
+
+        def more_evidence(*args, **kwargs):
+            ticket = prepare(*args, **kwargs)
+            h.speak(4)
+            wait_for(lambda: h.shadow.scored == 1)
+            return ticket
+
+        with patch.object(e, "prepare_transcript", side_effect=more_evidence):
+            self.hear(c)
+        self.assertEqual(h.shadow.binding_snapshot("Speaker A"), before)
+        self.assertEqual([event.get("action") for event in e.drain()], ["exit"])
+        h.shadow.forget()
+        self.assertGreater(h.shadow.binding_snapshot("Speaker A")[0], before[0])
+
     def test_stop_cancels_promptly_during_split_name_native_inference(self):
         # Exercise both split fragments and the complete exit through the real worker.
         for fragment in ("Unit", "privacy off", EXIT, "privacy mode"):

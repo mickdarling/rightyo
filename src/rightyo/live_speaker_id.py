@@ -399,6 +399,9 @@ class ShadowSpeakerId:
         # Bumped by `forget` (hailing-station #735 S-1): a queued or in-flight turn scored for
         # an earlier epoch never commits, so nothing from before a reset survives it.
         self._epoch = 0
+        # Binding changes invalidate cached authority without resetting label evidence or
+        # discarding other queued public turns (the separate forget epoch's job).
+        self._binding_revision = 0
         self._epoch_lock = threading.Lock()
         self.scored_seconds = 0.0
         self._stop = threading.Event()  # discard pending work and exit
@@ -446,6 +449,15 @@ class ShadowSpeakerId:
         """The enrolled display name of a compared identifier, or None; never blocks."""
         name = self._names.get(identity)
         return name if isinstance(name, str) else None
+
+    def binding_snapshot(self, label: str):
+        """An atomic binding/revision snapshot; detects changes away and back too.
+
+        Only state/identity changes advance the revision, not new evidence for the same
+        binding. Never waits for inference; shares the brief bookkeeping lock.
+        """
+        with self._epoch_lock:
+            return self._binding_revision, self.binding(label)
 
     def owner_evidence(self, owners) -> tuple[bool, bool, float]:
         """Owner-voice evidence for `owners` (rightyo#164); never waits on the worker.
@@ -635,6 +647,7 @@ class ShadowSpeakerId:
         without the bindings they produced, would soon report a recognised owner as not."""
         with self._epoch_lock:
             self._epoch += 1
+            self._binding_revision += 1
             self._labels = {}
             self._bound_ids = set()
             self.scored_seconds = 0.0
@@ -681,6 +694,11 @@ class ShadowSpeakerId:
                 best = min(turn_scores, key=lambda key: (-turn_scores[key], key))
                 if turn_scores[best] >= self.settings.bind_threshold:
                     state.state, state.identity, state.score = "bound", best, turn_scores[best]
+            if previous is None or (previous.state, previous.identity) != (
+                state.state,
+                state.identity,
+            ):
+                self._binding_revision += 1
             self._labels[label] = state
             self.scored += 1
             if state.state == "bound" and state.identity is not None:

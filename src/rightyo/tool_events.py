@@ -522,6 +522,8 @@ class _VoiceChecks:
     speaker_epoch: int | None
     split: int | None
     exit: tuple[bool, str | None] = (False, "voice_unavailable")
+    exit_origin: str | None = None
+    binding: tuple | None = None
     entry: bool = False
 
 
@@ -1160,6 +1162,8 @@ class SpeechEvents:
 
         transcript revalidates this ticket after scoring; mode changes, Stop, speaker
         forget and intervening turns invalidate it. No native wait holds our lock either.
+        Only exit and entry approvals cross the scoring window. Roles, owner vocative
+        and attention authority are resolved afterward from current bindings.
         """
         with self._lock:
             if (
@@ -1176,6 +1180,7 @@ class SpeechEvents:
                 self._voice_generation,
                 getattr(getattr(self._priority, "source", None), "epoch", None),
                 self._private_name_end,
+                binding=self._binding_snapshot(turn),
             )
             binding = None
             entry = None
@@ -1214,11 +1219,36 @@ class SpeechEvents:
                     ):
                         entry = getattr(self._priority, "entry_voice", None)
         if binding is not None:
-            ticket = replace(ticket, exit=self._exit_check(turn, inferred, binding=binding))
+            outcome, origin = self._exit_approval(turn, inferred, binding=binding)
+            ticket = replace(ticket, exit=outcome, exit_origin=origin)
         if callable(entry):
             with contextlib.suppress(Exception):
                 ticket = replace(ticket, entry=entry(turn) is True)
         return ticket
+
+    def _binding_snapshot(self, turn):
+        """Identity evidence only, never audio/text. Unknown providers fail closed.
+
+        Real speaker ID supplies a revision as well as the binding, so an owner -> guest
+        -> owner transition cannot reuse an old approval. Legacy adapters supply their
+        current binding; all approvals still require a fresh owner check at commit.
+        """
+        try:
+            source = getattr(self._priority, "source", None)
+            snapshot = getattr(source, "binding_snapshot", None)
+            if callable(snapshot):
+                evidence = snapshot(turn.speaker_id)
+            else:
+                lookup = getattr(source, "binding", None)
+                if not callable(lookup):
+                    return None
+                evidence = (None, lookup(turn.speaker_id))
+            return self._priority, source, turn.speaker_id, evidence
+        except Exception:  # noqa: BLE001 - private exceptions may contain words
+            return None
+
+    def _binding_unchanged(self, checks, turn):
+        return checks.binding is not None and checks.binding == self._binding_snapshot(turn)
 
     def _voice_checks_current(self, checks, turn, inferred):
         return (
@@ -1344,7 +1374,12 @@ class SpeechEvents:
             self._hear_other_voice(turn, role)
             name = self._speaker_name(turn, role)
             source = self._role_source(
-                turn, role, inferred, entry_voice=checks_current and voice_checks.entry
+                turn,
+                role,
+                inferred,
+                entry_voice=checks_current
+                and voice_checks.entry
+                and self._binding_unchanged(voice_checks, turn),
             )
             self._emit(
                 "transcript",
@@ -1761,8 +1796,14 @@ class SpeechEvents:
         )
         if outcome[0]:
             allowed, reason = self._binding_exit_check(turn, inferred)
-            if not allowed and reason in {"inferred", "playback", "no_owner_check"}:
-                outcome = False, reason
+            if checks.exit_origin == "binding":
+                if not allowed or not self._binding_unchanged(checks, turn):
+                    outcome = False, reason or "voice_unavailable"
+            elif checks.exit_origin == "voice":
+                if not allowed and reason in {"inferred", "playback", "no_owner_check"}:
+                    outcome = False, reason
+            else:
+                outcome = False, "voice_unavailable"
         # Only a turn heard entirely since the mode last went on, while it is still on, is
         # matched at all (#242 round 23, see `transcript`): one heard in an earlier private
         # period and released late can never end this one, answer its status or be counted.
@@ -1817,6 +1858,9 @@ class SpeechEvents:
                 clear()
 
     def _exit_check(self, turn, inferred, *, binding=None):
+        return self._exit_approval(turn, inferred, binding=binding)[0]
+
+    def _exit_approval(self, turn, inferred, *, binding=None):
         """Check binding OR this turn's voice, retaining the conservative prechecks.
 
         Always erase candidate audio, even if a binding passes or a precheck refuses.
@@ -1827,17 +1871,17 @@ class SpeechEvents:
                     binding = self._binding_exit_check(turn, inferred)
             allowed, reason = binding
             if allowed or reason in {"inferred", "playback", "no_owner_check"}:
-                return allowed, reason
+                return (allowed, reason), "binding" if allowed else None
             voice = getattr(self._priority, "exit_voice", None)
             if callable(voice):
                 outcome = voice(turn)
                 if outcome == "pass":
-                    return True, None
+                    return (True, None), "voice"
                 if outcome in {"voice_below_threshold", "voice_unavailable"}:
-                    return False, outcome
-            return False, reason
+                    return (False, outcome), None
+            return (False, reason), None
         except Exception:  # noqa: BLE001 - private exceptions may contain words
-            return False, "voice_unavailable"
+            return (False, "voice_unavailable"), None
         finally:
             self._clear_exit_audio()
 
