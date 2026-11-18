@@ -1342,21 +1342,29 @@ class PrototypeController:
         # (so a mode change between the two cannot split them). Only a matched local exit
         # may score its isolated sentence, without ever offering it to shadow.turn.
         with self._lock:
-            # Snapshot public eligibility and epoch before scoring an unbound renewed
-            # label. Bound labels keep the normal asynchronous path.
+            # Snapshot public eligibility and evidence before scoring an unbound label.
+            # Bound labels keep the normal asynchronous path.
             epoch = getattr(shadow, "epoch", None) if shadow is not None else None
+            snapshot = getattr(shadow, "binding_snapshot", None)
+            before = None
+            if callable(snapshot):
+                before = ((epoch, 0), None)
+                with contextlib.suppress(Exception):
+                    before = snapshot(turn.speaker_id)
             scored_before = (
                 roles is not None
                 and type(epoch) is int
-                and epoch > 0
-                and (shadow.binding(turn.speaker_id) or (None,))[0] != "bound"
+                and before is not None
+                and (before[1] or (None,))[0] != "bound"
                 and generation == self._generation
                 and not self._stop.is_set()
                 and not self._heard_private(turn)
             )
         if scored_before:
             # Privacy controls and Stop must stay responsive while the worker scores.
-            shadow.turn(turn, inferred=inferred, spans=spans, epoch=epoch, wait=True)
+            scored = None
+            with contextlib.suppress(Exception):
+                scored = shadow.turn(turn, inferred=inferred, spans=spans, epoch=epoch, wait=True)
         with self._lock:
             if scored_before and shadow.epoch != epoch:
                 # Renewed while scoring: this turn's old label has no authority now.
@@ -1365,6 +1373,8 @@ class PrototypeController:
             # Sample before acceptance/scoring: any intervening forget invalidates the
             # queued evidence rather than binding an old label in the new epoch.
             epoch = getattr(shadow, "epoch", None) if shadow is not None else None
+            if scored_before:
+                roles.note_publication(turn, before, scored if not inferred else None)
         private = self._accept(generation, work, memory, turn)
         if shadow is not None and private is False and not scored_before:
             # After the turn is accepted and published; it never raises or blocks.

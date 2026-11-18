@@ -491,6 +491,7 @@ class ShadowTests(unittest.TestCase):
             "acc_s",
             "state",
             "id",
+            "bind",
         }
         for line in harness.notes():
             self.assertIn(' label="Speaker A" ', line)
