@@ -1453,30 +1453,31 @@ from `started` to `ended`, with 300 ms either side), so the echo of a clip such 
 counted as `exit_refused` plus its content-free reason counter (below) and emits nothing.
 A refused name-only fragment also increments `exit_name_refused` and the refusal counters;
 an exit phrase without a recent accepted name fragment increments `exit_unnamed`.
-Name-only fragments use only the existing owner-binding check, never the isolated voice
-check, so they cannot produce a score or score log line.
+Name-only fragments authenticate independently with the same isolated voice fallback as
+complete exits. Private processor turns have no diarizer label and must use that fallback.
 Without enrollment, roles or names, the host must offer another way out.
 
-**Privacy keeps no speakers either.** When the host turns privacy off, rightyo forgets every
-speaker: the diarizer starts afresh (once no utterance is open, so a turn under way keeps its
-labels, but at most 10 s of audio after the first off reached since the last renewal, so
-privacy ended again meanwhile never postpones it further: steady speech then forces it, and
-the turn under way is published with no speaker label and adds no speaker evidence), every
-speaker-ID binding is dropped, and the per-label roles go with them; both are dropped again the
-moment the fresh diarizer takes over, since its labels restart there and a turn finished while
-it waited was bound to the old ones. Nothing a
-voice heard only in privacy did, a diarizer channel or a binding, outlives it. So right after
-privacy ends, voice features gated on the owner (the owner's role, `role_source`, and with them
-a host's voice privacy entry) wait until the owner has spoken publicly long enough to bind
-again (`speaker_id.bind_min_seconds`), and the owner-voice evidence restarts with the bindings
-(below). Audio heard before the off and still buffered when the stream reaches it (the pre-roll
-kept between utterances, or the start of an utterance open across it) is silenced, so none of it
-is sent to the recognizer with the first public utterance. Private turns never contribute
-to label scoring, binding, accumulation or owner-voice evidence; only matched exit
-candidates may receive the isolated voice check. Utterances in privacy add nothing to the session's skipped-segment or
+**Private audio supplies no speaker evidence.** Private frames reach the diarizer as
+exact silence, preserving stream time; private turns are unlabelled and never contribute
+to binding, accumulation or owner-voice evidence. At privacy-off a content-free audit
+reports `discarded`, `diarizer_private_frames` and `forget=skipped` or `forget=full`
+with a fixed reason token. Any nonzero private frame requires full speaker renewal,
+regardless of the endpointing energy threshold. Unknown or unfinished accounting also
+requires full forget. Otherwise public speaker bindings and conversation state survive.
+When renewal is required it waits for an idle boundary, bounded by 10 s of stream audio,
+and resets per-label state again when the fresh diarizer takes over.
+
+The byte-exact private interval is silenced in buffered utterance/pre-roll audio before
+it can join subsequent public speech. Audio preceding privacy-on survives; an on/off
+pair with no intervening audio erases nothing. Recovery windows intersecting privacy are
+discarded at entry and exit, leaving ordered empty barriers. Owned mutable retry PCM is
+zeroed, held text/results are dropped, and an in-flight retry is cancelled with its result
+refused. Native decoder copies cannot be certified wiped during an in-flight cancellation,
+so that case requires full forget. Recovery remains bounded local ASR, not a private
+archive. Utterances in privacy add nothing to the session's skipped-segment or
 suppressed-utterance totals.
-Everything else held per speaker label goes too: the engaged speaker and a lapsed engagement,
-cool-downs, explicit ends, appendix windows and delivered requests a dismissal could withdraw.
+On full forget, everything else held per speaker label goes too: the engaged speaker,
+a lapsed engagement, cool-downs, explicit ends, appendix windows and delivered requests a dismissal could withdraw.
 An engaged conversation is ended aloud, never silently: when a forget finds one (a public
 request after the off engaged it before the fresh diarizer took over, so its label came from the
 old diarizer), rightyo emits `conversation` back to `ambient`, reason `timeout`, with no
@@ -1530,15 +1531,14 @@ before the phrase (before the name, for the exit) means no match.
 
 A split exit is the enrolled owner's lone name fragment ("Jarvis,") heard while privacy
 is on, followed within 4 seconds by a turn that starts with an exit phrase. Both turns
-must authenticate: the name fragment requires an existing enrolled-owner binding and
-is never voice-scored; the completing turn may pass its own binding check or an isolated
-voice check on its own buffered audio alone. The fragment's binding need not remain
-present for that completing voice check. A guest or a TV supplying the name never
+must authenticate: each may pass its own binding check or an isolated voice check on
+its own buffered audio alone. Private processor turns are unlabelled, so both fragments
+must pass their own isolated voice checks. A guest or a TV supplying the name never
 counts. Any other turn between them, private or not, and any change of
 the mode, ends it, and a name piece released after the off (heard across it) never
 starts one. Private finalized pieces bypass continuation holds and wake joining: each
 piece replaces the retained sentence, and each half of a split exit authenticates its
-own turn. The name fragment's audio is zeroed after its binding check and never used by
+own turn. The name fragment's audio is zeroed after its owner check and never used by
 the completing turn's voice check. The inferred-word refusal remains conservative even
 for a start-private child: a whole-sentence embedding cannot prove that every inferred
 word was the owner's.
@@ -1564,10 +1564,10 @@ buffer contains no public prefix if privacy began mid-turn; that crossing turn r
 Between finalized turns, only the existing bounded local ASR assembly holds current
 utterance/pre-roll audio; there is no additional streaming private ring or archive.
 
-Only a complete named exit phrase matched by the existing local matcher (the `exit`
-kind, or `rest` completing an accepted split-name fragment) can invoke the scorer.
-Name-only fragments, other non-exit turns, unnamed remainders and status questions
-are never scored. Every exit check, including a name fragment's binding-only check,
+Only a complete named exit phrase or a name-only fragment matched by the existing local
+matcher (`exit`, `name`, or `rest` completing an accepted split-name fragment) can invoke
+the scorer. Other non-exit turns, unnamed remainders and status questions are never scored.
+Every exit check, including a name fragment's check,
 wipes and releases the sentence immediately after the check, whether a binding already
 passed, the voice passed, a precheck refused, or
 scoring/emission failed. Replacement, privacy-on/off, speaker forget/renewal, session
@@ -1617,8 +1617,8 @@ keys first. Counts reset when privacy goes off. `exit_refused` remains the total
 named exits, now including refused name-only fragments. Each refusal increments exactly
 one reason counter. Inferred words, missing owner-check capability and playback remain
 prechecks. The remaining original binding reasons apply when the isolated exit-voice
-path is not installed, and for name-only fragments; with it installed, a failed binding
-for a complete named exit phrase falls back to that check:
+path is not installed; with it installed, a failed binding for a complete named exit
+phrase or a split-name fragment falls back to that check:
 
 - `inferred`: the turn has inferred-label words.
 - `no_owner_check`: no per-turn identification or no callable `enrolled_owner` check.

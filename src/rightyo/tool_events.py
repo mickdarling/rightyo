@@ -9,7 +9,7 @@ import json
 import re
 import unicodedata
 from collections import deque
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from threading import RLock
 
 from rightyo.addressedness import answer_shaped, follow_up_cued, mentions_name
@@ -512,6 +512,21 @@ def _audio_input(value):
     return dict(expected)
 
 
+@dataclass(frozen=True)
+class _VoiceChecks:
+    """One turn's checks, valid only in the publisher/identity generation sampled."""
+
+    turn: Turn
+    inferred: bool
+    generation: int
+    speaker_epoch: int | None
+    split: int | None
+    exit: tuple[bool, str | None] = (False, "voice_unavailable")
+    exit_origin: str | None = None
+    binding: tuple | None = None
+    entry: bool = False
+
+
 class SpeechEvents:
     """Local v1 producer. Frozen request context never observes later turns.
 
@@ -565,6 +580,7 @@ class SpeechEvents:
         # overrides can never overflow the queue; exceeding the bound fails closed.
         self.max_open = max_pending - 4
         self._lock = RLock()
+        self._voice_generation = 0
         self._memory = TranscriptMemory(retention_ms=retention_ms)
         self._session = None
         self._sequence = self._now = 0
@@ -738,7 +754,7 @@ class SpeechEvents:
     def _size(payload):
         return len(encode_json(payload)) + 1  # Include the JSONL newline.
 
-    def _role_source(self, turn, role, inferred):
+    def _role_source(self, turn, role, inferred, *, entry_voice=False):
         """ "voiceprint" when `turn` is the owner by live voiceprint identification, else
         None (hailing-station #735, #807): the published role is `owner`, it came from a
         live identification binding of the label to an enrolled owner voice when the role
@@ -760,8 +776,7 @@ class SpeechEvents:
                 return None
             if not inferred:
                 return "voiceprint"
-            entry = getattr(self._priority, "entry_voice", None)
-            if _entry_shaped(turn.text) and callable(entry) and entry(turn) is True:
+            if _entry_shaped(turn.text) and entry_voice:
                 return "voiceprint_label"
         except Exception:  # noqa: BLE001 - a source is descriptive and never fails the turn
             pass
@@ -905,6 +920,7 @@ class SpeechEvents:
             # A new session's stream clock starts again; a mode still on covers all of it.
             self._duck_spans = [[0, None]] if self._duck else []
             self._private_name_end = None
+            self._voice_generation += 1
             self._private_seen.clear()
             self._role_sources = duck and priority is not None
             self._duck_acks = duck
@@ -1141,7 +1157,124 @@ class SpeechEvents:
             self._owner_voice_state = state
             self._emit("owner_voice", state=state)
 
-    def transcript(self, turn, now_ms, *, expect_decision=True, inferred=False, diarized_head=None):
+    def prepare_transcript(self, turn, *, inferred=False):
+        """Snapshot candidate checks, then score without any caller's controller lock.
+
+        transcript revalidates this ticket after scoring; mode changes, Stop, speaker
+        forget and intervening turns invalidate it. No native wait holds our lock either.
+        Only exit and entry approvals cross the scoring window. Roles, owner vocative
+        and attention authority are resolved afterward from current bindings.
+        """
+        with self._lock:
+            if (
+                not self._active
+                or not isinstance(turn, Turn)
+                or not turn.finalized
+                or turn.session_id != self._session
+                or type(inferred) is not bool
+            ):
+                return None
+            ticket = _VoiceChecks(
+                turn,
+                inferred,
+                self._voice_generation,
+                getattr(getattr(self._priority, "source", None), "epoch", None),
+                self._private_name_end,
+                binding=self._binding_snapshot(turn),
+            )
+            binding = None
+            entry = None
+            if self.heard_ducked(turn):
+                if (
+                    self._in_current_privacy(turn)
+                    and turn.utterance_id not in self._seen
+                    and turn.utterance_id not in self._private_seen
+                ):
+                    with contextlib.suppress(Exception):
+                        kinds = privacy_phrase(turn.text, self._addressing)
+                        if (
+                            "name" in kinds
+                            or "exit" in kinds
+                            or (
+                                "rest" in kinds
+                                and ticket.split is not None
+                                and 0 <= turn.start_ms - ticket.split <= PRIVACY_SPLIT_NAME_MS
+                            )
+                        ):
+                            binding = self._binding_exit_check(turn, inferred)
+            elif (
+                inferred
+                and self._role_sources
+                and self._per_turn
+                and turn.utterance_id not in self._seen
+                and _entry_shaped(turn.text)
+            ):
+                with contextlib.suppress(Exception):
+                    role = self._priority.role_for(turn)
+                    resolved = getattr(self._priority, "resolved_by_voiceprint", None)
+                    if (
+                        role == "owner"
+                        and callable(resolved)
+                        and resolved(turn.utterance_id) is True
+                    ):
+                        entry = getattr(self._priority, "entry_voice", None)
+        if binding is not None:
+            outcome, origin = self._exit_approval(turn, inferred, binding=binding)
+            ticket = replace(ticket, exit=outcome, exit_origin=origin)
+        if callable(entry):
+            with contextlib.suppress(Exception):
+                ticket = replace(ticket, entry=entry(turn) is True)
+        return ticket
+
+    def _binding_snapshot(self, turn):
+        """Identity evidence only, never audio/text. Unknown providers fail closed.
+
+        Real speaker ID supplies a per-label revision as well as the binding, so an
+        owner -> guest -> owner transition cannot reuse an old approval. Legacy adapters
+        supply their current binding, but cannot authorize a binding-derived exit.
+        """
+        try:
+            source = getattr(self._priority, "source", None)
+            snapshot = getattr(source, "binding_snapshot", None)
+            if callable(snapshot):
+                revision, binding = snapshot(turn.speaker_id)
+                evidence = (revision, binding)
+            else:
+                lookup = getattr(source, "binding", None)
+                if not callable(lookup):
+                    return None
+                evidence = (None, lookup(turn.speaker_id))
+            return self._priority, source, turn.speaker_id, evidence
+        except Exception:  # noqa: BLE001 - private exceptions may contain words
+            return None
+
+    def _binding_unchanged(self, checks, turn, *, require_revision=False):
+        return (
+            checks.binding is not None
+            and (not require_revision or checks.binding[3][0] is not None)
+            and checks.binding == self._binding_snapshot(turn)
+        )
+
+    def _voice_checks_current(self, checks, turn, inferred):
+        return (
+            isinstance(checks, _VoiceChecks)
+            and checks.turn is turn
+            and checks.inferred == inferred
+            and checks.generation == self._voice_generation
+            and checks.speaker_epoch
+            == getattr(getattr(self._priority, "source", None), "epoch", None)
+        )
+
+    def transcript(
+        self,
+        turn,
+        now_ms,
+        *,
+        expect_decision=True,
+        inferred=False,
+        diarized_head=None,
+        voice_checks=None,
+    ):
         """Emit one final turn; `inferred` marks a speaker label partly inferred (#137).
 
         `diarized_head` is the leading diarized run's character length in `turn.text`
@@ -1152,7 +1285,10 @@ class SpeechEvents:
         no override, no owner stop phrase, and a playback-only dismissal that withdraws
         nothing and leaves the speaker's engagement in place.
         """
+        if voice_checks is None:
+            voice_checks = self.prepare_transcript(turn, inferred=inferred)
         with self._lock:
+            checks_current = self._voice_checks_current(voice_checks, turn, inferred)
             if not self._active:
                 raise ContractError("speech event session is not active")
             if not isinstance(turn, Turn) or not turn.finalized or turn.session_id != self._session:
@@ -1183,10 +1319,11 @@ class SpeechEvents:
                 ):
                     # Kept only while privacy is on; cleared at its end (#735 S-1).
                     self._private_seen.append(uid)
-                    self._private(turn, inferred)
+                    self._private(turn, inferred, voice_checks if checks_current else None)
                 return
             # Any turn heard outside privacy ends a split exit.
             self._private_name_end = None
+            self._voice_generation += 1
             digest = hashlib.sha256(
                 json.dumps(turn.to_dict(), sort_keys=True).encode("utf-8")
             ).digest()
@@ -1241,7 +1378,14 @@ class SpeechEvents:
                 self._pending_bytes += size
             self._hear_other_voice(turn, role)
             name = self._speaker_name(turn, role)
-            source = self._role_source(turn, role, inferred)
+            source = self._role_source(
+                turn,
+                role,
+                inferred,
+                entry_voice=checks_current
+                and voice_checks.entry
+                and self._binding_unchanged(voice_checks, turn),
+            )
             self._emit(
                 "transcript",
                 turn=_with_role(turn, role),
@@ -1580,15 +1724,9 @@ class SpeechEvents:
         phrase is a no-op. A turn accepted before it was turned on and
         heard before it is still decided, but engages no conversation while it is on.
 
-        No `conversation` event is emitted while it is on (rightyo#244): a timer-driven
-        timeout's `emitted_at_ms` would say that private speech was being handled, and when.
-        Turning it on ends any engagement, said once at the entry (`conversation` back to
-        `ambient`, reason `timeout`, `at_ms` the entry), with nothing kept to revive, so nothing
-        can lapse, end or revive while private, and nothing deferred is emitted at the exit:
-        the next public request starts a fresh conversation. Nor is an owner-voice status
-        polled while it is on: the first poll after the exit may still show, at most once,
-        that private speech happened, though not when. Emits nothing else (but the on ack
-        below); turning it off reports counts only.
+        Privacy preserves the public conversation, dormant state and follow-up eligibility
+        (#291). Private turns cannot extend or end it. Normal public timeout and dismissal
+        rules still apply after the exit. Turning it off reports counts only.
 
         `ack` (#735 S-8) is true only for a host's applied `{"duck": true}` control line. Each
         such on, a redundant one while already on included, then emits one content-free
@@ -1605,25 +1743,14 @@ class SpeechEvents:
         with self._lock:
             at = now_ms
             self._clear_exit_audio()
-            ended = None
             # A change of mode always ends a split exit.
             self._private_name_end = None
+            self._voice_generation += 1
             if on and not self._duck:
-                self._request_outcomes.clear()
-                self._request_outcome_ends.clear()
-                self._pending_ack = None
-                # Privacy ends the conversation (rightyo#244), said at the entry itself, the
-                # moment the host already knows of, so the host never thinks it engaged: no
-                # timeout can fall due while private, and none is owed at the exit. Said once
-                # the mode is applied, so a failed emit cannot leave the entry half done.
+                # Keep the entry/ack clock identical to the former conversation end,
+                # without ending or otherwise changing the public engagement.
                 if self._engaged is not None and self._active:
-                    ended = self._engaged["speaker_id"]
-                self._engaged = None
-                self._dormant = None
-                # Defensive: with nothing engaged or dormant these no longer matter, and a
-                # fresh request resets them anyway.
-                self._asked_at = None
-                self._replied_at = None
+                    self._now = max(self._now, at)
                 self._duck_spans.append([at, None])
                 if len(self._duck_spans) > MAX_DUCK_SPANS:
                     first, second = self._duck_spans[0], self._duck_spans.pop(1)
@@ -1646,17 +1773,10 @@ class SpeechEvents:
                             + " ".join(f"{key}={value}" for key, value in counts.items())
                         )
             self._duck = on
-            if ended is not None:
-                # Stamped at the entry: the host refuses an `at_ms` after `emitted_at_ms`.
-                # The reason is `timeout` (no turn named), the end the host already accepts.
-                self._now = max(self._now, at)
-                self._emit(
-                    "conversation", state="ambient", reason="timeout", speaker_id=ended, at_ms=at
-                )
             if on and ack and self._active and self._duck_acks:
                 self._emit("privacy", action="on", at_ms=at)
 
-    def _private(self, turn, inferred):
+    def _private(self, turn, inferred, checks):
         """Match a turn heard in privacy against the local phrases, then drop it.
 
         Called with the lock held. Emits at most one content-free `privacy` event: "exit"
@@ -1673,16 +1793,29 @@ class SpeechEvents:
             self._private_counts["failed"] += 1
             self._clear_exit_audio()
         split, self._private_name_end = self._private_name_end, None
+        self._voice_generation += 1
+        outcome = (
+            checks.exit
+            if checks is not None and checks.split == split
+            else (False, "voice_unavailable")
+        )
+        if outcome[0]:
+            allowed, reason = self._binding_exit_check(turn, inferred)
+            if checks.exit_origin == "binding":
+                if not allowed or not self._binding_unchanged(checks, turn, require_revision=True):
+                    outcome = False, reason or "voice_unavailable"
+            elif checks.exit_origin == "voice":
+                if not allowed and reason in {"inferred", "playback", "no_owner_check"}:
+                    outcome = False, reason
+            else:
+                outcome = False, "voice_unavailable"
         # Only a turn heard entirely since the mode last went on, while it is still on, is
         # matched at all (#242 round 23, see `transcript`): one heard in an earlier private
         # period and released late can never end this one, answer its status or be counted.
         if "name" in kinds:
-            # A name alone is not an exit: only an existing owner binding may accept
-            # the fragment. Never voice-score its audio, and erase it after the check.
-            try:
-                allowed, reason = self._binding_exit_check(turn, inferred)
-            finally:
-                self._clear_exit_audio()
+            # Authenticate both split fragments independently. Private processor turns
+            # are unlabelled: only their own isolated voice can authenticate them.
+            allowed, reason = outcome
             if allowed:
                 self._private_name_end = turn.end_ms
             else:
@@ -1695,7 +1828,7 @@ class SpeechEvents:
             and 0 <= turn.start_ms - split <= PRIVACY_SPLIT_NAME_MS
         )
         if named:
-            allowed, reason = self._exit_check(turn, inferred)
+            allowed, reason = outcome
             if allowed:
                 self._private_counts["exit"] += 1
                 self._emit("privacy", action="exit")
@@ -1729,25 +1862,31 @@ class SpeechEvents:
             with contextlib.suppress(Exception):
                 clear()
 
-    def _exit_check(self, turn, inferred):
+    def _exit_check(self, turn, inferred, *, binding=None):
+        return self._exit_approval(turn, inferred, binding=binding)[0]
+
+    def _exit_approval(self, turn, inferred, *, binding=None):
         """Check binding OR this turn's voice, retaining the conservative prechecks.
 
         Always erase candidate audio, even if a binding passes or a precheck refuses.
         """
         try:
-            allowed, reason = self._binding_exit_check(turn, inferred)
+            if binding is None:
+                with self._lock:
+                    binding = self._binding_exit_check(turn, inferred)
+            allowed, reason = binding
             if allowed or reason in {"inferred", "playback", "no_owner_check"}:
-                return allowed, reason
+                return (allowed, reason), "binding" if allowed else None
             voice = getattr(self._priority, "exit_voice", None)
             if callable(voice):
                 outcome = voice(turn)
                 if outcome == "pass":
-                    return True, None
+                    return (True, None), "voice"
                 if outcome in {"voice_below_threshold", "voice_unavailable"}:
-                    return False, outcome
-            return False, reason
+                    return (False, outcome), None
+            return (False, reason), None
         except Exception:  # noqa: BLE001 - private exceptions may contain words
-            return False, "voice_unavailable"
+            return (False, "voice_unavailable"), None
         finally:
             self._clear_exit_audio()
 
@@ -1822,6 +1961,7 @@ class SpeechEvents:
         (a full backlog raises) cannot leave the forget half done. The host is always told."""
         integer(now_ms, "now_ms")
         with self._lock:
+            self._voice_generation += 1
             ended = (
                 self._engaged["speaker_id"] if self._engaged is not None and self._active else None
             )
@@ -2131,7 +2271,7 @@ class SpeechEvents:
             unscoped = self._scoped_replies and (
                 request_id is None or current is None or current.get("request_id") != request_id
             )
-            if self._active and not unscoped:
+            if self._active and not unscoped and not self._duck:
                 self._asked_at = now_ms if asked else None
                 if self._replied_at is None:
                     # The first phase reported since the request: a host may forward only
@@ -2154,6 +2294,22 @@ class SpeechEvents:
                     if span is not None:
                         span[1] = now_ms
             if unscoped:
+                return
+            if self._duck:
+                # Privacy keeps the public conversation but suppresses its events.
+                # Reconcile only a hold already created publicly: a private start must
+                # not engage or revive a conversation, nor leave a new hold behind.
+                if (
+                    self._active
+                    and self._conversation is not None
+                    and current is not None
+                    and phase == "ended"
+                    and "replying_since" in current
+                ):
+                    current.pop("replying_since")
+                    current["until_ms"] = max(
+                        current["until_ms"], now_ms + self._conversation.window_ms
+                    )
                 return
             if self._active and self._pending_ack is not None:
                 self._answer_ack(phase)
@@ -2230,7 +2386,7 @@ class SpeechEvents:
         follow-up. Only speech after the reply counts. An explicit end (closing, dismissal,
         another person) left nothing dormant. Emits nothing: engagement events name a request."""
         dormant = self._dormant
-        if dormant is None or now_ms - dormant["at_ms"] > REVIVE_WINDOW_MS:
+        if self._duck or dormant is None or now_ms - dormant["at_ms"] > REVIVE_WINDOW_MS:
             return None
         self._dormant = None
         engaged = {
@@ -2284,7 +2440,7 @@ class SpeechEvents:
     def _lapse(self, now_ms):
         """Return to ambient once stream time passes the engagement window (#82)."""
         engaged = self._engaged
-        if engaged is not None and now_ms >= self._window_end(engaged):
+        if not self._duck and engaged is not None and now_ms >= self._window_end(engaged):
             self._engaged = None
             # A question belongs to its conversation (#199); a revival starts a new reply.
             self._asked_at = None
@@ -3317,6 +3473,7 @@ class SpeechEvents:
             self._withdrawn.clear()
             self._private_seen.clear()
             self._private_name_end = None
+            self._voice_generation += 1
             self._clear_exit_audio()
             self._request_outcomes.clear()
             self._request_outcome_ends.clear()

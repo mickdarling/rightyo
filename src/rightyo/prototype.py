@@ -707,7 +707,7 @@ class PrototypeController:
         self._runner: ReplayRunner | None = None
         self._capture = None
         self._processor = None
-        # The session's speaker identifier, while one runs (forgotten when privacy ends).
+        # The session's identifier, forgotten only when speaker labels are renewed.
         self._shadow = None
         self._audio_thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -1078,6 +1078,13 @@ class PrototypeController:
         with self._lock:
             if generation != self._generation or self._stop.is_set():
                 return None
+            events = self._events
+            inferred = turn.utterance_id in self._inferred_turns
+        prepare = getattr(events, "prepare_transcript", None)
+        checks = prepare(turn, inferred=inferred) if callable(prepare) else None
+        with self._lock:
+            if generation != self._generation or self._stop.is_set():
+                return None
             # Privacy mode (internally duck, hailing-station #735 S-1), judged by when the
             # turn was heard (see `SpeechEvents.heard_ducked`): no hosted decision is ever
             # asked for it and it is kept out of the memory every later decision's context
@@ -1099,6 +1106,7 @@ class PrototypeController:
                     turn,
                     **({"inferred": True} if inferred else {}),
                     **({"diarized_head": head} if head is not None else {}),
+                    **({"voice_checks": checks} if callable(prepare) else {}),
                 )
             if self._decision_status == "off" or self._decision_cancel.is_set() or ducked:
                 return ducked
@@ -1123,7 +1131,8 @@ class PrototypeController:
         heard_ducked = getattr(self._events, "heard_ducked", None)
         if not callable(heard_ducked):
             return None if callable(getattr(self._events, "duck", None)) else False
-        return heard_ducked(SimpleNamespace(start_ms=start_ms, end_ms=end_ms)) is True
+        state = heard_ducked(SimpleNamespace(start_ms=start_ms, end_ms=end_ms))
+        return state if type(state) is bool else None
 
     def _heard_private(self, turn: Turn) -> bool:
         """Whether the publisher heard this turn in privacy mode (hailing-station #735)."""
@@ -1333,14 +1342,31 @@ class PrototypeController:
         # (so a mode change between the two cannot split them). Only a matched local exit
         # may score its isolated sentence, without ever offering it to shadow.turn.
         with self._lock:
-            private = self._accept(generation, work, memory, turn)
-            # #242 round 23: the speaker epoch is read in the same critical section as the
-            # privacy state, so a privacy cycle completing before `shadow.turn` queues the
-            # turn (`forget` advances the epoch) discards it instead of binding its old label.
-            epoch = (
-                getattr(shadow, "epoch", None) if shadow is not None and private is False else None
+            # Snapshot public eligibility and epoch before scoring an unbound renewed
+            # label. Bound labels keep the normal asynchronous path.
+            epoch = getattr(shadow, "epoch", None) if shadow is not None else None
+            scored_before = (
+                roles is not None
+                and type(epoch) is int
+                and epoch > 0
+                and (shadow.binding(turn.speaker_id) or (None,))[0] != "bound"
+                and generation == self._generation
+                and not self._stop.is_set()
+                and not self._heard_private(turn)
             )
-        if shadow is not None and private is False:
+        if scored_before:
+            # Privacy controls and Stop must stay responsive while the worker scores.
+            shadow.turn(turn, inferred=inferred, spans=spans, epoch=epoch, wait=True)
+        with self._lock:
+            if scored_before and shadow.epoch != epoch:
+                # Renewed while scoring: this turn's old label has no authority now.
+                turn = replace(turn, speaker_id=None, speaker_provenance="unknown")
+                self._inferred_turns.discard(turn.utterance_id)
+            # Sample before acceptance/scoring: any intervening forget invalidates the
+            # queued evidence rather than binding an old label in the new epoch.
+            epoch = getattr(shadow, "epoch", None) if shadow is not None else None
+        private = self._accept(generation, work, memory, turn)
+        if shadow is not None and private is False and not scored_before:
             # After the turn is accepted and published; it never raises or blocks.
             shadow.turn(
                 turn,
@@ -1637,7 +1663,7 @@ class PrototypeController:
 
     def _private_audio(self) -> bool:
         """Whether privacy mode is on now, as the publisher holds it."""
-        return getattr(self._events, "ducked", False) is True
+        return getattr(self._events, "ducked", False) is not False
 
     def _refuse_private_hosted(self) -> None:
         """#242 round 27: privacy is never active with a hosted audio consumer configured; the
@@ -1962,9 +1988,13 @@ class PrototypeController:
             if self._events is not None:
                 self._private_sentence.clear()
                 ending = not on and self._events.ducked is True
+                discarded = getattr(self._events, "_private_counts", {}).get("discarded", 0)
                 if on and self._events.ducked is not True:
                     # #242 round 27: where this privacy interval starts, in stream bytes.
                     self._private_from_bytes = self._received_bytes
+                    begin = getattr(getattr(self, "_processor", None), "begin_privacy", None)
+                    if callable(begin):
+                        begin(self._received_bytes)
                 # At least the end of every piece received so far, held ones included. Every
                 # applied on, a redundant one included, is acked (#735 S-8): audio received
                 # after the ack's `at_ms` falls inside the span.
@@ -1978,16 +2008,40 @@ class PrototypeController:
                     self._event_delivery_failed()
                     raise
                 if ending:
-                    # #242 round 27: an interval in which no audio was received, judged on the
-                    # stream clock in bytes (one sample counts), heard no one, so it forgets no
-                    # speaker: every effect of `_forget_speakers` (the publisher's renewed and
-                    # stale labels, the runner's, the diarizer renewal, the identifier's
-                    # bindings) assumes private audio was heard. Unknown (privacy began outside
-                    # the controller mid-session) forgets, fail closed.
                     start = self._private_from_bytes
                     self._private_from_bytes = None
-                    if start is None or self._received_bytes > start:
+                    count, reason = 0, None
+                    audit = getattr(self._processor, "end_privacy", None)
+                    if callable(audit):
+                        try:
+                            result = audit(self._received_bytes)
+                        except Exception:  # noqa: BLE001 - fail closed without content
+                            result = None
+                        if (
+                            isinstance(result, tuple)
+                            and len(result) == 2
+                            and type(result[0]) is int
+                            and result[0] >= 0
+                            and (
+                                result[1] is None
+                                or type(result[1]) is str
+                                and result[1] in {"private_frames", "privacy_unknown"}
+                            )
+                        ):
+                            count, reason = result
+                        elif start is None or self._received_bytes > start:
+                            reason = "audit_unavailable"
+                    elif start is None or self._received_bytes > start:
+                        reason = "audit_unavailable"
+                    if count or reason is not None:
                         self._forget_speakers()
+                    if self.report is not None:
+                        with contextlib.suppress(Exception):
+                            self.report(
+                                f"privacy off: discarded={discarded} "
+                                f"diarizer_private_frames={count} "
+                                + (f"forget=full reason={reason}" if reason else "forget=skipped")
+                            )
 
     def _speakers_renewed(self) -> None:
         """The fresh diarizer takes over (#735 S-1, round 15): its labels restart from the first

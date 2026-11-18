@@ -20,11 +20,14 @@ from test_live_audio import SILENCE, VOICE, FakeDiarizer
 
 from rightyo.contracts import Addressing
 from rightyo.live_audio import (
+    ASR_HELD_BYTES,
+    ASR_HELD_WINDOWS,
     BYTES_PER_MS,
     LiveAudioError,
     LiveConfig,
     LiveProcessor,
     _checked_units,
+    _FinalizedWindow,
     _recognizer_window,
     _WindowRecovery,
 )
@@ -194,7 +197,9 @@ class WhisperWindowRecoveryTests(unittest.TestCase):
             processor.finish()
         self.assertEqual(decode.call_count, 2)
         first, retry = decode.call_args_list
-        self.assertIs(first.args[1], retry.args[1])
+        # Recovery owns wipeable PCM; it must retry the exact samples, even when
+        # the replaceable initial transcriber required an immutable bytes input.
+        self.assertEqual(first.args[1], retry.args[1])
         self.assertTrue(callable(first.args[2]))
         self.assertTrue(callable(retry.args[2]))  # separate, cancellable process ownership
         self.assertEqual(first.args[0].whisper_executable, retry.args[0].whisper_executable)
@@ -683,6 +688,139 @@ class WhisperWindowRecoveryTests(unittest.TestCase):
         self.assertIn("outcome=lost window_id=5 start_ms=6560 end_ms=8200", reports[4])
         self.assertIn("reasons=0,1,0,0,0,1", reports[4])
         self.assertEqual(processor.buffered_audio_bytes, 0)
+
+    def test_compacted_rejection_does_not_overflow_a_smaller_public_window(self):
+        processor, turns, reports = self.processor()
+        entered, release = threading.Event(), threading.Event()
+
+        def packet(number, duration, document):
+            offset = (number - 1) * 15000
+            window = _recognizer_window(document, duration)
+            return _FinalizedWindow(
+                bytearray(b"\x01\x00" * (duration * 16)),
+                offset,
+                offset + duration,
+                offset,
+                number,
+                [],
+                "causal-replay",
+                True,
+                window.units,
+                window,
+                (0, 0),
+                duration,
+                False,
+            )
+
+        def retry(*_):
+            entered.set()
+            if not release.wait(3):
+                raise AssertionError("test did not release authored retry")
+            return doc(GOOD)
+
+        with patch("rightyo.live_audio._transcribe", side_effect=retry):
+            try:
+                for number in range(1, 5):
+                    processor._queue_window(packet(number, 15000, doc(BAD)))
+                self.assertTrue(entered.wait(1))
+                self.assertEqual(len(processor._recoveries), 4)
+                recovery = processor._recovery
+                for number in range(5, 39):
+                    processor._queue_window(packet(number, 15000, doc(GOOD)))
+                held_bytes = sum(
+                    entry.held_bytes() for entry in processor._waiting if not entry.retry_pending
+                )
+                rejected = packet(39, 15000, doc(BAD))
+                public = packet(40, 200, doc(segment(" PUBLIC_AFTER_REJECTION", 20, 180)))
+                self.assertEqual((held_bytes, rejected.held_bytes()), (16_374_672, 481_536))
+                self.assertEqual(public.held_bytes(), 8_028)
+                self.assertGreater(held_bytes + rejected.held_bytes(), ASR_HELD_BYTES)
+                rejected_pcm = rejected.pcm
+                processor._queue_window(rejected)
+                processor._queue_window(public)
+                self.assertFalse(any(rejected_pcm))
+                self.assertEqual(rejected.pcm, bytearray())
+                self.assertLessEqual(
+                    held_bytes + rejected.held_bytes() + public.held_bytes(), ASR_HELD_BYTES
+                )
+                self.assertFalse(rejected.overflow or public.overflow)
+                self.assertFalse(recovery.cancelled.is_set())
+            finally:
+                release.set()
+            processor._drain_results(wait=True)
+        self.assertEqual(
+            [turn.text for turn in turns],
+            ["RECOVERED_FIXTURE"] * 38 + ["PUBLIC_AFTER_REJECTION"],
+        )
+        self.assertEqual(processor.skipped_utterances, 1)
+        self.assertTrue(all("PUBLIC_AFTER_REJECTION" not in report for report in reports))
+
+    def test_public_rejection_keeps_pcm_when_callback_frees_retry_slot(self):
+        processor, turns, reports = self.processor()
+        entered, release = threading.Event(), threading.Event()
+        retry_lengths = []
+
+        def packet(number, duration, document, offset):
+            window = _recognizer_window(document, duration)
+            return _FinalizedWindow(
+                bytearray(b"\x01\x00" * (duration * 16)),
+                offset,
+                offset + duration,
+                offset,
+                number,
+                [],
+                "causal-replay",
+                True,
+                window.units,
+                window,
+                (0, 0),
+                duration,
+                False,
+            )
+
+        def decode(_config, pcm, _register):
+            retry_lengths.append(len(pcm))
+            if len(retry_lengths) == 1:
+                entered.set()
+                if not release.wait(10):
+                    raise AssertionError("test did not release authored retry")
+            return doc(GOOD)
+
+        def privacy_off(start, end):
+            # Closing the older private interval frees recovery slots while the
+            # public packet is still awaiting its final admission decision.
+            processor.end_privacy(800 * BYTES_PER_MS)
+            return False
+
+        with patch("rightyo.live_audio._transcribe", side_effect=decode):
+            try:
+                for index in range(4):
+                    processor._queue_window(packet(index + 1, 200, doc(BAD), index * 200))
+                self.assertTrue(entered.wait(1))
+                for index in range(ASR_HELD_WINDOWS):
+                    processor._queue_window(
+                        packet(index + 5, 40, doc(segment(" HELD_PUBLIC", 0, 20)), 800 + index * 40)
+                    )
+                public = packet(ASR_HELD_WINDOWS + 5, 200, doc(BAD), 800 + ASR_HELD_WINDOWS * 40)
+                processor._finalizing = public
+                self.assertEqual(len(processor._recoveries), 4)
+                with patch.object(processor, "_heard_private", side_effect=privacy_off) as privacy:
+                    processor._queue_window(public)
+                self.assertEqual(
+                    privacy.call_args_list[0].args,
+                    (public.offset, public.offset + public.duration_ms),
+                )
+                self.assertFalse(public.discarded)
+                self.assertTrue(public.retry_pending)
+                self.assertEqual(len(public.pcm), 200 * BYTES_PER_MS)
+                self.assertFalse(public.window.reasons[5])
+            finally:
+                release.set()
+            processor._drain_results(wait=True)
+        self.assertEqual(retry_lengths, [200 * BYTES_PER_MS] * 2)
+        self.assertEqual(turns[-1].text, "RECOVERED_FIXTURE")
+        self.assertEqual(processor.skipped_utterances, 0)
+        self.assertTrue(all("RECOVERED_FIXTURE" not in report for report in reports))
 
     def test_result_hold_overflow_never_cancels_the_older_recovery(self):
         processor, turns, reports, entered, release, _first, _retries, decode = self.blocked_retry()
