@@ -839,8 +839,8 @@ decisions arrive in) forms a request when all of these hold:
 - Jev's attend probability is at least `follow_up_min_probability`;
 - its recipient is `system` or `unknown` (never `other_human` or another speaker);
 - it is not a closing phrase;
-- it is not courtesy-only, unless it names the assistant or answers a question the
-  assistant asked;
+- it is not courtesy-only, unless it names the assistant or a question the assistant
+  asked is pending;
 - the decision was not a transient unavailability placeholder, and `owner_only` does not
   exclude the speaker;
 - with `require_cue` ([#199](https://github.com/mickdarling/rightyo/issues/199)), it
@@ -884,8 +884,8 @@ decisions arrive in) forms a request when all of these hold:
 
 A non-empty turn made entirely of the courtesy words listed under **Closings**, with
 no closing phrase and no question ending, is refused as `courtesy`, unless it names the
-assistant or passes the answer-shape check after the assistant asked a question.
-This includes a bare non-question "perfect" as well as existing answers such as "okay".
+assistant or a question the assistant asked is pending. Every other follow-up check,
+including the existing cue requirement, still applies.
 Neither an appendix, `continuation_cue`, nor `cue_min_attend` waives this check.
 The content-free follow-up diagnostic is
 `follow_up outcome=refused reason=courtesy attend=… bar=…`; it includes no text or ids.
@@ -962,7 +962,7 @@ and `{"reply": "ended"}` to inherited descriptor N, and RightyO stamps each with
 stream clock on arrival. An ended reply that asked the owner a question may say so:
 `{"reply": "ended", "asked": true}` ([#199](https://github.com/mickdarling/rightyo/issues/199)).
 Until the next reply starts, a follow-up that opens as an answer ("yes", "yeah", "sure",
-"no", "okay", "go ahead", "do it", "sounds good", or a bare non-question "perfect")
+"no", "okay", "go ahead", "do it", "sounds good")
 then carries its own cue under
 `require_cue`. Every other follow-up rule still applies. While engaged, a playing reply holds the window open (bounded
 at 180 s if its end never comes), and its end restarts the window from that moment. A

@@ -119,13 +119,50 @@ class CourtesyFollowUpTests(unittest.TestCase):
                 self.assert_formed(self.say(turn("named-courtesy", 2000, 2400, text)))
 
     def test_a_courtesy_answer_to_the_assistants_question_forms_a_follow_up(self):
-        for text in ("Okay.", "OK.", "Perfect.", "Okay, perfect."):
+        for text in (
+            "Okay.",
+            "Perfect.",
+            "Great.",
+            "Alright.",
+            "All right.",
+            "Cool.",
+            "Thanks.",
+            "Excellent.",
+            "Cheers.",
+        ):
             with self.subTest(text=text):
-                self.prepare(replace(MODE, require_cue=True), asked=True)
+                self.prepare(replace(MODE, require_cue=False), asked=True)
                 current = turn("courtesy-answer", 2000, 2400, text)
                 self.assertTrue(MODE.is_courtesy_only(text))
-                self.assertTrue(self.events._answers_question(current))
                 self.assert_formed(self.say(current))
+
+    def test_pending_question_keeps_existing_answer_cues(self):
+        for text, answers in (("Okay.", True), ("OK.", True), ("Perfect.", False)):
+            with self.subTest(text=text):
+                self.prepare(replace(MODE, require_cue=True), asked=True)
+                current = turn("courtesy-answer-cue", 2000, 2400, text)
+                self.assertEqual(self.events._answers_question(current), answers)
+                output = self.say(current)
+                if answers:
+                    self.assert_formed(output)
+                else:
+                    self.assert_refused(output, reason="no_cue")
+
+    def test_courtesy_exemption_starts_at_the_question_time(self):
+        for start in (1199, 1200):
+            with self.subTest(start=start):
+                self.prepare(asked=True)
+                output = self.say(turn("courtesy-question-window", start, 1600, "Great."))
+                if start < 1200:
+                    self.assert_refused(output)
+                else:
+                    self.assert_formed(output)
+
+    def test_next_reply_clears_the_pending_question_courtesy_exemption(self):
+        self.prepare(asked=True)
+        self.events.reply("started", 1300)
+        self.events.drain()
+        self.assert_refused(self.say(turn("courtesy-after-next-reply", 2000, 2400, "Great.")))
 
     def test_a_courtesy_with_a_real_request_forms_a_follow_up(self):
         self.prepare(replace(MODE, require_cue=True))

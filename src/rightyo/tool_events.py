@@ -26,7 +26,6 @@ from rightyo.contracts import (
     formed_request_text,
     identifier,
     integer,
-    normalize_phrase,
     speaker_role,
 )
 from rightyo.memory import TranscriptMemory
@@ -2618,7 +2617,7 @@ class SpeechEvents:
         if (
             conversation.is_courtesy_only(turn.text)
             and not self._named(turn)
-            and not self._answers_question(turn)
+            and not self._question_pending(turn)
         ):
             # Courtesy alone is not a follow-up, even with appendix or cue waivers (#296).
             return "courtesy"
@@ -2646,21 +2645,14 @@ class SpeechEvents:
         bar = self._conversation.cue_min_attend
         return bar is not None and decision.probabilities["attend"] >= bar
 
+    def _question_pending(self, turn):
+        """Whether the assistant's question is pending when this turn starts."""
+        asked = self._asked_at
+        return asked is not None and turn.start_ms >= asked
+
     def _answers_question(self, turn):
         """Whether a turn starting after a reply that asked the owner a question answers it."""
-        asked = self._asked_at
-        return (
-            asked is not None
-            and turn.start_ms >= asked
-            and (
-                answer_shaped(turn.text)
-                or (
-                    # A bare affirmative courtesy still answers "Shall I send it?" (#296).
-                    normalize_phrase(turn.text) == "perfect"
-                    and self._conversation.is_courtesy_only(turn.text)
-                )
-            )
-        )
+        return self._question_pending(turn) and answer_shaped(turn.text)
 
     def _continues(self, turn, decision):
         """Whether the engaged speaker's own turn continues the exchange (#213): with
