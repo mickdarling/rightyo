@@ -13,7 +13,7 @@ from test_enrolled_roles import OWNER_ID, SESSION, HaildModel, decided, turn
 from test_live_speaker_id import ENTRIES, Harness, ScriptedEmbedder, settings, tone, wait_for
 
 from rightyo.contracts import Addressing, ContractError, Conversation
-from rightyo.live_speaker_id import PUBLIC_SCORE_WAIT_S, EnrolledRoles
+from rightyo.live_speaker_id import PUBLIC_SCORE_WAIT_S, EnrolledRoles, LabelState
 from rightyo.memory import TranscriptMemory
 from rightyo.speaker_id import SpeakerIdConfig
 from rightyo.tool_events import SpeechEvents
@@ -198,6 +198,109 @@ class BindingPublicationTests(unittest.TestCase):
             self.publish(c, h, current)
             self.assertEqual(self.transcript(e)["turn"]["role"], expected)
         self.assertEqual(h.fields(h.notes()[-1])["bind"], "accumulated")
+
+    def test_renewal_waits_past_300ms_for_its_own_binding(self):
+        gate = threading.Event()
+        c, e, h = self.arrange(scores=(0.65,), gate=gate)
+        h.shadow.forget()
+        # Synthetic embedding takes longer than the initial-epoch publication budget.
+        release = threading.Timer(PUBLIC_SCORE_WAIT_S + 0.2, gate.set)
+        self.addCleanup(release.cancel)
+        release.start()
+        before = time.monotonic()
+        self.publish(c, h, turn("renewal", 0, 1500, "Jarvis, check the authored list"))
+        self.assertGreater(time.monotonic() - before, PUBLIC_SCORE_WAIT_S)
+        self.assertEqual(self.transcript(e)["turn"]["role"], "owner")
+        self.assertEqual(h.fields(h.notes()[-1])["bind"], "rebind")
+
+    def test_renewal_late_enqueue_after_worker_drain_never_hangs(self):
+        for shutdown in ("off", "stop"):
+            with self.subTest(shutdown=shutdown):
+                c, e, h = self.arrange()
+                h.shadow.forget()
+                enqueue = h.shadow._queue.put_nowait
+                late_queued = threading.Event()
+
+                def late_enqueue(item):
+                    # Admission passed active, then the worker exited and drained before
+                    # this item reached the queue. There is nobody left to signal it.
+                    if shutdown == "off":
+                        h.shadow._off.set()
+                        h.shadow._closing.set()
+                        h.shadow._thread.join(1)
+                    else:
+                        h.shadow.close()
+                    self.assertFalse(h.shadow._thread.is_alive())
+                    enqueue(item)
+                    late_queued.set()
+
+                published = threading.Event()
+
+                def publish():
+                    try:
+                        self.publish(c, h, turn(shutdown, 0, 1500, "Authored renewal request"))
+                    finally:
+                        published.set()
+
+                with patch.object(h.shadow._queue, "put_nowait", side_effect=late_enqueue):
+                    caller = threading.Thread(target=publish, daemon=True)
+                    caller.start()
+                    try:
+                        self.assertTrue(published.wait(1), "renewal waiter hung after final drain")
+                        self.assertTrue(late_queued.is_set())
+                        self.assertTrue(h.shadow._queue.empty())
+                        self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
+                    finally:
+                        h.shadow._discard_queue()
+                        caller.join(1)
+
+    def test_settled_participant_without_single_threshold_publishes_without_waiting(self):
+        gate = threading.Event()
+        c, e, h = self.arrange(scores=(0.4,), gate=gate)
+        # Obtain a real committed unknown state from authored audio and a scripted score.
+        gate.set()
+        h.shadow.audio(tone(3))
+        h.shadow.turn(turn("settle", 0, 3000, "These are authored guest words"), spans=((0, 3000),))
+        wait_for(lambda: h.shadow.scored == 1)
+        self.assertEqual(h.shadow.binding("Speaker A"), ("unknown", "owner"))
+        gate.clear()
+        before = time.monotonic()
+        with patch("rightyo.live_speaker_id._ScoringDone.wait") as waiting:
+            self.publish(c, h, turn("settled", 3000, 4500, "These are more authored words"))
+        self.assertLess(time.monotonic() - before, PUBLIC_SCORE_WAIT_S)
+        waiting.assert_not_called()
+        self.assertEqual(self.transcript(e)["turn"]["role"], "participant")
+        wait_for(lambda: h.embedder.calls == 2)
+        self.assertEqual(h.shadow.scored, 1)  # Publication preceded the slow embedding.
+
+    def test_initial_wait_eligibility_uses_state_duration_score_and_single_threshold(self):
+        for state, seconds, score, threshold, waits in (
+            ("tentative", 1.5, 0.65, None, True),
+            ("unknown", 3.0, 0.4, 0.7, True),
+            ("unknown", 1.5, 0.45, None, True),
+            ("unknown", 1.0, 0.45, None, False),
+            ("unknown", 3.0, 0.44, None, False),
+        ):
+            with self.subTest(state=state, seconds=seconds, score=score, threshold=threshold):
+                gate = threading.Event()
+                c, e, h = self.arrange(threshold=threshold, gate=gate)
+                # Immutable committed-state snapshots; synthetic bookkeeping only.
+                h.shadow._labels["Speaker A"] = LabelState(
+                    state=state, seconds=seconds, score=score, identity="owner"
+                )
+                before = time.monotonic()
+                self.publish(c, h, turn("candidate", 0, 1500, "Authored binding candidate"))
+                elapsed = time.monotonic() - before
+                if waits:
+                    self.assertGreaterEqual(elapsed, PUBLIC_SCORE_WAIT_S)
+                else:
+                    self.assertLess(elapsed, PUBLIC_SCORE_WAIT_S)
+                self.assertEqual(
+                    self.transcript(e)["turn"]["role"],
+                    "participant" if state == "unknown" and seconds >= 3 else "unknown",
+                )
+                gate.set()
+                wait_for(lambda: h.shadow.scored == 1)
 
     def test_a_later_binding_never_rewrites_an_earlier_published_role(self):
         c, e, h = self.arrange(scores=(0.65, 0.65))

@@ -23,8 +23,9 @@ gives a bound label its enrolled identifier's configured role; it never waits fo
 Embedding runs on a dedicated worker thread behind a small bounded queue, never on the
 audio thread: when the worker is busy, a turn is dropped and counted. A worker that fails
 is reported once and switches shadow identification off for the rest of the session; the
-normal shadow scoring stays asynchronous. Unbound public roles may wait up to 300 ms
-for their own score before publication; privacy controls and Stop remain responsive. Audio is never
+normal shadow scoring stays asynchronous. Initial public binding candidates may wait up
+to 300 ms for their own score; after renewal they wait until scoring finishes, as before.
+Privacy controls and Stop remain responsive. Audio is never
 written: the ring holds at most `RING_MS` of PCM in memory by default
 (`audio_retention.speaker_ring_seconds` sets it, #226) and is cleared when the session ends.
 
@@ -510,8 +511,9 @@ class ShadowSpeakerId:
     ):
         """Queue one finalized turn for scoring; never raises.
 
-        `wait` allows at most PUBLIC_SCORE_WAIT_S for an unbound public turn's own
-        scoring. Returns its revision/binding snapshot only if this item created a bind;
+        `wait` finishes an unbound public turn's own scoring after renewal; at epoch zero
+        only a possible binding turn waits, for at most PUBLIC_SCORE_WAIT_S. Returns its
+        revision/binding snapshot only if this item created a bind;
         timeout, failure, discard or insufficient speech returns None. Shadow scoring
         remains asynchronous. No waiting for inferred, overlap or unscorable turns.
 
@@ -564,17 +566,36 @@ class ShadowSpeakerId:
             if not pcm:
                 return
             try:
-                can_wait = (
-                    wait
-                    and not inferred
-                    and len(speech(_samples(pcm))) / SAMPLE_RATE >= self.settings.min_turn_seconds
-                )
+                can_wait = False
+                if wait and not inferred:
+                    seconds = min(len(speech(_samples(pcm))) / SAMPLE_RATE, MAX_VERIFY_SECONDS)
+                    state = self._labels.get(turn.speaker_id)
+                    can_wait = seconds >= self.settings.min_turn_seconds and (
+                        epoch > 0
+                        or self.settings.single_turn_bind_threshold is not None
+                        or state is None
+                        or state.state == "tentative"
+                        or (
+                            state.seconds + seconds >= self.settings.bind_min_seconds
+                            and state.score is not None
+                            and state.score >= self.settings.tentative_threshold
+                        )
+                    )
                 done = _ScoringDone() if can_wait else None
                 self._queue.put_nowait(
                     (epoch, turn.speaker_id, turn.end_ms - turn.start_ms, labelled_ms, pcm, done)
                 )
-                if done is not None and done.wait(PUBLIC_SCORE_WAIT_S):
-                    return done.binding
+                if done is not None:
+                    if epoch > 0:
+                        while not done.wait(0.05):
+                            # Admission can race the worker's final drain. Never leave a
+                            # late enqueue waiting on a worker that has already exited.
+                            if self._off.is_set() or self._stop.is_set():
+                                self._discard_queue()
+                                return
+                        return done.binding
+                    if done.wait(PUBLIC_SCORE_WAIT_S):
+                        return done.binding
                 if self._off.is_set() or self._stop.is_set():
                     self._discard_queue()
             except queue.Full:
