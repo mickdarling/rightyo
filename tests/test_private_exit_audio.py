@@ -25,6 +25,7 @@ from test_live_speaker_id import (
     settings,
     tone,
     turn,
+    unit,
     wait_for,
 )
 
@@ -33,6 +34,7 @@ from rightyo.live_audio import LiveConfig, LiveProcessor
 from rightyo.live_speaker_id import (
     PRIVATE_TURN_MAX_BYTES,
     EnrolledRoles,
+    EntryScore,
     LabelState,
     PrivateTurnAudio,
 )
@@ -86,6 +88,112 @@ class PrivateExitTests(unittest.TestCase):
             controller._generation, queue.Queue(), TranscriptMemory(), controller._shadow, current
         )
         return old
+
+    def test_stop_cancels_promptly_during_split_name_native_inference(self):
+        # Exercise both split fragments and the complete exit through the real worker.
+        for fragment in ("Unit", "privacy off", EXIT, "privacy mode"):
+            with self.subTest(fragment=fragment):
+                entered, release, stopped = (threading.Event() for _ in range(3))
+
+                class BlockingEmbedder(ScriptedEmbedder):
+                    def embed(self, pcm):
+                        entered.set()
+                        return super().embed(pcm)
+
+                embedder = BlockingEmbedder([unit(1, 0, 0)], gate=release)
+                harness = self.harness(embedder)
+                c, e, _ = self.controller(harness)
+                if fragment == "privacy off":
+                    # The name fragment was already independently authenticated.
+                    with patch.object(harness.shadow, "exit_score") as score:
+                        score.return_value = EntryScore(0.9, None, 0, "scored")
+                        self.hear(c, "Unit")
+                        score.assert_called_once()
+                if fragment == "privacy mode":
+                    c.duck(False)
+                    harness.shadow._labels["Speaker A"] = LabelState(
+                        state="bound", identity="owner", seconds=4
+                    )
+                    harness.shadow.audio(tone(2))
+                    c._observe_spans(c._generation, "live-1000", ((1000, 2000),))
+                errors = []
+
+                def hear():
+                    try:
+                        self.hear(c, fragment, start=1000, inferred=fragment == "privacy mode")
+                    except Exception as error:
+                        errors.append(error)
+
+                def stop():
+                    try:
+                        c.stop()
+                    except Exception as error:
+                        errors.append(error)
+                    finally:
+                        stopped.set()
+
+                audio, control = threading.Thread(target=hear), threading.Thread(target=stop)
+                audio.start()
+                try:
+                    self.assertTrue(entered.wait(1), "native stand-in did not start")
+                    borrowed = c._private_sentence.pcm
+                    control.start()
+                    self.assertTrue(stopped.wait(0.2), "Stop waited for native inference")
+                    self.assertTrue(c._stop.is_set())
+                    self.assertTrue(c._decision_cancel.is_set())
+                    self.assertFalse(any(borrowed))
+                    self.assertFalse(c._private_sentence.pcm)
+                finally:
+                    release.set()
+                    for worker in (audio, control):
+                        if worker.ident is not None:
+                            worker.join(3)
+                self.assertTrue(all(not worker.is_alive() for worker in (audio, control)))
+                self.assertEqual(errors, [])
+                self.assertNotIn("exit", [event.get("action") for event in e.drain()])
+
+    def test_inflight_name_check_cannot_authorize_a_new_privacy_generation(self):
+        for change in ("cycle", "redundant_on", "forget", "playback"):
+            with self.subTest(change=change):
+                harness = self.harness()
+                c, e, _ = self.controller(harness)
+                entered, release = threading.Event(), threading.Event()
+                errors = []
+
+                def score(*_):
+                    entered.set()
+                    if not release.wait(3):
+                        raise AssertionError("test did not release voice check")
+                    return EntryScore(0.9, None, 0, "scored")
+
+                def hear():
+                    try:
+                        self.hear(c, "Unit")
+                    except Exception as error:
+                        errors.append(error)
+
+                audio = threading.Thread(target=hear)
+                with patch.object(harness.shadow, "exit_score", side_effect=score):
+                    audio.start()
+                    try:
+                        self.assertTrue(entered.wait(1))
+                        if change == "cycle":
+                            c.duck(False)
+                            c.duck(True)
+                        elif change == "redundant_on":
+                            c.duck(True)
+                        elif change == "forget":
+                            c._forget_speakers()
+                        else:
+                            e.reply("started", now_ms=1000)
+                    finally:
+                        release.set()
+                        audio.join(3)
+                self.assertFalse(audio.is_alive())
+                self.assertEqual(errors, [])
+                self.assertIsNone(e._private_name_end)
+                self.hear(c, "privacy off", start=1000)
+                self.assertNotIn("exit", [event.get("action") for event in e.drain()])
 
     def test_replacement_zeroes_the_old_object_and_holds_only_the_latest_turn(self):
         buffer = PrivateTurnAudio()

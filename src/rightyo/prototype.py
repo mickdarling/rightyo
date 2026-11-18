@@ -1078,6 +1078,13 @@ class PrototypeController:
         with self._lock:
             if generation != self._generation or self._stop.is_set():
                 return None
+            events = self._events
+            inferred = turn.utterance_id in self._inferred_turns
+        prepare = getattr(events, "prepare_transcript", None)
+        checks = prepare(turn, inferred=inferred) if callable(prepare) else None
+        with self._lock:
+            if generation != self._generation or self._stop.is_set():
+                return None
             # Privacy mode (internally duck, hailing-station #735 S-1), judged by when the
             # turn was heard (see `SpeechEvents.heard_ducked`): no hosted decision is ever
             # asked for it and it is kept out of the memory every later decision's context
@@ -1099,6 +1106,7 @@ class PrototypeController:
                     turn,
                     **({"inferred": True} if inferred else {}),
                     **({"diarized_head": head} if head is not None else {}),
+                    **({"voice_checks": checks} if callable(prepare) else {}),
                 )
             if self._decision_status == "off" or self._decision_cancel.is_set() or ducked:
                 return ducked
@@ -1354,13 +1362,10 @@ class PrototypeController:
                 # Renewed while scoring: this turn's old label has no authority now.
                 turn = replace(turn, speaker_id=None, speaker_provenance="unknown")
                 self._inferred_turns.discard(turn.utterance_id)
-            private = self._accept(generation, work, memory, turn)
-            # #242 round 23: the speaker epoch is read in the same critical section as the
-            # privacy state, so a privacy cycle completing before `shadow.turn` queues the
-            # turn (`forget` advances the epoch) discards it instead of binding its old label.
-            epoch = (
-                getattr(shadow, "epoch", None) if shadow is not None and private is False else None
-            )
+            # Sample before acceptance/scoring: any intervening forget invalidates the
+            # queued evidence rather than binding an old label in the new epoch.
+            epoch = getattr(shadow, "epoch", None) if shadow is not None else None
+        private = self._accept(generation, work, memory, turn)
         if shadow is not None and private is False and not scored_before:
             # After the turn is accepted and published; it never raises or blocks.
             shadow.turn(

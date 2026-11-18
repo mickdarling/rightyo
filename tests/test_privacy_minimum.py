@@ -1,5 +1,6 @@
 """#291: authored turns and synthetic PCM; no capture, downloads or enrolled data."""
 
+import builtins
 import contextlib
 import io
 import queue
@@ -81,6 +82,75 @@ class PrivacyMinimumTests(unittest.TestCase):
             controller._feed(
                 controller._generation, processor, pcm[offset : offset + 640], "demo", shadow
             )
+
+    def test_privacy_off_after_publisher_cuts_drops_units_without_closing_session(self):
+        c, e, s, p, _, _ = self.arrange()
+        p.config = replace(p.config, edge_attribution_ms=500)
+        paused, exited = threading.Event(), threading.Event()
+        packets, errors = [], []
+
+        def exit_privacy():
+            try:
+                if not paused.wait(3):
+                    raise AssertionError("publisher did not reach its cuts")
+                c.duck(False)
+            except Exception as error:
+                errors.append(error)
+            finally:
+                exited.set()
+
+        def unit_cuts(left, right):
+            # _publish_window has computed both boundaries but not read the slice.
+            packet = p._publishing
+            packets.append((packet, packet.pcm, packet.units))
+            paused.set()
+            self.assertTrue(exited.wait(3), "privacy-off waited for the publisher")
+            return builtins.zip(left, right)
+
+        c.duck(True)
+        e.drain()
+        control = threading.Thread(target=exit_privacy)
+        control.start()
+        try:
+            with patch("rightyo.live_audio.zip", side_effect=unit_cuts, create=True):
+                self.feed(c, p, VOICE * 10 + SILENCE * 72, s)
+        finally:
+            paused.set()
+            control.join(3)
+        self.assertFalse(control.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(packets), 1)
+        packet, pcm, units = packets[0]
+        self.assertTrue(packet.discarded)
+        self.assertFalse(any(pcm))
+        self.assertEqual(units, [])
+        self.assertEqual(packet.units, [])
+        self.assertEqual(packet.pcm, bytearray())
+        self.assertFalse(p.failed)
+        self.assertFalse(p.closed)
+        self.assertFalse(p._merger.holding)
+        self.assertFalse(c._stop.is_set())
+        self.assertEqual(e.drain(), [])
+        self.assertFalse(c._private_sentence.pcm)
+        self.assertEqual(s.offered, 0)
+
+    def test_edge_attribution_accepts_an_empty_unit_slice(self):
+        _, e, _, p, _, _ = self.arrange()
+        p.config = replace(p.config, edge_attribution_ms=500)
+        p._publish_units(
+            [],
+            [],
+            0,
+            b"",
+            "diarization-timeline",
+            number=1,
+            timeline_present=True,
+            complete=True,
+            packet=Mock(discarded=False),
+        )
+        self.assertFalse(p.failed)
+        self.assertFalse(p._merger.holding)
+        self.assertEqual(e.drain(), [])
 
     def test_empty_privacy_interval_preserves_and_publishes_public_prefix(self):
         c, e, s, p, notes, units = self.arrange()

@@ -2297,17 +2297,21 @@ class LiveProcessor:
                 self._publishing = None
 
     def _publish_window(self, packet: _FinalizedWindow) -> None:
-        if self.closed or packet.discarded:
-            packet.release()
-            return
-        pcm, offset, timeline = packet.pcm, packet.offset, packet.timeline
-        window, complete, provenance = packet.window, packet.complete, packet.provenance
-        checked = _checked_units(packet.units, packet.duration_ms)
+        # Privacy-off/Stop release the packet under this same lock. Never iterate or
+        # slice its shared units outside it; cuts remain valid only while not discarded.
+        with self._recovery_lock:
+            if self.closed or packet.discarded:
+                packet.release()
+                return
+            pcm, offset, timeline = packet.pcm, packet.offset, packet.timeline
+            window, complete, provenance = packet.window, packet.complete, packet.provenance
+            checked = _checked_units(packet.units, packet.duration_ms)
+            unit_count = len(checked) if checked is not None else 0
         if window is not None:
             skipped = window.rejected
             self._skipped_segments += skipped
             suppressed = checked is None or (
-                not checked and bool(window.rejected or window.retried or window.reasons[5])
+                not unit_count and bool(window.rejected or window.retried or window.reasons[5])
             )
             self._skipped_utterances += packet.loss_count if suppressed else 0
         else:
@@ -2339,7 +2343,7 @@ class LiveProcessor:
                 f"asr_window outcome={outcome} window_id={packet.number}{extent}"
                 f" start_ms={offset} end_ms={offset + packet.duration_ms}"
                 f" segments={window.segments} retry_segments={window.retry_segments}"
-                f" units={len(window.units)} repaired={window.repaired} rejected={window.rejected}"
+                f" units={unit_count} repaired={window.repaired} rejected={window.rejected}"
                 f" reasons={','.join(map(str, window.reasons))}"
                 f" asr_elapsed_ms={window.elapsed_ms}",
                 span=(offset, offset + packet.duration_ms),
@@ -2363,23 +2367,30 @@ class LiveProcessor:
             self._merger.flush()
             return
         gaps = window.gaps if window is not None else set()
-        cuts = sorted({0, len(checked)} | gaps)
+        cuts = sorted({0, unit_count} | gaps)
         for left, right in zip(cuts, cuts[1:]):
+            with self._recovery_lock:
+                if self.closed or packet.discarded:
+                    return
+                units = checked[left:right]
             if left in gaps:
                 self._merger.flush()
             self._publish_units(
-                checked[left:right],
+                units,
                 timeline,
                 offset,
                 pcm,
                 provenance,
                 number=packet.number,
                 timeline_present=packet.timeline_present,
-                complete=complete and right == len(checked) and right not in gaps,
+                complete=complete and right == unit_count and right not in gaps,
+                packet=packet,
                 loss_before=left in gaps,
                 loss_after=right in gaps,
             )
-        if len(checked) in gaps:
+        if self.closed or packet.discarded:
+            return
+        if unit_count in gaps:
             self._merger.flush()
         self._merger.due(packet.through_ms, None)
 
@@ -2394,10 +2405,13 @@ class LiveProcessor:
         number: int,
         timeline_present: bool,
         complete: bool,
+        packet: _FinalizedWindow,
         loss_before: bool = False,
         loss_after: bool = False,
     ) -> None:
         """Attribute one uninterrupted run; neither edge inference nor merging crosses loss."""
+        if self.closed or packet.discarded or not units:
+            return
         # Touching segments overlap no duration, but still block edge inference.
         relevant = [segment for segment in timeline if segment["end_ms"] >= offset]
         attributed = []
@@ -2429,7 +2443,7 @@ class LiveProcessor:
                 if label is not None and touching == {label}:
                     entry[3] = label
         inferred: set[int] = set()
-        if self.config.edge_attribution_ms and provenance == "diarization-timeline":
+        if attributed and self.config.edge_attribution_ms and provenance == "diarization-timeline":
             # Edge inference may use evidence only inside this uninterrupted run.
             # Boundary-touching segments still block a competing label. At a loss,
             # evidence entirely on its other side cannot supply that label itself.
@@ -2487,6 +2501,8 @@ class LiveProcessor:
                 groups[-1]["inferred"] = True
         kept = [group for group in groups if group["text"].strip()]
         for index, group in enumerate(kept):
+            if self.closed or packet.discarded:
+                return
             head = group["diarized_head"]
             leading = len(group["text"]) - len(group["text"].lstrip())
             group["text"] = group["text"].strip()

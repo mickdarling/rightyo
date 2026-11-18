@@ -9,7 +9,7 @@ import json
 import re
 import unicodedata
 from collections import deque
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from threading import RLock
 
 from rightyo.addressedness import answer_shaped, follow_up_cued, mentions_name
@@ -512,6 +512,19 @@ def _audio_input(value):
     return dict(expected)
 
 
+@dataclass(frozen=True)
+class _VoiceChecks:
+    """One turn's checks, valid only in the publisher/identity generation sampled."""
+
+    turn: Turn
+    inferred: bool
+    generation: int
+    speaker_epoch: int | None
+    split: int | None
+    exit: tuple[bool, str | None] = (False, "voice_unavailable")
+    entry: bool = False
+
+
 class SpeechEvents:
     """Local v1 producer. Frozen request context never observes later turns.
 
@@ -565,6 +578,7 @@ class SpeechEvents:
         # overrides can never overflow the queue; exceeding the bound fails closed.
         self.max_open = max_pending - 4
         self._lock = RLock()
+        self._voice_generation = 0
         self._memory = TranscriptMemory(retention_ms=retention_ms)
         self._session = None
         self._sequence = self._now = 0
@@ -738,7 +752,7 @@ class SpeechEvents:
     def _size(payload):
         return len(encode_json(payload)) + 1  # Include the JSONL newline.
 
-    def _role_source(self, turn, role, inferred):
+    def _role_source(self, turn, role, inferred, *, entry_voice=False):
         """ "voiceprint" when `turn` is the owner by live voiceprint identification, else
         None (hailing-station #735, #807): the published role is `owner`, it came from a
         live identification binding of the label to an enrolled owner voice when the role
@@ -760,8 +774,7 @@ class SpeechEvents:
                 return None
             if not inferred:
                 return "voiceprint"
-            entry = getattr(self._priority, "entry_voice", None)
-            if _entry_shaped(turn.text) and callable(entry) and entry(turn) is True:
+            if _entry_shaped(turn.text) and entry_voice:
                 return "voiceprint_label"
         except Exception:  # noqa: BLE001 - a source is descriptive and never fails the turn
             pass
@@ -905,6 +918,7 @@ class SpeechEvents:
             # A new session's stream clock starts again; a mode still on covers all of it.
             self._duck_spans = [[0, None]] if self._duck else []
             self._private_name_end = None
+            self._voice_generation += 1
             self._private_seen.clear()
             self._role_sources = duck and priority is not None
             self._duck_acks = duck
@@ -1141,7 +1155,91 @@ class SpeechEvents:
             self._owner_voice_state = state
             self._emit("owner_voice", state=state)
 
-    def transcript(self, turn, now_ms, *, expect_decision=True, inferred=False, diarized_head=None):
+    def prepare_transcript(self, turn, *, inferred=False):
+        """Snapshot candidate checks, then score without any caller's controller lock.
+
+        transcript revalidates this ticket after scoring; mode changes, Stop, speaker
+        forget and intervening turns invalidate it. No native wait holds our lock either.
+        """
+        with self._lock:
+            if (
+                not self._active
+                or not isinstance(turn, Turn)
+                or not turn.finalized
+                or turn.session_id != self._session
+                or type(inferred) is not bool
+            ):
+                return None
+            ticket = _VoiceChecks(
+                turn,
+                inferred,
+                self._voice_generation,
+                getattr(getattr(self._priority, "source", None), "epoch", None),
+                self._private_name_end,
+            )
+            binding = None
+            entry = None
+            if self.heard_ducked(turn):
+                if (
+                    self._in_current_privacy(turn)
+                    and turn.utterance_id not in self._seen
+                    and turn.utterance_id not in self._private_seen
+                ):
+                    with contextlib.suppress(Exception):
+                        kinds = privacy_phrase(turn.text, self._addressing)
+                        if (
+                            "name" in kinds
+                            or "exit" in kinds
+                            or (
+                                "rest" in kinds
+                                and ticket.split is not None
+                                and 0 <= turn.start_ms - ticket.split <= PRIVACY_SPLIT_NAME_MS
+                            )
+                        ):
+                            binding = self._binding_exit_check(turn, inferred)
+            elif (
+                inferred
+                and self._role_sources
+                and self._per_turn
+                and turn.utterance_id not in self._seen
+                and _entry_shaped(turn.text)
+            ):
+                with contextlib.suppress(Exception):
+                    role = self._priority.role_for(turn)
+                    resolved = getattr(self._priority, "resolved_by_voiceprint", None)
+                    if (
+                        role == "owner"
+                        and callable(resolved)
+                        and resolved(turn.utterance_id) is True
+                    ):
+                        entry = getattr(self._priority, "entry_voice", None)
+        if binding is not None:
+            ticket = replace(ticket, exit=self._exit_check(turn, inferred, binding=binding))
+        if callable(entry):
+            with contextlib.suppress(Exception):
+                ticket = replace(ticket, entry=entry(turn) is True)
+        return ticket
+
+    def _voice_checks_current(self, checks, turn, inferred):
+        return (
+            isinstance(checks, _VoiceChecks)
+            and checks.turn is turn
+            and checks.inferred == inferred
+            and checks.generation == self._voice_generation
+            and checks.speaker_epoch
+            == getattr(getattr(self._priority, "source", None), "epoch", None)
+        )
+
+    def transcript(
+        self,
+        turn,
+        now_ms,
+        *,
+        expect_decision=True,
+        inferred=False,
+        diarized_head=None,
+        voice_checks=None,
+    ):
         """Emit one final turn; `inferred` marks a speaker label partly inferred (#137).
 
         `diarized_head` is the leading diarized run's character length in `turn.text`
@@ -1152,7 +1250,10 @@ class SpeechEvents:
         no override, no owner stop phrase, and a playback-only dismissal that withdraws
         nothing and leaves the speaker's engagement in place.
         """
+        if voice_checks is None:
+            voice_checks = self.prepare_transcript(turn, inferred=inferred)
         with self._lock:
+            checks_current = self._voice_checks_current(voice_checks, turn, inferred)
             if not self._active:
                 raise ContractError("speech event session is not active")
             if not isinstance(turn, Turn) or not turn.finalized or turn.session_id != self._session:
@@ -1183,10 +1284,11 @@ class SpeechEvents:
                 ):
                     # Kept only while privacy is on; cleared at its end (#735 S-1).
                     self._private_seen.append(uid)
-                    self._private(turn, inferred)
+                    self._private(turn, inferred, voice_checks if checks_current else None)
                 return
             # Any turn heard outside privacy ends a split exit.
             self._private_name_end = None
+            self._voice_generation += 1
             digest = hashlib.sha256(
                 json.dumps(turn.to_dict(), sort_keys=True).encode("utf-8")
             ).digest()
@@ -1241,7 +1343,9 @@ class SpeechEvents:
                 self._pending_bytes += size
             self._hear_other_voice(turn, role)
             name = self._speaker_name(turn, role)
-            source = self._role_source(turn, role, inferred)
+            source = self._role_source(
+                turn, role, inferred, entry_voice=checks_current and voice_checks.entry
+            )
             self._emit(
                 "transcript",
                 turn=_with_role(turn, role),
@@ -1601,6 +1705,7 @@ class SpeechEvents:
             self._clear_exit_audio()
             # A change of mode always ends a split exit.
             self._private_name_end = None
+            self._voice_generation += 1
             if on and not self._duck:
                 # Keep the entry/ack clock identical to the former conversation end,
                 # without ending or otherwise changing the public engagement.
@@ -1631,7 +1736,7 @@ class SpeechEvents:
             if on and ack and self._active and self._duck_acks:
                 self._emit("privacy", action="on", at_ms=at)
 
-    def _private(self, turn, inferred):
+    def _private(self, turn, inferred, checks):
         """Match a turn heard in privacy against the local phrases, then drop it.
 
         Called with the lock held. Emits at most one content-free `privacy` event: "exit"
@@ -1648,13 +1753,23 @@ class SpeechEvents:
             self._private_counts["failed"] += 1
             self._clear_exit_audio()
         split, self._private_name_end = self._private_name_end, None
+        self._voice_generation += 1
+        outcome = (
+            checks.exit
+            if checks is not None and checks.split == split
+            else (False, "voice_unavailable")
+        )
+        if outcome[0]:
+            allowed, reason = self._binding_exit_check(turn, inferred)
+            if not allowed and reason in {"inferred", "playback", "no_owner_check"}:
+                outcome = False, reason
         # Only a turn heard entirely since the mode last went on, while it is still on, is
         # matched at all (#242 round 23, see `transcript`): one heard in an earlier private
         # period and released late can never end this one, answer its status or be counted.
         if "name" in kinds:
             # Authenticate both split fragments independently. Private processor turns
             # are unlabelled: only their own isolated voice can authenticate them.
-            allowed, reason = self._exit_check(turn, inferred)
+            allowed, reason = outcome
             if allowed:
                 self._private_name_end = turn.end_ms
             else:
@@ -1667,7 +1782,7 @@ class SpeechEvents:
             and 0 <= turn.start_ms - split <= PRIVACY_SPLIT_NAME_MS
         )
         if named:
-            allowed, reason = self._exit_check(turn, inferred)
+            allowed, reason = outcome
             if allowed:
                 self._private_counts["exit"] += 1
                 self._emit("privacy", action="exit")
@@ -1701,13 +1816,16 @@ class SpeechEvents:
             with contextlib.suppress(Exception):
                 clear()
 
-    def _exit_check(self, turn, inferred):
+    def _exit_check(self, turn, inferred, *, binding=None):
         """Check binding OR this turn's voice, retaining the conservative prechecks.
 
         Always erase candidate audio, even if a binding passes or a precheck refuses.
         """
         try:
-            allowed, reason = self._binding_exit_check(turn, inferred)
+            if binding is None:
+                with self._lock:
+                    binding = self._binding_exit_check(turn, inferred)
+            allowed, reason = binding
             if allowed or reason in {"inferred", "playback", "no_owner_check"}:
                 return allowed, reason
             voice = getattr(self._priority, "exit_voice", None)
@@ -1794,6 +1912,7 @@ class SpeechEvents:
         (a full backlog raises) cannot leave the forget half done. The host is always told."""
         integer(now_ms, "now_ms")
         with self._lock:
+            self._voice_generation += 1
             ended = (
                 self._engaged["speaker_id"] if self._engaged is not None and self._active else None
             )
@@ -3289,6 +3408,7 @@ class SpeechEvents:
             self._withdrawn.clear()
             self._private_seen.clear()
             self._private_name_end = None
+            self._voice_generation += 1
             self._clear_exit_audio()
             self._request_outcomes.clear()
             self._request_outcome_ends.clear()
