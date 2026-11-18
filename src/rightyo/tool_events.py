@@ -2710,6 +2710,8 @@ class SpeechEvents:
         speaker_id = self._engaged["speaker_id"] if self._engaged else turn.speaker_id
         if (
             turn.speaker_id is not None
+            and turn.end_ms - turn.start_ms >= self._conversation.presence_min_ms
+            and len(turn.text.split()) >= self._conversation.presence_min_words
             and not (self._per_turn and role in {"owner", "trusted"})
             and not self._playback_overlaps(turn.start_ms, turn.end_ms)
         ):

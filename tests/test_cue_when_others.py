@@ -67,7 +67,12 @@ class OthersCueTests(unittest.TestCase):
         if other:
             # This turn spans playback even when it starts before playback's margin.
             second = turn(
-                "other", 1100, 2400, "Lovely morning", speaker=speaker, provenance=provenance
+                "other",
+                1100,
+                2400,
+                "Lovely authored morning",
+                speaker=speaker,
+                provenance=provenance,
             )
             events.transcript(second, 2400, expect_decision=False)
         if (asked or continuation) and playback is None:
@@ -226,11 +231,11 @@ class OthersCueTests(unittest.TestCase):
 
     def test_later_voice_does_not_hide_prior_voice_from_a_pending_decision(self):
         _, _, events = self.replay(text="Jarvis, the blue folder")
-        other = turn("other2", 7000, 7400, "Lovely afternoon", speaker="Speaker B")
+        other = turn("other2", 6400, 7400, "Lovely authored afternoon", speaker="Speaker B")
         events.transcript(other, 7400, expect_decision=False)
         pending = turn("pending", 8000, 8400, "The green folder")
         events.transcript(pending, 8400)
-        later = turn("later", 9000, 9400, "Lovely evening", speaker="Speaker B")
+        later = turn("later", 8400, 9400, "Lovely authored evening", speaker="Speaker B")
         events.transcript(later, 9400, expect_decision=False)
         events.decision(decided(pending, "uncertain", attend=0.6), 9500)
         self.assertFalse(any(e["type"] == "request" for e in events.drain()))
@@ -240,19 +245,21 @@ class OthersCueTests(unittest.TestCase):
             with self.subTest(before_request=before_request):
                 events = SpeechEvents()
                 events.start(SESSION, now_ms=0, conversation=MODE, addressing=NAMES, priority=OWNER)
-                other = turn("other", 0, 400, "Lovely morning", speaker="Speaker B")
-                request = turn("request", 500, 900, "Jarvis, tidy the folder")
+                other = turn("other", 0, 1000, "Lovely authored morning", speaker="Speaker B")
+                request = turn("request", 1100, 1500, "Jarvis, tidy the folder")
                 if before_request:
-                    events.transcript(other, 400, expect_decision=False)
-                events.transcript(request, 900)
+                    events.transcript(other, 1000, expect_decision=False)
+                events.transcript(request, 1500)
                 if not before_request:
-                    other = turn("other", 1100, 1400, "Lovely morning", speaker="Speaker B")
-                    events.transcript(other, 1400, expect_decision=False)
-                events.decision(decided(request, "attend"), 1500)
+                    other = turn(
+                        "other", 1600, 2600, "Lovely authored morning", speaker="Speaker B"
+                    )
+                    events.transcript(other, 2600, expect_decision=False)
+                events.decision(decided(request, "attend"), 2700)
                 events.drain()
-                more = turn("more", 2000, 2400, "The blue folder")
-                events.transcript(more, 2400)
-                events.decision(decided(more, "uncertain", attend=0.6), 2500)
+                more = turn("more", 3000, 3400, "The blue folder")
+                events.transcript(more, 3400)
+                events.decision(decided(more, "uncertain", attend=0.6), 3500)
                 self.assertFalse(any(e["type"] == "request" for e in events.drain()))
 
     def test_direct_attend_without_name_is_blocked_by_others_present(self):
@@ -344,7 +351,7 @@ class OthersCueTests(unittest.TestCase):
         first = turn("first", 0, 900, "Jarvis, open the blue folder")
         events.transcript(first, 900)
         events.decision(decided(first, "attend"), 1000)
-        other = turn("other", 1100, 2400, "Lovely morning", speaker="Speaker B")
+        other = turn("other", 1100, 2400, "Lovely authored morning", speaker="Speaker B")
         events.transcript(other, 2400, expect_decision=False)
         pending = turn("pending", 6000, 6800, "The green folder")
         events.transcript(pending, 6800)
@@ -421,12 +428,12 @@ class OwnerVocativeBarTests(unittest.TestCase):
         guest = turn(
             "guest",
             0,
-            900,
+            1000,
             "Jarvis, sort the authored list",
             "Speaker B",
             provenance="diarization-timeline",
         )
-        self.events.transcript(guest, 900)
+        self.events.transcript(guest, 1000)
         self.events.decision(decided(guest, "attend"), 1000)
         owner = turn(
             "owner", 1000, 1200, "Jarvis, open the authored list", provenance="diarization-timeline"
@@ -663,7 +670,9 @@ class OthersPresentSnapshotTests(unittest.TestCase):
         events.decision(decided(owner, "attend"), 1000)
         events.drain()
         if others:
-            participant = turn("participant", 1100, 2400, "Lovely morning", speaker="Speaker B")
+            participant = turn(
+                "participant", 1100, 2400, "Lovely authored morning", speaker="Speaker B"
+            )
             events.transcript(participant, 2400, expect_decision=False)
         current = turn("pending", 3000, 3800, "The green folder")
         events.transcript(current, 3800)
@@ -756,7 +765,7 @@ class OthersPresentSnapshotTests(unittest.TestCase):
                 events, current = self.pending(others=False)
                 if reset:
                     events.forget_speakers(now_ms=4000)
-                later = turn("later", 4000, 4800, "Lovely morning", speaker="Speaker B")
+                later = turn("later", 4000, 4800, "Lovely authored morning", speaker="Speaker B")
                 events.transcript(later, 4800, expect_decision=False)
                 self.assertIs(events._others_present(current), False)
                 events.decision(decided(current, "attend", attend=0.98), 5000)

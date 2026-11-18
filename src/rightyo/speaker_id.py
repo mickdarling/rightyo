@@ -24,7 +24,7 @@ import selectors
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -187,7 +187,13 @@ class SpeakerIdConfig:
     `bind_min_seconds` (0.5-120, default 3.0) and `enabled` (default true). `rightyo
     enroll` uses it; with `live` true, live sessions also run shadow identification
     (#137 step 4a, `rightyo.live_speaker_id`): scores are logged, nothing else changes.
-    A label binds only once `bind_min_seconds` of its speech has been accumulated.
+    A label normally binds once `bind_min_seconds` of speech has accumulated. Optional
+    `single_turn_bind_threshold` (null/off by default, bind_threshold to 1) also permits
+    one independently scored turn of at least `single_turn_bind_min_seconds` (default
+    1.5, or `min_turn_seconds` if higher; `min_turn_seconds` to 10) to bind. This fails
+    closed unless the label was unbound before the turn and the turn's best identity is
+    also the accumulated best identity, with its accumulated mean at or above
+    `bind_threshold`.
 
     `roles` (default false, requires `live`) applies the bindings (#137 step 4b): a label
     bound to an enrolled identifier carries the role the `speakers` section gives that
@@ -229,6 +235,8 @@ class SpeakerIdConfig:
     entry_remainder_threshold: float = 0.35
     entry_gap_max_seconds: float = 0.6
     entry_window_seconds: float = 0.25
+    single_turn_bind_threshold: float | None = None
+    single_turn_bind_min_seconds: float = 1.5
 
     @classmethod
     def from_dict(cls, value: Any) -> SpeakerIdConfig | None:
@@ -238,6 +246,8 @@ class SpeakerIdConfig:
             "model",
             "store",
             "bind_threshold",
+            "single_turn_bind_threshold",
+            "single_turn_bind_min_seconds",
             "tentative_threshold",
             "min_turn_seconds",
             "threads",
@@ -266,8 +276,12 @@ class SpeakerIdConfig:
         if not all(isinstance(item, str) and Path(item).is_absolute() for item in paths):
             raise ValueError("invalid speaker_id section")
         bind = value.get("bind_threshold", 0.60)
+        single = value.get("single_turn_bind_threshold")
         tentative = value.get("tentative_threshold", 0.45)
         min_turn = value.get("min_turn_seconds", 1.0)
+        if not _bounded(min_turn, 0.5, 10.0):
+            raise ValueError("invalid speaker_id section")
+        single_min = value.get("single_turn_bind_min_seconds", max(1.5, min_turn))
         threads = value.get("threads", 4)
         live = value.get("live", False)
         bind_min = value.get("bind_min_seconds", 3.0)
@@ -294,7 +308,8 @@ class SpeakerIdConfig:
             not _bounded(bind, 0.0, 1.0)
             or not _bounded(tentative, 0.0, 1.0)
             or not 0 < tentative < bind
-            or not _bounded(min_turn, 0.5, 10.0)
+            or (single is not None and not _bounded(single, bind, 1.0))
+            or not _bounded(single_min, min_turn, 10.0)
             or type(threads) is not int
             or not 1 <= threads <= 8
             or type(live) is not bool
@@ -324,7 +339,16 @@ class SpeakerIdConfig:
             float(remainder_threshold),
             float(gap_max),
             float(window),
+            None if single is None else float(single),
+            float(single_min),
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Emit every effective setting, including the derived single-turn minimum."""
+        return {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in asdict(self).items()
+        }
 
     def band(self, score: float) -> str:
         """`bind` at or above the bind threshold, `tentative` above the lower one, else `below`."""

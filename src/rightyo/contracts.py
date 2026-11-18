@@ -551,6 +551,8 @@ class Conversation:
     # Apply the meeting attention bar after another diarized voice (#283); 0 is off.
     # Every request needs owner authority plus the assistant name; no follow-ups.
     cue_when_others_ms: int = 0
+    presence_min_ms: int = 1000
+    presence_min_words: int = 3
 
     def __post_init__(self) -> None:
         if (
@@ -567,6 +569,13 @@ class Conversation:
             or not 0 <= self.cue_when_others_ms <= MAX_CONVERSATION_WINDOW_MS
         ):
             raise ContractError("invalid other-voice cue window")
+        if (
+            type(self.presence_min_ms) is not int
+            or not 0 <= self.presence_min_ms <= MAX_CONVERSATION_WINDOW_MS
+            or type(self.presence_min_words) is not int
+            or not 0 <= self.presence_min_words <= 1000
+        ):
+            raise ContractError("invalid other-voice presence minimum")
         if type(self.require_cue) is not bool:
             raise ContractError("invalid follow-up cue requirement")
         if self.cue_min_attend is not None and probability(self.cue_min_attend) <= 0:
@@ -630,6 +639,8 @@ class Conversation:
             "cue_min_attend",
             "continuation_cue",
             "cue_when_others_ms",
+            "presence_min_ms",
+            "presence_min_words",
         }
         if not isinstance(raw, dict) or set(raw) - allowed:
             raise ContractError("conversation must be an object with known keys only")
@@ -653,6 +664,12 @@ class Conversation:
             **({"cue_min_attend": self.cue_min_attend} if self.cue_min_attend is not None else {}),
             **({"continuation_cue": True} if self.continuation_cue else {}),
             **({"cue_when_others_ms": self.cue_when_others_ms} if self.cue_when_others_ms else {}),
+            **({"presence_min_ms": self.presence_min_ms} if self.presence_min_ms != 1000 else {}),
+            **(
+                {"presence_min_words": self.presence_min_words}
+                if self.presence_min_words != 3
+                else {}
+            ),
         }
 
 

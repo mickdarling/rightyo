@@ -690,6 +690,14 @@ class ShadowSpeakerId:
                 {key: cosine(mean, value) for key, value in comparable.items()},
                 self.settings,
             )
+            rule = "accumulated" if state.state == "bound" else "-"
+            if (
+                previous is not None
+                and previous.state == "bound"
+                and state.state == "bound"
+                and previous.identity == state.identity
+            ):
+                rule = "-"
             if epoch > 0 and state.state != "bound":
                 # Renewal changes labels, not enrollment. The first independently scored
                 # public turn can bind with accumulated evidence, without the duration minimum.
@@ -699,6 +707,23 @@ class ShadowSpeakerId:
                     and state.scores.get(best, -1.0) >= self.settings.bind_threshold
                 ):
                     state.state, state.identity, state.score = "bound", best, state.scores[best]
+                    rule = "rebind"
+            single = self.settings.single_turn_bind_threshold
+            if (
+                state.state != "bound"
+                and single is not None
+                and (previous is None or previous.state != "bound")
+                and seconds >= self.settings.single_turn_bind_min_seconds
+            ):
+                best = min(turn_scores, key=lambda key: (-turn_scores[key], key))
+                accumulated_best = min(state.scores, key=lambda key: (-state.scores[key], key))
+                if (
+                    turn_scores[best] >= single
+                    and state.scores.get(best, -1.0) >= self.settings.bind_threshold
+                    and best == accumulated_best
+                ):
+                    state.state, state.identity, state.score = "bound", best, state.scores[best]
+                    rule = "single"
             if previous is None or (previous.state, previous.identity) != (
                 state.state,
                 state.identity,
@@ -716,6 +741,7 @@ class ShadowSpeakerId:
             f" labelled_ms={labelled_ms} speech_ms={round(seconds * 1000)}"
             f" turn_score={turn_scores[state.identity]:.3f} acc_score={state.score:.3f}"
             f" acc_s={state.seconds:.1f} state={state.state} id={state.identity}{self._route}"
+            f" bind={rule}"
         )
 
     def entry_score(self, start_ms: int, end_ms: int, spans, owners) -> EntryScore:

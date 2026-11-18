@@ -637,7 +637,13 @@ differences:
   own thread after the turn is emitted, so a turn's role reflects the turns before it. A
   voice's first turns in a session are therefore `unknown` until its label has
   accumulated `bind_min_seconds` of speech (3 s by default) at or above `bind_threshold`;
-  the turns after that carry the role. A turn keeps the role it was emitted with on its
+  the turns after that carry the role. Optional `speaker_id.single_turn_bind_threshold`
+  (null/off by default, `bind_threshold` to 1.0) permits earlier binding on one clear
+  turn with at least `speaker_id.single_turn_bind_min_seconds` of scored speech (default
+  1.5, or `min_turn_seconds` if higher; `min_turn_seconds` to 10.0). It fails closed unless
+  the label was unbound before the turn, its best turn identity is also the accumulated
+  best identity, and that identity's accumulated mean is at or above `bind_threshold`.
+  A turn keeps the role it was emitted with on its
   `attention`, its `request` and in every later context snapshot, even if the binding
   changes before its decision arrives, so a host's fingerprint checks still match. A label
   that falls below `tentative_threshold` loses its binding, and its later turns lose the
@@ -782,7 +788,7 @@ of per-turn attention.
 event, no follow-ups, byte-identical fixtures. Turn it on with the configuration's
 `"conversation": {}` object; `session.started` then advertises it as a top-level
 `conversation` object, and a host that accepts that object must accept `conversation`
-events. The object takes eight optional keys:
+events. The object takes ten optional keys:
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
@@ -791,6 +797,8 @@ events. The object takes eight optional keys:
 | `closing_phrases` | "that's all", "that's it", "thanks, that's all", "never mind", and so on | up to 16 | Phrases that end the conversation (see [closings](#closings)) |
 | `appendix_ms` | 0 (off) | 0 to 5,000 | How soon after a request ends the same speaker's next turn counts as an appendix to it (see below) |
 | `cue_when_others_ms` | 0 (off) | 0 to 120,000 | Apply the meeting attention bar automatically while another voice was recently heard (see below) |
+| `presence_min_ms` | 1,000 | 0 to 120,000 | Minimum other-turn duration (`end_ms - start_ms`) for presence evidence |
+| `presence_min_words` | 3 | 0 to 1,000 | Minimum whitespace-separated word count for presence evidence |
 | `require_cue` | false | true or false | Whether a follow-up must also carry a cue that it continues the exchange (see below) |
 | `cue_min_attend` | absent (off) | above 0 to 1 | With `require_cue`, the attend probability at which a follow-up needs no cue |
 | `continuation_cue` | false | true or false | With `require_cue`, whether the requester continuing after a reply needs no cue (see below) |
@@ -804,6 +812,9 @@ The same meeting `ask_anywhere` policy may promote an owner's named abstention (
 `ignore`), with `others_present: "ask_anywhere"` in its evidence. The assistant's name
 may occur anywhere, including configured variants and the meeting policy's split names.
 The presence window lasts this many milliseconds after an eligible other turn ends.
+An eligible turn must meet both `conversation.presence_min_ms` and
+`conversation.presence_min_words`. These minimums apply only to the other-voice presence
+bar, not to the answered-by-other check, which can recognize a short answer.
 While engaged, another voice differs from the engaged speaker; without engagement it
 differs from the current turn's speaker, so a first direct request is protected too.
 The verdict is snapshotted when each public turn is accepted, like meeting and media.
