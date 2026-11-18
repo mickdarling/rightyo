@@ -134,6 +134,123 @@ class SingleTurnBindTests(unittest.TestCase):
             )
         self.assertIsNone(SpeakerIdConfig.from_dict(raw).single_turn_bind_threshold)
 
+    def sequence(self, vectors, durations, *, threshold=0.7, entries=ENTRIES[:1], **config):
+        h = Harness(
+            ScriptedEmbedder(vectors),
+            config=settings(single_turn_bind_threshold=threshold, **config),
+            entries=entries,
+        )
+        h.shadow.start()
+        try:
+            for count, seconds in enumerate(durations, 1):
+                h.speak(seconds)
+                wait_for(lambda: h.shadow.scored == count)
+        finally:
+            h.shadow.close(drain=True)
+        return h, [h.fields(note) for note in h.notes()]
+
+    def test_alternating_scores_keep_accumulated_evidence(self):
+        scores = [0.30, 0.75] * 4
+        baseline, before = self.sequence([vector(s) for s in scores], [2.0] * 8, threshold=None)
+        h, after = self.sequence([vector(s) for s in scores], [2.0] * 8)
+        self.assertEqual([n["state"] for n in after], [n["state"] for n in before])
+        self.assertEqual(after[-1]["state"], "tentative")
+        self.assertEqual(h.shadow.binding("Speaker A"), baseline.shadow.binding("Speaker A"))
+        self.assertEqual(h.shadow._bound_ids, set())
+
+    def test_long_low_score_keeps_accumulated_evidence(self):
+        # Nine seconds uses five overlapping embedding windows.
+        vectors, durations = [vector(0.10)] * 5 + [vector(0.75)], [9.0, 1.5]
+        baseline, before = self.sequence(vectors, durations, threshold=None)
+        h, after = self.sequence(vectors, durations)
+        self.assertEqual([n["state"] for n in after], [n["state"] for n in before])
+        self.assertEqual(h.shadow.binding("Speaker A"), ("unknown", "owner"))
+        roles = EnrolledRoles(OWNER_ID)
+        for source in (baseline.shadow, h.shadow):
+            roles.source = source
+            self.assertEqual(
+                roles.role_for(turn("low", 11000, 12500, "Authored turn")), "participant"
+            )
+        self.assertEqual(h.shadow._bound_ids, set())
+
+    def test_single_bind_diagnostic_keeps_accumulated_mean(self):
+        h, notes = self.sequence([vector(0.50), vector(0.75)], [1.0, 1.6])
+        state = h.shadow._labels["Speaker A"]
+        self.assertEqual(notes[-1]["bind"], "single")
+        self.assertAlmostEqual(state.score, state.scores["owner"])
+        self.assertEqual(notes[-1]["acc_score"], f"{state.scores['owner']:.3f}")
+        self.assertNotEqual(notes[-1]["acc_score"], notes[-1]["turn_score"])
+
+    def test_single_bind_needs_its_own_minimum_speech(self):
+        for seconds, expected in ((1.2, "tentative"), (1.6, "bound")):
+            with self.subTest(seconds=seconds):
+                h = self.score(0.9, seconds=seconds, threshold=0.7)
+                self.assertEqual(h.shadow.binding("Speaker A"), (expected, "owner"))
+                self.assertEqual(
+                    h.fields(h.notes()[0])["bind"], "single" if expected == "bound" else "-"
+                )
+
+    def test_single_minimum_config_validation(self):
+        raw = {"python": "/synthetic/python", "model": "/synthetic/model", "min_turn_seconds": 0.5}
+        self.assertEqual(SpeakerIdConfig.from_dict(raw).single_turn_bind_min_seconds, 1.5)
+        for value in (None, True, "1.5", 0.49, 10.01, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                SpeakerIdConfig.from_dict({**raw, "single_turn_bind_min_seconds": value})
+        for value in (0.5, 1.5, 10):
+            parsed = SpeakerIdConfig.from_dict({**raw, "single_turn_bind_min_seconds": value})
+            self.assertEqual(parsed.single_turn_bind_min_seconds, value)
+            self.assertIsInstance(parsed.single_turn_bind_min_seconds, float)
+        with self.assertRaises(ValueError):
+            SpeakerIdConfig.from_dict({**raw, "min_turn_seconds": 2.0})
+        with self.assertRaises(ValueError):
+            SpeakerIdConfig.from_dict(
+                {**raw, "min_turn_seconds": 2.0, "single_turn_bind_min_seconds": 1.9}
+            )
+        self.assertEqual(
+            SpeakerIdConfig.from_dict(
+                {**raw, "min_turn_seconds": 2.0, "single_turn_bind_min_seconds": 2.0}
+            ).single_turn_bind_min_seconds,
+            2.0,
+        )
+
+    def test_single_bind_needs_the_accumulated_best_identity(self):
+        entries = [ENTRIES[0], {**ENTRIES[1], "embedding": [0.6, 0.8, 0]}]
+        first = [0.55, 0.4, math.sqrt(1 - 0.55**2 - 0.4**2)]
+        second = [0.75, 0.3125, math.sqrt(1 - 0.75**2 - 0.3125**2)]
+        h, notes = self.sequence([first, second], [1.2, 1.6], entries=entries)
+        state = h.shadow._labels["Speaker A"]
+        self.assertGreater(state.scores["guest"], state.scores["owner"])
+        self.assertGreaterEqual(state.scores["owner"], 0.6)
+        self.assertEqual(h.shadow.binding("Speaker A"), ("tentative", "guest"))
+        self.assertEqual(notes[-1]["bind"], "-")
+
+    def test_single_bind_does_not_replace_a_prior_binding(self):
+        vectors, durations = [[1, 0, 0], [0, 1, 0]], [1.0, 1.99]
+        # The shorter single minimum isolates prior-binding hardening.
+        h, notes = self.sequence(
+            vectors, durations, entries=ENTRIES[:2], single_turn_bind_min_seconds=1.0
+        )
+        self.assertEqual(notes[0]["state"], "bound")
+        self.assertEqual(notes[0]["id"], "owner")
+        baseline, before = self.sequence(vectors, durations, entries=ENTRIES[:2], threshold=None)
+        self.assertEqual(h.shadow.binding("Speaker A"), baseline.shadow.binding("Speaker A"))
+        self.assertEqual(notes[-1]["state"], before[-1]["state"])
+        self.assertEqual(notes[-1]["state"], "tentative")
+        self.assertEqual(notes[-1]["bind"], "-")
+
+    def test_accumulated_identity_change_reports_its_rule(self):
+        h, notes = self.sequence(
+            [[0, 1, 0], [1, 0, 0]],
+            [1.0, 2.0],
+            entries=ENTRIES[:2],
+            threshold=None,
+            bind_min_seconds=1.0,
+        )
+        self.assertEqual(notes[0]["id"], "guest")
+        self.assertEqual(notes[0]["state"], "bound")
+        self.assertEqual(h.shadow.binding("Speaker A"), ("bound", "owner"))
+        self.assertEqual(notes[-1]["bind"], "accumulated")
+
 
 class BaseBindingPublicationTests(unittest.TestCase):
     def arrange(self, *, threshold=None, scores=(0.8,)):

@@ -189,7 +189,10 @@ class SpeakerIdConfig:
     (#137 step 4a, `rightyo.live_speaker_id`): scores are logged, nothing else changes.
     A label normally binds once `bind_min_seconds` of speech has accumulated. Optional
     `single_turn_bind_threshold` (null/off by default, bind_threshold to 1) also permits
-    one independently scored turn of at least `min_turn_seconds` to bind.
+    one independently scored turn of at least `single_turn_bind_min_seconds` (default
+    1.5, `min_turn_seconds` to 10) to bind. This fails closed unless the label was unbound
+    before the turn and the turn's best identity is also the accumulated best identity,
+    with its accumulated mean at or above `bind_threshold`.
 
     `roles` (default false, requires `live`) applies the bindings (#137 step 4b): a label
     bound to an enrolled identifier carries the role the `speakers` section gives that
@@ -232,6 +235,7 @@ class SpeakerIdConfig:
     entry_gap_max_seconds: float = 0.6
     entry_window_seconds: float = 0.25
     single_turn_bind_threshold: float | None = None
+    single_turn_bind_min_seconds: float = 1.5
 
     @classmethod
     def from_dict(cls, value: Any) -> SpeakerIdConfig | None:
@@ -242,6 +246,7 @@ class SpeakerIdConfig:
             "store",
             "bind_threshold",
             "single_turn_bind_threshold",
+            "single_turn_bind_min_seconds",
             "tentative_threshold",
             "min_turn_seconds",
             "threads",
@@ -273,6 +278,7 @@ class SpeakerIdConfig:
         single = value.get("single_turn_bind_threshold")
         tentative = value.get("tentative_threshold", 0.45)
         min_turn = value.get("min_turn_seconds", 1.0)
+        single_min = value.get("single_turn_bind_min_seconds", 1.5)
         threads = value.get("threads", 4)
         live = value.get("live", False)
         bind_min = value.get("bind_min_seconds", 3.0)
@@ -301,6 +307,7 @@ class SpeakerIdConfig:
             or not 0 < tentative < bind
             or (single is not None and not _bounded(single, bind, 1.0))
             or not _bounded(min_turn, 0.5, 10.0)
+            or not _bounded(single_min, min_turn, 10.0)
             or type(threads) is not int
             or not 1 <= threads <= 8
             or type(live) is not bool
@@ -331,6 +338,7 @@ class SpeakerIdConfig:
             float(gap_max),
             float(window),
             None if single is None else float(single),
+            float(single_min),
         )
 
     def band(self, score: float) -> str:

@@ -691,7 +691,12 @@ class ShadowSpeakerId:
                 self.settings,
             )
             rule = "accumulated" if state.state == "bound" else "-"
-            if previous is not None and previous.state == "bound" and state.state == "bound":
+            if (
+                previous is not None
+                and previous.state == "bound"
+                and state.state == "bound"
+                and previous.identity == state.identity
+            ):
                 rule = "-"
             if epoch > 0 and state.state != "bound":
                 # Renewal changes labels, not enrollment. The first independently scored
@@ -704,10 +709,20 @@ class ShadowSpeakerId:
                     state.state, state.identity, state.score = "bound", best, state.scores[best]
                     rule = "rebind"
             single = self.settings.single_turn_bind_threshold
-            if state.state != "bound" and single is not None:
+            if (
+                state.state != "bound"
+                and single is not None
+                and (previous is None or previous.state != "bound")
+                and seconds >= self.settings.single_turn_bind_min_seconds
+            ):
                 best = min(turn_scores, key=lambda key: (-turn_scores[key], key))
-                if turn_scores[best] >= single:
-                    state.state, state.identity, state.score = "bound", best, turn_scores[best]
+                accumulated_best = min(state.scores, key=lambda key: (-state.scores[key], key))
+                if (
+                    turn_scores[best] >= single
+                    and state.scores.get(best, -1.0) >= self.settings.bind_threshold
+                    and best == accumulated_best
+                ):
+                    state.state, state.identity, state.score = "bound", best, state.scores[best]
                     rule = "single"
             if previous is None or (previous.state, previous.identity) != (
                 state.state,
