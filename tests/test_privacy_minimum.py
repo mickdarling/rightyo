@@ -23,6 +23,124 @@ from rightyo.tool import _stderr
 from rightyo.tool_events import SpeechEvents
 
 
+class PrivateReplyHoldTests(unittest.TestCase):
+    """Authored playback controls and turns; no audio or host process."""
+
+    def engaged(self, scoped=False):
+        events = SpeechEvents(request_control=scoped)
+        events.start(
+            duck.SESSION, now_ms=0, addressing=duck.OURS, conversation=duck.MODE, duck=True
+        )
+        events.drain()
+        request = duck.heard("request", 0, 900, "Jarvis, check the authored fixture.")
+        events.transcript(request, 900)
+        events.decision(duck.decided(request, "attend"), 950)
+        events.drain()
+        request_id = events._engaged["request_id"] if scoped else None
+        if scoped:
+            events.request_outcome(
+                {
+                    "version": 1,
+                    "session_id": duck.SESSION,
+                    "request_id": request_id,
+                    "state": "accepted",
+                },
+                960,
+            )
+            events.drain()
+        return events, request_id
+
+    def follow(self, events, at):
+        turn = duck.heard(f"follow-{at}", at, at + 900, "And the second fixture?")
+        events.transcript(turn, turn.end_ms)
+        events.decision(duck.decided(turn, "uncertain", attend=0.8), turn.end_ms + 50)
+        return events.drain()
+
+    def test_private_reply_end_does_not_keep_a_late_follow_up(self):
+        for scoped in (False, True):
+            with self.subTest(scoped=scoped):
+                events, request_id = self.engaged(scoped)
+                events.reply("started", 1000, request_id=request_id)
+                events.duck(True, now_ms=1500)
+                events.reply("ended", 2000, request_id=request_id)
+                self.assertEqual(events.drain(), [])
+                events.duck(False, now_ms=3000)
+                self.assertEqual(events.drain(), [])
+                self.assertNotIn("request", [e["type"] for e in self.follow(events, 30000)])
+
+    def test_private_reply_end_keeps_the_public_follow_up_window(self):
+        for scoped in (False, True):
+            for exit_ms in (3000, 20000):
+                with self.subTest(scoped=scoped, exit_ms=exit_ms):
+                    public, public_id = self.engaged(scoped)
+                    private, private_id = self.engaged(scoped)
+                    public.reply("started", 1000, request_id=public_id)
+                    private.reply("started", 1000, request_id=private_id)
+                    private.duck(True, now_ms=1500)
+                    public.reply("ended", 2000, request_id=public_id)
+                    private.reply("ended", 2000, request_id=private_id)
+                    self.assertEqual(private.drain(), [])
+                    private.duck(False, now_ms=exit_ms)
+                    self.assertEqual(private.drain(), [])
+                    self.assertEqual(private._engaged, public._engaged)
+                    self.assertNotIn("replying_since", private._engaged)
+                    self.assertEqual(private._engaged["until_ms"], 12000)
+                    # The end, not privacy exit, starts the ordinary ten-second window.
+                    at = 11000 if exit_ms == 3000 else 21000
+                    expected = self.follow(public, at)
+                    self.assertEqual(self.follow(private, at), expected)
+                    self.assertEqual(any(e["type"] == "request" for e in expected), at == 11000)
+
+    def test_private_reply_start_does_not_leave_a_hold_at_exit(self):
+        for scoped in (False, True):
+            for end_ms in (2000, 4000):
+                with self.subTest(scoped=scoped, end_ms=end_ms):
+                    events, request_id = self.engaged(scoped)
+                    before = dict(events._engaged)
+                    events.duck(True, now_ms=1000)
+                    events.reply("started", 1500, request_id=request_id)
+                    if end_ms < 3000:
+                        events.reply("ended", end_ms, request_id=request_id)
+                    events.duck(False, now_ms=3000)
+                    self.assertEqual(events.drain(), [])
+                    self.assertEqual(events._engaged, before)
+                    if end_ms > 3000:
+                        events.reply("ended", end_ms, request_id=request_id)
+                    self.assertNotIn("replying_since", events._engaged)
+                    self.assertNotIn("request", [e["type"] for e in self.follow(events, 30000)])
+
+    def test_public_reply_still_playing_at_exit_keeps_its_hold_until_its_end(self):
+        for scoped in (False, True):
+            with self.subTest(scoped=scoped):
+                events, request_id = self.engaged(scoped)
+                events.reply("started", 1000, request_id=request_id)
+                before = dict(events._engaged)
+                events.duck(True, now_ms=1500)
+                events.duck(False, now_ms=3000)
+                self.assertEqual(events.drain(), [])
+                self.assertEqual(events._engaged, before)
+                events.expire(30000)
+                self.assertEqual(events._engaged["replying_since"], 1000)
+                events.reply("ended", 31000, request_id=request_id)
+                self.assertNotIn("replying_since", events._engaged)
+                self.assertEqual(events._engaged["until_ms"], 41000)
+                self.assertIn("request", [e["type"] for e in self.follow(events, 40000)])
+
+    def test_unscoped_private_end_cannot_release_a_scoped_reply_hold(self):
+        for unrelated in (None, duck.SESSION + ":other"):
+            with self.subTest(request_id=unrelated):
+                events, request_id = self.engaged(scoped=True)
+                events.reply("started", 1000, request_id=request_id)
+                before = dict(events._engaged)
+                events.duck(True, now_ms=1500)
+                events.reply("ended", 2000, request_id=unrelated)
+                events.duck(False, now_ms=3000)
+                self.assertEqual(events.drain(), [])
+                self.assertEqual(events._engaged, before)
+                events.reply("ended", 4000, request_id=request_id)
+                self.assertNotIn("replying_since", events._engaged)
+
+
 class Units:
     recognizer_id = "authored-units"
 

@@ -2293,7 +2293,23 @@ class SpeechEvents:
                     span = self._playback_scopes.pop(scope, None)
                     if span is not None:
                         span[1] = now_ms
-            if unscoped or self._duck:
+            if unscoped:
+                return
+            if self._duck:
+                # Privacy keeps the public conversation but suppresses its events.
+                # Reconcile only a hold already created publicly: a private start must
+                # not engage or revive a conversation, nor leave a new hold behind.
+                if (
+                    self._active
+                    and self._conversation is not None
+                    and current is not None
+                    and phase == "ended"
+                    and "replying_since" in current
+                ):
+                    current.pop("replying_since")
+                    current["until_ms"] = max(
+                        current["until_ms"], now_ms + self._conversation.window_ms
+                    )
                 return
             if self._active and self._pending_ack is not None:
                 self._answer_ack(phase)
