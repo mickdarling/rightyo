@@ -640,9 +640,9 @@ differences:
   the turns after that carry the role. Optional `speaker_id.single_turn_bind_threshold`
   (null/off by default, `bind_threshold` to 1.0) permits earlier binding on one clear
   turn with at least `speaker_id.single_turn_bind_min_seconds` of scored speech (default
-  1.5, `min_turn_seconds` to 10.0). It fails closed unless the label was unbound before
-  the turn, its best turn identity is also the accumulated best identity, and that
-  identity's accumulated mean is at or above `bind_threshold`.
+  1.5, or `min_turn_seconds` if higher; `min_turn_seconds` to 10.0). It fails closed unless
+  the label was unbound before the turn, its best turn identity is also the accumulated
+  best identity, and that identity's accumulated mean is at or above `bind_threshold`.
   A turn keeps the role it was emitted with on its
   `attention`, its `request` and in every later context snapshot, even if the binding
   changes before its decision arrives, so a host's fingerprint checks still match. A label

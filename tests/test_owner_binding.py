@@ -192,7 +192,13 @@ class SingleTurnBindTests(unittest.TestCase):
 
     def test_single_minimum_config_validation(self):
         raw = {"python": "/synthetic/python", "model": "/synthetic/model", "min_turn_seconds": 0.5}
-        self.assertEqual(SpeakerIdConfig.from_dict(raw).single_turn_bind_min_seconds, 1.5)
+        for minimum, expected in ((0.5, 1.5), (1.0, 1.5), (2.0, 2.0), (10.0, 10.0)):
+            with self.subTest(min_turn_seconds=minimum):
+                parsed = SpeakerIdConfig.from_dict({**raw, "min_turn_seconds": minimum})
+                self.assertEqual(parsed.single_turn_bind_min_seconds, expected)
+                self.assertIsNone(parsed.single_turn_bind_threshold)
+                self.assertEqual(parsed.to_dict()["single_turn_bind_min_seconds"], expected)
+                self.assertEqual(SpeakerIdConfig.from_dict(parsed.to_dict()), parsed)
         for value in (None, True, "1.5", 0.49, 10.01, float("nan"), float("inf")):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 SpeakerIdConfig.from_dict({**raw, "single_turn_bind_min_seconds": value})
@@ -200,18 +206,16 @@ class SingleTurnBindTests(unittest.TestCase):
             parsed = SpeakerIdConfig.from_dict({**raw, "single_turn_bind_min_seconds": value})
             self.assertEqual(parsed.single_turn_bind_min_seconds, value)
             self.assertIsInstance(parsed.single_turn_bind_min_seconds, float)
-        with self.assertRaises(ValueError):
-            SpeakerIdConfig.from_dict({**raw, "min_turn_seconds": 2.0})
+            self.assertEqual(SpeakerIdConfig.from_dict(parsed.to_dict()), parsed)
         with self.assertRaises(ValueError):
             SpeakerIdConfig.from_dict(
                 {**raw, "min_turn_seconds": 2.0, "single_turn_bind_min_seconds": 1.9}
             )
-        self.assertEqual(
-            SpeakerIdConfig.from_dict(
-                {**raw, "min_turn_seconds": 2.0, "single_turn_bind_min_seconds": 2.0}
-            ).single_turn_bind_min_seconds,
-            2.0,
+        parsed = SpeakerIdConfig.from_dict(
+            {**raw, "min_turn_seconds": 2.0, "single_turn_bind_min_seconds": 2.0}
         )
+        self.assertEqual(parsed.single_turn_bind_min_seconds, 2.0)
+        self.assertEqual(SpeakerIdConfig.from_dict(parsed.to_dict()), parsed)
 
     def test_single_bind_needs_the_accumulated_best_identity(self):
         entries = [ENTRIES[0], {**ENTRIES[1], "embedding": [0.6, 0.8, 0]}]

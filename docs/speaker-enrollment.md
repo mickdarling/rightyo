@@ -81,7 +81,8 @@ and `enabled` (default true). The section is off when absent or `"enabled": fals
 
 Optional `single_turn_bind_threshold` (null/off by default, `bind_threshold` to 1.0)
 allows one independently scored turn to bind before `bind_min_seconds`. It needs at least
-`single_turn_bind_min_seconds` of scored speech (default 1.5, `min_turn_seconds` to 10.0).
+`single_turn_bind_min_seconds` of scored speech (default 1.5, or `min_turn_seconds` if
+higher; `min_turn_seconds` to 10.0).
 The rule fails closed unless the label was unbound before the turn, the turn's best
 identity is also the accumulated best identity, and that identity's accumulated mean
 is at or above `bind_threshold`.
