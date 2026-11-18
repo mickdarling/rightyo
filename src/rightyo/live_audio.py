@@ -1264,6 +1264,8 @@ class _FinalizedWindow:
         self.units = []
         self.window = None
         self.timeline = []
+        # A released barrier has no recognizer metadata left to coalesce into.
+        self.overflow = False
 
     def held_bytes(self) -> int:
         # A logical admission budget, not a claim about a native model's RSS.
@@ -2141,48 +2143,53 @@ class LiveProcessor:
                 self._finalizing = None
 
     def _queue_window(self, packet: _FinalizedWindow) -> None:
-        queued = False
-        with self._recovery_lock:
-            if self.closed:
-                packet.release()
-                return
-            self._discard_late_private_window_locked(packet)
-            self._recovery_privacy_spans = [
-                span
-                for span in self._recovery_privacy_spans
-                if span[1] is None or span[1] > packet.offset * BYTES_PER_MS
-            ]
-            overflow = bool(self._waiting and self._waiting[-1].overflow)
-            invalid = (
-                packet.window is not None and not packet.window.units and packet.window.rejected
-            )
-            if not overflow and invalid and len(self._recoveries) < ASR_RECOVERY_WINDOWS:
-                packet.retry_pending = True
-                self._recoveries.append(packet)
-            elif not overflow:
-                if invalid:
-                    self._lose_window(packet, reason=5, compact=True)
-                held = [entry for entry in self._waiting if not entry.retry_pending]
-                overflow = bool(self._waiting) and (
-                    len(held) >= ASR_HELD_WINDOWS
-                    or sum(entry.held_bytes() for entry in held) + packet.held_bytes()
-                    > ASR_HELD_BYTES
-                )
-            if not overflow and (self._waiting or packet.retry_pending):
-                self._waiting.append(packet)
-                queued = True
-        if overflow:
-            # The privacy callback may take a host lock: never invoke it while holding
-            # the lifecycle lock that Stop needs.
-            packet.private_loss = self._heard_private(
-                packet.offset, packet.offset + packet.duration_ms
-            )
+        private_loss = None
+        while True:
+            queued = False
             with self._recovery_lock:
                 if self.closed:
                     packet.release()
                     return
-                self._append_overflow(packet)
-        elif queued:
+                self._discard_late_private_window_locked(packet)
+                self._recovery_privacy_spans = [
+                    span
+                    for span in self._recovery_privacy_spans
+                    if span[1] is None or span[1] > packet.offset * BYTES_PER_MS
+                ]
+                # Recompute admission after every host callback. Privacy may have
+                # discarded either this packet or the former overflow tail meanwhile.
+                overflow = not packet.discarded and bool(
+                    self._waiting and self._waiting[-1].overflow
+                )
+                invalid = (
+                    packet.window is not None and not packet.window.units and packet.window.rejected
+                )
+                retry = not overflow and invalid and len(self._recoveries) < ASR_RECOVERY_WINDOWS
+                if not overflow and not retry and not packet.discarded:
+                    held = [entry for entry in self._waiting if not entry.retry_pending]
+                    overflow = bool(self._waiting) and (
+                        len(held) >= ASR_HELD_WINDOWS
+                        or sum(entry.held_bytes() for entry in held) + packet.held_bytes()
+                        > ASR_HELD_BYTES
+                    )
+                if overflow and private_loss is not None:
+                    packet.private_loss = private_loss
+                    self._append_overflow(packet)
+                    return
+                if not overflow:
+                    if retry:
+                        packet.retry_pending = True
+                        self._recoveries.append(packet)
+                    elif invalid:
+                        self._lose_window(packet, reason=5, compact=True)
+                    if self._waiting or packet.retry_pending:
+                        self._waiting.append(packet)
+                        queued = True
+                    break
+            # The privacy callback may take a host lock: never invoke it while holding
+            # the lifecycle lock that Stop needs. No queue/window decision survives it.
+            private_loss = self._heard_private(packet.offset, packet.offset + packet.duration_ms)
+        if queued:
             self._drain_results()
         else:
             self._commit_window(packet)
@@ -2205,7 +2212,12 @@ class LiveProcessor:
 
     def _append_overflow(self, packet: _FinalizedWindow) -> None:
         self._lose_window(packet, reason=5, compact=True)
-        if self._waiting and self._waiting[-1].overflow:
+        if (
+            self._waiting
+            and self._waiting[-1].overflow
+            and not self._waiting[-1].discarded
+            and self._waiting[-1].window is not None
+        ):
             gap = self._waiting[-1]
             gap.duration_ms = packet.offset + packet.duration_ms - gap.offset
             gap.through_ms = packet.through_ms
@@ -2524,9 +2536,15 @@ class LiveProcessor:
                 )
             # Only the speaker who just paused was judged finished; earlier groups in the
             # utterance were followed by other speech already.
-            if self.config.on_private_turn_audio is not None and self._heard_private(
+            private_turn = self.config.on_private_turn_audio is not None and self._heard_private(
                 group["start_ms"], group["end_ms"]
-            ):
+            )
+            # The host predicate can yield to privacy-off, releasing this packet's
+            # PCM/units. Drop our attributed snapshot before either publication path.
+            with self._recovery_lock:
+                if self.closed or packet.discarded:
+                    return
+            if private_turn:
                 # Privacy wins a continuation tie: discard the held public prefix without
                 # publishing it, while keeping only this private sentence's PCM for exit.
                 self._merger.discard()

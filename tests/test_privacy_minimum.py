@@ -16,7 +16,7 @@ from test_live_speaker_id import Harness, ScriptedEmbedder, settings, tone, unit
 from test_whisper_window_recovery import BAD, GOOD, doc
 
 from rightyo.contracts import SpeakerPriority
-from rightyo.live_audio import LiveConfig, LiveProcessor, _recognizer_window
+from rightyo.live_audio import LiveConfig, LiveProcessor, _FinalizedWindow, _recognizer_window
 from rightyo.live_speaker_id import EnrolledRoles, EntryScore, LabelState
 from rightyo.memory import TranscriptMemory
 from rightyo.tool import _stderr
@@ -411,6 +411,180 @@ class PrivacyMinimumTests(unittest.TestCase):
                     [x["turn"]["text"] for x in e.drain() if x["type"] == "transcript"],
                     ["Authored public sentence."],
                 )
+
+    def test_privacy_off_between_overflow_inspection_and_append_keeps_session_public(self):
+        c, e, s, p, _, units = self.arrange()
+        entered, resume, inspected, exited = (threading.Event() for _ in range(4))
+        errors, retained = [], []
+        decoded = 0
+
+        def decode(pcm, register=None):
+            nonlocal decoded
+            decoded += 1
+            units._window = _recognizer_window(doc(BAD if decoded == 1 else GOOD), len(pcm) // 32)
+            return units._window.units
+
+        def retry(*_):
+            entered.set()
+            if not resume.wait(3):
+                raise AssertionError("test did not release recovery")
+            return doc(GOOD)
+
+        def exit_privacy():
+            try:
+                if not inspected.wait(3):
+                    raise AssertionError("queue did not inspect overflow tail")
+                retained.extend(
+                    (packet, packet.pcm, packet.units, packet.window)
+                    for packet in (*p._waiting, p._finalizing)
+                )
+                c.duck(False)
+            except Exception as error:
+                errors.append(error)
+            finally:
+                exited.set()
+
+        heard_private = p._heard_private
+
+        def pause_after_inspection(start, end):
+            if p._finalizing is not None and p._finalizing.number == 4:
+                self.assertTrue(p._waiting[-1].overflow)
+                inspected.set()
+                self.assertTrue(exited.wait(3), "privacy-off waited for queue admission")
+            return heard_private(start, end)
+
+        units.transcribe = decode
+        c.duck(True)
+        e.drain()
+        control = threading.Thread(target=exit_privacy)
+        control.start()
+        with (
+            patch("rightyo.live_audio.ASR_HELD_WINDOWS", 1),
+            patch("rightyo.live_audio._transcribe", side_effect=retry),
+            patch.object(p, "_heard_private", side_effect=pause_after_inspection),
+        ):
+            try:
+                for _ in range(4):
+                    self.feed(c, p, VOICE * 10 + SILENCE * 72, s)
+                    self.assertTrue(entered.wait(1))
+                self.assertTrue(inspected.is_set())
+                self.assertEqual(errors, [])
+                for packet, pcm, text, window in retained:
+                    self.assertTrue(packet.discarded)
+                    self.assertFalse(any(pcm))
+                    self.assertEqual(text, [])
+                    self.assertFalse(packet.pcm or packet.units or packet.timeline)
+                    self.assertIsNone(packet.window)
+                    if window is not None:
+                        self.assertEqual(window.units, [])
+                self.assertFalse(p.closed or p.failed or c._stop.is_set())
+                self.assertEqual(e.drain(), [])
+                self.assertFalse(c._private_sentence.pcm)
+            finally:
+                inspected.set()
+                resume.set()
+                control.join(3)
+                if p._recovery is not None:
+                    self.assertTrue(p._recovery.done.wait(3))
+                    p._drain_results()
+        self.assertFalse(control.is_alive())
+        self.assertEqual(errors, [])
+        units.transcribe = lambda *_: [
+            {"start_ms": 200, "end_ms": 400, "text": "Authored public sentence."}
+        ]
+        self.feed(c, p, VOICE * 10 + SILENCE * 72, s)
+        p.finish()
+        self.assertEqual(
+            [x["turn"]["text"] for x in e.drain() if x["type"] == "transcript"],
+            ["Authored public sentence."],
+        )
+
+    def test_public_admission_rechecks_discarded_overflow_tail_after_callback(self):
+        _, _, _, p, _, _ = self.arrange()
+        turns = []
+        p.on_turn = turns.append
+
+        def packet(offset, number):
+            window = _recognizer_window(doc(GOOD), 200)
+            return _FinalizedWindow(
+                bytearray(VOICE * 10),
+                offset,
+                offset + 200,
+                offset,
+                number,
+                [],
+                "causal-replay",
+                True,
+                window.units,
+                window,
+                (0, 0),
+                200,
+                False,
+            )
+
+        tail, public = packet(0, 1), packet(200, 2)
+        private_pcm = tail.pcm
+        with p._recovery_lock:
+            p._append_overflow(tail)
+        private_units, private_window = tail.units, tail.window
+
+        # Simulate privacy-off while the owner is outside its lifecycle lock querying
+        # the host predicate. Only the old tail intersects the closed private interval.
+        def exit_before_append(*_):
+            p.end_privacy(200 * 32)
+            return False
+
+        with patch.object(p, "_heard_private", side_effect=exit_before_append):
+            p._queue_window(public)
+        self.assertTrue(tail.discarded)
+        self.assertFalse(tail.overflow)
+        self.assertFalse(any(private_pcm))
+        self.assertEqual(private_units, [])
+        self.assertEqual(private_window.units, [])
+        self.assertIsNone(tail.window)
+        self.assertFalse(public.discarded or public.overflow)
+        self.assertEqual([turn.text for turn in turns], ["RECOVERED_FIXTURE"])
+        self.assertFalse(p.closed or p.failed)
+
+    def test_attributed_private_units_are_dropped_if_exit_runs_in_host_predicate(self):
+        for verdict in (False, True):
+            with self.subTest(verdict=verdict):
+                _, _, _, p, _, _ = self.arrange()
+                turns, private_audio = [], Mock()
+                p.on_turn = turns.append
+                p.config = replace(p.config, on_private_turn_audio=private_audio)
+                window = _recognizer_window(doc(GOOD), 200)
+                packet = _FinalizedWindow(
+                    bytearray(VOICE * 10),
+                    0,
+                    200,
+                    0,
+                    1,
+                    [],
+                    "causal-replay",
+                    True,
+                    window.units,
+                    window,
+                    (0, 0),
+                    200,
+                    False,
+                )
+                pcm, units = packet.pcm, packet.units
+
+                def exit_during_attribution(*_):
+                    p.end_privacy(200 * 32)
+                    return verdict
+
+                with patch.object(p, "_heard_private", side_effect=exit_during_attribution):
+                    p._commit_window(packet)
+                self.assertTrue(packet.discarded)
+                self.assertFalse(any(pcm))
+                self.assertEqual(units, [])
+                self.assertIsNone(packet.window)
+                self.assertFalse(p._merger.holding)
+                private_audio.assert_not_called()
+                self.assertEqual(turns, [])
+                self.assertFalse(p.closed or p.failed)
 
     def test_exit_before_window_registration_refuses_late_private_decode(self):
         c, e, s, p, _, units = self.arrange()
