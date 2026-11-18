@@ -2166,6 +2166,8 @@ class LiveProcessor:
                 )
                 retry = not overflow and invalid and len(self._recoveries) < ASR_RECOVERY_WINDOWS
                 if not overflow and not retry and not packet.discarded:
+                    if invalid:
+                        self._lose_window(packet, reason=5, compact=True)
                     held = [entry for entry in self._waiting if not entry.retry_pending]
                     overflow = bool(self._waiting) and (
                         len(held) >= ASR_HELD_WINDOWS
@@ -2180,8 +2182,6 @@ class LiveProcessor:
                     if retry:
                         packet.retry_pending = True
                         self._recoveries.append(packet)
-                    elif invalid:
-                        self._lose_window(packet, reason=5, compact=True)
                     if self._waiting or packet.retry_pending:
                         self._waiting.append(packet)
                         queued = True
