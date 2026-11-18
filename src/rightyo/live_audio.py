@@ -1267,8 +1267,11 @@ class _FinalizedWindow:
         # A released barrier has no recognizer metadata left to coalesce into.
         self.overflow = False
 
-    def held_bytes(self) -> int:
+    def held_bytes(self, *, compacted: bool = False) -> int:
         # A logical admission budget, not a claim about a native model's RSS.
+        if compacted:
+            # _lose_window(compact=True) keeps only the base entry and one gap.
+            return 1024 + 512
         return (
             1024
             + len(self.pcm)
@@ -2166,12 +2169,11 @@ class LiveProcessor:
                 )
                 retry = not overflow and invalid and len(self._recoveries) < ASR_RECOVERY_WINDOWS
                 if not overflow and not retry and not packet.discarded:
-                    if invalid:
-                        self._lose_window(packet, reason=5, compact=True)
                     held = [entry for entry in self._waiting if not entry.retry_pending]
                     overflow = bool(self._waiting) and (
                         len(held) >= ASR_HELD_WINDOWS
-                        or sum(entry.held_bytes() for entry in held) + packet.held_bytes()
+                        or sum(entry.held_bytes() for entry in held)
+                        + packet.held_bytes(compacted=invalid)
                         > ASR_HELD_BYTES
                     )
                 if overflow and private_loss is not None:
@@ -2179,6 +2181,8 @@ class LiveProcessor:
                     self._append_overflow(packet)
                     return
                 if not overflow:
+                    if invalid and not retry:
+                        self._lose_window(packet, reason=5, compact=True)
                     if retry:
                         packet.retry_pending = True
                         self._recoveries.append(packet)
