@@ -1412,16 +1412,10 @@ class PrototypeController:
         self._turn_gaps.pop(turn.utterance_id, None)
         self._diarized_heads.pop(turn.utterance_id, None)
         self._inferred_turns.discard(turn.utterance_id)
-        private = self._heard_private(turn)
         try:
             self._publish("transcript", turn, self_turn=True, inferred=inferred)
         finally:
             self._private_sentence.clear()
-        if not private and "entry" in privacy_phrase(turn.text, self.config.addressing):
-            if self.config.hosted_speech:
-                self._end_private_hosted(self._generation)
-            else:
-                self.duck(True, ack=False)
 
     def _private_turn_audio(self, generation, turn, pcm):
         with self._lock:
@@ -2067,7 +2061,7 @@ class PrototypeController:
             if self._events is not None:
                 self._events.meeting(on)
 
-    def duck(self, on: bool, *, ack=True) -> None:
+    def duck(self, on: bool) -> None:
         """Forward the host's duck mode (hailing-station #735) to the event publisher.
 
         Held by the publisher across sessions, like media mode; ignored without one (the
@@ -2098,7 +2092,7 @@ class PrototypeController:
                 # applied on, a redundant one included, is acked (#735 S-8): audio received
                 # after the ack's `at_ms` falls inside the span.
                 try:
-                    self._events.duck(on, now_ms=self._received_ms, ack=on and ack)
+                    self._events.duck(on, now_ms=self._received_ms, ack=on)
                 except ContractError:
                     # The ack overran the event backlog after the duck was applied: the
                     # session fails as any lost event fails it (Codex on #248), so `listen`

@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from test_conversation import SESSION, decided, turn
-from test_duck_mode import enrolled, heard
+from test_duck_mode import HOSTED_CONSUMERS, enrolled, heard
 
 from rightyo.contracts import SpeakerPriority
 from rightyo.live_audio import LiveConfig, LiveProcessor
@@ -213,7 +213,7 @@ class SessionTests(unittest.TestCase):
         self.path.write_text(json.dumps({**self.base, **sections}))
         return PrototypeConfig.load(self.path)
 
-    def session(self, **sections):
+    def session(self, *, allow_hosted_speech=False, **sections):
         config = self.config(**sections)
         events = SpeechEvents(request_control=True)
         self.notes = []
@@ -221,6 +221,7 @@ class SessionTests(unittest.TestCase):
             self.ctl = PrototypeController(
                 config,
                 event_publisher=events,
+                allow_hosted_speech=allow_hosted_speech,
                 report=self.notes.append,
                 processor_factory=Mock(),
                 provider_factory=Mock(),
@@ -464,15 +465,62 @@ class SessionTests(unittest.TestCase):
                 "request" in [e["type"] for e in self.events.drain()], kind == "echo_only"
             )
 
-    def test_private_entry_and_exit(self):
+    def test_self_entry_waits_for_host_duck(self):
+        entry = " ".join(sorted(PRIVACY_ENTRY)[0])
+        current = heard("entry", 0, 1000, entry)
+        self.session()
+        (expected,) = self.accept(current, decide=False)
+        self.assertEqual(expected["type"], "transcript")
+        for policy in ("suppress", "publish"):
+            with self.subTest(policy=policy):
+                ctl = self.session(self_voice={"enabled": True, "transcripts": policy})
+                ctl.reply_window("r", 0, 32_000, 0)
+                self.tag(0, 2000)
+                ctl._processor = Mock()
+                output = self.accept(current)
+                self.assertFalse(self.events.ducked)
+                self.assertEqual(output, [expected])
+                self.shadow.turn.assert_not_called()
+                self.assertEqual(ctl._memory.retained_ids, set())
+                self.assertEqual(self.events._memory.retained_ids, set())
+
+                self.assertEqual(read_lines(ctl, {"duck": True}), [])
+                self.assertTrue(self.events.ducked)
+                ctl._processor.begin_privacy.assert_called_once_with(1000 * PCM_BYTES_PER_MS)
+                (ack,) = self.events.drain()
+                self.assertEqual(
+                    (ack["type"], ack["action"], ack["at_ms"]), ("privacy", "on", 1000)
+                )
+                self.assertEqual(self.accept(heard("private", 1000, 2000, entry)), [])
+
+    def test_hosted_self_entry_keeps_session_running(self):
+        ctl = self.session(
+            self_voice={"enabled": True},
+            allow_hosted_speech=True,
+            **HOSTED_CONSUMERS["transcriber"],
+        )
+        ctl.reply_window("r", 0, 16_000, 0)
+        self.tag(0, 1000)
+        entry = " ".join(sorted(PRIVACY_ENTRY)[0])
+        (event,) = self.accept(heard("entry", 0, 1000, entry))
+        self.assertEqual(event["type"], "transcript")
+        self.assertFalse(ctl._stop.is_set())
+        self.assertFalse(self.events.ducked)
+
+    def test_self_entry_matcher_error_stays_suppressed(self):
+        ctl = self.session(self_voice={"enabled": True})
+        ctl.reply_window("r", 0, 16_000, 0)
+        self.tag(0, 1000)
+        with patch("rightyo.tool_events.privacy_phrase", side_effect=ValueError):
+            self.assertEqual(self.accept(heard("x", 0, 1000, "x")), [])
+        self.assertFalse(self.events.ducked)
+
+    def test_private_exit_from_self_is_ignored(self):
         ctl = self.session(self_voice={"enabled": True})
         ctl.reply_window("r", 0, 48_000, 0)
         self.tag(0, 3000)
-        ctl._processor = Mock()
-        entry = " ".join(sorted(PRIVACY_ENTRY)[0])
-        self.assertEqual(self.accept(heard("entry", 0, 1000, entry)), [])
-        self.assertTrue(self.events.ducked)
-        ctl._processor.begin_privacy.assert_called_once_with(1000 * PCM_BYTES_PER_MS)
+        ctl.duck(True)
+        self.events.drain()
         roles = enrolled()
         self.events._priority, self.events._per_turn = roles, True
         phrase = " ".join(("Unit", *PRIVACY_EXIT[0]))

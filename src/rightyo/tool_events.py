@@ -1336,7 +1336,12 @@ class SpeechEvents:
             self._private_name_end = None
             self._voice_generation += 1
             if self_turn and self.self_voice.config.transcripts == "suppress":
-                return
+                # The host matches privacy entry on the public transcript stream.
+                try:
+                    if "entry" not in privacy_phrase(turn.text, self._addressing):
+                        return
+                except Exception:  # noqa: BLE001 - the words must never reach an error or a log
+                    return
             digest = hashlib.sha256(
                 json.dumps(turn.to_dict(), sort_keys=True).encode("utf-8")
             ).digest()

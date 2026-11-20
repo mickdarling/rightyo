@@ -1046,10 +1046,10 @@ answer start is also excluded from the answered-by-other check. The default
 suppresses self transcripts. `"publish"` emits the ordinary public transcript
 shape for the host. Private turns always stay private.
 
-A self turn matching the existing standalone privacy-entry grammar enters local
-privacy. With a hosted speech backend the session ends on that entry. A self
-turn can never authorize a privacy exit or either half of a split exit.
-The host's privacy-control acknowledgement remains specific to its control line.
+A self turn heard outside privacy that matches the standalone privacy-entry
+grammar is always published, even under `"suppress"`, so the host's safety
+matcher sees it. RightyO never enters or leaves privacy on its own because of a
+self turn. Only the host's `{"duck": true}` control triggers the privacy-on ack.
 Tag qualification here uses synthetic turns and spans.
 
 ## Acknowledgement gating
