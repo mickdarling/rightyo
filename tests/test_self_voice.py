@@ -6,9 +6,11 @@ import json
 import os
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 from dataclasses import replace
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -132,7 +134,7 @@ class StoreTests(unittest.TestCase):
         self.window("r", 100, None, 0, 60_000)
         self.assertEqual(self.classify(150_000, 180_000, 180_000)[0], "partial")
         self.window("r", 100, None, 0, 181_000)
-        self.assertEqual(self.classify(180_000, 180_001, 181_000)[0], "partial")
+        self.assertEqual(self.classify(180_000, 180_001, 181_000)[0], "outside")
         self.window("s", 182_000, None, 50, 182_000)
         self.assertEqual(self.classify(302_000, 302_050, 310_000)[0], "partial")
         self.assertEqual(self.classify(302_050, 302_051, 310_000)[0], "outside")
@@ -145,7 +147,9 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.classify(120_000, 121_000, 121_000)[0], "echo_only")
         self.assertEqual(self.classify(240_000, 240_001, 241_000)[0], "outside")
         self.window("r", 0, None, 0, 241_000)
-        self.assertEqual(self.classify(240_000, 240_001, 241_000)[0], "partial")
+        self.tag("r", 240_000, 240_001, "echo_only", 241_000)
+        self.assertEqual(self.store.coverage(240_000, 240_001), (False, 0))
+        self.assertEqual(self.classify(240_000, 240_001, 241_000)[0], "outside")
         self.window("r", 0, 241_000, 0, 241_000)
         self.window("r", 0, None, 0, 242_000)
         self.assertEqual(self.classify(241_000, 241_001, 242_000)[0], "outside")
@@ -169,9 +173,10 @@ class StoreTests(unittest.TestCase):
     def test_outside_window(self):
         self.window("r", 10, 110, 0, 110)
         self.tag("s", 10, 110, "mixed", 110)
+        self.assertEqual(self.store.spans, [])
         self.tag("r", 0, 10, "mixed", 110)
         self.tag("r", 10, 110, "echo_only", 110)
-        self.assertEqual(len(self.store.spans), 1)
+        self.assertEqual(self.store.coverage(0, 10), (True, 0))
         self.assertEqual(self.classify(0, 110, 110)[0], "outside")
 
     def test_merge_and_union(self):
@@ -234,6 +239,28 @@ class StoreTests(unittest.TestCase):
         self.tag("r", 50, 1000, "echo_only", 1000)
         self.store.advance(HISTORY_MS + 21)
         self.assertEqual(self.classify(0, 1000, HISTORY_MS + 21), ("partial", 0))
+
+    def test_lost_mixed_prefix_with_adjacent_echo(self):
+        for removal in ("window_eviction", "span_cap", "age_pruning"):
+            with self.subTest(removal=removal):
+                self.setUp()
+                received = 2000
+                self.window("r", 0, 500, 0, received)
+                self.window("s", 0, 2000, 0, received)
+                self.tag("r", 0, 100, "mixed", received)
+                self.tag("s", 100, 500, "echo_only", received)
+                self.assertEqual(self.classify(0, 500, received), ("mixed", 0.8))
+                if removal == "window_eviction":
+                    for idx in range(7):
+                        self.window(str(idx), 0, 500, 0, received)
+                elif removal == "span_cap":
+                    for idx in range(511):
+                        self.tag("s", 501 + 2 * idx, 502 + 2 * idx, "echo_only", received)
+                else:
+                    received = HISTORY_MS + 101
+                    self.store.advance(received)
+                self.assertEqual(self.classify(0, 500, received), ("partial", 0.8))
+                self.assertEqual(self.classify(100, 500, received), ("echo_only", 1))
 
     def test_future_close_and_echo_are_dropped(self):
         self.window("r", 0, None, 0, 0)
@@ -387,6 +414,35 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(store.classify(1, 1000, 1001)[0], "echo_only")
         ctl.self_echo("r", 8000, 8001, "mixed")
         self.assertEqual(store.classify(500, 501, 1001), ("mixed", 1))
+
+    def test_mixed_at_sample_8001_window_edge(self):
+        ctl = self.session(self_voice={"enabled": True})
+        ctl.reply_window("r", 0, 8001, 0)
+        ctl.reply_window("s", 8000, 16_000, 0)
+        ctl.self_echo("r", 8000, 8001, "mixed")
+        ctl.self_echo("s", 8000, 16_000, "echo_only")
+        current = turn("x", 500, 1000, ctl.config.addressing.names[0], "a")
+        self.assertIn("request", [e["type"] for e in self.accept(current)])
+        self.assertIn("self_voice outcome=person reason=mixed fraction=1.00", self.notes)
+
+    def test_revival_preserves_expired_gap(self):
+        for mixed in (True, False):
+            with self.subTest(mixed=mixed):
+                ctl = self.session(self_voice={"enabled": True})
+                ctl.reply_window("r", 0, None, 400)
+                ctl._received_ms = 120_500
+                if mixed:
+                    self.tag(120_400, 120_500, "mixed")
+                    self.assertEqual(self.events.self_voice.coverage(120_400, 120_500), (True, 0))
+                ctl.reply_window("r", 0, None, 400)
+                self.tag(120_500, 120_900)
+                current = turn("x", 120_400, 120_900, ctl.config.addressing.names[0], "a")
+                self.assertIn("request", [e["type"] for e in self.accept(current)])
+                self.assertIn("self_voice outcome=person reason=outside fraction=0.80", self.notes)
+                self.assertEqual(
+                    self.accept(replace(current, utterance_id="y", start_ms=120_500)), []
+                )
+                self.assertIn("self_voice outcome=self reason=echo_only fraction=1.00", self.notes)
 
     def test_capability_and_written_clock(self):
         ctl = self.session(self_voice={"enabled": True})
@@ -736,6 +792,35 @@ class SessionTests(unittest.TestCase):
         self.accept(heard("person", 1000, 2000, "x"))
         self.assertEqual(locks, [False, False])
 
+    def test_stalled_reporter_follows_person_publication(self):
+        ctl = self.session(self_voice={"enabled": True})
+        ctl.reply_window("r", 0, 16_000, 0)
+        self.tag(0, 1000)
+        self.tag(0, 100, "mixed")
+        current = heard("entry", 0, 1000, " ".join(sorted(PRIVACY_ENTRY)[0]))
+        ctl._received_ms = current.end_ms
+        reporting, release = Event(), Event()
+
+        def report(line):
+            if line == "self_voice outcome=person reason=mixed fraction=1.00":
+                reporting.set()
+                release.wait()
+
+        ctl.report = report
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            future = worker.submit(
+                ctl._turn, ctl._generation, ctl._decision_queue, ctl._memory, self.shadow, current
+            )
+            try:
+                self.assertTrue(reporting.wait(timeout=5))
+                self.assertEqual(
+                    [(e["type"], e["turn"]["utterance_id"]) for e in self.events.drain()],
+                    [("transcript", current.utterance_id)],
+                )
+            finally:
+                release.set()
+            future.result()
+
     def test_summary(self):
         base = (
             "speaker_id summary offered=1 scored=0 short=0 overlap=0 dropped=0"
@@ -752,7 +837,7 @@ class SessionTests(unittest.TestCase):
                 self.tag(1100, 1200, "mixed")
                 self.accept(heard("x", 0, 100, "x"))
                 ctl.reply_window("s", 0, 36_000 * 16, 0)
-                expected += " self=1 tags_echo=1/1 tags_mixed=1/1 windows_dropped=1"
+                expected += " self=1 tags_echo=1/1 tags_mixed=2/0 windows_dropped=1"
             shadow = ShadowSpeakerId(Mock(), report=self.notes.append)
             shadow.offered = 1
             with (

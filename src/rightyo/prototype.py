@@ -1374,48 +1374,47 @@ class PrototypeController:
                 # The privacy-entry voice check (hailing-station #735) scores these pieces and
                 # the rest of the span apart, when the transcript is published below.
                 roles.note_spans(turn.utterance_id, spans)
+        if not is_self:
+            # A private turn is never speaker evidence (#735 S-1): no binding or count is
+            # derived from speech heard in privacy, judged by the same decision `_accept` made
+            # (so a mode change between the two cannot split them). Only a matched local exit
+            # may score its isolated sentence, without ever offering it to shadow.turn.
+            with self._lock:
+                # Snapshot public eligibility and epoch before scoring an unbound renewed
+                # label. Bound labels keep the normal asynchronous path.
+                epoch = getattr(shadow, "epoch", None) if shadow is not None else None
+                scored_before = (
+                    roles is not None
+                    and type(epoch) is int
+                    and epoch > 0
+                    and (shadow.binding(turn.speaker_id) or (None,))[0] != "bound"
+                    and generation == self._generation
+                    and not self._stop.is_set()
+                    and not self._heard_private(turn)
+                )
+            if scored_before:
+                # Privacy controls and Stop must stay responsive while the worker scores.
+                shadow.turn(turn, inferred=inferred, spans=spans, epoch=epoch, wait=True)
+            with self._lock:
+                if scored_before and shadow.epoch != epoch:
+                    # Renewed while scoring: this turn's old label has no authority now.
+                    turn = replace(turn, speaker_id=None, speaker_provenance="unknown")
+                    self._inferred_turns.discard(turn.utterance_id)
+                # Sample before acceptance/scoring: any intervening forget invalidates the
+                # queued evidence rather than binding an old label in the new epoch.
+                epoch = getattr(shadow, "epoch", None) if shadow is not None else None
+            private = self._accept(generation, work, memory, turn)
+            if shadow is not None and private is False and not scored_before:
+                # After the turn is accepted and published; it never raises or blocks.
+                shadow.turn(
+                    turn,
+                    inferred=inferred,
+                    spans=spans,
+                    **({"epoch": epoch} if type(epoch) is int else {}),
+                )
         if diagnostic is not None:
             with contextlib.suppress(Exception):
                 self.report(diagnostic)
-        if is_self:
-            return
-        # A private turn is never speaker evidence (#735 S-1): no binding or count is
-        # derived from speech heard in privacy, judged by the same decision `_accept` made
-        # (so a mode change between the two cannot split them). Only a matched local exit
-        # may score its isolated sentence, without ever offering it to shadow.turn.
-        with self._lock:
-            # Snapshot public eligibility and epoch before scoring an unbound renewed
-            # label. Bound labels keep the normal asynchronous path.
-            epoch = getattr(shadow, "epoch", None) if shadow is not None else None
-            scored_before = (
-                roles is not None
-                and type(epoch) is int
-                and epoch > 0
-                and (shadow.binding(turn.speaker_id) or (None,))[0] != "bound"
-                and generation == self._generation
-                and not self._stop.is_set()
-                and not self._heard_private(turn)
-            )
-        if scored_before:
-            # Privacy controls and Stop must stay responsive while the worker scores.
-            shadow.turn(turn, inferred=inferred, spans=spans, epoch=epoch, wait=True)
-        with self._lock:
-            if scored_before and shadow.epoch != epoch:
-                # Renewed while scoring: this turn's old label has no authority now.
-                turn = replace(turn, speaker_id=None, speaker_provenance="unknown")
-                self._inferred_turns.discard(turn.utterance_id)
-            # Sample before acceptance/scoring: any intervening forget invalidates the
-            # queued evidence rather than binding an old label in the new epoch.
-            epoch = getattr(shadow, "epoch", None) if shadow is not None else None
-        private = self._accept(generation, work, memory, turn)
-        if shadow is not None and private is False and not scored_before:
-            # After the turn is accepted and published; it never raises or blocks.
-            shadow.turn(
-                turn,
-                inferred=inferred,
-                spans=spans,
-                **({"epoch": epoch} if type(epoch) is int else {}),
-            )
 
     def _accept_self(self, turn, inferred):
         """Under the controller lock, before either speaker scoring path."""

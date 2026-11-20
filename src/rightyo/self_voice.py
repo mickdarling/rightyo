@@ -50,6 +50,7 @@ class Window:
     expires: int
     tail: int
     from_sample: int
+    eligible_from: int
 
     def region_end(self, received):
         return (min(received, self.expires) if self.end is None else self.end) + self.tail
@@ -70,6 +71,7 @@ class SelfVoice:
         self.config = config
         self.windows = {}
         self.spans = []
+        self.mixed_lost_until = 0
         self.empty_closes = deque(maxlen=MAX_WINDOWS)
         self.kept = {"echo_only": 0, "mixed": 0}
         self.dropped = {"echo_only": 0, "mixed": 0}
@@ -89,6 +91,8 @@ class SelfVoice:
         if not removed:
             return
         mixed = [span for span in removed if span.kind == "mixed"]
+        for span in mixed:
+            self.mixed_lost_until = max(self.mixed_lost_until, span.end)
         self.spans = [
             span
             for span in self.spans
@@ -131,7 +135,8 @@ class SelfVoice:
             return
         if window is not None:
             if end is None:
-                # A refresh also revives an expired window. Only a close is final.
+                if received >= window.expires:
+                    window.eligible_from = max(window.start, received)
                 window.expires = received + OPEN_MS
             else:
                 window.end, window.tail = end, tail
@@ -148,7 +153,9 @@ class SelfVoice:
             oldest = next(iter(self.windows))
             del self.windows[oldest]
             self._discard({s for s in self.spans if s.reply == oldest})
-        self.windows[reply] = Window(start, end, received + OPEN_MS, tail, from_sample)
+        self.windows[reply] = Window(
+            start, end, received + OPEN_MS, tail, from_sample, eligible_from=start
+        )
 
     def self_echo(self, reply, start, end, kind, received):
         merged = self._insert(reply, start, end, kind, received)
@@ -162,15 +169,13 @@ class SelfVoice:
         if window is None:
             return None
         # The host may have written samples the processor has yet to consume.
-        limit = (window.expires if window.end is None else window.end) + window.tail
-        if kind == "mixed":
-            if max(start, window.start) >= min(end, limit):
+        if kind != "mixed":
+            limit = (window.expires if window.end is None else window.end) + window.tail
+            if not (
+                window.eligible_from <= start < end <= limit
+                and received - LATE_MS <= end <= received + AHEAD_MS
+            ):
                 return None
-        elif not (
-            window.start <= start < end <= limit
-            and received - LATE_MS <= end <= received + AHEAD_MS
-        ):
-            return None
         kept = []
         for span in self.spans:
             if (
@@ -211,8 +216,11 @@ class SelfVoice:
             return "outside", 0.0
         mixed, covered = self.coverage(start, end)
         fraction = covered / (end - start)
+        if start < self.mixed_lost_until:
+            return "partial", fraction
         if not any(
-            w.start <= start and end <= w.region_end(received) for w in self.windows.values()
+            w.eligible_from <= start and end <= w.region_end(received)
+            for w in self.windows.values()
         ):
             return "outside", fraction
         if mixed:

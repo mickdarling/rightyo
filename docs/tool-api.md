@@ -1030,6 +1030,8 @@ A null end opens a window. Its 120-second expiry runs from the consumed stream
 time when RightyO first sees the open. A lost initial open shortens the usable
 first window because earlier turns have already been decided. An identical
 refresh extends the expiry from receipt and can reopen an expired window.
+On revival, echo-only tags and turns must start at or after the refresh receipt
+time to qualify for self exclusion in that window.
 A closing record supplies an end at or after the start and a measured tail of
 0–2000 ms. It stands alone if the open was lost. An explicit close is final
 while retained. The store holds up to eight windows and evicts the oldest first.
@@ -1043,11 +1045,12 @@ its end is limited to consumed stream time or expiry, whichever is earlier, plus
 
 Tags cover half-open spans with a strictly later end. Confidence is required
 and may be null or a number from 0 through 1. Classification uses the class alone.
-A `mixed` tag rounds outward. Any overlap with its reply's region keeps the
-entire tag, including portions outside the window. Mixed tags have no five-second
-lateness or 35-second lookahead limit. Same-class spans for the same reply merge
+A `mixed` tag rounds outward. A known reply ID keeps the entire tag across open,
+expired and closed windows, regardless of window bounds, lateness or lookahead.
+An unknown reply ID is dropped. Same-class spans for the same reply merge
 on contact. History is bounded to 65 seconds and 512 spans. Eviction or pruning
 of a mixed span also removes every overlapping echo-only span across all replies.
+Turns starting before the latest end of any discarded mixed span take the person path.
 
 A finalized turn must fit wholly in a window and meet the configured fraction of
 echo-only coverage. Any mixed overlap takes the ordinary person path, including
@@ -1065,8 +1068,9 @@ under either policy so the host can apply its safety matcher. A local entry
 matcher failure also publishes the transcript. Only the host's `{"duck": true}`
 control triggers the privacy-on ack. A self turn heard in privacy cannot exit,
 report status, or contribute a self start, count or diagnostic. Outside privacy,
-per-turn diagnostics contain only outcome, reason and fraction. The enabled
-speaker-ID summary adds the self count, kept/dropped tag counts per class, and
+the per-turn diagnostic follows acceptance and any transcript publication. It
+contains only outcome, reason and fraction. The enabled speaker-ID summary
+adds the self count, kept/dropped tag counts per class, and
 the count of windows dropped for an empty region or excessive future endpoint.
 Tag qualification here uses synthetic turns and spans.
 
