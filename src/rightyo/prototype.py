@@ -73,6 +73,7 @@ from rightyo.providers import (
     request_former_for,
     unavailable_decision,
 )
+from rightyo.self_voice import SelfVoiceConfig
 from rightyo.smart_turn import EndOfTurn, SmartTurn, SmartTurnError
 from rightyo.speaker_id import SpeakerIdConfig
 from rightyo.speech_backends import (
@@ -367,6 +368,7 @@ class PrototypeConfig:
     # default to 60 s and are independent.
     speaker_ring_ms: int = RING_MS
     timeline_window_ms: int = TIMELINE_WINDOW_MS
+    self_voice: SelfVoiceConfig = SelfVoiceConfig()
 
     @property
     def voiceprint_roles(self) -> bool:
@@ -450,6 +452,7 @@ class PrototypeConfig:
                 "speaker_id",
                 "other_agents",
                 "audio_retention",
+                "self_voice",
                 "microphone_helper",
                 *LOCAL_ASSETS,
             }
@@ -490,6 +493,7 @@ class PrototypeConfig:
             speaker_id = raw.pop("speaker_id", None)
             if speaker_id is not None:
                 speaker_id = SpeakerIdConfig.from_dict(speaker_id)
+            self_voice = SelfVoiceConfig.from_dict(raw.pop("self_voice", {}))
             ring_ms, window_ms = audio_retention_spec(raw.pop("audio_retention", {}))
             turns = raw.pop("turns", {})
             if not isinstance(turns, dict) or set(turns) - {
@@ -572,6 +576,7 @@ class PrototypeConfig:
                 speaker_id=speaker_id,
                 speaker_ring_ms=ring_ms,
                 timeline_window_ms=window_ms,
+                self_voice=self_voice,
             )
             if not all(value.is_file() for value in values.values()):
                 raise ValueError
@@ -1025,6 +1030,13 @@ class PrototypeController:
                     acknowledgement=self.config.acknowledgement,
                     meeting_ask_anywhere=self.config.meeting_ask_anywhere,
                     other_agents=self.config.other_agents,
+                    **(
+                        {"self_voice": self.config.self_voice}
+                        if self.config.self_voice.enabled
+                        and mode == "stdin"
+                        and self.retain_transcripts
+                        else {}
+                    ),
                     **({} if self.owner_voice is None else {"owner_voice": self.owner_voice}),
                     # Privacy mode (internally duck, hailing-station #735): the live
                     # controller takes the control, so a publisher that holds it advertises
@@ -1332,6 +1344,26 @@ class PrototypeController:
             # voiceprint evidence (#137), in shadow mode or with roles.
             inferred = turn.utterance_id in self._inferred_turns
             spans = self._turn_spans.pop(turn.utterance_id, None)
+            if (
+                self.config.self_voice.enabled
+                and generation == self._generation
+                and not self._stop.is_set()
+            ):
+                store = getattr(self._events, "self_voice", None)
+                if store is not None:
+                    reason, fraction = store.classify(turn.start_ms, turn.end_ms, self._received_ms)
+                    is_self = reason == "echo_only"
+                    if self.report is not None and (
+                        reason != "outside" or store.overlaps_window(turn.start_ms, turn.end_ms)
+                    ):
+                        with contextlib.suppress(Exception):
+                            self.report(
+                                f"self_voice outcome={'self' if is_self else 'person'}"
+                                f" reason={reason} fraction={fraction:.2f}"
+                            )
+                    if is_self:
+                        self._accept_self(turn, inferred)
+                        return
             roles = self._enrolled_roles
             if roles is not None:
                 # The privacy-entry voice check (hailing-station #735) scores these pieces and
@@ -1374,6 +1406,22 @@ class PrototypeController:
                 spans=spans,
                 **({"epoch": epoch} if type(epoch) is int else {}),
             )
+
+    def _accept_self(self, turn, inferred):
+        """Under the controller lock, before either speaker scoring path."""
+        self._turn_gaps.pop(turn.utterance_id, None)
+        self._diarized_heads.pop(turn.utterance_id, None)
+        self._inferred_turns.discard(turn.utterance_id)
+        private = self._heard_private(turn)
+        try:
+            self._publish("transcript", turn, self_turn=True, inferred=inferred)
+        finally:
+            self._private_sentence.clear()
+        if not private and "entry" in privacy_phrase(turn.text, self.config.addressing):
+            if self.config.hosted_speech:
+                self._end_private_hosted(self._generation)
+            else:
+                self.duck(True, ack=False)
 
     def _private_turn_audio(self, generation, turn, pcm):
         with self._lock:
@@ -1604,7 +1652,15 @@ class PrototypeController:
                 # A replay or stdin stream that ended normally scores its last turns; a
                 # stopped or failed session discards them.
                 with contextlib.suppress(Exception):
-                    shadow.close(drain=not stop.is_set())
+                    store = getattr(self._events, "self_voice", None)
+                    options = {}
+                    if (
+                        self.config.self_voice.enabled
+                        and store is not None
+                        and _takes_keyword(shadow.close, "self_count")
+                    ):
+                        options["self_count"] = store.self_count
+                    shadow.close(drain=not stop.is_set(), **options)
             with self._lock:
                 if self._shadow is shadow:
                     self._shadow = None
@@ -1628,6 +1684,8 @@ class PrototypeController:
             if not pcm:
                 return False
             self._received_bytes += len(pcm)
+            # Turn start_ms/end_ms add utterance-relative offsets to this same stream's
+            # frame position. On stdin both clocks start at byte zero: sample // 16 ms.
             self._received_ms = self._received_bytes // PCM_BYTES_PER_MS
             if self._audio_started is None:
                 self._audio_started = time.monotonic()
@@ -1706,6 +1764,16 @@ class PrototypeController:
                     gap = self._turn_gaps.pop(turn.utterance_id, None)
                     if generation != self._generation or stop.is_set():
                         continue
+                    if (
+                        self.config.self_voice.enabled
+                        and gap
+                        and gap.get("following") == "different_speaker"
+                    ):
+                        store = getattr(self._events, "self_voice", None)
+                        if store is not None:
+                            store.advance(self._received_ms)
+                            if store.excludes_answer(turn.end_ms + gap["silence_ms"]):
+                                gap = None
                     if self._decision_cancel.is_set():
                         enabled = False
                     runner.expire(self._now_ms())
@@ -1929,6 +1997,37 @@ class PrototypeController:
                     # Only close an already-known physical span; never open or renew one.
                     self._runner.close_legacy_reply(self._now_ms())
 
+    def _self_voice_store(self):
+        store = getattr(self._events, "self_voice", None)
+        if store is None or self._event_terminal or self._stop.is_set():
+            raise PrototypeError("self voice control unavailable")
+        return store
+
+    def reply_window(self, reply, from_sample, to_sample, tail_ms):
+        with self._lock:
+            self._self_voice_store().reply_window(
+                reply,
+                from_sample // 16,
+                None if to_sample is None else to_sample // 16,
+                tail_ms,
+                self._received_ms,
+            )
+
+    def self_echo(self, reply, from_sample, to_sample, kind, confidence=None):
+        with self._lock:
+            self._self_voice_store().self_echo(
+                reply,
+                from_sample // 16,
+                to_sample // 16,
+                kind,
+                self._received_ms,
+                partial_end=bool(to_sample % 16),
+            )
+        if self.report is not None:
+            with contextlib.suppress(Exception):
+                score = "-" if confidence is None else f"{confidence:.2f}"
+                self.report(f"self_echo class={kind} confidence={score}")
+
     def request_outcome(self, value) -> None:
         """Trusted control-FD lifecycle report, scoped to this producer session (#262)."""
         from rightyo.request_outcomes import validate
@@ -1968,7 +2067,7 @@ class PrototypeController:
             if self._events is not None:
                 self._events.meeting(on)
 
-    def duck(self, on: bool) -> None:
+    def duck(self, on: bool, *, ack=True) -> None:
         """Forward the host's duck mode (hailing-station #735) to the event publisher.
 
         Held by the publisher across sessions, like media mode; ignored without one (the
@@ -1999,7 +2098,7 @@ class PrototypeController:
                 # applied on, a redundant one included, is acked (#735 S-8): audio received
                 # after the ack's `at_ms` falls inside the span.
                 try:
-                    self._events.duck(on, now_ms=self._received_ms, ack=on)
+                    self._events.duck(on, now_ms=self._received_ms, ack=on and ack)
                 except ContractError:
                     # The ack overran the event backlog after the duck was applied: the
                     # session fails as any lost event fails it (Codex on #248), so `listen`
@@ -2110,6 +2209,10 @@ class PrototypeController:
                 if method == "transcript"
                 else fields
             )
+            if method == "decision" and self.config.self_voice.enabled:
+                store = getattr(self._events, "self_voice", None)
+                if store is not None:
+                    store.advance(self._received_ms)
             result = getattr(self._events, method)(value, now_ms=self._now_ms(), **options)
             runner = self._runner
             if runner is not None and runner.request_context:

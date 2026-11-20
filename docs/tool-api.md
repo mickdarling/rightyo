@@ -53,7 +53,9 @@ The session keeps listening in both cases.
 Initial capabilities declare `activation: "finalized-turn"` when decisions are
 available, or `"disabled"` for transcription-only listening, `partials: false`,
 `speakers: "anonymous"` (or `"enrolled"` when [speaker roles](#speaker-roles-and-owner-override)
-are configured), and `context: true`. Mock replay decisions are identified
+are configured), and `context: true`. With host echo tags enabled, ordinary stdin
+listeners also advertise `self_echo: 1` (see [host echo tags](#host-echo-tags)).
+Mock replay decisions are identified
 by `provider: "mock"` and `model: "mock-v1"`; they are fixture rules. A local
 listener without Jev opt-in emits no invented attention decisions.
 
@@ -996,6 +998,59 @@ Without `--control-fd` the window runs from the request, as before.
 **Not yet.** Only a request, or a reply that revives a lapsed one, engages. The decision model is not told the conversation is engaged; the follow-up
 rule works on its answer instead. Name-less direct requests before any engagement and
 looser name matching are separate work under #82.
+
+### Host echo tags
+
+Ordinary stdin listeners can opt in with a top-level prototype configuration section,
+independent of conversation mode:
+
+```json
+{"self_voice":{"enabled":true,"transcripts":"suppress","echo_only_min_fraction":0.8}}
+```
+
+All three keys are optional. The defaults are `false`, `"suppress"` and `0.8`.
+The fraction accepts numbers from 0.5 through 1. When enabled, the started event
+advertises `capabilities.self_echo = 1`. Send these exact control records only
+after that advertisement. Existing reply-phase records still time the conversation.
+
+```jsonl
+{"type":"reply_window","reply":"r1","from_sample":16000,"to_sample":null,"tail_ms":400}
+{"type":"self_echo","reply":"r1","from_sample":16000,"to_sample":24000,"class":"echo_only","confidence":null}
+{"type":"reply_window","reply":"r1","from_sample":16000,"to_sample":24000,"tail_ms":200}
+```
+
+Sample indices are nonnegative integers into the 16 kHz mono PCM written to this
+child's stdin, starting at zero. Integer division by 16 yields stream milliseconds.
+Each reply ID matches `[A-Za-z0-9_-]{1,64}`. Each line fits the 512-byte control
+limit. The host merges spans to stay within ten records per second across both types.
+Malformed or disabled controls produce a content-free stderr note and are skipped.
+
+A null end opens a window. Resending the identical opening record refreshes its
+120-second stream-time expiry. A closing record supplies an end at or after the
+start and a measured tail of 0–2000 ms. It stands alone if the open was lost.
+Duplicate closes are ignored. The eight most recently opened windows are retained.
+
+Tags cover half-open spans with a strictly later end and a class of `echo_only` or
+`mixed`. Confidence is required and may be null or a number from 0 through 1.
+Calibration notes report class and confidence only. Classification uses the class alone. A tag must fit entirely in its reply's window,
+including the tail. Tags over 5 seconds late are dropped. Same-class spans for the
+same reply merge on contact. History is bounded to 60 seconds plus 5 seconds of
+margin and 512 spans.
+
+A finalized turn must fit wholly in a window and meet the configured fraction of
+echo-only coverage. Any mixed overlap takes the ordinary person path, including
+barge-in requests and stops. Acceptance uses the tags available at that instant.
+Self only removes evidence. It contributes no speaker scoring, presence, answer,
+request, follow-up, override, dismissal or transcript memory. A tagged echo-only
+answer start is also excluded from the answered-by-other check. The default
+suppresses self transcripts. `"publish"` emits the ordinary public transcript
+shape for the host. Private turns always stay private.
+
+A self turn matching the existing standalone privacy-entry grammar enters local
+privacy. With a hosted speech backend the session ends on that entry. A self
+turn can never authorize a privacy exit or either half of a split exit.
+The host's privacy-control acknowledgement remains specific to its control line.
+Tag qualification here uses synthetic turns and spans.
 
 ## Acknowledgement gating
 

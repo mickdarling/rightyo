@@ -32,6 +32,7 @@ from rightyo.memory import TranscriptMemory
 from rightyo.providers import ConfiguredPriorityProvider, ProviderError
 from rightyo.request_outcomes import TERMINAL, OutcomeApplied
 from rightyo.request_outcomes import validate as validate_request_outcome
+from rightyo.self_voice import SelfVoice
 
 MAX_EVENT_BYTES = 1200000
 # The duck-mode control version advertised on `started` (hailing-station #735). Version 2
@@ -561,6 +562,7 @@ class SpeechEvents:
         if type(request_control) is not bool:
             raise ContractError("invalid request control setting")
         self.request_control = request_control
+        self.self_voice = None
         self._request_outcomes = {}
         self._request_outcome_ends = {}
         self._scoped_replies = False
@@ -861,6 +863,7 @@ class SpeechEvents:
         owner_voice=None,
         duck=False,
         meeting=False,
+        self_voice=None,
     ):
         with self._lock:
             identifier(session_id, "session_id")
@@ -907,6 +910,7 @@ class SpeechEvents:
             if len(self._sessions) >= 1000:
                 raise ContractError("event publisher session budget exceeded")
             self._sessions.add(session_key)
+            self.self_voice = SelfVoice(self_voice) if self_voice and self_voice.enabled else None
             self._attention_enabled = attention_enabled
             self._clear_content()
             self._seen.clear()
@@ -975,6 +979,7 @@ class SpeechEvents:
                     "partials": False,
                     "speakers": "anonymous" if priority is None else "enrolled",
                     "context": True,
+                    **({"self_echo": 1} if self.self_voice is not None else {}),
                 },
                 # Configured forms of address are advertised beside, not inside, the
                 # existing capability set so strict consumers of that set are unchanged.
@@ -1274,6 +1279,7 @@ class SpeechEvents:
         inferred=False,
         diarized_head=None,
         voice_checks=None,
+        self_turn=False,
     ):
         """Emit one final turn; `inferred` marks a speaker label partly inferred (#137).
 
@@ -1285,7 +1291,7 @@ class SpeechEvents:
         no override, no owner stop phrase, and a playback-only dismissal that withdraws
         nothing and leaves the speaker's engagement in place.
         """
-        if voice_checks is None:
+        if voice_checks is None and not self_turn:
             voice_checks = self.prepare_transcript(turn, inferred=inferred)
         with self._lock:
             checks_current = self._voice_checks_current(voice_checks, turn, inferred)
@@ -1300,6 +1306,11 @@ class SpeechEvents:
             integer(now_ms, "now_ms")
             self.expire(max(now_ms, turn.end_ms))
             if self.heard_ducked(turn):
+                if self_turn:
+                    self._private_name_end = None
+                    self._voice_generation += 1
+                    self._clear_exit_audio()
+                    return
                 # Privacy mode (hailing-station #735 S-1): matched locally, then dropped. No
                 # transcript, no memory, no decision, no digest of the words, and no use of
                 # the session's turn budget.
@@ -1324,6 +1335,8 @@ class SpeechEvents:
             # Any turn heard outside privacy ends a split exit.
             self._private_name_end = None
             self._voice_generation += 1
+            if self_turn and self.self_voice.config.transcripts == "suppress":
+                return
             digest = hashlib.sha256(
                 json.dumps(turn.to_dict(), sort_keys=True).encode("utf-8")
             ).digest()
@@ -1340,13 +1353,16 @@ class SpeechEvents:
             # decision, the request turn and every later context snapshot.
             # With live identification the role is resolved per turn instead, from the
             # bindings at this moment, and then repeated unchanged the same way.
-            role = (
-                None
-                if self._priority is None
-                else speaker_role(self._priority.role_for(turn))
-                if self._per_turn
-                else self._assign_role(turn, context["turns"])
-            )
+            role = None
+            if self._per_turn:
+                role = speaker_role(self._priority.role_for(turn))
+            elif self._priority is not None:
+                if self_turn:
+                    # Read configured roles for publication without remembering a participant.
+                    role = self._priority.priority.configured_role(turn.speaker_id)
+                    role = role or ("unknown" if turn.speaker_id is None else "participant")
+                else:
+                    role = self._assign_role(turn, context["turns"])
             if (
                 role in {"owner", "trusted"}
                 and self._labels_renewed
@@ -1355,6 +1371,11 @@ class SpeechEvents:
                 # A configured label after the speakers were forgotten may name anyone (#735
                 # S-1, round 17): fail closed until the session restarts.
                 role = "unknown"
+            if self_turn:
+                self._seen[turn.utterance_id] = digest
+                if turn.end_ms > self._now - self.retention_ms:
+                    self._emit_transcript(turn, role, inferred, entry_voice=False)
+                return
             if inferred and role is not None:
                 self._inferred[turn.utterance_id] = turn.end_ms
             if type(diarized_head) is int and 0 < diarized_head <= len(turn.text):
@@ -1377,21 +1398,13 @@ class SpeechEvents:
                 self._pending[turn.utterance_id] = (turn, context, size, role)
                 self._pending_bytes += size
             self._hear_other_voice(turn, role)
-            name = self._speaker_name(turn, role)
-            source = self._role_source(
+            self._emit_transcript(
                 turn,
                 role,
                 inferred,
                 entry_voice=checks_current
                 and voice_checks.entry
                 and self._binding_unchanged(voice_checks, turn),
-            )
-            self._emit(
-                "transcript",
-                turn=_with_role(turn, role),
-                # Beside the turn, never inside it, so turn fingerprints are unchanged.
-                **({} if name is None else {"speaker_name": name}),
-                **({} if source is None else {"role_source": source}),
             )
             if self._dismissal is not None and self._stop_rules.is_stop_phrase(turn.text):
                 # The deterministic fast path (#98): an exact stop phrase dismisses at
@@ -1413,6 +1426,16 @@ class SpeechEvents:
                     # be the engaged speaker's own (#137), so it leaves it.
                     if turn.utterance_id not in self._inferred:
                         self._disengage(turn, "dismissed")
+
+    def _emit_transcript(self, turn, role, inferred, *, entry_voice):
+        name = None if inferred else self._speaker_name(turn, role)
+        source = self._role_source(turn, role, inferred, entry_voice=entry_voice)
+        self._emit(
+            "transcript",
+            turn=_with_role(turn, role),
+            **({} if name is None else {"speaker_name": name}),
+            **({} if source is None else {"role_source": source}),
+        )
 
     @staticmethod
     def _comparable(first, second):
@@ -2735,6 +2758,8 @@ class SpeechEvents:
         requests a guest's quick word never vetoes."""
         at = decision.answered_at_ms
         if at is None or (self._per_turn and role in {"owner", "trusted"}):
+            return False
+        if self.self_voice is not None and self.self_voice.excludes_answer(at):
             return False
         return not self._playback_overlaps(at, at)
 
