@@ -109,6 +109,10 @@ class SelfVoice:
         while self.self_starts and self.self_starts[0] < cutoff:
             self.self_starts.popleft()
 
+    def _remove_window(self, reply):
+        del self.windows[reply]
+        self._discard({s for s in self.spans if s.reply == reply and s.kind == "echo_only"})
+
     def reply_window(self, reply, start, end, tail, received, *, from_sample=None):
         self.advance(received)
         if from_sample is None:
@@ -129,8 +133,7 @@ class SelfVoice:
             # Remember the explicit close without retaining an empty region.
             self.empty_closes.append(reply)
             if window is not None:
-                self._discard({s for s in self.spans if s.reply == reply})
-                del self.windows[reply]
+                self._remove_window(reply)
             self.windows_dropped = min(MAX_COUNT, self.windows_dropped + 1)
             return
         if window is not None:
@@ -150,9 +153,7 @@ class SelfVoice:
                 ]
             return
         if len(self.windows) == MAX_WINDOWS:
-            oldest = next(iter(self.windows))
-            del self.windows[oldest]
-            self._discard({s for s in self.spans if s.reply == oldest})
+            self._remove_window(next(iter(self.windows)))
         self.windows[reply] = Window(
             start, end, received + OPEN_MS, tail, from_sample, eligible_from=start
         )
@@ -165,11 +166,11 @@ class SelfVoice:
         counts[kind] = min(MAX_COUNT, counts[kind] + 1)
 
     def _insert(self, reply, start, end, kind, received):
-        window = self.windows.get(reply)
-        if window is None:
-            return None
-        # The host may have written samples the processor has yet to consume.
         if kind != "mixed":
+            window = self.windows.get(reply)
+            if window is None:
+                return None
+            # The host may have written samples the processor has yet to consume.
             limit = (window.expires if window.end is None else window.end) + window.tail
             if not (
                 window.eligible_from <= start < end <= limit

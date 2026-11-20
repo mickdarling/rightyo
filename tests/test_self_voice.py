@@ -157,7 +157,7 @@ class StoreTests(unittest.TestCase):
     def test_window_cap_and_eviction(self):
         for idx in range(9):
             self.window(str(idx), 0, 100, 0, 100)
-            self.tag(str(idx), idx, idx + 1, "mixed", 100)
+            self.tag(str(idx), idx, idx + 1, "echo_only", 100)
         self.assertEqual(list(self.store.windows), list(map(str, range(1, 9))))
         self.assertEqual([s.reply for s in self.store.spans], list(self.store.windows))
 
@@ -172,7 +172,7 @@ class StoreTests(unittest.TestCase):
 
     def test_outside_window(self):
         self.window("r", 10, 110, 0, 110)
-        self.tag("s", 10, 110, "mixed", 110)
+        self.tag("s", 10, 110, "echo_only", 110)
         self.assertEqual(self.store.spans, [])
         self.tag("r", 0, 10, "mixed", 110)
         self.tag("r", 10, 110, "echo_only", 110)
@@ -215,14 +215,21 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.classify(105, 120, 120), ("mixed", 0))
         self.assertEqual(self.classify(104, 105, 120), ("mixed", 1))
 
-    def test_window_eviction_removes_overlapping_echo(self):
-        self.window("r", 0, 100, 0, 100)
-        self.window("s", 0, 100, 0, 100)
-        self.tag("r", 0, 50, "mixed", 100)
-        self.tag("s", 0, 100, "echo_only", 100)
-        for idx in range(7):
-            self.window(str(idx), 0, 100, 0, 100)
-        self.assertEqual(self.classify(0, 100, 100), ("partial", 0))
+    def test_removing_window_keeps_existing_mixed(self):
+        for removal in ("window_eviction", "empty_close"):
+            with self.subTest(removal=removal):
+                self.setUp()
+                self.window("r", 0, None, 0, 100)
+                self.window("s", 0, 100, 0, 100)
+                self.tag("r", 0, 100, "echo_only", 100)
+                self.tag("r", 0, 50, "mixed", 100)
+                self.tag("s", 0, 80, "echo_only", 100)
+                if removal == "empty_close":
+                    self.window("r", 0, 0, 0, 100)
+                else:
+                    for idx in range(7):
+                        self.window(str(idx), 0, 100, 0, 100)
+                self.assertEqual(self.classify(0, 100, 100), ("mixed", 0.8))
 
     def test_span_eviction_removes_overlapping_echo(self):
         self.window("r", 0, 2000, 0, 2000)
@@ -241,7 +248,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.classify(0, 1000, HISTORY_MS + 21), ("partial", 0))
 
     def test_lost_mixed_prefix_with_adjacent_echo(self):
-        for removal in ("window_eviction", "span_cap", "age_pruning"):
+        for removal in ("span_cap", "age_pruning"):
             with self.subTest(removal=removal):
                 self.setUp()
                 received = 2000
@@ -250,10 +257,7 @@ class StoreTests(unittest.TestCase):
                 self.tag("r", 0, 100, "mixed", received)
                 self.tag("s", 100, 500, "echo_only", received)
                 self.assertEqual(self.classify(0, 500, received), ("mixed", 0.8))
-                if removal == "window_eviction":
-                    for idx in range(7):
-                        self.window(str(idx), 0, 500, 0, received)
-                elif removal == "span_cap":
+                if removal == "span_cap":
                     for idx in range(511):
                         self.tag("s", 501 + 2 * idx, 502 + 2 * idx, "echo_only", received)
                 else:
@@ -418,6 +422,19 @@ class SessionTests(unittest.TestCase):
     def test_mixed_at_sample_8001_window_edge(self):
         ctl = self.session(self_voice={"enabled": True})
         ctl.reply_window("r", 0, 8001, 0)
+        self.assert_mixed_barge_in(ctl)
+
+    def test_mixed_after_empty_close(self):
+        ctl = self.session(self_voice={"enabled": True})
+        ctl.reply_window("r", 8000, None, 0)
+        ctl.reply_window("r", 8000, 8001, 0)
+        self.assert_mixed_barge_in(ctl)
+
+    def test_mixed_for_unseen_reply(self):
+        ctl = self.session(self_voice={"enabled": True})
+        self.assert_mixed_barge_in(ctl)
+
+    def assert_mixed_barge_in(self, ctl):
         ctl.reply_window("s", 8000, 16_000, 0)
         ctl.self_echo("r", 8000, 8001, "mixed")
         ctl.self_echo("s", 8000, 16_000, "echo_only")

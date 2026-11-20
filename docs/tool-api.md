@@ -1045,10 +1045,10 @@ its end is limited to consumed stream time or expiry, whichever is earlier, plus
 
 Tags cover half-open spans with a strictly later end. Confidence is required
 and may be null or a number from 0 through 1. Classification uses the class alone.
-A `mixed` tag rounds outward. A known reply ID keeps the entire tag across open,
-expired and closed windows, regardless of window bounds, lateness or lookahead.
-An unknown reply ID is dropped. Same-class spans for the same reply merge
-on contact. History is bounded to 65 seconds and 512 spans. Eviction or pruning
+A `mixed` tag rounds outward and is kept in full for any reply ID, regardless of
+window state, lateness or lookahead. Removing a window preserves its mixed tags.
+Same-class spans for the same reply merge on contact. Only the 65-second history
+limit and the 512-span cap remove mixed spans. Eviction or pruning
 of a mixed span also removes every overlapping echo-only span across all replies.
 Turns starting before the latest end of any discarded mixed span take the person path.
 
