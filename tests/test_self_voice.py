@@ -531,6 +531,17 @@ class SessionTests(unittest.TestCase):
         self.assertIn("dismiss", [e["type"] for e in self.accept(stop)])
         self.assertIn("self_voice outcome=person reason=mixed fraction=1.00", self.notes)
 
+    def test_mixed_wholly_ahead_preserves_stop(self):
+        ctl = self.session(self_voice={"enabled": True})
+        self.accept(turn("a", 0, 500, "Unit", "a"))
+        ctl.reply_window("r", 500 * 16, None, 0)
+        ctl._received_ms = 1300
+        self.tag(500, 1300)
+        self.tag(1400, 1900, "mixed")
+        stop = turn("b", 500, 1500, SpeakerPriority().stop_phrases[0], "a")
+        self.assertIn("dismiss", [e["type"] for e in self.accept(stop)])
+        self.assertIn("self_voice outcome=person reason=mixed fraction=0.80", self.notes)
+
     def test_mixed_barge_in(self):
         def sequence(mixed):
             self.session(**({"self_voice": {"enabled": True}} if mixed else {}))
