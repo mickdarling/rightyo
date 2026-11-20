@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -217,6 +218,43 @@ def _unique_control_keys(pairs):
     return value
 
 
+WINDOW_KEYS = {"type", "reply", "from_sample", "to_sample", "tail_ms"}
+ECHO_KEYS = {"type", "reply", "from_sample", "to_sample", "class", "confidence"}
+
+
+def _apply_self_voice(message, controller):
+    reply = message["reply"]
+    start, end = message["from_sample"], message["to_sample"]
+    if not isinstance(reply, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", reply):
+        raise ValueError
+    if type(start) is not int or start < 0 or (end is not None and type(end) is not int):
+        raise ValueError
+    if set(message) == WINDOW_KEYS:
+        tail = message["tail_ms"]
+        if (
+            message["type"] != "reply_window"
+            or (end is not None and end < start)
+            or type(tail) is not int
+            or not 0 <= tail <= 2000
+        ):
+            raise ValueError
+        controller.reply_window(reply, start, end, tail)
+    else:
+        confidence = message["confidence"]
+        if (
+            message["type"] != "self_echo"
+            or end is None
+            or end <= start
+            or message["class"] not in ("echo_only", "mixed")
+            or (
+                confidence is not None
+                and (type(confidence) not in (int, float) or not 0 <= confidence <= 1)
+            )
+        ):
+            raise ValueError
+        controller.self_echo(reply, start, end, message["class"], confidence)
+
+
 def _apply_control(line: bytes, controller) -> None:
     try:
         message = json.loads(line, object_pairs_hook=_unique_control_keys)
@@ -227,9 +265,13 @@ def _apply_control(line: bytes, controller) -> None:
             {"duck"},
             {"meeting"},
             {"request_outcome"},
+            WINDOW_KEYS,
+            ECHO_KEYS,
         ):
             raise ValueError
-        if "request_outcome" in message:
+        if "type" in message:
+            _apply_self_voice(message, controller)
+        elif "request_outcome" in message:
             controller.request_outcome(message["request_outcome"])
         elif "media" in message:
             controller.media(message["media"])

@@ -47,6 +47,7 @@ def started_event(config: PrototypeConfig) -> dict:
         audio_input=STDIN_AUDIO_INPUT,
         dismissal=config.dismissal,
         conversation=config.conversation,
+        self_voice=config.self_voice,
         acknowledgement=config.acknowledgement,
         meeting_ask_anywhere=config.meeting_ask_anywhere,
         other_agents=config.other_agents,
