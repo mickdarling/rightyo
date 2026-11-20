@@ -21,7 +21,13 @@ from rightyo.live_speaker_id import ShadowSpeakerId
 from rightyo.prototype import PCM_BYTES_PER_MS, PrototypeConfig, PrototypeController, PrototypeError
 from rightyo.self_voice import HISTORY_MS, SelfVoice, SelfVoiceConfig
 from rightyo.tool import _read_control
-from rightyo.tool_events import PRIVACY_ENTRY, PRIVACY_EXIT, SpeechEvents, encode_json
+from rightyo.tool_events import (
+    PRIVACY_ENTRY,
+    PRIVACY_EXIT,
+    PRIVACY_STATUS,
+    SpeechEvents,
+    encode_json,
+)
 from scripts.emit_started_event import started_event
 
 WINDOW = dict(type="reply_window", reply="r-1_", from_sample=0, to_sample=None, tail_ms=400)
@@ -126,10 +132,23 @@ class StoreTests(unittest.TestCase):
         self.window("r", 100, None, 0, 60_000)
         self.assertEqual(self.classify(150_000, 180_000, 180_000)[0], "partial")
         self.window("r", 100, None, 0, 181_000)
-        self.assertEqual(self.classify(180_000, 180_001, 181_000)[0], "outside")
+        self.assertEqual(self.classify(180_000, 180_001, 181_000)[0], "partial")
         self.window("s", 182_000, None, 50, 182_000)
         self.assertEqual(self.classify(302_000, 302_050, 310_000)[0], "partial")
         self.assertEqual(self.classify(302_050, 302_051, 310_000)[0], "outside")
+
+    def test_delayed_open_and_refresh(self):
+        self.window("r", 0, None, 0, 60_000)
+        self.assertEqual(self.store.windows["r"].expires, 180_000)
+        self.window("r", 0, None, 0, 120_000)
+        self.tag("r", 120_000, 121_000, "echo_only", 121_000)
+        self.assertEqual(self.classify(120_000, 121_000, 121_000)[0], "echo_only")
+        self.assertEqual(self.classify(240_000, 240_001, 241_000)[0], "outside")
+        self.window("r", 0, None, 0, 241_000)
+        self.assertEqual(self.classify(240_000, 240_001, 241_000)[0], "partial")
+        self.window("r", 0, 241_000, 0, 241_000)
+        self.window("r", 0, None, 0, 242_000)
+        self.assertEqual(self.classify(241_000, 241_001, 242_000)[0], "outside")
 
     def test_window_cap_and_eviction(self):
         for idx in range(9):
@@ -140,14 +159,17 @@ class StoreTests(unittest.TestCase):
 
     def test_lateness(self):
         self.window("r", 0, 200, 0, 200)
-        self.tag("r", 0, 99, "mixed", 5100)
+        self.tag("r", 0, 99, "echo_only", 5100)
+        self.assertFalse(self.store.spans)
         self.tag("r", 0, 100, "echo_only", 5100)
         self.assertEqual(self.classify(0, 100, 5100), ("echo_only", 1))
+        self.tag("r", 0, 99, "mixed", 5100)
+        self.assertEqual(self.classify(0, 100, 5100)[0], "mixed")
 
     def test_outside_window(self):
         self.window("r", 10, 110, 0, 110)
         self.tag("s", 10, 110, "mixed", 110)
-        self.tag("r", 0, 109, "mixed", 110)
+        self.tag("r", 0, 10, "mixed", 110)
         self.tag("r", 10, 110, "echo_only", 110)
         self.assertEqual(len(self.store.spans), 1)
         self.assertEqual(self.classify(0, 110, 110)[0], "outside")
@@ -165,15 +187,64 @@ class StoreTests(unittest.TestCase):
         self.tag("s", 80, 81, "mixed", 100)
         self.assertEqual(self.classify(0, 100, 100), ("mixed", 0.85))
 
-    def test_submillisecond_mixed_and_retracted_tail(self):
+    def test_mixed_straddles_window_edges(self):
+        for start, end, outside in ((90, 110, 90), (190, 210, 200)):
+            with self.subTest(start=start):
+                self.setUp()
+                self.window("r", 100, 200, 0, 200)
+                self.window("s", 90, 210, 0, 210)
+                self.tag("s", 90, 210, "echo_only", 210)
+                self.tag("r", start, end, "mixed", 210)
+                self.assertEqual(self.classify(start, end, 210)[0], "mixed")
+                self.assertEqual(
+                    self.classify(outside, outside + 10, 210)[0],
+                    "mixed",
+                )
+
+    def test_retracted_tail_keeps_mixed(self):
         self.window("r", 0, None, 100, 100)
+        self.window("s", 0, 150, 0, 100)
         self.tag("r", 0, 150, "echo_only", 100)
-        self.tag("r", 99, 99, "mixed", 100, partial_end=True)
-        self.assertEqual(self.classify(90, 110, 100)[0], "mixed")
+        self.tag("r", 99, 120, "mixed", 100)
         self.window("r", 0, 100, 5, 100)
-        self.assertFalse(self.store.excludes_answer(105))
-        self.assertTrue(self.store.excludes_answer(104))
-        self.assertFalse(self.store.excludes_answer(99))
+        self.assertEqual(self.classify(105, 120, 120), ("mixed", 0))
+        self.assertEqual(self.classify(104, 105, 120), ("mixed", 1))
+
+    def test_window_eviction_removes_overlapping_echo(self):
+        self.window("r", 0, 100, 0, 100)
+        self.window("s", 0, 100, 0, 100)
+        self.tag("r", 0, 50, "mixed", 100)
+        self.tag("s", 0, 100, "echo_only", 100)
+        for idx in range(7):
+            self.window(str(idx), 0, 100, 0, 100)
+        self.assertEqual(self.classify(0, 100, 100), ("partial", 0))
+
+    def test_span_eviction_removes_overlapping_echo(self):
+        self.window("r", 0, 2000, 0, 2000)
+        self.tag("r", 0, 10, "mixed", 2000)
+        self.tag("r", 1, 9, "echo_only", 2000)
+        for idx in range(511):
+            self.tag("r", 20 + 2 * idx, 21 + 2 * idx, "echo_only", 2000)
+        self.assertEqual(self.classify(1, 9, 2000), ("partial", 0))
+
+    def test_pruned_mixed_prefix_removes_merged_echo(self):
+        self.window("r", 0, 1000, 0, 1000)
+        self.tag("r", 0, 20, "mixed", 1000)
+        self.tag("r", 0, 50, "echo_only", 1000)
+        self.tag("r", 50, 1000, "echo_only", 1000)
+        self.store.advance(HISTORY_MS + 21)
+        self.assertEqual(self.classify(0, 1000, HISTORY_MS + 21), ("partial", 0))
+
+    def test_future_close_and_echo_are_dropped(self):
+        self.window("r", 0, None, 0, 0)
+        self.window("r", 0, 35_001, 0, 0)
+        self.assertIsNone(self.store.windows["r"].end)
+        self.tag("r", 0, 35_001, "echo_only", 0)
+        self.assertEqual(self.classify(0, 100, 100), ("partial", 0))
+        self.tag("r", 0, 35_000, "echo_only", 0)
+        self.tag("r", 0, 35_001, "mixed", 0)
+        self.assertEqual(self.classify(0, 100, 100), ("mixed", 1))
+        self.assertEqual(self.store.windows_dropped, 1)
 
     def test_span_cap_and_pruning(self):
         self.window("r", 0, 2000, 0, 0)
@@ -181,7 +252,7 @@ class StoreTests(unittest.TestCase):
             self.tag("r", idx * 2, idx * 2 + 1, "echo_only", 1100)
         self.assertEqual(len(self.store.spans), 512)
         self.assertEqual(self.store.spans[0].start, 2)
-        self.classify(0, 2, HISTORY_MS + 2000)
+        self.store.advance(HISTORY_MS + 2000)
         self.assertEqual(self.store.spans, [])
 
 
@@ -297,6 +368,26 @@ class SessionTests(unittest.TestCase):
                 "d0d228b511d5d4a71b28fb19f9a9af39b17c8798e000e3e6f8c3395d4c7736fc",
             )
 
+    def test_submillisecond_rounding(self):
+        ctl = self.session(self_voice={"enabled": True})
+        ctl._received_ms = 1001
+        store = self.events.self_voice
+        ctl.reply_window("r", 1, 16_015, 0)
+        ctl.self_echo("r", 1, 16_015, "echo_only")
+        self.assertEqual(store.classify(0, 1, 1001)[0], "outside")
+        self.assertEqual(store.classify(1000, 1001, 1001)[0], "outside")
+        ctl.reply_window("s", 0, 1001 * 16, 0)
+        self.assertEqual(store.classify(0, 1, 1001), ("partial", 0))
+        self.assertEqual(store.classify(1000, 1001, 1001), ("partial", 0))
+        ctl.self_echo("s", 1, 15, "echo_only")
+        ctl.reply_window("empty", 1, 15, 0)
+        ctl.reply_window("empty", 1, None, 0)
+        self.assertNotIn("empty", store.windows)
+        self.assertEqual(len(store.spans), 1)
+        self.assertEqual(store.classify(1, 1000, 1001)[0], "echo_only")
+        ctl.self_echo("r", 8000, 8001, "mixed")
+        self.assertEqual(store.classify(500, 501, 1001), ("mixed", 1))
+
     def test_capability_and_written_clock(self):
         ctl = self.session(self_voice={"enabled": True})
         for payload in (self.started, started_event(ctl.config)):
@@ -390,16 +481,55 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(len(self.events._pending), 0)
         self.assertEqual(self.shadow.turn.call_count, 1)
 
-    def test_unchanged_publication(self):
-        current = turn("x", 0, 1000, "x", "b")
-        self.session()
-        expected = self.accept(current)[0]
-        self.session(self_voice={"enabled": True, "transcripts": "publish"})
-        self.ctl.reply_window("r", 0, 16_000, 0)
-        self.tag(0, 1000)
-        (actual,) = self.accept(current)
-        self.assertEqual(encode_json(actual), encode_json(expected))
-        self.assertEqual(self.events._roles, {})
+    def test_published_self_has_no_person_identity(self):
+        entry = " ".join(sorted(PRIVACY_ENTRY)[0])
+        for policy in ("publish", "suppress"):
+            with self.subTest(policy=policy):
+                ctl = self.session(self_voice={"enabled": True, "transcripts": policy})
+                roles = enrolled()
+                self.events._priority, self.events._per_turn = roles, True
+                self.events._role_sources = True
+                ctl.reply_window("r", 0, 16_000, 0)
+                self.tag(0, 1000)
+                current = heard("x", 0, 1000, entry if policy == "suppress" else "x")
+                self.assertEqual(roles.role_for(current), "owner")
+                with patch.object(roles, "role_for", wraps=roles.role_for) as lookup:
+                    (event,) = self.accept(current)
+                self.assertEqual(event["type"], "transcript")
+                self.assertEqual(event["turn"], {**current.to_dict(), "role": "unknown"})
+                lookup.assert_not_called()
+                self.assertNotIn("speaker_name", event)
+                self.assertNotIn("role_source", event)
+                self.assertEqual(self.events._roles, {})
+
+    def test_self_publications_leave_person_budget(self):
+        ctl = self.session(self_voice={"enabled": True, "transcripts": "publish"})
+        ctl.reply_window("r", 0, 1100 * 16, 0)
+        self.tag(0, 1100)
+        with patch.object(self.events._memory, "snapshot") as snapshot:
+            for idx in range(1100):
+                current = heard(str(idx), idx, idx + 1, "x")
+                (event,) = self.accept(current)
+                self.assertEqual(event["type"], "transcript")
+            self.assertEqual(self.accept(current), [])
+        snapshot.assert_not_called()
+        self.assertLessEqual(len(self.events.self_voice.published), 512)
+        self.assertNotIn("0", self.events.self_voice.published)
+        person = turn("person", 1100, 1500, "Unit", "a")
+        self.assertIn("request", [e["type"] for e in self.accept(person)])
+        self.assertEqual(set(self.events._seen), {"person"})
+        self.assertFalse(ctl._stop.is_set())
+
+    def test_lagged_mixed_preserves_stop(self):
+        ctl = self.session(self_voice={"enabled": True})
+        self.accept(turn("a", 0, 500, "Unit", "a"))
+        ctl.reply_window("r", 500 * 16, None, 0)
+        ctl._received_ms = 1000
+        self.tag(500, 1000)
+        self.tag(950, 1600, "mixed")
+        stop = turn("b", 500, 1000, SpeakerPriority().stop_phrases[0], "a")
+        self.assertIn("dismiss", [e["type"] for e in self.accept(stop)])
+        self.assertIn("self_voice outcome=person reason=mixed fraction=1.00", self.notes)
 
     def test_mixed_barge_in(self):
         def sequence(mixed):
@@ -449,7 +579,7 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(state["post_turn_gap"], {"observed": False})
         self.assertIn("request", [p["type"] for p in self.events.drain()])
 
-    def test_answer_point(self):
+    def test_unclassified_answer_point_keeps_gap(self):
         for kind in ("echo_only", "mixed"):
             ctl = self.session(self_voice={"enabled": True})
             ctl.reply_window("r", 16_000, 32_000, 0)
@@ -461,9 +591,34 @@ class SessionTests(unittest.TestCase):
             self.events.decision(
                 replace(event, decision=replace(event.decision, answered_at_ms=1250)), 2000
             )
-            self.assertEqual(
-                "request" in [e["type"] for e in self.events.drain()], kind == "echo_only"
+            self.assertNotIn("request", [e["type"] for e in self.events.drain()])
+
+    def test_echo_then_mixed_answer_keeps_base_gap(self):
+        gap = dict(observed=True, following="different_speaker", silence_ms=100, window_ms=1200)
+        for enabled in (False, True):
+            ctl = self.session(
+                self_voice={"enabled": enabled},
+                decision={"provider": "jev", "allow_hosted": True, "other_answered_blocks": True},
             )
+            if enabled:
+                ctl.reply_window("r", 16_000, 32_000, 0)
+                self.tag(1000, 2000)
+                self.tag(1500, 1501, "mixed")
+            current = turn("x", 0, 900, "x", "a")
+            ctl._observe_gap(ctl._generation, "x", gap)
+            self.accept(current, decide=False)
+            self.accept(turn("answer", 1000, 2000, "x", "b"), decide=False)
+            ctl._phase = "finishing"
+            runner = ctl._runner
+            runner.provider.requests = 0
+            runner.provider.decide.return_value = decided(current, "attend").decision
+            ctl._decide(ctl._generation, ctl._stop, ctl._decision_queue, runner, True)
+            (state,) = runner.provider.decide.call_args_list[0].args
+            self.assertEqual(state["post_turn_gap"], gap)
+            requests = [
+                e["turn"]["utterance_id"] for e in self.events.drain() if e["type"] == "request"
+            ]
+            self.assertNotIn("x", requests)
 
     def test_self_entry_waits_for_host_duck(self):
         entry = " ".join(sorted(PRIVACY_ENTRY)[0])
@@ -471,6 +626,7 @@ class SessionTests(unittest.TestCase):
         self.session()
         (expected,) = self.accept(current, decide=False)
         self.assertEqual(expected["type"], "transcript")
+        expected["turn"]["role"] = "unknown"
         for policy in ("suppress", "publish"):
             with self.subTest(policy=policy):
                 ctl = self.session(self_voice={"enabled": True, "transcripts": policy})
@@ -507,12 +663,15 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(ctl._stop.is_set())
         self.assertFalse(self.events.ducked)
 
-    def test_self_entry_matcher_error_stays_suppressed(self):
+    def test_self_entry_matcher_error_publishes_once(self):
         ctl = self.session(self_voice={"enabled": True})
         ctl.reply_window("r", 0, 16_000, 0)
         self.tag(0, 1000)
         with patch("rightyo.tool_events.privacy_phrase", side_effect=ValueError):
-            self.assertEqual(self.accept(heard("x", 0, 1000, "x")), [])
+            current = heard("x", 0, 1000, "x")
+            (event,) = self.accept(current)
+            self.assertEqual(self.accept(current), [])
+        self.assertEqual((event["type"], event["turn"]["role"]), ("transcript", "unknown"))
         self.assertFalse(self.events.ducked)
 
     def test_private_exit_from_self_is_ignored(self):
@@ -530,11 +689,72 @@ class SessionTests(unittest.TestCase):
         actions = self.accept(heard("control", 3000, 4000, phrase))
         self.assertEqual([e["action"] for e in actions], ["exit"])
 
+    def test_private_self_status_and_exit_leave_no_record(self):
+        ctl = self.session(self_voice={"enabled": True})
+        ctl.reply_window("r", 0, 64_000, 0)
+        self.tag(0, 4000)
+        self.accept(heard("public", 0, 1000, "x"))
+        store = self.events.self_voice
+        notes = list(self.notes)
+        ctl.duck(True)
+        self.events.drain()
+        roles = enrolled()
+        self.events._priority, self.events._per_turn = roles, True
+        for idx, phrase in enumerate((PRIVACY_STATUS[0], ("Unit", *PRIVACY_EXIT[0]))):
+            start = (idx + 1) * 1000
+            self.assertEqual(
+                self.accept(heard(str(idx), start, start + 1000, " ".join(phrase))), []
+            )
+        self.assertTrue(self.events.ducked)
+        ctl.duck(False)
+        self.assertEqual(self.accept(heard("held", 1000, 2000, " ".join(PRIVACY_STATUS[0]))), [])
+        self.assertEqual((list(store.self_starts), store.self_count), ([0], 1))
+        self.assertEqual(
+            [line for line in self.notes if line.startswith("self_voice")],
+            [line for line in notes if line.startswith("self_voice")],
+        )
+
+    def test_turn_report_outside_controller_lock(self):
+        ctl = self.session(self_voice={"enabled": True})
+        locks = []
+        ctl.report = lambda line: locks.append(ctl._lock._is_owned())
+        ctl.reply_window("r", 0, 32_000, 0)
+        self.tag(0, 1000)
+        self.assertEqual(locks, [])
+        self.accept(heard("self", 0, 1000, "x"))
+        self.accept(heard("person", 1000, 2000, "x"))
+        self.assertEqual(locks, [False, False])
+
     def test_summary(self):
-        for count in (None, 0, 2):
-            notes = []
-            shadow = ShadowSpeakerId(Mock(), report=notes.append)
-            shadow.offered = int(count != 2)
-            shadow.close(self_count=count)
-            (line,) = notes
-            self.assertEqual(line.endswith(f" self={count}"), count is not None)
+        base = (
+            "speaker_id summary offered=1 scored=0 short=0 overlap=0 dropped=0"
+            " clipped=0 inferred=0 unsegmented=0 labelled_ms=0"
+        )
+        for enabled in (False, True):
+            ctl = self.session(self_voice={"enabled": enabled})
+            expected = base
+            if enabled:
+                ctl.reply_window("r", 0, 16_000, 0)
+                self.tag(0, 1000)
+                self.tag(1500, 2000)
+                self.tag(500, 501, "mixed")
+                self.tag(1100, 1200, "mixed")
+                self.accept(heard("x", 0, 100, "x"))
+                ctl.reply_window("s", 0, 36_000 * 16, 0)
+                expected += " self=1 tags_echo=1/1 tags_mixed=1/1 windows_dropped=1"
+            shadow = ShadowSpeakerId(Mock(), report=self.notes.append)
+            shadow.offered = 1
+            with (
+                patch.object(ctl, "_shadow_speaker_id", return_value=shadow),
+                patch("rightyo.prototype.StdinPcmCapture") as capture,
+            ):
+                capture.return_value.read.return_value = b""
+                capture.return_value.overrun = False
+                capture.return_value.discarded_tail_bytes = capture.return_value.dropped_bytes = 0
+                ctl._audio(
+                    ctl._generation, ctl._stop, SESSION, ctl._decision_queue, ctl._memory, "stdin"
+                )
+            self.assertEqual(
+                [line for line in self.notes if line.startswith("speaker_id summary")], [expected]
+            )
+            self.assertFalse(any(line.startswith("self_echo") for line in self.notes))

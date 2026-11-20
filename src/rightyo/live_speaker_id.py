@@ -938,7 +938,9 @@ class ShadowSpeakerId:
 
     # ------------------------------------------------------------------ teardown
 
-    def close(self, *, drain: bool = False, self_count: int | None = None) -> None:
+    def close(
+        self, *, drain: bool = False, self_count: int | None = None, tag_summary: str = ""
+    ) -> None:
         """End the worker; with `drain`, score already queued turns first (bounded wait)."""
         if drain:
             self._closing.set()
@@ -956,7 +958,7 @@ class ShadowSpeakerId:
                     embedder.close()
             self._thread.join(2)
         self._ring.clear()
-        if not self.offered and not self_count:
+        if not self.offered and not self_count and not tag_summary:
             return
         # Each line is formatted on its own and best-effort, so one bad value never costs
         # the others (and the summary always follows).
@@ -975,6 +977,7 @@ class ShadowSpeakerId:
             f" clipped={self.clipped} inferred={self.inferred}"
             f" unsegmented={self.unsegmented} labelled_ms={self.labelled_ms}{self._route}"
             + ("" if self_count is None else f" self={self_count}")
+            + (f" {tag_summary}" if tag_summary else "")
         )
 
 

@@ -1020,36 +1020,54 @@ after that advertisement. Existing reply-phase records still time the conversati
 ```
 
 Sample indices are nonnegative integers into the 16 kHz mono PCM written to this
-child's stdin, starting at zero. Integer division by 16 yields stream milliseconds.
+child's stdin, starting at zero. There are 16 samples per stream millisecond.
+Turn times share this origin. The child's consumed-audio clock can lag the host's writes.
 Each reply ID matches `[A-Za-z0-9_-]{1,64}`. Each line fits the 512-byte control
 limit. The host merges spans to stay within ten records per second across both types.
 Malformed or disabled controls produce a content-free stderr note and are skipped.
 
-A null end opens a window. Resending the identical opening record refreshes its
-120-second stream-time expiry. A closing record supplies an end at or after the
-start and a measured tail of 0–2000 ms. It stands alone if the open was lost.
-Duplicate closes are ignored. The eight most recently opened windows are retained.
+A null end opens a window. Its 120-second expiry runs from the consumed stream
+time when RightyO first sees the open. A lost initial open shortens the usable
+first window because earlier turns have already been decided. An identical
+refresh extends the expiry from receipt and can reopen an expired window.
+A closing record supplies an end at or after the start and a measured tail of
+0–2000 ms. It stands alone if the open was lost. An explicit close is final
+while retained. The store holds up to eight windows and evicts the oldest first.
 
-Tags cover half-open spans with a strictly later end and a class of `echo_only` or
-`mixed`. Confidence is required and may be null or a number from 0 through 1.
-Calibration notes report class and confidence only. Classification uses the class alone. A tag must fit entirely in its reply's window,
-including the tail. Tags over 5 seconds late are dropped. Same-class spans for the
-same reply merge on contact. History is bounded to 60 seconds plus 5 seconds of
-margin and 512 spans.
+Window regions and `echo_only` tags round inward to whole milliseconds. Empty
+regions and echo spans are dropped. A closing endpoint or echo-only end more
+than 35 seconds ahead of the consumed clock is dropped. Echo-only tags must fit
+wholly inside their reply's region and arrive within five seconds of their end.
+For insertion, an open region reaches its expiry plus tail. At classification
+its end is limited to consumed stream time or expiry, whichever is earlier, plus tail.
+
+Tags cover half-open spans with a strictly later end. Confidence is required
+and may be null or a number from 0 through 1. Classification uses the class alone.
+A `mixed` tag rounds outward. Any overlap with its reply's region keeps the
+entire tag, including portions outside the window. Mixed tags have no five-second
+lateness or 35-second lookahead limit. Same-class spans for the same reply merge
+on contact. History is bounded to 65 seconds and 512 spans. Eviction or pruning
+of a mixed span also removes every overlapping echo-only span across all replies.
 
 A finalized turn must fit wholly in a window and meet the configured fraction of
 echo-only coverage. Any mixed overlap takes the ordinary person path, including
 barge-in requests and stops. Acceptance uses the tags available at that instant.
-Self only removes evidence. It contributes no speaker scoring, presence, answer,
-request, follow-up, override, dismissal or transcript memory. A tagged echo-only
-answer start is also excluded from the answered-by-other check. The default
-suppresses self transcripts. `"publish"` emits the ordinary public transcript
-shape for the host. Private turns always stay private.
+Self only removes evidence. It contributes no speaker scoring, presence, request,
+follow-up, override, dismissal, person turn budget or transcript memory. Only the
+exact start of a turn already classified self as a whole is excluded from
+answered-by-other. If the answer is still held when the preceding turn is
+decided, the gap counts as usual.
 
-A self turn heard outside privacy that matches the standalone privacy-entry
-grammar is always published, even under `"suppress"`, so the host's safety
-matcher sees it. RightyO never enters or leaves privacy on its own because of a
-self turn. Only the host's `{"duck": true}` control triggers the privacy-on ack.
+The default suppresses self transcripts. `"publish"` emits the ordinary
+transcript shape with role `unknown` and omits speaker name and role source.
+A public self turn matching the standalone privacy-entry grammar is published
+under either policy so the host can apply its safety matcher. A local entry
+matcher failure also publishes the transcript. Only the host's `{"duck": true}`
+control triggers the privacy-on ack. A self turn heard in privacy cannot exit,
+report status, or contribute a self start, count or diagnostic. Outside privacy,
+per-turn diagnostics contain only outcome, reason and fraction. The enabled
+speaker-ID summary adds the self count, kept/dropped tag counts per class, and
+the count of windows dropped for an empty region or excessive future endpoint.
 Tag qualification here uses synthetic turns and spans.
 
 ## Acknowledgement gating

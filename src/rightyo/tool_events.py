@@ -32,7 +32,7 @@ from rightyo.memory import TranscriptMemory
 from rightyo.providers import ConfiguredPriorityProvider, ProviderError
 from rightyo.request_outcomes import TERMINAL, OutcomeApplied
 from rightyo.request_outcomes import validate as validate_request_outcome
-from rightyo.self_voice import SelfVoice
+from rightyo.self_voice import MAX_SPANS, SelfVoice
 
 MAX_EVENT_BYTES = 1200000
 # The duck-mode control version advertised on `started` (hailing-station #735). Version 2
@@ -1340,15 +1340,25 @@ class SpeechEvents:
                 try:
                     if "entry" not in privacy_phrase(turn.text, self._addressing):
                         return
-                except Exception:  # noqa: BLE001 - the words must never reach an error or a log
-                    return
+                except Exception:  # noqa: BLE001 - let the host check entry on the transcript
+                    pass
             digest = hashlib.sha256(
                 json.dumps(turn.to_dict(), sort_keys=True).encode("utf-8")
             ).digest()
             previous = self._seen.get(turn.utterance_id)
+            if previous is None and self.self_voice is not None:
+                previous = self.self_voice.published.get(turn.utterance_id)
             if previous is not None:
                 if previous != digest:
                     raise ContractError("final event turn cannot be revised")
+                return
+            if self_turn:
+                if turn.end_ms > self._now - self.retention_ms:
+                    self._emit("transcript", turn=_with_role(turn, "unknown"))
+                    published = self.self_voice.published
+                    if len(published) == MAX_SPANS:
+                        del published[next(iter(published))]
+                    published[turn.utterance_id] = digest
                 return
             if len(self._seen) >= 1000:
                 raise ContractError("event session turn budget exceeded")
@@ -1362,12 +1372,7 @@ class SpeechEvents:
             if self._per_turn:
                 role = speaker_role(self._priority.role_for(turn))
             elif self._priority is not None:
-                if self_turn:
-                    # Read configured roles for publication without remembering a participant.
-                    role = self._priority.priority.configured_role(turn.speaker_id)
-                    role = role or ("unknown" if turn.speaker_id is None else "participant")
-                else:
-                    role = self._assign_role(turn, context["turns"])
+                role = self._assign_role(turn, context["turns"])
             if (
                 role in {"owner", "trusted"}
                 and self._labels_renewed
@@ -1376,11 +1381,6 @@ class SpeechEvents:
                 # A configured label after the speakers were forgotten may name anyone (#735
                 # S-1, round 17): fail closed until the session restarts.
                 role = "unknown"
-            if self_turn:
-                self._seen[turn.utterance_id] = digest
-                if turn.end_ms > self._now - self.retention_ms:
-                    self._emit_transcript(turn, role, inferred, entry_voice=False)
-                return
             if inferred and role is not None:
                 self._inferred[turn.utterance_id] = turn.end_ms
             if type(diarized_head) is int and 0 < diarized_head <= len(turn.text):

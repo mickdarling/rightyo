@@ -1338,6 +1338,8 @@ class PrototypeController:
             return None
 
     def _turn(self, generation, work, memory, shadow, turn: Turn) -> None:
+        diagnostic = None
+        is_self = False
         with self._lock:
             # Read before `_accept` consumes it. The identifier embeds only the turn's
             # own-label timeline pieces (#148), so an inferred-label word's audio is never
@@ -1351,24 +1353,32 @@ class PrototypeController:
             ):
                 store = getattr(self._events, "self_voice", None)
                 if store is not None:
+                    store.advance(self._received_ms)
                     reason, fraction = store.classify(turn.start_ms, turn.end_ms, self._received_ms)
                     is_self = reason == "echo_only"
-                    if self.report is not None and (
-                        reason != "outside" or store.overlaps_window(turn.start_ms, turn.end_ms)
-                    ):
-                        with contextlib.suppress(Exception):
-                            self.report(
+                    if not self._heard_private(turn) and not self._private_audio():
+                        if is_self:
+                            store.record_self(turn.start_ms)
+                        if self.report is not None and (
+                            reason != "outside"
+                            or store.overlaps_window(turn.start_ms, turn.end_ms, self._received_ms)
+                        ):
+                            diagnostic = (
                                 f"self_voice outcome={'self' if is_self else 'person'}"
                                 f" reason={reason} fraction={fraction:.2f}"
                             )
                     if is_self:
                         self._accept_self(turn, inferred)
-                        return
             roles = self._enrolled_roles
-            if roles is not None:
+            if roles is not None and not is_self:
                 # The privacy-entry voice check (hailing-station #735) scores these pieces and
                 # the rest of the span apart, when the transcript is published below.
                 roles.note_spans(turn.utterance_id, spans)
+        if diagnostic is not None:
+            with contextlib.suppress(Exception):
+                self.report(diagnostic)
+        if is_self:
+            return
         # A private turn is never speaker evidence (#735 S-1): no binding or count is
         # derived from speech heard in privacy, judged by the same decision `_accept` made
         # (so a mode change between the two cannot split them). Only a matched local exit
@@ -1653,7 +1663,10 @@ class PrototypeController:
                         and store is not None
                         and _takes_keyword(shadow.close, "self_count")
                     ):
-                        options["self_count"] = store.self_count
+                        with self._lock:
+                            options["self_count"] = store.self_count
+                            if _takes_keyword(shadow.close, "tag_summary"):
+                                options["tag_summary"] = store.tag_summary()
                     shadow.close(drain=not stop.is_set(), **options)
             with self._lock:
                 if self._shadow is shadow:
@@ -2001,26 +2014,20 @@ class PrototypeController:
         with self._lock:
             self._self_voice_store().reply_window(
                 reply,
-                from_sample // 16,
+                (from_sample + 15) // 16,
                 None if to_sample is None else to_sample // 16,
                 tail_ms,
                 self._received_ms,
+                from_sample=from_sample,
             )
 
     def self_echo(self, reply, from_sample, to_sample, kind, confidence=None):
+        if kind == "mixed":
+            start, end = from_sample // 16, (to_sample + 15) // 16
+        else:
+            start, end = (from_sample + 15) // 16, to_sample // 16
         with self._lock:
-            self._self_voice_store().self_echo(
-                reply,
-                from_sample // 16,
-                to_sample // 16,
-                kind,
-                self._received_ms,
-                partial_end=bool(to_sample % 16),
-            )
-        if self.report is not None:
-            with contextlib.suppress(Exception):
-                score = "-" if confidence is None else f"{confidence:.2f}"
-                self.report(f"self_echo class={kind} confidence={score}")
+            self._self_voice_store().self_echo(reply, start, end, kind, self._received_ms)
 
     def request_outcome(self, value) -> None:
         """Trusted control-FD lifecycle report, scoped to this producer session (#262)."""
@@ -2209,7 +2216,7 @@ class PrototypeController:
                     store.advance(self._received_ms)
             result = getattr(self._events, method)(value, now_ms=self._now_ms(), **options)
             runner = self._runner
-            if runner is not None and runner.request_context:
+            if runner is not None and runner.request_context and not fields.get("self_turn"):
                 # What the assistant last acted on, or None once dismissed (#199).
                 runner.note_request(getattr(self._events, "last_request", None))
             return result
