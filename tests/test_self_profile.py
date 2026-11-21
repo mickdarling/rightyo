@@ -1,15 +1,19 @@
 """Synthetic host references and deterministic speaker vectors."""
 
+import fcntl
 import hashlib
 import io
 import json
 import os
+import signal
+import subprocess
 import tempfile
 import threading
 import time
 import unittest
 import wave
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, redirect_stderr
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -29,7 +33,7 @@ from rightyo.enroll import STORE_MARKER, Store, speech, voiceprint
 from rightyo.live_speaker_id import EnrolledRoles, ShadowSpeakerId
 from rightyo.prototype import PrototypeController
 from rightyo.self_profile import CACHE_NAME, MANIFEST_BYTES, WAV_BYTES, load_profile
-from rightyo.speaker_id import SAMPLE_RATE
+from rightyo.speaker_id import SAMPLE_RATE, SpeakerEmbedder
 from rightyo.tool import listen
 
 PCM = b"\x00\x20" * SAMPLE_RATE
@@ -444,8 +448,78 @@ class ProfileTests(unittest.TestCase):
         store = Store(refs.config.store)
         store.create()
         assert refs.load() and refs.cache.is_file()
+        (store.path / ".self-voice-tmp-stale").touch()
         assert store.delete_all() == []
         assert not store.path.exists()
+
+    def test_delete_all_waits_for_cache_rename(self):
+        refs = self.references()
+        store = Store(refs.config.store)
+        store.create()
+        paused, resume, attempted, blocked = (threading.Event() for _ in range(4))
+        rename, flock = os.replace, fcntl.flock
+
+        def hold_rename(*args, **kwargs):
+            paused.set()
+            assert resume.wait(5)
+            return rename(*args, **kwargs)
+
+        def observe_delete_lock(fd, operation):
+            if operation == fcntl.LOCK_EX:
+                try:
+                    flock(fd, operation | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    blocked.set()
+                finally:
+                    attempted.set()
+            return flock(fd, operation)
+
+        with (
+            patch("os.replace", side_effect=hold_rename),
+            patch("fcntl.flock", side_effect=observe_delete_lock),
+            ThreadPoolExecutor(2) as pool,
+        ):
+            writer = pool.submit(refs.load)
+            try:
+                assert paused.wait(3)
+                assert len(list(store.path.glob(".self-voice-tmp-*"))) == 1
+                deletion = pool.submit(store.delete_all)
+                assert attempted.wait(3)
+                assert blocked.is_set() and not deletion.done()
+            finally:
+                resume.set()
+            assert writer.result(timeout=3)
+            assert deletion.result(timeout=3) == []
+        assert not store.path.exists()
+
+    def test_delete_all_before_cache_write(self):
+        for keep_directory in (False, True):
+            with self.subTest(keep_directory=keep_directory):
+                refs = self.references()
+                store = Store(refs.config.store)
+                store.create()
+                if keep_directory:
+                    (store.path / "unrelated").touch()
+                paused, resume = threading.Event(), threading.Event()
+
+                def hold_factory():
+                    paused.set()
+                    assert resume.wait(5)
+                    return closing(refs.model)
+
+                refs.open_model.side_effect = hold_factory
+                with ThreadPoolExecutor(1) as pool:
+                    writer = pool.submit(refs.load)
+                    try:
+                        assert paused.wait(3)
+                        assert store.delete_all() == []
+                    finally:
+                        resume.set()
+                    assert writer.result(timeout=3)
+                if keep_directory:
+                    assert {p.name for p in store.path.iterdir()} == {STORE_MARKER, "unrelated"}
+                else:
+                    assert not store.path.exists()
 
     def test_missing_model_sha_computes_without_cache(self):
         refs = self.references()
@@ -601,8 +675,6 @@ class ProfileTests(unittest.TestCase):
 
     def test_listen_progress_during_reference_embedding(self):
         refs = self.references()
-        from concurrent.futures import ThreadPoolExecutor
-
         started, release, transcript = (threading.Event() for _ in range(3))
         embed = refs.model.embed
         workers = []
@@ -772,6 +844,49 @@ class ProfileTests(unittest.TestCase):
         finally:
             release.set()
             worker.close()
+
+    def test_close_reaps_reference_child_during_handshake(self):
+        refs = self.references()
+        runtime = refs.path.parent / "worker"
+        runtime.write_text('#!/bin/sh\ntrap "" TERM\n: > "$0.ready"\nread -r line\n')
+        runtime.chmod(0o700)
+        children = []
+        popen = subprocess.Popen
+
+        def spawn(*args, **kwargs):
+            process = popen(*args, **kwargs)
+            children.append(process)
+            return process
+
+        def factory(settings):
+            if threading.current_thread() is worker._thread:
+                return refs.model
+            return SpeakerEmbedder(runtime, refs.path, identity=refs.model.model)
+
+        worker = ShadowSpeakerId(
+            refs.config,
+            self_voice_manifest=refs.path,
+            entries=lambda _: ENTRIES,
+            embedder_factory=factory,
+        )
+        with patch("subprocess.Popen", side_effect=spawn):
+            worker.start()
+            try:
+                wait_for((refs.path.parent / "worker.ready").exists)
+                (child,) = children
+                assert child.poll() is None
+                loader = worker._profile_thread
+                start = time.monotonic()
+                worker.close()
+                assert not loader.is_alive()
+                assert child.poll() == -signal.SIGKILL
+                assert time.monotonic() - start < 5
+            finally:
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait(timeout=2)
+                worker.close()
 
     def test_self_only_privacy_checks_skip_embedding(self):
         refs = self.references()

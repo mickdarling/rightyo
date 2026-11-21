@@ -15,7 +15,7 @@ from array import array
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from rightyo.enroll import SELF_VOICE_CACHE, Store, speech, voiceprint
+from rightyo.enroll import SELF_VOICE_CACHE, SELF_VOICE_TEMP_PREFIX, Store, speech, voiceprint
 from rightyo.speaker_id import MAX_EMBEDDING_DIM, SAMPLE_RATE, finite_number
 
 MANIFEST_BYTES = 16 * 1024
@@ -244,7 +244,7 @@ def _cache(directory):
 
 
 def _save(directory, vectors):
-    name = f".self-voice-tmp-{secrets.token_hex(12)}"
+    name = SELF_VOICE_TEMP_PREFIX + secrets.token_hex(12)
     fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
     try:
         with os.fdopen(fd, "w") as temporary:
@@ -296,16 +296,19 @@ def load_profile(path, settings, model_sha, open_embedder, report, stop):
                 try:
                     store = Store(settings.store)
                     fd = resources.enter_context(_directory(store.path))
-                    if store.marked(fd):
+                    marker = resources.enter_context(store.open_marker(fd))
+                    if marker is not None:
                         directory = fd
                 except (ValueError, OSError):
                     pass  # An unavailable store leaves reference loading compute-only.
             cached = _cache(directory) if directory is not None else None
             vectors = _vectors(clips, model_sha, cached or {}, open_embedder, stop)
             _check_stop(stop)
-            if directory is not None and cached != vectors and store.marked(directory):
+            if directory is not None and cached != vectors:
                 try:
-                    _save(directory, vectors)
+                    with store.locked_marker(directory, marker, stop=stop) as marked:
+                        if marked:
+                            _save(directory, vectors)
                 except OSError:
                     raise ProfileError("cache_write") from None
     except ProfileError as error:

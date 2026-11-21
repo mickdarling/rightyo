@@ -644,21 +644,36 @@ class ShadowSpeakerId:
 
     @contextlib.contextmanager
     def _open_profile_embedder(self):
-        embedder = self._embedder_factory(self.settings)
-        if embedder is self._embedder:
-            raise ValueError("reference embedder is shared")
         try:
-            with self._embedder_lock:
-                self._profile_embedder = embedder
+            token = SpeakerEmbedder.on_spawn.set(self._register_profile_embedder)
+            try:
+                embedder = self._embedder_factory(self.settings)
+            finally:
+                SpeakerEmbedder.on_spawn.reset(token)
+            if embedder is self._embedder:
+                raise ValueError("reference embedder is shared")
+            self._register_profile_embedder(embedder)
             yield embedder
         finally:
             self._close_profile_embedder()
 
-    def _close_profile_embedder(self):
+    def _register_profile_embedder(self, embedder):
         with self._embedder_lock:
-            embedder, self._profile_embedder = self._profile_embedder, None
-        if embedder is not None:
-            embedder.close()
+            self._profile_embedder = embedder
+            if self._stop.is_set():
+                raise ValueError("reference loading stopped")
+
+    def _close_profile_embedder(self, *, interrupt=False):
+        with self._embedder_lock:
+            embedder = self._profile_embedder
+            if embedder is None:
+                return
+            if interrupt and isinstance(embedder, SpeakerEmbedder):
+                close = embedder.terminate
+            else:
+                self._profile_embedder = None
+                close = embedder.close
+        close()
 
     def _load_profile(self, model_sha):
         vectors = load_profile(
@@ -706,7 +721,10 @@ class ShadowSpeakerId:
                         name="rightyo-self-profile",
                         daemon=True,
                     )
-                    self._profile_thread.start()
+                    with self._embedder_lock:
+                        if self._stop.is_set():
+                            return
+                        self._profile_thread.start()
                 except Exception:
                     self._report("self_profile voices=0 unavailable reason=worker")
                     self._profile_thread = None
@@ -1113,11 +1131,14 @@ class ShadowSpeakerId:
                 with contextlib.suppress(Exception):
                     embedder.close()
             self._thread.join(2)
-        loader = self._profile_thread
+        with self._embedder_lock:
+            loader = self._profile_thread
         if loader is not None and loader.is_alive():
             with contextlib.suppress(Exception):
-                self._close_profile_embedder()
-            loader.join(0.5)
+                self._close_profile_embedder(interrupt=True)
+            loader.join(3)
+            if loader.is_alive():
+                self._report("self_profile shutdown incomplete reason=timeout")
         self._ring.clear()
         if not self.offered and not self_count and not tag_summary and self._manifest is None:
             return
