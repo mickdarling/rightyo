@@ -371,6 +371,12 @@ def listen(args, *, output=None, controller_factory=PrototypeController, audio_i
     # Content-free session notes (end-of-turn scores, capture, shadow speaker
     # identification) go to stderr in every mode.
     consent["report"] = _stderr
+    manifest = getattr(args, "self_voice_manifest", None)
+    if manifest is not None:
+        if config.self_voice.enabled and config.speaker_id is not None and config.speaker_id.live:
+            consent["self_voice_manifest"] = manifest
+        else:
+            _stderr("self_profile voices=0 unavailable reason=disabled")
     if args.mode == "stdin":
         consent["audio_input"] = sys.stdin.buffer if audio_input is None else audio_input
         consent["audio_provenance"] = provenance

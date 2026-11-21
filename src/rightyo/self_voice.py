@@ -212,22 +212,26 @@ class SelfVoice:
     def overlaps_window(self, start, end, received):
         return any(w.start < end and start < w.region_end(received) for w in self.windows.values())
 
-    def classify(self, start, end, received):
+    def contains(self, start, end, received):
+        """Read-only window eligibility at turn acceptance."""
+        return start < end and any(
+            w.eligible_from <= start and end <= w.region_end(received)
+            for w in self.windows.values()
+        )
+
+    def classify(self, start, end, received, *, self_bound=False):
         if end <= start:
             return "outside", 0.0
         mixed, covered = self.coverage(start, end)
         fraction = covered / (end - start)
         if start < self.mixed_lost_until:
             return "partial", fraction
-        if not any(
-            w.eligible_from <= start and end <= w.region_end(received)
-            for w in self.windows.values()
-        ):
+        if not self.contains(start, end, received):
             return "outside", fraction
         if mixed:
             return "mixed", fraction
         if fraction < self.config.echo_only_min_fraction:
-            return "partial", fraction
+            return ("self_profile" if self_bound else "partial"), fraction
         return "echo_only", fraction
 
     def record_self(self, start):

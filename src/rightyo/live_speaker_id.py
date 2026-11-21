@@ -1,4 +1,4 @@
-"""Shadow live speaker identification (#137 step 4a): scores only, no behaviour change.
+"""Live speaker identification with optional enrolled roles and self exclusion.
 
 When the `speaker_id` section sets `"live": true`, a live session runs this alongside the
 processor. For each finalized turn with a session speaker label from the diarization
@@ -13,12 +13,12 @@ its own labelled audio. The accumulated vector is scored against the enrolled vo
 made with the same model, and each label gets a shadow binding state: `bound` to an
 enrolled identifier, `tentative` or `unknown`.
 
-In shadow mode nothing here changes turns, roles, requests, attention or events: the
+In scores-only mode the
 result is a content-free stderr note per scored turn (labels, enrolled identifiers,
 durations and scores only; never audio, embeddings, transcript text or paths), which is
 calibration data for the accumulated-score thresholds (#141). With `"roles": true` (#137
 step 4b, #113), `EnrolledRoles` reads the current bindings when each turn is emitted and
-gives a bound label its enrolled identifier's configured role; it never waits for one.
+gives a bound label its enrolled identifier's configured role.
 
 Embedding runs on a dedicated worker thread behind a small bounded queue, never on the
 audio thread: when the worker is busy, a turn is dropped and counted. A worker that fails
@@ -27,6 +27,14 @@ normal live scoring stays asynchronous. After a renewal, unbound roles wait for 
 own score before publication; privacy controls and Stop remain responsive. Audio is never
 written: the ring holds at most `RING_MS` of PCM in memory by default
 (`audio_retention.speaker_ring_seconds` sets it, #226) and is cleared when the session ends.
+
+With a self-voice manifest, the same worker embeds fixed host references and caches
+their vectors separately. Only scored public turns wholly inside a reply window add
+self evidence. Its duration-weighted mean of per-turn best reference scores must clear
+the bind threshold and duration minimum and lead the best person score by 0.10.
+Person bindings take precedence. A self binding survives down to the tentative
+threshold while ahead of every person. Forget clears all label evidence. Self
+references are excluded from person identification and isolated privacy checks.
 
 Private turns never enter that queue, ring or accumulated evidence. An enrolled-owner
 exit candidate may borrow one mutable sentence for an isolated check (#946 step 1),
@@ -57,6 +65,7 @@ from rightyo.enroll import (
     windows,
 )
 from rightyo.providers import ConfiguredPriorityProvider
+from rightyo.self_profile import load_profile
 from rightyo.speaker_id import SAMPLE_RATE, SpeakerEmbedder, SpeakerIdConfig
 
 BYTES_PER_MS = 32  # mono PCM16 at 16 kHz
@@ -68,6 +77,7 @@ RING_MS = 60000
 MIN_RING_MS = 10000
 MAX_RING_MS = 600000
 QUEUE_SIZE = 4
+SELF_BIND_MARGIN = 0.10
 # A privacy-entry voice check (hailing-station #735) waits at most this long for the worker;
 # a check not done by then refuses, the safe failure. At most this many wait at once.
 ENTRY_CHECK_TIMEOUT_S = 2.0
@@ -268,6 +278,29 @@ class LabelState:
     score: float | None = None  # accumulated score against `identity`
     scores: dict[str, float] = field(default_factory=dict)
 
+    self_total: float = 0.0
+    self_seconds: float = 0.0
+    self_bound: bool = False
+
+    def update_self(self, best, seconds, settings):
+        if best is not None:
+            self.self_total += seconds * best
+            self.self_seconds += seconds
+        if not self.self_seconds:
+            return
+        score = self.self_total / self.self_seconds
+        person = max(self.scores.values(), default=-1.0)
+        if self.state == "bound":
+            self.self_bound = False
+        elif self.self_bound:
+            self.self_bound = score >= settings.tentative_threshold and score > person
+        else:
+            self.self_bound = (
+                self.self_seconds >= settings.bind_min_seconds
+                and score >= settings.bind_threshold
+                and score >= person + SELF_BIND_MARGIN
+            )
+
     def add(self, vector: list[float], seconds: float) -> list[float]:
         """Accumulate one unit turn embedding weighted by its speech seconds; the new mean."""
         weighted = [value * seconds for value in vector]
@@ -371,8 +404,11 @@ class ShadowSpeakerId:
         queue_size: int = QUEUE_SIZE,
         ring_ms: int = RING_MS,
         route: str | None = None,
+        self_voice_manifest=None,
     ):
         self.settings = settings
+        self._manifest = self_voice_manifest
+        self._self_prints = ()
         # The host's input route kind (rightyo#164), only from the allowlist, appended to
         # the `key=value` notes so a mismatch can be attributed to an input chain.
         route = input_route(route)
@@ -380,7 +416,7 @@ class ShadowSpeakerId:
         self._report_to = report
         self._embedder_factory = embedder_factory
         self._entries = entries
-        self._queue: queue.Queue[tuple[int, str, int, int, bytes, threading.Event | None]] = (
+        self._queue: queue.Queue[tuple[int, str, int, int, bytes, bool, threading.Event | None]] = (
             queue.Queue(maxsize=queue_size)
         )
         # Privacy-entry voice checks (#735), taken before queued turns: a caller waits on one.
@@ -433,7 +469,7 @@ class ShadowSpeakerId:
         if self._off.is_set() and not (self._closing.is_set() or self._stop.is_set()):
             return None
         state = self._labels.get(label)
-        if state is None:
+        if state is None or (state.identity is None and self._self_prints):
             return None
         if state.state == "unknown" and (
             self._epoch > 0 or state.seconds < self.settings.bind_min_seconds
@@ -444,6 +480,14 @@ class ShadowSpeakerId:
             # After a renewal, below-bar labels stay unknown until a public turn binds.
             return "insufficient", state.identity
         return state.state, state.identity
+
+    def self_bound(self, label: str) -> bool:
+        """Read the committed label state without waiting for inference."""
+        with self._epoch_lock:
+            state = self._labels.get(label)
+            if self._off.is_set() and not (self._closing.is_set() or self._stop.is_set()):
+                return False
+            return state is not None and state.self_bound
 
     def display_name(self, identity: str) -> str | None:
         """The enrolled display name of a compared identifier, or None; never blocks."""
@@ -499,7 +543,14 @@ class ShadowSpeakerId:
             return self._epoch
 
     def turn(
-        self, turn, *, inferred: bool = False, spans=None, epoch: int | None = None, wait=False
+        self,
+        turn,
+        *,
+        inferred: bool = False,
+        spans=None,
+        epoch: int | None = None,
+        wait=False,
+        in_window=False,
     ) -> None:
         """Queue one finalized turn for scoring; never raises.
 
@@ -559,7 +610,15 @@ class ShadowSpeakerId:
             try:
                 done = threading.Event() if wait else None
                 self._queue.put_nowait(
-                    (epoch, turn.speaker_id, turn.end_ms - turn.start_ms, labelled_ms, pcm, done)
+                    (
+                        epoch,
+                        turn.speaker_id,
+                        turn.end_ms - turn.start_ms,
+                        labelled_ms,
+                        pcm,
+                        in_window and bool(self._self_prints),
+                        done,
+                    )
                 )
                 if done is not None:
                     while not done.wait(0.05):
@@ -579,6 +638,7 @@ class ShadowSpeakerId:
 
     def _run(self) -> None:
         embedder = None
+        profile_pending = self._manifest is not None
         try:
             embedder = self._embedder_factory(self.settings)
             with self._embedder_lock:
@@ -598,7 +658,12 @@ class ShadowSpeakerId:
                 for entry in matched
                 if isinstance(entry.get("display_name"), str)
             }
-            if not prints:
+            if profile_pending:
+                self._self_prints = load_profile(
+                    self._manifest, self.settings, embedder, self._report
+                )
+                profile_pending = False
+            if not prints and not self._self_prints:
                 self._off.set()
                 self._report("speaker_id live: no voiceprint enrolled with this model; shadow off")
                 return
@@ -633,6 +698,8 @@ class ShadowSpeakerId:
             if not self._stop.is_set():
                 self._report("speaker_id unavailable; shadow identification off for this session")
         finally:
+            if profile_pending:
+                self._report("self_profile voices=0 unavailable reason=worker")
             self._off.set()
             self._discard_queue()
             self._release_checks()
@@ -664,6 +731,7 @@ class ShadowSpeakerId:
         turn_ms: int,
         labelled_ms: int,
         pcm: bytes,
+        in_window: bool = False,
     ):
         samples = speech(_samples(pcm))
         seconds = len(samples) / SAMPLE_RATE
@@ -674,9 +742,15 @@ class ShadowSpeakerId:
         seconds = len(samples) / SAMPLE_RATE
         vector, _ = voiceprint(embedder.embed, samples)
         comparable = {key: value for key, value in prints.items() if len(value) == len(vector)}
-        if not comparable:
+        if prints and not comparable:
             raise ValueError("no comparable voiceprint")
         turn_scores = {key: cosine(vector, value) for key, value in comparable.items()}
+        self_score = None
+        if in_window:
+            self_score = max(
+                (cosine(vector, ref) for ref in self._self_prints if len(ref) == len(vector)),
+                default=None,
+            )
         # Update a copy and commit it only once complete, so a failure part-way never
         # leaves a label half-updated (or created without a score).
         with self._epoch_lock:
@@ -684,12 +758,16 @@ class ShadowSpeakerId:
                 return  # Queued before a `forget`: its label may now be someone else.
             previous = self._labels.get(label)
             state = LabelState() if previous is None else replace(previous)
-            mean = state.add(vector, seconds)
-            bind(
-                state,
-                {key: cosine(mean, value) for key, value in comparable.items()},
-                self.settings,
-            )
+            if comparable:
+                mean = state.add(vector, seconds)
+                bind(
+                    state,
+                    {key: cosine(mean, value) for key, value in comparable.items()},
+                    self.settings,
+                )
+            else:
+                state.turns += 1
+                state.seconds += seconds
             rule = "accumulated" if state.state == "bound" else "-"
             if (
                 previous is not None
@@ -698,7 +776,7 @@ class ShadowSpeakerId:
                 and previous.identity == state.identity
             ):
                 rule = "-"
-            if epoch > 0 and state.state != "bound":
+            if turn_scores and epoch > 0 and state.state != "bound":
                 # Renewal changes labels, not enrollment. The first independently scored
                 # public turn can bind with accumulated evidence, without the duration minimum.
                 best = min(turn_scores, key=lambda key: (-turn_scores[key], key))
@@ -711,6 +789,7 @@ class ShadowSpeakerId:
             single = self.settings.single_turn_bind_threshold
             if (
                 state.state != "bound"
+                and turn_scores
                 and single is not None
                 and (previous is None or previous.state != "bound")
                 and seconds >= self.settings.single_turn_bind_min_seconds
@@ -724,6 +803,8 @@ class ShadowSpeakerId:
                 ):
                     state.state, state.identity, state.score = "bound", best, state.scores[best]
                     rule = "single"
+            if self._self_prints:
+                state.update_self(self_score, seconds, self.settings)
             if previous is None or (previous.state, previous.identity) != (
                 state.state,
                 state.identity,
@@ -734,14 +815,27 @@ class ShadowSpeakerId:
             if state.state == "bound" and state.identity is not None:
                 self._bound_ids.add(state.identity)
             # In the same epoch as its binding: never counted after a `forget`.
-            self.scored_seconds += seconds
+            if comparable:
+                self.scored_seconds += seconds
         # Report after the bookkeeping, best-effort: a failing channel changes nothing.
+        turn_score = self_score if state.self_bound else turn_scores.get(state.identity)
         self._report(
             f"speaker_id label={_quoted(label)} turn_ms={turn_ms}"
             f" labelled_ms={labelled_ms} speech_ms={round(seconds * 1000)}"
-            f" turn_score={turn_scores[state.identity]:.3f} acc_score={state.score:.3f}"
-            f" acc_s={state.seconds:.1f} state={state.state} id={state.identity}{self._route}"
+            f" turn_score={_number(turn_score, '.3f')} {self._state_note(state)}{self._route}"
             f" bind={rule}"
+        )
+
+    @staticmethod
+    def _state_note(state):
+        if state.self_bound:
+            return (
+                f"acc_score={state.self_total / state.self_seconds:.3f}"
+                f" acc_s={state.self_seconds:.1f} state=self"
+            )
+        return (
+            f"acc_score={_number(state.score, '.3f')} acc_s={state.seconds:.1f}"
+            f" state={state.state} id={state.identity or '-'}"
         )
 
     def entry_score(self, start_ms: int, end_ms: int, spans, owners) -> EntryScore:
@@ -958,18 +1052,18 @@ class ShadowSpeakerId:
                     embedder.close()
             self._thread.join(2)
         self._ring.clear()
-        if not self.offered and not self_count and not tag_summary:
+        if not self.offered and not self_count and not tag_summary and self._manifest is None:
             return
         # Each line is formatted on its own and best-effort, so one bad value never costs
         # the others (and the summary always follows).
-        for label in sorted(dict(self._labels)):
+        with self._epoch_lock:
+            labels = dict(self._labels)
+        for label in sorted(labels):
             with contextlib.suppress(Exception):
-                state = self._labels[label]
+                state = labels[label]
                 self._report(
                     f"speaker_id final label={_quoted(label)} turns={state.turns}"
-                    f" acc_score={_number(state.score, '.3f')}"
-                    f" acc_s={_number(state.seconds, '.1f')}"
-                    f" state={state.state} id={state.identity or '-'}{self._route}"
+                    f" {self._state_note(state)}{self._route}"
                 )
         self._report(
             f"speaker_id summary offered={self.offered} scored={self.scored}"
@@ -978,6 +1072,11 @@ class ShadowSpeakerId:
             f" unsegmented={self.unsegmented} labelled_ms={self.labelled_ms}{self._route}"
             + ("" if self_count is None else f" self={self_count}")
             + (f" {tag_summary}" if tag_summary else "")
+            + (
+                f" self_bound={sum(s.self_bound for s in labels.values())}"
+                if self._manifest is not None
+                else ""
+            )
         )
 
 
@@ -1179,6 +1278,8 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         state, identity = binding
         if state == "bound" and identity is not None:
             return self.priority.configured_role(identity) or "participant", binding
+        if state == "unknown" and getattr(source, "self_bound", lambda _: False)(label) is True:
+            return "unknown", None
         return ("participant" if state == "unknown" else "unknown"), binding
 
     def owner_voice(self, threshold_s: float) -> str | None:

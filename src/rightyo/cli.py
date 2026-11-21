@@ -409,6 +409,9 @@ def main(argv: list[str] | None = None) -> int:
             ' {"duck": true|false}'
         ),
     )
+    listen.add_argument(
+        "--self-voice-manifest", type=Path, help="absolute path to host-rendered self references"
+    )
     listen.add_argument("--use-jev", action="store_true")
     listen.add_argument("--allow-hosted", action="store_true")
     listen.add_argument(

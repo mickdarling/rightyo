@@ -631,6 +631,52 @@ class SessionTests(unittest.TestCase):
 
         self.assertEqual(sequence(False), sequence(True))
 
+    def profile_session(self):
+        ctl = self.session(self_voice={"enabled": True})
+        ctl.self_voice_manifest = self.path
+        self.shadow.self_bound = lambda label: label == "a"
+        ctl.reply_window("r", 0, 2000 * 16, 0)
+        return ctl
+
+    def test_profile_turns_and_watermark(self):
+        ctl = self.profile_session()
+        self.assertEqual(self.accept(heard("x", 0, 500, "x", "a")), [])
+        self.assertIn("self_voice outcome=self reason=self_profile fraction=0.00", self.notes)
+        ctl._events.self_voice.mixed_lost_until = 501
+        self.assertIn(
+            "request", [e["type"] for e in self.accept(heard("y", 500, 1000, "Unit", "a"))]
+        )
+        self.shadow.turn.assert_called_once()
+        self.assertTrue(self.shadow.turn.call_args.kwargs["in_window"])
+
+    def test_profile_mixed_barge_in(self):
+        self.profile_session()
+        self.tag(499, 501, "mixed")
+        self.tag(1499, 1501, "mixed")
+        first = self.accept(heard("x", 0, 1000, "Unit", "a"))
+        stop = self.accept(heard("y", 1000, 2000, SpeakerPriority().stop_phrases[0], "a"))
+        self.assertIn("request", [e["type"] for e in first])
+        self.assertIn("dismiss", [e["type"] for e in stop])
+        self.assertEqual(self.shadow.turn.call_count, 2)
+
+    def test_profile_outside_role_and_presence(self):
+        self.profile_session()
+        output = self.accept(heard("x", 2000, 4000, "Unit x x", "a"))
+        transcript = next(e for e in output if e["type"] == "transcript")
+        self.assertEqual(transcript["turn"]["role"], "unknown")
+        self.assertIn("request", [e["type"] for e in output])
+        self.assertFalse(self.events._cue_voices)
+        self.assertFalse(self.shadow.turn.call_args.kwargs["in_window"])
+
+    def test_profile_private_turns_never_scored(self):
+        ctl = self.profile_session()
+        ctl.duck(True)
+        self.events.drain()
+        for label in ("a", "b"):
+            self.assertEqual(self.accept(heard(label, 0, 1000, "x", label)), [])
+        self.shadow.turn.assert_not_called()
+        self.assertEqual(self.events.self_voice.self_count, 0)
+
     def test_acceptance_precedes_late_tag(self):
         ctl = self.session(self_voice={"enabled": True})
         ctl.reply_window("r", 0, 16_000, 0)

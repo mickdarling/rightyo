@@ -652,6 +652,7 @@ class PrototypeController:
         report=None,
         end_of_turn_factory=SmartTurn,
         speaker_id_factory=ShadowSpeakerId,
+        self_voice_manifest=None,
         owner_voice=None,
         input_route=None,
         retain_transcripts=True,
@@ -669,6 +670,7 @@ class PrototypeController:
         self.processor_factory = processor_factory
         self.end_of_turn_factory = end_of_turn_factory
         self.speaker_id_factory = speaker_id_factory
+        self.self_voice_manifest = self_voice_manifest
         self.capture_factory = capture_factory
         self.provider_factory = provider_factory
         # Explicit consent for configured hosted speech backends to receive audio.
@@ -1084,7 +1086,13 @@ class PrototypeController:
             self._audio_thread.start()
 
     def _accept(
-        self, generation: int, work: queue.Queue, memory: TranscriptMemory, turn: Turn
+        self,
+        generation: int,
+        work: queue.Queue,
+        memory: TranscriptMemory,
+        turn: Turn,
+        *,
+        outside_self=False,
     ) -> bool | None:
         """Accept a final turn; whether it was heard in privacy, or None once stopped."""
         with self._lock:
@@ -1116,6 +1124,7 @@ class PrototypeController:
                 self._publish(
                     "transcript",
                     turn,
+                    **({"outside_self": True} if outside_self else {}),
                     **({"inferred": True} if inferred else {}),
                     **({"diarized_head": head} if head is not None else {}),
                     **({"voice_checks": checks} if callable(prepare) else {}),
@@ -1311,6 +1320,11 @@ class PrototypeController:
             # With roles on (step 4b) it runs without a diagnostic channel too (the lab).
             report = self.report if self.report is not None else _no_report
             options = {} if self.input_route is None else {"route": self.input_route}
+            if self.self_voice_manifest is not None:
+                if _takes_keyword(self.speaker_id_factory, "self_voice_manifest"):
+                    options["self_voice_manifest"] = self.self_voice_manifest
+                else:
+                    report("self_profile voices=0 unavailable reason=provider")
             # A configured ring length (#226); the default passes nothing, as before. A
             # provider that takes no `ring_ms` runs with its own ring, and a note says so.
             ring_not_applied = False
@@ -1339,7 +1353,8 @@ class PrototypeController:
 
     def _turn(self, generation, work, memory, shadow, turn: Turn) -> None:
         diagnostic = None
-        is_self = False
+        is_self = outside_self = False
+        score_options = {}
         with self._lock:
             # Read before `_accept` consumes it. The identifier embeds only the turn's
             # own-label timeline pieces (#148), so an inferred-label word's audio is never
@@ -1354,8 +1369,24 @@ class PrototypeController:
                 store = getattr(self._events, "self_voice", None)
                 if store is not None:
                     store.advance(self._received_ms)
-                    reason, fraction = store.classify(turn.start_ms, turn.end_ms, self._received_ms)
-                    is_self = reason == "echo_only"
+                    bound = False
+                    lookup = (
+                        getattr(shadow, "self_bound", None)
+                        if self.self_voice_manifest is not None
+                        else None
+                    )
+                    if callable(lookup):
+                        inside = store.contains(turn.start_ms, turn.end_ms, self._received_ms)
+                        bound = (
+                            turn.speaker_provenance == "diarization-timeline"
+                            and lookup(turn.speaker_id) is True
+                        )
+                        outside_self = bound and not inside
+                        score_options["in_window"] = inside
+                    reason, fraction = store.classify(
+                        turn.start_ms, turn.end_ms, self._received_ms, self_bound=bound
+                    )
+                    is_self = reason in ("echo_only", "self_profile")
                     if not self._heard_private(turn) and not self._private_audio():
                         if is_self:
                             store.record_self(turn.start_ms)
@@ -1394,7 +1425,9 @@ class PrototypeController:
                 )
             if scored_before:
                 # Privacy controls and Stop must stay responsive while the worker scores.
-                shadow.turn(turn, inferred=inferred, spans=spans, epoch=epoch, wait=True)
+                shadow.turn(
+                    turn, inferred=inferred, spans=spans, epoch=epoch, wait=True, **score_options
+                )
             with self._lock:
                 if scored_before and shadow.epoch != epoch:
                     # Renewed while scoring: this turn's old label has no authority now.
@@ -1403,7 +1436,9 @@ class PrototypeController:
                 # Sample before acceptance/scoring: any intervening forget invalidates the
                 # queued evidence rather than binding an old label in the new epoch.
                 epoch = getattr(shadow, "epoch", None) if shadow is not None else None
-            private = self._accept(generation, work, memory, turn)
+            private = self._accept(
+                generation, work, memory, turn, **({"outside_self": True} if outside_self else {})
+            )
             if shadow is not None and private is False and not scored_before:
                 # After the turn is accepted and published; it never raises or blocks.
                 shadow.turn(
@@ -1411,6 +1446,7 @@ class PrototypeController:
                     inferred=inferred,
                     spans=spans,
                     **({"epoch": epoch} if type(epoch) is int else {}),
+                    **score_options,
                 )
         if diagnostic is not None:
             with contextlib.suppress(Exception):
