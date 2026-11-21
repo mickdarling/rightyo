@@ -24,9 +24,10 @@ import selectors
 import subprocess
 import sys
 import time
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 SAMPLE_RATE = 16000
 # One request carries at most 30 s of PCM16; a response is one short vector.
@@ -379,6 +380,11 @@ def model_identity(model: str | Path) -> dict[str, str]:
 class SpeakerEmbedder:
     """`embed(pcm) -> list[float]` through one persistent worker; single owner, synchronous."""
 
+    # A loader can observe construction inside its one-argument embedder factory.
+    on_spawn: ContextVar[Callable[[SpeakerEmbedder], None] | None] = ContextVar(
+        "speaker_embedder_on_spawn", default=None
+    )
+
     def __init__(
         self,
         python: str | Path,
@@ -419,6 +425,9 @@ class SpeakerEmbedder:
             raise SpeakerIdError("The speaker model could not start") from None
         self.buffer = bytearray()
         try:
+            on_spawn = self.on_spawn.get()
+            if on_spawn is not None:
+                on_spawn(self)
             self._receive(max(self.timeout, 30))
         except BaseException:
             self.close()
@@ -500,7 +509,8 @@ class SpeakerEmbedder:
             raise SpeakerIdError("The speaker model failed")
         return [float(item) for item in vector]
 
-    def close(self) -> None:
+    def terminate(self) -> None:
+        """Interrupt a pending pipe operation. Its owning thread closes the streams."""
         if self.process.poll() is None:
             self.process.terminate()
             try:
@@ -508,6 +518,9 @@ class SpeakerEmbedder:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait(timeout=2)
+
+    def close(self) -> None:
+        self.terminate()
         for stream in (self.process.stdin, self.process.stdout):
             if stream is not None:
                 stream.close()

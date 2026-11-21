@@ -16,10 +16,11 @@ from unittest.mock import Mock, patch
 
 from test_conversation import SESSION, decided, turn
 from test_duck_mode import HOSTED_CONSUMERS, enrolled, heard
+from test_live_speaker_id import ENTRIES, ScriptedEmbedder, settings, unit, wait_for
 
 from rightyo.contracts import SpeakerPriority
 from rightyo.live_audio import LiveConfig, LiveProcessor
-from rightyo.live_speaker_id import ShadowSpeakerId
+from rightyo.live_speaker_id import EnrolledRoles, ShadowSpeakerId
 from rightyo.prototype import PCM_BYTES_PER_MS, PrototypeConfig, PrototypeController, PrototypeError
 from rightyo.self_voice import HISTORY_MS, SelfVoice, SelfVoiceConfig
 from rightyo.tool import _read_control
@@ -630,6 +631,116 @@ class SessionTests(unittest.TestCase):
             return first + stop
 
         self.assertEqual(sequence(False), sequence(True))
+
+    def profile_session(self):
+        ctl = self.session(self_voice={"enabled": True})
+        ctl.self_voice_manifest = self.path
+        self.shadow.self_bound = lambda label: label == "a"
+        ctl.reply_window("r", 0, 2000 * 16, 0)
+        return ctl
+
+    def test_profile_turns_and_watermark(self):
+        ctl = self.profile_session()
+        self.assertEqual(self.accept(heard("x", 0, 500, "x", "a")), [])
+        self.assertIn("self_voice outcome=self reason=self_profile fraction=0.00", self.notes)
+        ctl._events.self_voice.mixed_lost_until = 501
+        self.assertIn(
+            "request", [e["type"] for e in self.accept(heard("y", 500, 1000, "Unit", "a"))]
+        )
+        self.shadow.turn.assert_called_once()
+        self.assertFalse(self.shadow.turn.call_args.kwargs["in_window"])
+
+    def test_profile_mixed_barge_in(self):
+        self.profile_session()
+        self.tag(499, 501, "mixed")
+        self.tag(1499, 1501, "mixed")
+        first = self.accept(heard("x", 0, 1000, "Unit", "a"))
+        stop = self.accept(heard("y", 1000, 2000, SpeakerPriority().stop_phrases[0], "a"))
+        self.assertIn("request", [e["type"] for e in first])
+        self.assertIn("dismiss", [e["type"] for e in stop])
+        self.assertEqual(self.shadow.turn.call_count, 2)
+
+    def test_profile_outside_role_and_presence(self):
+        def sequence(profile):
+            ctl = self.profile_session()
+            if not profile:
+                ctl.self_voice_manifest = None
+            roles = enrolled()
+            self.shadow.self_bound = lambda _: True
+            self.shadow.binding = lambda _: ("unknown", "owner")
+            roles.source = self.shadow
+            self.events._priority, self.events._per_turn = roles, True
+            output = self.accept(heard("x", 2000, 4000, "Unit x x", "other"))
+            self.assertEqual(output[0]["turn"]["role"], "participant")
+            self.assertIn("request", [e["type"] for e in output])
+            self.assertEqual(list(self.events._cue_voices), [(4000, "other")])
+            return [encode_json(event) for event in output]
+
+        self.assertEqual(sequence(False), sequence(True))
+
+    def scoring_session(self, profile):
+        ctl = self.session(self_voice={"enabled": True})
+        ctl.self_voice_manifest = self.path if profile else None
+        ctl._now_ms = lambda: ctl._received_ms
+        embedder = ScriptedEmbedder([unit(0, 1, 0), unit(1, 0, 0)])
+        self.shadow = ShadowSpeakerId(
+            settings(bind_min_seconds=2),
+            entries=lambda _: ENTRIES[:1],
+            embedder_factory=lambda _: embedder,
+        )
+        if profile:
+            self.shadow._self_prints = (unit(0, 1, 0),)
+        self.shadow.start()
+        self.addCleanup(self.shadow.close)
+        self.shadow.audio(b"\x00\x20" * 16_000 * 4)
+        ctl._observe_spans(ctl._generation, "x", ((0, 2000),))
+        ctl._observe_spans(ctl._generation, "y", ((2000, 4000),))
+        return ctl
+
+    def test_renewed_owner_stop_outside_window(self):
+        def sequence(profile):
+            ctl = self.scoring_session(profile)
+            roles = EnrolledRoles(SpeakerPriority.from_dict({"owner": ["owner"]}))
+            roles.source = self.shadow
+            ctl._enrolled_roles = self.events._priority = roles
+            self.events._per_turn = True
+            self.shadow.forget()
+            ctl.reply_window("r", 0, 2000 * 16, 0)
+            self.accept(heard("x", 0, 2000, "Unit", "a"))
+            self.assertEqual(self.shadow.self_bound("a"), profile)
+            stop = heard("y", 2000, 4000, SpeakerPriority().stop_phrases[0], "a")
+            output = self.accept(stop)
+            self.assertEqual(self.shadow.binding("a"), ("bound", "owner"))
+            self.assertEqual(output[0]["turn"]["role"], "owner")
+            self.assertIn("dismiss", [e["type"] for e in output])
+            return [encode_json(event) for event in output]
+
+        self.assertEqual(sequence(False), sequence(True))
+
+    def test_mixed_then_untagged_stop(self):
+        def sequence(profile):
+            ctl = self.scoring_session(profile)
+            ctl.reply_window("r", 0, 4000 * 16, 0)
+            self.tag(0, 2000, "mixed")
+            first = self.accept(heard("x", 0, 2000, "Unit", "a"))
+            wait_for(lambda: self.shadow.scored == 1)
+            stop = self.accept(heard("y", 2000, 4000, SpeakerPriority().stop_phrases[0], "a"))
+            self.assertIn("dismiss", [e["type"] for e in stop])
+            wait_for(lambda: self.shadow.scored == 2)
+            # Only the untagged second turn was eligible for reference evidence.
+            self.assertEqual(self.shadow._labels["a"].self_seconds, 2 if profile else 0)
+            return [encode_json(event) for event in first + stop]
+
+        self.assertEqual(sequence(False), sequence(True))
+
+    def test_profile_private_turns_never_scored(self):
+        ctl = self.profile_session()
+        ctl.duck(True)
+        self.events.drain()
+        for label in ("a", "b"):
+            self.assertEqual(self.accept(heard(label, 0, 1000, "x", label)), [])
+        self.shadow.turn.assert_not_called()
+        self.assertEqual(self.events.self_voice.self_count, 0)
 
     def test_acceptance_precedes_late_tag(self):
         ctl = self.session(self_voice={"enabled": True})

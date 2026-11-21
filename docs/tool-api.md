@@ -1052,7 +1052,7 @@ limit and the 512-span cap remove mixed spans. Eviction or pruning
 of a mixed span also removes every overlapping echo-only span across all replies.
 Turns starting before the latest end of any discarded mixed span take the person path.
 
-A finalized turn must fit wholly in a window and meet the configured fraction of
+For tag-based exclusion, a finalized turn must fit wholly in a window and meet the configured fraction of
 echo-only coverage. Any mixed overlap takes the ordinary person path, including
 barge-in requests and stops. Acceptance uses the tags available at that instant.
 Self only removes evidence. It contributes no speaker scoring, presence, request,
@@ -1073,6 +1073,65 @@ contains only outcome, reason and fraction. The enabled speaker-ID summary
 adds the self count, kept/dropped tag counts per class, and
 the count of windows dropped for an empty region or excessive future endpoint.
 Tag qualification here uses synthetic turns and spans.
+
+### Optional self voiceprint profile
+
+Pass `listen --self-voice-manifest <absolute path>` to add fixed, host-rendered
+reference voices. This requires `self_voice.enabled` and a live `speaker_id`
+section. An inactive flag produces one stderr note with `reason=disabled`.
+Omitting the flag keeps tag-only classification. The host writes clips and
+manifest by atomic rename, with the manifest last. The child reads it once.
+
+The UTF-8 JSON object has exactly two fields, integer `version` equal to 1
+and a `voices` array of at most 16 objects. Each object has exactly these fields.
+
+| Field | Accepted value |
+| --- | --- |
+| `id` | Unique string matching `[A-Za-z0-9_-]{1,64}` |
+| `file` | Bare filename ending in `.wav`, with no leading dot, slash, backslash or `..` |
+| `source` | `reply`, `ack` or `device_cue` |
+| `rendered_at` | Nonnegative integer Unix timestamp in seconds |
+| `sha256` | 64 lowercase hex digits covering the entire WAV file |
+
+Use a private directory (0700) and regular private files (0600), all owned by
+the child's uid. Group/other permission bits and symlinks are refused for the
+directory, manifest and clips. The manifest fits in 16 KiB. Each clip lives beside
+it, fits in 1 MiB, and holds 8–20 seconds inclusive of mono 16 kHz signed 16-bit
+little-endian RIFF/WAVE PCM. Use only fixed assistant reference speech. A path,
+metadata, size or schema violation disables the whole profile. A digest mismatch
+or invalid WAV skips that voice. A reference embedding failure discards the profile.
+An empty list clears the cached voices and enables no profile. All failures leave
+the tag classifier available.
+
+A dedicated loader opens a separate enrollment embedder for cache misses. It uses
+the same speech filtering, overlapping windows and normalized mean. Person scoring
+and privacy checks proceed while the references load. The private JSON cache,
+`.self-voice-cache-v1` in the configured or default
+enrollment store, contains only vectors keyed by model SHA, voice ID, render time
+and WAV SHA. Caching requires an existing marked private store and a model SHA.
+Full enrollment deletion removes the cache. Each load replaces changed entries and
+drops removed voices. Host reference changes take effect at the next child start.
+
+A scored public turn adds evidence only when it lies wholly inside an eligible
+reply window, has no mixed overlap, and starts at or after the discarded-mixed
+watermark. The label accumulates the best reference cosine, weighted by speech seconds.
+Self binding requires `bind_min_seconds` of this evidence, a mean at least
+`bind_threshold`, and a lead of at least **0.10** over the highest accumulated
+enrolled-person score. Any current person binding takes precedence. Self binding
+holds while the mean is at least `tentative_threshold` and strictly ahead of
+every person score. Speaker renewal or forget clears the accumulated label evidence.
+Only person prints can bind a person or provide owner, trusted or privacy authority.
+
+A self-bound timeline label can classify a turn as `self_profile` at acceptance
+without echo-only tags. The same whole-window, refresh, mixed-overlap and
+discarded-mixed watermark rules apply. Mixed barge-ins follow the person path.
+Outside the eligible region, ordinary person roles and other-voice presence apply.
+A self-classified turn uses
+the same transcript and privacy handling as a tag-classified turn. The startup
+note gives the voice count, availability and rule. Speaker diagnostics show
+`state=self` without a voice ID, and the summary gives the current `self_bound`
+label count. Qualification uses synthetic clips and a stand-in embedder.
+Adaptation from live audio is deferred.
 
 ## Acknowledgement gating
 

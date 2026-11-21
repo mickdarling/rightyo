@@ -652,6 +652,7 @@ class PrototypeController:
         report=None,
         end_of_turn_factory=SmartTurn,
         speaker_id_factory=ShadowSpeakerId,
+        self_voice_manifest=None,
         owner_voice=None,
         input_route=None,
         retain_transcripts=True,
@@ -669,6 +670,7 @@ class PrototypeController:
         self.processor_factory = processor_factory
         self.end_of_turn_factory = end_of_turn_factory
         self.speaker_id_factory = speaker_id_factory
+        self.self_voice_manifest = self_voice_manifest
         self.capture_factory = capture_factory
         self.provider_factory = provider_factory
         # Explicit consent for configured hosted speech backends to receive audio.
@@ -1311,6 +1313,11 @@ class PrototypeController:
             # With roles on (step 4b) it runs without a diagnostic channel too (the lab).
             report = self.report if self.report is not None else _no_report
             options = {} if self.input_route is None else {"route": self.input_route}
+            if self.self_voice_manifest is not None:
+                if _takes_keyword(self.speaker_id_factory, "self_voice_manifest"):
+                    options["self_voice_manifest"] = self.self_voice_manifest
+                else:
+                    report("self_profile voices=0 unavailable reason=provider")
             # A configured ring length (#226); the default passes nothing, as before. A
             # provider that takes no `ring_ms` runs with its own ring, and a note says so.
             ring_not_applied = False
@@ -1340,6 +1347,7 @@ class PrototypeController:
     def _turn(self, generation, work, memory, shadow, turn: Turn) -> None:
         diagnostic = None
         is_self = False
+        score_options = {}
         with self._lock:
             # Read before `_accept` consumes it. The identifier embeds only the turn's
             # own-label timeline pieces (#148), so an inferred-label word's audio is never
@@ -1355,7 +1363,19 @@ class PrototypeController:
                 if store is not None:
                     store.advance(self._received_ms)
                     reason, fraction = store.classify(turn.start_ms, turn.end_ms, self._received_ms)
-                    is_self = reason == "echo_only"
+                    lookup = (
+                        getattr(shadow, "self_bound", None) if self.self_voice_manifest else None
+                    )
+                    if callable(lookup):
+                        # A partial turn is contained and free of mixed overlap unless
+                        # the discarded-mixed watermark forced the partial result.
+                        eligible = reason == "partial" and turn.start_ms >= store.mixed_lost_until
+                        score_options["in_window"] = eligible
+                        if eligible and turn.speaker_provenance == "diarization-timeline":
+                            with contextlib.suppress(Exception):
+                                if lookup(turn.speaker_id) is True:
+                                    reason = "self_profile"
+                    is_self = reason in ("echo_only", "self_profile")
                     if not self._heard_private(turn) and not self._private_audio():
                         if is_self:
                             store.record_self(turn.start_ms)
@@ -1394,7 +1414,9 @@ class PrototypeController:
                 )
             if scored_before:
                 # Privacy controls and Stop must stay responsive while the worker scores.
-                shadow.turn(turn, inferred=inferred, spans=spans, epoch=epoch, wait=True)
+                shadow.turn(
+                    turn, inferred=inferred, spans=spans, epoch=epoch, wait=True, **score_options
+                )
             with self._lock:
                 if scored_before and shadow.epoch != epoch:
                     # Renewed while scoring: this turn's old label has no authority now.
@@ -1411,6 +1433,7 @@ class PrototypeController:
                     inferred=inferred,
                     spans=spans,
                     **({"epoch": epoch} if type(epoch) is int else {}),
+                    **score_options,
                 )
         if diagnostic is not None:
             with contextlib.suppress(Exception):

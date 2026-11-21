@@ -15,16 +15,19 @@ only (`rightyo.live_speaker_id`, step 4a).
 
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import operator
 import os
 import re
+import secrets
 import stat
 import sys
 import time
 import wave
 from array import array
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, TextIO
@@ -52,6 +55,8 @@ RELATIVE_FLOOR = 10 ** (-35 / 10)  # a frame is speech within 35 dB of the loude
 ABSOLUTE_FLOOR = 1e-6 * 32768**2  # and above -60 dBFS
 MAX_ENTRY_BYTES = 65536
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+SELF_VOICE_CACHE = ".self-voice-cache-v1"
+SELF_VOICE_TEMP_PREFIX = ".self-voice-tmp-"
 STORE_MARKER = ".rightyo-voice-store"
 TEMPORARY = re.compile(r"\.[a-z0-9][a-z0-9_-]{0,31}\.json\.tmp-[0-9]+")
 
@@ -256,7 +261,7 @@ class Store:
             raise EnrollError("The enrollment store could not be read") from None
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise EnrollError("The enrollment store must be a directory owned by you")
-        if not self._marked():
+        if not self.marked():
             return True
         try:
             os.chmod(self.path, 0o700)
@@ -272,14 +277,60 @@ class Store:
             raise EnrollError("The enrollment store could not be secured") from None
         return True
 
-    def _marked(self) -> bool:
-        marker = self.path / STORE_MARKER
-        return marker.is_file() and not marker.is_symlink()
+    def marked(self, directory_fd=None) -> bool:
+        """Check the marker in the store or its already-open directory."""
+        marker = self.path / STORE_MARKER if directory_fd is None else STORE_MARKER
+        try:
+            info = os.stat(marker, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return stat.S_ISREG(info.st_mode)
+
+    @contextmanager
+    def open_marker(self, directory):
+        """Pin the marked store generation across reference computation or deletion."""
+        if not self.marked(directory):
+            yield None
+            return
+        try:
+            fd = os.open(
+                STORE_MARKER, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
+            )
+        except FileNotFoundError:
+            yield None
+            return
+        try:
+            yield fd if stat.S_ISREG(os.fstat(fd).st_mode) else None
+        finally:
+            os.close(fd)
+
+    @contextmanager
+    def locked_marker(self, directory, marker, *, stop=None):
+        if marker is None:
+            yield False
+            return
+        if stop is None:
+            fcntl.flock(marker, fcntl.LOCK_EX)
+        else:
+            while not stop.is_set():
+                try:
+                    fcntl.flock(marker, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    stop.wait(0.05)
+            else:
+                yield False
+                return
+        try:
+            with self.open_marker(directory) as current:
+                yield current is not None and os.path.samestat(os.fstat(current), os.fstat(marker))
+        finally:
+            fcntl.flock(marker, fcntl.LOCK_UN)
 
     def create(self) -> None:
         """Create the store, or adopt an empty directory; never take over one in use."""
         if self._check():
-            if self._marked():
+            if self.marked():
                 return
             if any(self.path.iterdir()):
                 raise EnrollError(
@@ -395,16 +446,42 @@ class Store:
             return []
         removed = []
         try:
-            for child in sorted(self.path.iterdir()):
-                if (child.is_file() or child.is_symlink()) and self._ours(child):
-                    if child.suffix == ".json":
-                        removed.append(child.stem)
-                    child.unlink()
-            marker = self.path / STORE_MARKER
-            if self._marked() and [child.name for child in self.path.iterdir()] == [STORE_MARKER]:
-                marker.unlink()
-            if not any(self.path.iterdir()):
-                self.path.rmdir()
+            with ExitStack() as resources:
+                directory = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                resources.callback(os.close, directory)
+                marker = resources.enter_context(self.open_marker(directory))
+                marked = resources.enter_context(self.locked_marker(directory, marker))
+                if marker is not None and not marked:
+                    raise EnrollError("The enrollment store changed during deletion")
+                for name in sorted(os.listdir(directory)):
+                    child = self.path / name
+                    if marked and (
+                        name == SELF_VOICE_CACHE or name.startswith(SELF_VOICE_TEMP_PREFIX)
+                    ):
+                        os.unlink(name, dir_fd=directory)
+                    elif (child.is_file() or child.is_symlink()) and self._ours(child):
+                        if child.suffix == ".json":
+                            removed.append(child.stem)
+                        os.unlink(name, dir_fd=directory)
+                remaining = os.listdir(directory)
+                if marked and remaining == [STORE_MARKER]:
+                    os.unlink(STORE_MARKER, dir_fd=directory)
+                    self.path.rmdir()
+                elif marked:
+                    # Keep unrelated files and a valid marker. In-flight writers still
+                    # hold the old inode and must observe this deletion after locking it.
+                    name = SELF_VOICE_TEMP_PREFIX + secrets.token_hex(12)
+                    fd = os.open(
+                        name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory
+                    )
+                    os.close(fd)
+                    try:
+                        os.replace(name, STORE_MARKER, src_dir_fd=directory, dst_dir_fd=directory)
+                    except OSError:
+                        os.unlink(name, dir_fd=directory)
+                        raise
+                elif not remaining:
+                    self.path.rmdir()
         except OSError:
             raise EnrollError("The enrollment store could not be fully deleted") from None
         return removed
