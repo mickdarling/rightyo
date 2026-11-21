@@ -28,6 +28,7 @@ from test_live_speaker_id import (
 )
 from test_live_speaker_id import turn as labelled
 
+from rightyo import self_profile
 from rightyo.contracts import SpeakerPriority
 from rightyo.enroll import STORE_MARKER, Store, speech, voiceprint
 from rightyo.live_speaker_id import EnrolledRoles, ShadowSpeakerId
@@ -520,6 +521,40 @@ class ProfileTests(unittest.TestCase):
                     assert {p.name for p in store.path.iterdir()} == {STORE_MARKER, "unrelated"}
                 else:
                     assert not store.path.exists()
+
+    def test_delete_all_after_reference_decode(self):
+        refs = self.references()
+        store = Store(refs.config.store)
+        store.create()
+        (store.path / "unrelated").touch()
+        marker = store.path / STORE_MARKER
+        original = marker.stat()
+        assert refs.load() and refs.cache.is_file()
+        refs.write([{**refs.voice, "rendered_at": 1}])
+        paused, resume = threading.Event(), threading.Event()
+        decode = self_profile._samples
+
+        def hold_after_decode(data):
+            samples = decode(data)
+            assert samples is not None
+            paused.set()
+            assert resume.wait(5)
+            return samples
+
+        with (
+            patch.object(self_profile, "_samples", hold_after_decode),
+            ThreadPoolExecutor(1) as pool,
+        ):
+            writer = pool.submit(refs.load)
+            try:
+                assert paused.wait(3)
+                assert store.delete_all() == []
+                assert not refs.cache.exists()
+                assert not os.path.samestat(original, marker.stat())
+            finally:
+                resume.set()
+            assert len(writer.result(timeout=3)) == 1
+        assert {p.name for p in store.path.iterdir()} == {STORE_MARKER, "unrelated"}
 
     def test_missing_model_sha_computes_without_cache(self):
         refs = self.references()

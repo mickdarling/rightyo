@@ -289,19 +289,21 @@ def _vectors(clips, model_sha, cached, open_embedder, stop):
 def load_profile(path, settings, model_sha, open_embedder, report, stop):
     """Return the complete reference set. A cache hit needs no reference embedder."""
     try:
-        clips, skipped = _clips(path, stop)
         with ExitStack() as resources:
             directory = None
+            cached = None
             if model_sha:
                 try:
                     store = Store(settings.store)
                     fd = resources.enter_context(_directory(store.path))
                     marker = resources.enter_context(store.open_marker(fd))
-                    if marker is not None:
-                        directory = fd
+                    with store.locked_marker(fd, marker, stop=stop) as marked:
+                        if marked:
+                            directory = fd
+                            cached = _cache(fd)
                 except (ValueError, OSError):
                     pass  # An unavailable store leaves reference loading compute-only.
-            cached = _cache(directory) if directory is not None else None
+            clips, skipped = _clips(path, stop)
             vectors = _vectors(clips, model_sha, cached or {}, open_embedder, stop)
             _check_stop(stop)
             if directory is not None and cached != vectors:

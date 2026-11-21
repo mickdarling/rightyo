@@ -304,9 +304,8 @@ class Store:
         finally:
             os.close(fd)
 
-    @staticmethod
     @contextmanager
-    def locked_marker(directory, marker, *, stop=None):
+    def locked_marker(self, directory, marker, *, stop=None):
         if marker is None:
             yield False
             return
@@ -323,15 +322,8 @@ class Store:
                 yield False
                 return
         try:
-            try:
-                current = os.stat(STORE_MARKER, dir_fd=directory, follow_symlinks=False)
-            except FileNotFoundError:
-                current = None
-            yield (
-                current is not None
-                and stat.S_ISREG(current.st_mode)
-                and os.path.samestat(current, os.fstat(marker))
-            )
+            with self.open_marker(directory) as current:
+                yield current is not None and os.path.samestat(os.fstat(current), os.fstat(marker))
         finally:
             fcntl.flock(marker, fcntl.LOCK_UN)
 
