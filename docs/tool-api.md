@@ -1098,19 +1098,23 @@ the child's uid. Group/other permission bits and symlinks are refused for the
 directory, manifest and clips. The manifest fits in 16 KiB. Each clip lives beside
 it, fits in 1 MiB, and holds 8–20 seconds inclusive of mono 16 kHz signed 16-bit
 little-endian RIFF/WAVE PCM. Use only fixed assistant reference speech. A path,
-metadata, size or schema violation disables the whole profile. A digest mismatch,
-invalid WAV or unusable embedding skips that voice. An empty list clears the cached
-voices and enables no profile. All failures leave the tag classifier available.
+metadata, size or schema violation disables the whole profile. A digest mismatch
+or invalid WAV skips that voice. A reference embedding failure discards the profile.
+An empty list clears the cached voices and enables no profile. All failures leave
+the tag classifier available.
 
-The shadow worker uses the enrollment model, speech filtering, overlapping windows
-and normalized mean. Listening and tag decisions can proceed while the references
-load. The private JSON cache, `.self-voice-cache-v1` in the configured or default
+A dedicated loader opens a separate enrollment embedder for cache misses. It uses
+the same speech filtering, overlapping windows and normalized mean. Person scoring
+and privacy checks proceed while the references load. The private JSON cache,
+`.self-voice-cache-v1` in the configured or default
 enrollment store, contains only vectors keyed by model SHA, voice ID, render time
-and WAV SHA. Each load replaces changed entries and drops removed voices. Changes
-to the host references take effect at the next child start.
+and WAV SHA. Caching requires an existing marked private store and a model SHA.
+Full enrollment deletion removes the cache. Each load replaces changed entries and
+drops removed voices. Host reference changes take effect at the next child start.
 
-For each scored public turn wholly inside an eligible reply window, the label
-accumulates the best cosine across references, weighted by scored speech seconds.
+A scored public turn adds evidence only when it lies wholly inside an eligible
+reply window, has no mixed overlap, and starts at or after the discarded-mixed
+watermark. The label accumulates the best reference cosine, weighted by speech seconds.
 Self binding requires `bind_min_seconds` of this evidence, a mean at least
 `bind_threshold`, and a lead of at least **0.10** over the highest accumulated
 enrolled-person score. Any current person binding takes precedence. Self binding
@@ -1121,8 +1125,8 @@ Only person prints can bind a person or provide owner, trusted or privacy author
 A self-bound timeline label can classify a turn as `self_profile` at acceptance
 without echo-only tags. The same whole-window, refresh, mixed-overlap and
 discarded-mixed watermark rules apply. Mixed barge-ins follow the person path.
-Outside the eligible region the label's turn follows that path with role
-`unknown` and contributes no other-voice presence. A self-classified turn uses
+Outside the eligible region, ordinary person roles and other-voice presence apply.
+A self-classified turn uses
 the same transcript and privacy handling as a tag-classified turn. The startup
 note gives the voice count, availability and rule. Speaker diagnostics show
 `state=self` without a voice ID, and the summary gives the current `self_bound`

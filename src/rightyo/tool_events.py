@@ -1280,7 +1280,6 @@ class SpeechEvents:
         diarized_head=None,
         voice_checks=None,
         self_turn=False,
-        outside_self=False,
     ):
         """Emit one final turn; `inferred` marks a speaker label partly inferred (#137).
 
@@ -1370,9 +1369,7 @@ class SpeechEvents:
             # With live identification the role is resolved per turn instead, from the
             # bindings at this moment, and then repeated unchanged the same way.
             role = None
-            if outside_self:
-                role = "unknown"
-            elif self._per_turn:
+            if self._per_turn:
                 role = speaker_role(self._priority.role_for(turn))
             elif self._priority is not None:
                 role = self._assign_role(turn, context["turns"])
@@ -1405,7 +1402,7 @@ class SpeechEvents:
                     raise ContractError("pending attention context budget exceeded")
                 self._pending[turn.utterance_id] = (turn, context, size, role)
                 self._pending_bytes += size
-            self._hear_other_voice(turn, role, outside_self=outside_self)
+            self._hear_other_voice(turn, role)
             self._emit_transcript(
                 turn,
                 role,
@@ -2734,14 +2731,13 @@ class SpeechEvents:
             for start, end in self._playbacks
         )
 
-    def _hear_other_voice(self, turn, role, *, outside_self=False):
+    def _hear_other_voice(self, turn, role):
         """Record eligible history and snapshot this turn's presence bar (#283)."""
         if self._conversation is None or not self._conversation.cue_when_others_ms:
             return
         speaker_id = self._engaged["speaker_id"] if self._engaged else turn.speaker_id
         if (
-            not outside_self
-            and turn.speaker_id is not None
+            turn.speaker_id is not None
             and turn.end_ms - turn.start_ms >= self._conversation.presence_min_ms
             and len(turn.text.split()) >= self._conversation.presence_min_words
             and not (self._per_turn and role in {"owner", "trusted"})

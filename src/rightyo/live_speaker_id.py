@@ -28,10 +28,12 @@ own score before publication; privacy controls and Stop remain responsive. Audio
 written: the ring holds at most `RING_MS` of PCM in memory by default
 (`audio_retention.speaker_ring_seconds` sets it, #226) and is cleared when the session ends.
 
-With a self-voice manifest, the same worker embeds fixed host references and caches
-their vectors separately. Only scored public turns wholly inside a reply window add
-self evidence. Its duration-weighted mean of per-turn best reference scores must clear
-the bind threshold and duration minimum and lead the best person score by 0.10.
+A separate loader reads fixed host references and opens its own enrollment embedder
+only on a cache miss. Public scoring and privacy checks proceed while it loads.
+Only scored public turns wholly inside a reply window, free of mixed overlap and
+clear of the discarded-mixed watermark, add self evidence. Its duration-weighted mean
+of per-turn best reference scores must clear the bind threshold and duration minimum
+and lead the best person score by 0.10.
 Person bindings take precedence. A self binding survives down to the tentative
 threshold while ahead of every person. Forget clears all label evidence. Self
 references are excluded from person identification and isolated privacy checks.
@@ -409,6 +411,8 @@ class ShadowSpeakerId:
         self.settings = settings
         self._manifest = self_voice_manifest
         self._self_prints = ()
+        self._profile_thread = None
+        self._profile_embedder = None
         # The host's input route kind (rightyo#164), only from the allowlist, appended to
         # the `key=value` notes so a mismatch can be attributed to an input chain.
         route = input_route(route)
@@ -430,7 +434,7 @@ class ShadowSpeakerId:
         # session (replaced whole), every identifier a label has bound to (only added to),
         # and the seconds of speech scored; the last two restart at `forget`, and are written
         # and read together under `_epoch_lock`.
-        self._compared: frozenset[str] = frozenset()
+        self._compared: frozenset[str] | None = None
         self._bound_ids: set[str] = set()
         # Bumped by `forget` (hailing-station #735 S-1): a queued or in-flight turn scored for
         # an earlier epoch never commits, so nothing from before a reset survives it.
@@ -515,7 +519,7 @@ class ShadowSpeakerId:
         `forget`), so a `forget` between them never pairs old seconds with no bindings.
         """
         owners = tuple(owners)
-        compared = self._compared
+        compared = self._compared or ()
         with self._epoch_lock:
             seconds = self.scored_seconds
             bound = any(owner in self._bound_ids for owner in owners)
@@ -579,8 +583,10 @@ class ShadowSpeakerId:
             elif epoch != self.epoch:
                 # #242 round 23: accepted before a `forget`; its label may now be someone else.
                 return
+            score_self = in_window and bool(self._self_prints)
             if (
                 not self.active
+                or (self._compared == frozenset() and not score_self)
                 or turn.speaker_id is None
                 or turn.speaker_provenance != "diarization-timeline"
             ):
@@ -616,7 +622,7 @@ class ShadowSpeakerId:
                         turn.end_ms - turn.start_ms,
                         labelled_ms,
                         pcm,
-                        in_window and bool(self._self_prints),
+                        score_self,
                         done,
                     )
                 )
@@ -635,6 +641,39 @@ class ShadowSpeakerId:
             pass
 
     # ------------------------------------------------------------------ worker thread
+
+    @contextlib.contextmanager
+    def _open_profile_embedder(self):
+        embedder = self._embedder_factory(self.settings)
+        if embedder is self._embedder:
+            raise ValueError("reference embedder is shared")
+        try:
+            with self._embedder_lock:
+                self._profile_embedder = embedder
+            yield embedder
+        finally:
+            self._close_profile_embedder()
+
+    def _close_profile_embedder(self):
+        with self._embedder_lock:
+            embedder, self._profile_embedder = self._profile_embedder, None
+        if embedder is not None:
+            embedder.close()
+
+    def _load_profile(self, model_sha):
+        vectors = load_profile(
+            self._manifest,
+            self.settings,
+            model_sha,
+            self._open_profile_embedder,
+            self._report,
+            self._stop,
+        )
+        with self._epoch_lock:
+            if not self._stop.is_set():
+                self._self_prints = vectors
+                if not vectors and not self._compared:
+                    self._off.set()
 
     def _run(self) -> None:
         embedder = None
@@ -658,24 +697,35 @@ class ShadowSpeakerId:
                 for entry in matched
                 if isinstance(entry.get("display_name"), str)
             }
+            self._compared = frozenset(prints)
             if profile_pending:
-                self._self_prints = load_profile(
-                    self._manifest, self.settings, embedder, self._report
-                )
+                try:
+                    self._profile_thread = threading.Thread(
+                        target=self._load_profile,
+                        args=(model.get("sha256"),),
+                        name="rightyo-self-profile",
+                        daemon=True,
+                    )
+                    self._profile_thread.start()
+                except Exception:
+                    self._report("self_profile voices=0 unavailable reason=worker")
+                    self._profile_thread = None
                 profile_pending = False
-            if not prints and not self._self_prints:
+            if not prints and self._profile_thread is None:
                 self._off.set()
                 self._report("speaker_id live: no voiceprint enrolled with this model; shadow off")
                 return
-            self._compared = frozenset(prints)
             self._report(f"speaker_id start enrolled={len(prints)}{self._route}")
-            while not self._stop.is_set():
+            while not self._stop.is_set() and not self._off.is_set():
                 try:
                     check = self._checks.get_nowait()
                 except queue.Empty:
                     pass
                 else:
-                    if isinstance(check, _ExitCheck):
+                    if self._owners_unavailable(check.owners):
+                        # A check queued during startup had no enrollment snapshot yet.
+                        check.done.set()
+                    elif isinstance(check, _ExitCheck):
                         self._exit_check(embedder, prints, check)
                     else:
                         self._check(embedder, prints, check)
@@ -733,6 +783,8 @@ class ShadowSpeakerId:
         pcm: bytes,
         in_window: bool = False,
     ):
+        if not prints and not in_window:
+            return
         samples = speech(_samples(pcm))
         seconds = len(samples) / SAMPLE_RATE
         if seconds < self.settings.min_turn_seconds:
@@ -805,9 +857,9 @@ class ShadowSpeakerId:
                     rule = "single"
             if self._self_prints:
                 state.update_self(self_score, seconds, self.settings)
-            if previous is None or (previous.state, previous.identity) != (
-                state.state,
-                state.identity,
+            if comparable and (
+                previous is None
+                or (previous.state, previous.identity) != (state.state, state.identity)
             ):
                 self._binding_revisions[label] = self._binding_revisions.get(label, 0) + 1
             self._labels[label] = state
@@ -838,6 +890,10 @@ class ShadowSpeakerId:
             f" state={state.state} id={state.identity or '-'}"
         )
 
+    def _owners_unavailable(self, owners):
+        compared = self._compared
+        return compared is not None and compared.isdisjoint(owners)
+
     def entry_score(self, start_ms: int, end_ms: int, spans, owners) -> EntryScore:
         """A privacy-entry voice check (hailing-station #735, rightyo#250): the turn's own
         label timeline pieces (`spans`, #148) and the rest of `[start_ms, end_ms)`, the
@@ -847,7 +903,8 @@ class ShadowSpeakerId:
         `clipped`. Blocks the caller at most `ENTRY_CHECK_TIMEOUT_S`; never raises. Nothing
         is kept or reported here."""
         try:
-            if not self.active:
+            owners = tuple(owners)
+            if not self.active or self._owners_unavailable(owners):
                 return EntryScore(None, None, 0, "unavailable")
             pieces = _pieces(spans, start_ms, end_ms)
             gaps, at = [], start_ms
@@ -864,7 +921,7 @@ class ShadowSpeakerId:
                     if clipped or not pcm:
                         return EntryScore(None, None, 0, "clipped")
                     parts[index].append(pcm)
-            check = _EntryCheck(b"".join(parts[0]), tuple(parts[1]), tuple(owners))
+            check = _EntryCheck(b"".join(parts[0]), tuple(parts[1]), owners)
             try:
                 self._checks.put_nowait(check)
             except queue.Full:
@@ -884,7 +941,12 @@ class ShadowSpeakerId:
         """
         check = _ExitCheck(pcm, owners)
         try:
-            if not self.active or not pcm or len(pcm) > PRIVATE_TURN_MAX_BYTES:
+            if (
+                not self.active
+                or self._owners_unavailable(check.owners)
+                or not pcm
+                or len(pcm) > PRIVATE_TURN_MAX_BYTES
+            ):
                 return check.result
             try:
                 self._checks.put_nowait(check)
@@ -1051,6 +1113,11 @@ class ShadowSpeakerId:
                 with contextlib.suppress(Exception):
                     embedder.close()
             self._thread.join(2)
+        loader = self._profile_thread
+        if loader is not None and loader.is_alive():
+            with contextlib.suppress(Exception):
+                self._close_profile_embedder()
+            loader.join(0.5)
         self._ring.clear()
         if not self.offered and not self_count and not tag_summary and self._manifest is None:
             return
@@ -1278,8 +1345,6 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         state, identity = binding
         if state == "bound" and identity is not None:
             return self.priority.configured_role(identity) or "participant", binding
-        if state == "unknown" and getattr(source, "self_bound", lambda _: False)(label) is True:
-            return "unknown", None
         return ("participant" if state == "unknown" else "unknown"), binding
 
     def owner_voice(self, threshold_s: float) -> str | None:

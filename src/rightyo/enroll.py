@@ -52,6 +52,7 @@ RELATIVE_FLOOR = 10 ** (-35 / 10)  # a frame is speech within 35 dB of the loude
 ABSOLUTE_FLOOR = 1e-6 * 32768**2  # and above -60 dBFS
 MAX_ENTRY_BYTES = 65536
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+SELF_VOICE_CACHE = ".self-voice-cache-v1"
 STORE_MARKER = ".rightyo-voice-store"
 TEMPORARY = re.compile(r"\.[a-z0-9][a-z0-9_-]{0,31}\.json\.tmp-[0-9]+")
 
@@ -256,7 +257,7 @@ class Store:
             raise EnrollError("The enrollment store could not be read") from None
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise EnrollError("The enrollment store must be a directory owned by you")
-        if not self._marked():
+        if not self.marked():
             return True
         try:
             os.chmod(self.path, 0o700)
@@ -272,14 +273,19 @@ class Store:
             raise EnrollError("The enrollment store could not be secured") from None
         return True
 
-    def _marked(self) -> bool:
-        marker = self.path / STORE_MARKER
-        return marker.is_file() and not marker.is_symlink()
+    def marked(self, directory_fd=None) -> bool:
+        """Check the marker in the store or its already-open directory."""
+        marker = self.path / STORE_MARKER if directory_fd is None else STORE_MARKER
+        try:
+            info = os.stat(marker, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return stat.S_ISREG(info.st_mode)
 
     def create(self) -> None:
         """Create the store, or adopt an empty directory; never take over one in use."""
         if self._check():
-            if self._marked():
+            if self.marked():
                 return
             if any(self.path.iterdir()):
                 raise EnrollError(
@@ -354,6 +360,8 @@ class Store:
         carrying our schema keys; a dangling link named like one is ours to remove.
         """
         name = child.name
+        if name == SELF_VOICE_CACHE:
+            return self.marked()
         if TEMPORARY.fullmatch(name):
             return True
         if not (child.suffix == ".json" and IDENTIFIER.fullmatch(child.stem)):
@@ -401,7 +409,7 @@ class Store:
                         removed.append(child.stem)
                     child.unlink()
             marker = self.path / STORE_MARKER
-            if self._marked() and [child.name for child in self.path.iterdir()] == [STORE_MARKER]:
+            if self.marked() and [child.name for child in self.path.iterdir()] == [STORE_MARKER]:
                 marker.unlink()
             if not any(self.path.iterdir()):
                 self.path.rmdir()

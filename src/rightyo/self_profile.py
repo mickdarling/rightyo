@@ -1,4 +1,4 @@
-"""Local host-rendered self references. Load once on the speaker worker."""
+"""Local host-rendered self references. Load once on a dedicated background thread."""
 
 import hashlib
 import io
@@ -12,16 +12,16 @@ import struct
 import sys
 import wave
 from array import array
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from rightyo.enroll import Store, speech, voiceprint
+from rightyo.enroll import SELF_VOICE_CACHE, Store, speech, voiceprint
 from rightyo.speaker_id import MAX_EMBEDDING_DIM, SAMPLE_RATE, finite_number
 
 MANIFEST_BYTES = 16 * 1024
 WAV_BYTES = 1024 * 1024
 # Outside the store's <person-id>.json namespace.
-CACHE_NAME = ".self-voice-cache-v1"
+CACHE_NAME = SELF_VOICE_CACHE
 CACHE_BYTES = 1024 * 1024
 
 
@@ -191,7 +191,12 @@ def _samples(data):
     return samples
 
 
-def _clips(path):
+def _check_stop(stop):
+    if stop.is_set():
+        raise ProfileError("stopped")
+
+
+def _clips(path, stop):
     path = Path(path)
     if not path.is_absolute():
         raise ProfileError("absolute_path")
@@ -200,6 +205,7 @@ def _clips(path):
     with _directory(path.parent) as directory:
         voices = _voices(_read(directory, path.name, MANIFEST_BYTES))
         for voice in voices:
+            _check_stop(stop)
             name = voice["file"]
             if name not in files:
                 data = _read(directory, name, WAV_BYTES)
@@ -215,12 +221,11 @@ def _clips(path):
     return clips, skipped
 
 
-def _cache(store):
+def _cache(directory):
     try:
-        with _directory(store.path) as directory:
-            cached = json.loads(
-                _read(directory, CACHE_NAME, CACHE_BYTES, mode=0o600), object_pairs_hook=_unique
-            )
+        cached = json.loads(
+            _read(directory, CACHE_NAME, CACHE_BYTES, mode=0o600), object_pairs_hook=_unique
+        )
         if (
             isinstance(cached, dict)
             and len(cached) <= 16
@@ -238,70 +243,83 @@ def _cache(store):
     return None
 
 
-def _save(store, vectors):
-    # Initialize new/empty enrollment stores through Store. A pre-existing private
-    # directory may already contain person entries or an unreadable prior cache.
+def _save(directory, vectors):
+    name = f".self-voice-tmp-{secrets.token_hex(12)}"
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
     try:
-        with _directory(store.path) as directory, os.scandir(directory) as entries:
-            empty = next(entries, None) is None
-    except FileNotFoundError:
-        empty = True
-    if empty:
-        store.create()
-    with _directory(store.path) as directory:
-        name = f".self-voice-tmp-{secrets.token_hex(12)}"
-        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
+        with os.fdopen(fd, "w") as temporary:
+            os.fchmod(fd, 0o600)
+            json.dump(vectors, temporary, allow_nan=False)
+        os.replace(name, CACHE_NAME, src_dir_fd=directory, dst_dir_fd=directory)
+    finally:
         try:
-            with os.fdopen(fd, "w") as temporary:
-                os.fchmod(fd, 0o600)
-                json.dump(vectors, temporary, allow_nan=False)
-            os.replace(name, CACHE_NAME, src_dir_fd=directory, dst_dir_fd=directory)
-        finally:
-            try:
-                os.unlink(name, dir_fd=directory)
-            except FileNotFoundError:
-                pass
+            os.unlink(name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
 
 
-def load_profile(path, settings, embedder, report):
-    """Return only finished vectors. Report fixed rule tokens for skips and availability."""
+def _vectors(clips, model_sha, cached, open_embedder, stop):
+    vectors, missing = {}, []
+    for voice, samples in clips:
+        _check_stop(stop)
+        key = f"{model_sha}:{voice['id']}:{voice['rendered_at']}:{voice['sha256']}"
+        if key in cached:
+            vectors[key] = cached[key]
+        else:
+            missing.append((key, samples))
+    if missing:
+        _check_stop(stop)
+        with open_embedder() as embedder:
+            if model_sha and embedder.model.get("sha256") != model_sha:
+                raise ProfileError("model")
+
+            def embed(pcm):
+                _check_stop(stop)
+                return embedder.embed(pcm)
+
+            for key, samples in missing:
+                _check_stop(stop)
+                voiced = speech(samples)
+                if not voiced:
+                    raise ProfileError("embedding")
+                vectors[key], _ = voiceprint(embed, voiced)
+    return vectors
+
+
+def load_profile(path, settings, model_sha, open_embedder, report, stop):
+    """Return the complete reference set. A cache hit needs no reference embedder."""
     try:
-        clips, skipped = _clips(path)
+        clips, skipped = _clips(path, stop)
+        with ExitStack() as resources:
+            directory = None
+            if model_sha:
+                try:
+                    store = Store(settings.store)
+                    fd = resources.enter_context(_directory(store.path))
+                    if store.marked(fd):
+                        directory = fd
+                except (ValueError, OSError):
+                    pass  # An unavailable store leaves reference loading compute-only.
+            cached = _cache(directory) if directory is not None else None
+            vectors = _vectors(clips, model_sha, cached or {}, open_embedder, stop)
+            _check_stop(stop)
+            if directory is not None and cached != vectors and store.marked(directory):
+                try:
+                    _save(directory, vectors)
+                except OSError:
+                    raise ProfileError("cache_write") from None
     except ProfileError as error:
         report(f"self_profile voices=0 unavailable reason={error}")
         return ()
-    except (OSError, ValueError):
+    except OSError:
         report("self_profile voices=0 unavailable reason=read")
         return ()
-    try:
-        store = Store(settings.store)
-        cached = _cache(store)
-    except ValueError:
-        store, cached = None, None
-    vectors = {}
-    for voice, samples in clips:
-        key = f"{embedder.model['sha256']}:{voice['id']}:{voice['rendered_at']}:{voice['sha256']}"
-        vector = cached.get(key) if cached else None
-        if vector is None:
-            try:
-                voiced = speech(samples)
-                if not voiced:
-                    raise ValueError
-                vector, _ = voiceprint(embedder.embed, voiced)
-            except Exception:  # a failed reference cannot stop person identification
-                skipped.append("embedding")
-                continue
-        vectors[key] = vector
-    reason = "loaded" if vectors else (skipped[-1] if skipped else "empty")
-    if cached != vectors:
-        try:
-            if store is None:
-                raise ValueError
-            _save(store, vectors)
-        except (ValueError, OSError):
-            reason = "cache_write"
+    except Exception:
+        report("self_profile voices=0 unavailable reason=embedding")
+        return ()
     for rule in skipped:
         report(f"self_profile skipped reason={rule}")
+    reason = "loaded" if vectors else (skipped[-1] if skipped else "empty")
     status = "ready" if vectors else "unavailable"
     report(f"self_profile voices={len(vectors)} {status} reason={reason}")
     return tuple(vectors.values())

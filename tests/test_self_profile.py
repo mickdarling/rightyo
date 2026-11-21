@@ -6,10 +6,11 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import wave
 from argparse import Namespace
-from contextlib import redirect_stderr
+from contextlib import closing, redirect_stderr
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -24,7 +25,7 @@ from test_live_speaker_id import (
 from test_live_speaker_id import turn as labelled
 
 from rightyo.contracts import SpeakerPriority
-from rightyo.enroll import Store, speech, voiceprint
+from rightyo.enroll import STORE_MARKER, Store, speech, voiceprint
 from rightyo.live_speaker_id import EnrolledRoles, ShadowSpeakerId
 from rightyo.prototype import PrototypeController
 from rightyo.self_profile import CACHE_NAME, MANIFEST_BYTES, WAV_BYTES, load_profile
@@ -49,6 +50,7 @@ class References:
         self.path = directory / "manifest"
         self.config = settings(store=root / "store")
         self.model = ScriptedEmbedder()
+        self.open_model = Mock(side_effect=lambda: closing(self.model))
         self.notes = []
         self.voice = self.clip(wav())
         self.write([self.voice])
@@ -71,7 +73,14 @@ class References:
 
     def load(self):
         self.notes.clear()
-        return load_profile(self.path, self.config, self.model, self.notes.append)
+        return load_profile(
+            self.path,
+            self.config,
+            self.model.model.get("sha256"),
+            self.open_model,
+            self.notes.append,
+            threading.Event(),
+        )
 
     @property
     def cache(self):
@@ -360,6 +369,7 @@ class ProfileTests(unittest.TestCase):
         default = refs.config.store
         self.enterContext(patch("rightyo.enroll.DEFAULT_STORE", default))
         refs.config = replace(refs.config, store=None)
+        Store().create()
         path = default / CACHE_NAME
         model = refs.model
         b = refs.clip(wav(seconds=20), name="b")
@@ -374,8 +384,10 @@ class ProfileTests(unittest.TestCase):
         assert Store(default).entries() == ([], 0)
         calls = model.calls
         assert len(refs.load()) == 2 and model.calls == calls
+        assert refs.open_model.call_count == 1
         refs.write([b])
         assert len(refs.load()) == 1 and model.calls == calls
+        assert refs.open_model.call_count == 1
         for field, value in [
             ("id", "B-1"),
             ("rendered_at", 1),
@@ -408,9 +420,61 @@ class ProfileTests(unittest.TestCase):
         assert refs.notes == ["self_profile voices=0 unavailable reason=empty"]
         assert json.loads(path.read_bytes()) == {}
 
+    def test_cache_requires_existing_marked_store(self):
+        for kind in ("missing", "empty", "unmarked", "symlink_marker"):
+            with self.subTest(kind=kind):
+                refs = self.references()
+                path = refs.config.store
+                if kind != "missing":
+                    path.mkdir(mode=0o700)
+                if kind == "unmarked":
+                    refs.cache.write_bytes(b"existing")
+                if kind == "symlink_marker":
+                    (path / STORE_MARKER).symlink_to(refs.path)
+                before = set(path.iterdir()) if path.exists() else None
+                assert refs.load()
+                calls = refs.model.calls
+                assert refs.load() and refs.model.calls > calls
+                assert (set(path.iterdir()) if path.exists() else None) == before
+                if kind == "unmarked":
+                    assert refs.cache.read_bytes() == b"existing"
+
+    def test_delete_all_removes_cached_references(self):
+        refs = self.references()
+        store = Store(refs.config.store)
+        store.create()
+        assert refs.load() and refs.cache.is_file()
+        assert store.delete_all() == []
+        assert not store.path.exists()
+
+    def test_missing_model_sha_computes_without_cache(self):
+        refs = self.references()
+        Store(refs.config.store).create()
+        with patch("rightyo.self_profile._cache") as cache:
+            for _ in range(2):
+                person, reference = ScriptedEmbedder(), ScriptedEmbedder()
+                del person.model["sha256"], reference.model["sha256"]
+                worker = ShadowSpeakerId(
+                    refs.config,
+                    self_voice_manifest=refs.path,
+                    entries=lambda _: [{**ENTRIES[0], "model": person.model}],
+                    embedder_factory=Mock(side_effect=[person, reference]),
+                )
+                worker.start()
+                try:
+                    wait_for(lambda: bool(worker._self_prints))
+                    assert reference.calls > 0 and reference.closed
+                    worker.audio(PCM)
+                    worker.turn(labelled(0, 1000), spans=[(0, 1000)], wait=True)
+                    assert worker.scored == 1 and worker.active
+                finally:
+                    worker.close()
+            cache.assert_not_called()
+        assert not refs.cache.exists()
+
     def test_unreadable_cache_is_replaced(self):
         refs = self.references()
-        refs.config.store.mkdir(mode=0o700)
+        Store(refs.config.store).create()
         separate = refs.path.parent / "separate"
         separate.write_bytes(b"invalid")
         refs.cache.symlink_to(separate)
@@ -421,13 +485,14 @@ class ProfileTests(unittest.TestCase):
 
     def test_atomic_cache_replacement_failure(self):
         refs = self.references()
+        Store(refs.config.store).create()
         assert refs.load()
         original = refs.cache.read_bytes()
         names = sorted(refs.config.store.iterdir())
         refs.write([{**refs.voice, "rendered_at": 1}])
         with patch("os.replace", side_effect=OSError):
-            assert refs.load()
-        assert refs.notes == ["self_profile voices=1 ready reason=cache_write"]
+            assert not refs.load()
+        assert refs.notes == ["self_profile voices=0 unavailable reason=cache_write"]
         assert refs.cache.read_bytes() == original
         assert sorted(refs.config.store.iterdir()) == names
         refs.cache.chmod(0o400)
@@ -491,7 +556,7 @@ class ProfileTests(unittest.TestCase):
         assert shadow._bound_ids == set()
         roles = EnrolledRoles(SpeakerPriority())
         roles.source = shadow
-        assert roles.role_for(labelled(0, 1000, "label")) == "unknown"
+        assert roles.role_for(labelled(0, 1000, "label")) == "participant"
         assert not roles.enrolled_owner(labelled(0, 1000, "label"))
         note = shadow._report_to.call_args.args[0]
         assert "state=self" in note and "id=" not in note
@@ -543,7 +608,7 @@ class ProfileTests(unittest.TestCase):
         workers = []
 
         def delayed(pcm):
-            assert threading.current_thread() is workers[0]._thread
+            assert threading.current_thread() is not workers[0]._thread
             started.set()
             assert release.wait(10)
             return embed(pcm)
@@ -552,7 +617,10 @@ class ProfileTests(unittest.TestCase):
 
         def worker(config, **kwargs):
             result = ShadowSpeakerId(
-                config, **kwargs, embedder_factory=lambda _: refs.model, entries=lambda _: ENTRIES
+                config,
+                **kwargs,
+                embedder_factory=Mock(side_effect=[ScriptedEmbedder(), refs.model]),
+                entries=lambda _: ENTRIES,
             )
             workers.append(result)
             return result
@@ -588,6 +656,8 @@ class ProfileTests(unittest.TestCase):
                 assert transcript.wait(5)
                 assert not workers[0].self_bound("Speaker A")
                 assert not workers[0]._self_prints
+                release.set()
+                wait_for(lambda: bool(workers[0]._self_prints))
             finally:
                 release.set()
                 source.close()
@@ -599,12 +669,139 @@ class ProfileTests(unittest.TestCase):
         workers[0]._thread.join(5)
         assert len(workers[0]._self_prints) == 1
 
+    def test_blocked_reference_preserves_public_and_privacy_scoring(self):
+        def sequence(profile):
+            refs = self.references()
+            started, release = threading.Event(), threading.Event()
+
+            def hold_reference(pcm):
+                started.set()
+                if not release.wait(15):
+                    raise RuntimeError
+                return unit(0, 1, 0)
+
+            refs.model.embed = hold_reference
+            person = ScriptedEmbedder()
+            worker = ShadowSpeakerId(
+                refs.config,
+                self_voice_manifest=refs.path if profile else None,
+                embedder_factory=Mock(side_effect=[person, refs.model]),
+                entries=lambda _: ENTRIES,
+            )
+            worker.start()
+            try:
+                if profile:
+                    assert started.wait(3)
+                    assert not worker.self_bound("Speaker A")
+                worker.audio(PCM * 5)
+                for i in range(5):
+                    span = (1000 * i, 1000 * (i + 1))
+                    worker.turn(labelled(*span), spans=[span], in_window=True)
+                    wait_for(lambda: worker.scored == i + 1)
+                entry = worker.entry_score(0, 1000, [(0, 1000)], ["owner"])
+                pcm = bytearray(PCM)
+                exit_score = worker.exit_score(pcm, ["owner"])
+                assert not any(pcm) and entry.outcome == exit_score.outcome == "scored"
+                assert not worker._self_prints and not worker.dropped
+                return worker.binding("Speaker A"), worker.scored, person.calls, entry, exit_score
+            finally:
+                release.set()
+                worker.close()
+
+        assert sequence(True) == sequence(False)
+
+    def test_reference_error_preserves_next_public_score(self):
+        refs = self.references()
+        Store(refs.config.store).create()
+        assert refs.load()
+        refs.write([refs.voice, {**refs.voice, "id": "b"}])
+
+        class Embedder(ScriptedEmbedder):
+            def embed(self, pcm):
+                if len(pcm) > len(PCM):
+                    self.close()
+                    raise ValueError
+                assert not self.closed
+                return super().embed(pcm)
+
+        person, reference = Embedder(), Embedder()
+        worker = ShadowSpeakerId(
+            refs.config,
+            self_voice_manifest=refs.path,
+            entries=lambda _: ENTRIES,
+            embedder_factory=Mock(side_effect=[person, reference]),
+            report=refs.notes.append,
+        )
+        worker.start()
+        try:
+            wait_for(lambda: "self_profile voices=0 unavailable reason=embedding" in refs.notes)
+            worker.audio(PCM)
+            worker.turn(labelled(0, 1000), spans=[(0, 1000)], wait=True)
+            assert worker.scored == 1 and worker.active
+            assert reference.closed and not person.closed and not worker._self_prints
+        finally:
+            worker.close()
+
+    def test_stop_interrupts_reference_loading(self):
+        refs = self.references()
+        refs.write([refs.voice, {**refs.voice, "id": "b"}])
+        started, release = threading.Event(), threading.Event()
+
+        def block(pcm):
+            started.set()
+            assert release.wait(10)
+            return unit(1, 0, 0)
+
+        refs.model.embed = Mock(side_effect=block)
+        refs.model.close = release.set
+        worker = ShadowSpeakerId(
+            refs.config,
+            self_voice_manifest=refs.path,
+            entries=lambda _: ENTRIES,
+            embedder_factory=Mock(side_effect=[ScriptedEmbedder(), refs.model]),
+        )
+        worker.start()
+        try:
+            assert started.wait(3)
+            before = time.monotonic()
+            worker.close()
+            assert time.monotonic() - before < 2
+            assert not worker._profile_thread.is_alive()
+            assert release.is_set() and not worker._self_prints
+            refs.model.embed.assert_called_once()
+        finally:
+            release.set()
+            worker.close()
+
+    def test_self_only_privacy_checks_skip_embedding(self):
+        refs = self.references()
+        person = ScriptedEmbedder()
+        person.embed_private = Mock(wraps=person.embed)
+        worker = ShadowSpeakerId(
+            refs.config,
+            self_voice_manifest=refs.path,
+            entries=lambda _: [],
+            embedder_factory=Mock(side_effect=[person, refs.model]),
+        )
+        worker.start()
+        try:
+            wait_for(lambda: bool(worker._self_prints))
+            worker.audio(PCM)
+            assert worker.entry_score(0, 1000, [(0, 1000)], ["owner"]).outcome == "unavailable"
+            pcm = bytearray(PCM)
+            assert worker.exit_score(pcm, ["owner"]).outcome == "unavailable"
+            assert not any(pcm)
+            person.embed_private.assert_not_called()
+            assert person.calls == 0
+        finally:
+            worker.close()
+
     def test_reference_without_person_enrollment(self):
         refs = self.references()
         worker = ShadowSpeakerId(
             refs.config,
             self_voice_manifest=refs.path,
-            embedder_factory=lambda _: refs.model,
+            embedder_factory=Mock(side_effect=[ScriptedEmbedder(), refs.model]),
             entries=lambda _: [],
             report=refs.notes.append,
         )
@@ -612,7 +809,11 @@ class ProfileTests(unittest.TestCase):
         try:
             wait_for(lambda: bool(worker._self_prints))
             worker.audio(PCM * 3)
+            worker.turn(labelled(0, 3000), spans=[(0, 3000)], wait=True)
+            assert worker.offered == 0
+            snapshot = worker.binding_snapshot("Speaker A")
             worker.turn(labelled(0, 3000), spans=[(0, 3000)], in_window=True, wait=True)
+            assert worker.binding_snapshot("Speaker A") == snapshot
             assert worker.self_bound("Speaker A")
             assert worker.binding("Speaker A") is None
             assert worker.owner_evidence(["owner"]) == (False, False, 0)

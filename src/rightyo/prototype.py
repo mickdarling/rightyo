@@ -1086,13 +1086,7 @@ class PrototypeController:
             self._audio_thread.start()
 
     def _accept(
-        self,
-        generation: int,
-        work: queue.Queue,
-        memory: TranscriptMemory,
-        turn: Turn,
-        *,
-        outside_self=False,
+        self, generation: int, work: queue.Queue, memory: TranscriptMemory, turn: Turn
     ) -> bool | None:
         """Accept a final turn; whether it was heard in privacy, or None once stopped."""
         with self._lock:
@@ -1124,7 +1118,6 @@ class PrototypeController:
                 self._publish(
                     "transcript",
                     turn,
-                    **({"outside_self": True} if outside_self else {}),
                     **({"inferred": True} if inferred else {}),
                     **({"diarized_head": head} if head is not None else {}),
                     **({"voice_checks": checks} if callable(prepare) else {}),
@@ -1353,7 +1346,7 @@ class PrototypeController:
 
     def _turn(self, generation, work, memory, shadow, turn: Turn) -> None:
         diagnostic = None
-        is_self = outside_self = False
+        is_self = False
         score_options = {}
         with self._lock:
             # Read before `_accept` consumes it. The identifier embeds only the turn's
@@ -1369,23 +1362,19 @@ class PrototypeController:
                 store = getattr(self._events, "self_voice", None)
                 if store is not None:
                     store.advance(self._received_ms)
-                    bound = False
+                    reason, fraction = store.classify(turn.start_ms, turn.end_ms, self._received_ms)
                     lookup = (
-                        getattr(shadow, "self_bound", None)
-                        if self.self_voice_manifest is not None
-                        else None
+                        getattr(shadow, "self_bound", None) if self.self_voice_manifest else None
                     )
                     if callable(lookup):
-                        inside = store.contains(turn.start_ms, turn.end_ms, self._received_ms)
-                        bound = (
-                            turn.speaker_provenance == "diarization-timeline"
-                            and lookup(turn.speaker_id) is True
-                        )
-                        outside_self = bound and not inside
-                        score_options["in_window"] = inside
-                    reason, fraction = store.classify(
-                        turn.start_ms, turn.end_ms, self._received_ms, self_bound=bound
-                    )
+                        # A partial turn is contained and free of mixed overlap unless
+                        # the discarded-mixed watermark forced the partial result.
+                        eligible = reason == "partial" and turn.start_ms >= store.mixed_lost_until
+                        score_options["in_window"] = eligible
+                        if eligible and turn.speaker_provenance == "diarization-timeline":
+                            with contextlib.suppress(Exception):
+                                if lookup(turn.speaker_id) is True:
+                                    reason = "self_profile"
                     is_self = reason in ("echo_only", "self_profile")
                     if not self._heard_private(turn) and not self._private_audio():
                         if is_self:
@@ -1436,9 +1425,7 @@ class PrototypeController:
                 # Sample before acceptance/scoring: any intervening forget invalidates the
                 # queued evidence rather than binding an old label in the new epoch.
                 epoch = getattr(shadow, "epoch", None) if shadow is not None else None
-            private = self._accept(
-                generation, work, memory, turn, **({"outside_self": True} if outside_self else {})
-            )
+            private = self._accept(generation, work, memory, turn)
             if shadow is not None and private is False and not scored_before:
                 # After the turn is accepted and published; it never raises or blocks.
                 shadow.turn(

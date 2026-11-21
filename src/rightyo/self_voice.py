@@ -219,7 +219,7 @@ class SelfVoice:
             for w in self.windows.values()
         )
 
-    def classify(self, start, end, received, *, self_bound=False):
+    def classify(self, start, end, received):
         if end <= start:
             return "outside", 0.0
         mixed, covered = self.coverage(start, end)
@@ -231,7 +231,7 @@ class SelfVoice:
         if mixed:
             return "mixed", fraction
         if fraction < self.config.echo_only_min_fraction:
-            return ("self_profile" if self_bound else "partial"), fraction
+            return "partial", fraction
         return "echo_only", fraction
 
     def record_self(self, start):
