@@ -657,7 +657,12 @@ class ProfileTests(unittest.TestCase):
         shadow = make_shadow()
         score(shadow, unit(0, 0, 1))
         assert not shadow.self_bound("label")
+        before = shadow.presence_snapshot("label")
         score(shadow, unit(0, 1, 0))
+        after = shadow.presence_snapshot("label")
+        assert not before.self_bound and after.self_bound
+        assert after.revision == before.revision + 1
+        assert after.self_generation is not before.self_generation
         assert shadow.self_bound("label")
         assert shadow.binding("label") == ("unknown", "owner")
         assert shadow._labels["label"].scores == {"owner": 0}
@@ -963,7 +968,7 @@ class ProfileTests(unittest.TestCase):
             assert worker.offered == 0
             snapshot = worker.binding_snapshot("Speaker A")
             worker.turn(labelled(0, 3000), spans=[(0, 3000)], in_window=True, wait=True)
-            assert worker.binding_snapshot("Speaker A") == snapshot
+            assert worker.binding_snapshot("Speaker A")[0] > snapshot[0]
             assert worker.self_bound("Speaker A")
             assert worker.binding("Speaker A") is None
             assert worker.owner_evidence(["owner"]) == (False, False, 0)
