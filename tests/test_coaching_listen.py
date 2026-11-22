@@ -64,6 +64,7 @@ class Child:
         provenance="synthetic",
         read_output=True,
         dismissal=None,
+        disable_startup_timeout=False,
     ):
         self.events = []
         self._pending = queue.Queue()
@@ -84,6 +85,15 @@ class Child:
         )
         mock = directory / "suggestions.json"
         mock.write_text(json.dumps(suggestions if suggestions is not None else {"live-1": ADVICE}))
+        entrypoint = ["-m", "rightyo"]
+        if disable_startup_timeout:
+            entrypoint = [
+                "-c",
+                "from rightyo import coaching_listen\n"
+                "from rightyo.cli import main\n"
+                "coaching_listen.STARTUP_SECONDS = float('inf')\n"
+                "raise SystemExit(main())",
+            ]
         read_fd, self.control_fd = os.pipe()
         env = os.environ.copy()
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
@@ -95,8 +105,7 @@ class Child:
             self.process = subprocess.Popen(
                 [
                     sys.executable,
-                    "-m",
-                    "rightyo",
+                    *entrypoint,
                     "listen",
                     "--config",
                     str(config),
@@ -217,6 +226,14 @@ class Child:
                 "owner_mid_answer": owner_mid_answer,
                 "playback": playback,
             }
+        )
+
+    def wait_for_initial_state(self):
+        # Child launch and imports can take several seconds on a loaded host.
+        return self.next(
+            lambda event: event.get("type") == "coaching_state"
+            and event.get("reason") == "initial",
+            timeout=15,
         )
 
     def next(self, predicate, timeout=3):
@@ -561,13 +578,20 @@ class CoachingListenTests(unittest.TestCase):
 
     def test_idle_qualification_expiry_retires_even_when_pcm_pipe_stays_open(self):
         child = self.child()
+        # Drain startup output before the short lease begins. The listener writes
+        # one event per poll and discards queued events when the lease expires.
+        child.wait_for_initial_state()
         child.enable(valid_for_ms=250)
         child.exited(2)
+        # Retirement can discard a queued lease_expired state before writing closed.
         self.assertTrue(
             any(
-                event.get("type") == "coaching_state" and not event["capture_permitted"]
+                event.get("type") == "coaching_state"
+                and event["reason"] in {"lease_expired", "closed"}
+                and not event["capture_permitted"]
                 for event in child.events
-            )
+            ),
+            child.events,
         )
         self.assert_terminal(child, "cancelled")
         self.assert_no_actions(child)
@@ -619,8 +643,10 @@ class CoachingListenTests(unittest.TestCase):
             b"x" * 8193,
         ):
             with self.subTest(data=data[:48]):
-                child = self.child()
-                child.next(lambda event: event.get("type") == "coaching_state")
+                # A qualification timeout produces the same exit and closing state.
+                # Only the parent exit wait should expire if the record is ignored.
+                child = self.child(disable_startup_timeout=True)
+                child.wait_for_initial_state()
                 child.send_bytes(data)
                 child.exited(2)
                 self.assertFalse(
