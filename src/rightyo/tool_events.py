@@ -980,6 +980,7 @@ class SpeechEvents:
                     "speakers": "anonymous" if priority is None else "enrolled",
                     "context": True,
                     **({"self_echo": 1} if self.self_voice is not None else {}),
+                    **({"duck_after_sample": 1} if duck else {}),
                 },
                 # Configured forms of address are advertised beside, not inside, the
                 # existing capability set so strict consumers of that set are unchanged.
@@ -1021,7 +1022,7 @@ class SpeechEvents:
                     else {"acknowledgement": acknowledgement.to_dict()}
                 ),
                 # And for privacy mode (internally duck, hailing-station #735), when the
-                # producer takes the `{"duck": true|false}` control (live `listen`, not
+                # producer takes the duck controls (live `listen`, not
                 # replay): a host enters it only for a child that advertised version 3+, and
                 # must then accept `privacy` events, which are never emitted without it.
                 # `private` reports a session that starts in privacy mode.

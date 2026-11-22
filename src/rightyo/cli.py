@@ -406,7 +406,8 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "with --mode stdin: an inherited file descriptor carrying host JSON lines "
             '{"reply": "started"} / {"reply": "ended"} (#124), {"media": true|false} and'
-            ' {"duck": true|false}'
+            ' {"duck": true|false} or {"duck": false, "after_sample": N}, where N counts'
+            " complete 16 kHz mono s16le samples written to stdin since session start"
         ),
     )
     listen.add_argument(
@@ -419,7 +420,8 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "start in privacy mode (internally duck, hailing-station #735): nothing heard is"
-            ' kept or emitted from the first frame until the host sends {"duck": false}'
+            " kept or emitted from the first frame until the host's privacy-off control"
+            ' applies ({"duck": false} or {"duck": false, "after_sample": N})'
         ),
     )
     listen.add_argument(

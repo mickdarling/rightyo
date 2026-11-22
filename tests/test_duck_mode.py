@@ -40,7 +40,7 @@ from rightyo.live_audio import (
     _transcribe,
     recognizer_dir,
 )
-from rightyo.live_speaker_id import EnrolledRoles, EntryScore, PcmRing, PrivateTurnAudio
+from rightyo.live_speaker_id import EnrolledRoles, EntryScore, PcmRing
 from rightyo.memory import TranscriptMemory
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
 from rightyo.providers import ConfiguredPriorityProvider
@@ -1083,6 +1083,11 @@ class PrivacyEventsTests(unittest.TestCase):
             stream = events.drain() + self.conversation_script(events, private=False)
             # Only these differ by design: the advertisement, and a voiceprint role source,
             # which is published only beside privacy control.
+            self.assertEqual("duck" in stream[0], duck)
+            if duck:
+                self.assertEqual(stream[0]["capabilities"].pop("duck_after_sample"), 1)
+            else:
+                self.assertNotIn("duck_after_sample", stream[0]["capabilities"])
             stream[0].pop("duck", None)
             for event in stream:
                 event.pop("role_source", None)
@@ -1795,23 +1800,21 @@ class DuckControllerTests(unittest.TestCase):
 
     def test_the_controller_forwards_or_ignores_without_a_publisher(self):
         events = SpeechEvents()
-        local = SimpleNamespace(hosted_speech=False)
-        controller = SimpleNamespace(
-            _lock=threading.RLock(),
-            _events=events,
-            _private_sentence=PrivateTurnAudio(),
-            _received_ms=7,
-            _received_bytes=224,
-            config=local,
-        )
-        PrototypeController.duck(controller, True)
+        controller = self.controller(constructor={"event_publisher": events})
+        controller._received_ms = 7
+        controller._received_bytes = 224
+        controller.duck(True)
         self.assertIs(events._duck, True)
         self.assertEqual(events._duck_spans, [[7, None]])
-        PrototypeController.duck(
-            SimpleNamespace(_lock=threading.RLock(), _events=None, config=local), True
-        )
+        controller.duck_after_sample(300)
+        self.assertEqual(events._duck_spans, [[7, 7]])  # Non-stdin off is immediate.
+        lab = self.controller()
+        lab._mode = "stdin"
+        lab.duck(True)
+        lab.duck_after_sample(300)
+        self.assertIsNone(lab._pending_off_sample)
         with self.assertRaises(PrototypeError):
-            PrototypeController.duck(controller, "yes")
+            controller.duck("yes")
 
     def breaks(self, private, **extra):
         controller = self.controller(**extra)
@@ -2708,6 +2711,101 @@ class PrivacyAckTests(unittest.TestCase):
         os.write(write, b"".join(line + b"\n" for line in lines))
         os.close(write)
         _read_control(read, controller)
+
+    def sample_session(self):
+        controller, events, _started = self.arrange(private=True)
+        controller._mode = "stdin"
+        controller._processor = processor = mock.Mock()
+        processor.end_privacy.return_value = (0, None)
+        shadow = mock.Mock()
+
+        def feed(samples):
+            pcm = b"\x01\x02" * samples
+            self.assertTrue(
+                controller._feed(controller._generation, processor, pcm, "stdin", shadow)
+            )
+            processor.push_pcm16.assert_called_with(pcm)
+
+        return controller, events, feed, shadow
+
+    def test_after_sample_rounds_up_and_keeps_the_crossing_chunk_private(self):
+        controller, events, feed, shadow = self.sample_session()
+        self.control(controller, b'{"duck": false, "after_sample": 17}')
+        feed(16)
+        self.assertTrue(events.heard_ducked(turn("before", 0, 1, "A")))
+        controller._processor.end_privacy.assert_not_called()
+        feed(2)
+        shadow.audio.assert_called_with(bytes(4))
+        controller._processor.end_privacy.assert_called_once_with(36)
+        self.assertEqual(events._duck_spans, [[0, 2]])
+        self.assertTrue(events.heard_ducked(turn("crossing", 1, 2, "B")))
+        feed(30)
+        shadow.audio.assert_called_with(b"\x01\x02" * 30)
+        self.assertFalse(events.heard_ducked(turn("later", 2, 3, "C")))
+        self.assertEqual(events.drain(), [])
+
+    def test_after_sample_already_fed_matches_plain_off(self):
+        for line in (
+            b'{"duck": false}',
+            b'{"duck": false, "after_sample": 0}',
+            b'{"duck": false, "after_sample": 17}',
+        ):
+            with self.subTest(line=line):
+                controller, events, feed, _shadow = self.sample_session()
+                feed(17)
+                self.control(controller, line)
+                self.assertEqual(events._duck_spans, [[0, 1]])
+                self.assertFalse(events.ducked)
+                controller._processor.end_privacy.assert_called_once_with(34)
+
+    def test_after_sample_keeps_the_largest_pending_position(self):
+        controller, events, feed, _shadow = self.sample_session()
+        self.control(controller, b'{"duck": false, "after_sample": 32}')
+        feed(16)
+        self.control(
+            controller,
+            b'{"duck": false, "after_sample": 64}',
+            b'{"duck": false, "after_sample": 48}',
+            b'{"duck": false, "after_sample": 16}',
+        )
+        feed(47)
+        self.assertTrue(events.ducked)
+        feed(1)
+        self.assertFalse(events.ducked)
+        self.assertEqual(events._duck_spans, [[0, 4]])
+
+    def test_after_sample_on_cancels_and_plain_off_applies_immediately(self):
+        controller, events, feed, _shadow = self.sample_session()
+        self.control(controller, b'{"duck": false, "after_sample": 32}', b'{"duck": true}')
+        feed(32)
+        self.assertTrue(events.ducked)
+        self.assertEqual([e["at_ms"] for e in self.acks(events.drain())], [0])
+        self.control(controller, b'{"duck": false, "after_sample": 64}', b'{"duck": false}')
+        self.assertFalse(events.ducked)
+        self.assertEqual(events._duck_spans, [[0, 2]])
+        feed(32)
+        controller._processor.end_privacy.assert_called_once_with(64)
+        self.assertEqual(events.drain(), [])
+
+    def test_invalid_after_sample_lines_are_skipped(self):
+        controller, events, feed, _shadow = self.sample_session()
+        lines = (
+            b'{"duck": true, "after_sample": 0}',
+            b'{"duck": 0, "after_sample": 0}',
+            b'{"duck": false, "after_sample": -1}',
+            b'{"duck": false, "after_sample": true}',
+            b'{"duck": false, "after_sample": "0"}',
+            b'{"duck": false, "after_sample": 0.0}',
+            b'{"duck": false, "after_sample": null}',
+            b'{"duck": false, "after_sample": 1, "extra": 0}',
+            b'{"duck": false, "after_sample": 1, "after_sample": 0}',
+            b'{"duck": true, "duck": false, "after_sample": 0}',
+        )
+        self.control(controller, *lines)
+        feed(16)
+        self.assertTrue(events.ducked)
+        self.assertEqual(events.drain(), [])
+        self.assertEqual(self.errors.getvalue().count("invalid control line; skipped"), len(lines))
 
     def test_the_ack_follows_the_span_with_the_received_audio_position(self):
         controller, events, _started = self.arrange()

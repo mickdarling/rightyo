@@ -386,6 +386,10 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(
                 read_lines(self.ctl, WINDOW, ECHO), ["rightyo: invalid control line; skipped"] * 2
             )
+            # Check the exact addition to the historical started event before hashing the rest.
+            self.assertEqual(
+                encode_json(self.started["capabilities"].pop("duck_after_sample")), "1"
+            )
             payloads = [self.started]
             for index, text in enumerate(("Unit", SpeakerPriority().stop_phrases[0])):
                 payloads += self.accept(

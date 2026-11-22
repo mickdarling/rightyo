@@ -736,6 +736,7 @@ class PrototypeController:
         self._request_limit: int | None = DEFAULT_REQUEST_LIMIT
         self._received_ms = 0
         self._received_bytes = 0
+        self._pending_off_sample: int | None = None
         # #242 round 27: the stream byte offset the current privacy interval began at, or None
         # when unknown or public; an interval that received no audio forgets no speaker (`duck`).
         self._private_from_bytes: int | None = 0 if self._private_audio() else None
@@ -1000,6 +1001,7 @@ class PrototypeController:
             self._turn_spans = {}
             self._pending = self._requests = self._received_ms = 0
             self._received_bytes = 0
+            self._pending_off_sample = None
             # #242 round 27: a session that starts private (`--start-private`, or the mode held
             # from before) has heard nothing in it yet; one that starts public, nothing private.
             self._private_from_bytes = 0 if self._private_audio() else None
@@ -1729,6 +1731,10 @@ class PrototypeController:
                 # if one is bypassed, the session ends as an error before this chunk goes on.
                 self._end_private_hosted(generation)
                 return False
+            after_sample = self._pending_off_sample
+            if after_sample is not None and self._received_bytes // 2 >= after_sample:
+                # This entire chunk keeps the privacy state sampled above.
+                self._apply_duck(False, max(self._received_ms, (after_sample + 15) // 16))
         if shadow is not None:
             # Before the processor, so a turn it finalizes on this chunk finds its audio.
             # In privacy mode (hailing-station #735 S-1) the speaker ring keeps silence of
@@ -1964,6 +1970,7 @@ class PrototypeController:
             self._turn_spans.clear()
             self._pending = self._received_ms = 0
             self._received_bytes = 0
+            self._pending_off_sample = None
             # #242 round 27: the stream clock restarts; nothing is heard in privacy until audio.
             self._private_from_bytes = 0 if self._private_audio() else None
             self._budget_ms = None
@@ -2090,6 +2097,20 @@ class PrototypeController:
             if self._events is not None:
                 self._events.meeting(on)
 
+    def duck_after_sample(self, sample: int) -> None:
+        """Apply a privacy-off change at an exact stdin stream position."""
+        if type(sample) is not int or sample < 0:
+            raise PrototypeError("invalid privacy-off sample")
+        with self._lock:
+            if self._events is None:
+                return
+            if self._mode == "stdin":
+                sample = max(self._pending_off_sample or 0, sample)
+                if sample > self._received_bytes // 2:
+                    self._pending_off_sample = sample
+                    return
+            self._apply_duck(False, self._received_ms)
+
     def duck(self, on: bool) -> None:
         """Forward the host's duck mode (hailing-station #735) to the event publisher.
 
@@ -2108,62 +2129,67 @@ class PrototypeController:
             raise PrototypeError("duck mode is refused with a hosted speech backend")
         with self._lock:
             if self._events is not None:
-                self._private_sentence.clear()
-                ending = not on and self._events.ducked is True
-                discarded = getattr(self._events, "_private_counts", {}).get("discarded", 0)
-                if on and self._events.ducked is not True:
-                    # #242 round 27: where this privacy interval starts, in stream bytes.
-                    self._private_from_bytes = self._received_bytes
-                    begin = getattr(getattr(self, "_processor", None), "begin_privacy", None)
-                    if callable(begin):
-                        begin(self._received_bytes)
-                # At least the end of every piece received so far, held ones included. Every
-                # applied on, a redundant one included, is acked (#735 S-8): audio received
-                # after the ack's `at_ms` falls inside the span.
+                self._apply_duck(on, self._received_ms)
+
+    def _apply_duck(self, on: bool, now_ms: int) -> None:
+        """Apply the change and its privacy bookkeeping with the controller lock held."""
+        self._pending_off_sample = None
+        self._private_sentence.clear()
+        ending = not on and self._events.ducked is True
+        discarded = getattr(self._events, "_private_counts", {}).get("discarded", 0)
+        if on and self._events.ducked is not True:
+            # #242 round 27: where this privacy interval starts, in stream bytes.
+            self._private_from_bytes = self._received_bytes
+            begin = getattr(getattr(self, "_processor", None), "begin_privacy", None)
+            if callable(begin):
+                begin(self._received_bytes)
+        # At least the end of every piece received so far, held ones included. Every
+        # applied on, a redundant one included, is acked (#735 S-8): audio received
+        # after the ack's `at_ms` falls inside the span.
+        try:
+            self._events.duck(on, now_ms=now_ms, ack=on)
+        except ContractError:
+            # The ack overran the event backlog after the duck was applied: the
+            # session fails as any lost event fails it (Codex on #248), so `listen`
+            # never sits waiting for audio the host withholds, nor ends as a clean
+            # stop. The caller still applies later control lines (an off included).
+            self._event_delivery_failed()
+            raise
+        if ending:
+            start = self._private_from_bytes
+            self._private_from_bytes = None
+            count, reason = 0, None
+            audit = getattr(self._processor, "end_privacy", None)
+            if callable(audit):
                 try:
-                    self._events.duck(on, now_ms=self._received_ms, ack=on)
-                except ContractError:
-                    # The ack overran the event backlog after the duck was applied: the
-                    # session fails as any lost event fails it (Codex on #248), so `listen`
-                    # never sits waiting for audio the host withholds, nor ends as a clean
-                    # stop. The caller still applies later control lines (an off included).
-                    self._event_delivery_failed()
-                    raise
-                if ending:
-                    start = self._private_from_bytes
-                    self._private_from_bytes = None
-                    count, reason = 0, None
-                    audit = getattr(self._processor, "end_privacy", None)
-                    if callable(audit):
-                        try:
-                            result = audit(self._received_bytes)
-                        except Exception:  # noqa: BLE001 - fail closed without content
-                            result = None
-                        if (
-                            isinstance(result, tuple)
-                            and len(result) == 2
-                            and type(result[0]) is int
-                            and result[0] >= 0
-                            and (
-                                result[1] is None
-                                or type(result[1]) is str
-                                and result[1] in {"private_frames", "privacy_unknown"}
-                            )
-                        ):
-                            count, reason = result
-                        elif start is None or self._received_bytes > start:
-                            reason = "audit_unavailable"
-                    elif start is None or self._received_bytes > start:
-                        reason = "audit_unavailable"
-                    if count or reason is not None:
-                        self._forget_speakers()
-                    if self.report is not None:
-                        with contextlib.suppress(Exception):
-                            self.report(
-                                f"privacy off: discarded={discarded} "
-                                f"diarizer_private_frames={count} "
-                                + (f"forget=full reason={reason}" if reason else "forget=skipped")
-                            )
+                    result = audit(self._received_bytes)
+                except Exception:  # noqa: BLE001 - fail closed without content
+                    result = None
+                if (
+                    isinstance(result, tuple)
+                    and len(result) == 2
+                    and type(result[0]) is int
+                    and result[0] >= 0
+                    and (
+                        result[1] is None
+                        or type(result[1]) is str
+                        and result[1] in {"private_frames", "privacy_unknown"}
+                    )
+                ):
+                    count, reason = result
+                elif start is None or self._received_bytes > start:
+                    reason = "audit_unavailable"
+            elif start is None or self._received_bytes > start:
+                reason = "audit_unavailable"
+            if count or reason is not None:
+                self._forget_speakers()
+            if self.report is not None:
+                with contextlib.suppress(Exception):
+                    self.report(
+                        f"privacy off: discarded={discarded} "
+                        f"diarizer_private_frames={count} "
+                        + (f"forget=full reason={reason}" if reason else "forget=skipped")
+                    )
 
     def _speakers_renewed(self) -> None:
         """The fresh diarizer takes over (#735 S-1, round 15): its labels restart from the first
