@@ -1544,8 +1544,9 @@ change at an exact stream position. The host sends `{"duck": false, "after_sampl
 where N is a non-negative integer counting complete 16 kHz mono s16le samples written
 to stdin since session start. If the session has already been fed N samples, the off
 applies immediately. Otherwise privacy stays on through the entire chunk that reaches
-or passes N. Its off edge in milliseconds is the later of the chunk's end in whole
-milliseconds and N/16 rounded up. The existing counts report runs when the off applies.
+or passes N. In both cases, round the end of the last fed chunk and N/16 up to whole
+milliseconds and use the later value as the off edge. The existing counts report runs
+when the off applies.
 
 While an off is pending, another positioned off keeps the larger N. A new
 `{"duck": true}` cancels the pending off and receives the usual on acknowledgement.

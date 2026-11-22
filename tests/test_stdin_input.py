@@ -280,7 +280,7 @@ class StdinListenTests(unittest.TestCase):
         controller.start({"mode": "stdin", "session_id": self.args.session_id})
         try:
             self.assertTrue(first_push.wait(5))
-            # All input has been read. Only the first chunk has been fed.
+            # The position counts samples fed to the session.
             reader = controller._stdin_capture._reader
             reader.join(5)
             self.assertFalse(reader.is_alive())

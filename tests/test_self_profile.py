@@ -1007,10 +1007,15 @@ class ProfileTests(unittest.TestCase):
                     "transcript",
                     "session",
                 ]
+                started, newline, rest = baseline.partition("\n")
+                addition = ', "duck_after_sample": 1'
+                assert json.loads(started)["capabilities"]["duck_after_sample"] == 1
+                assert started.count(addition) == 1
+                historical = started.replace(addition, "") + newline + rest
                 assert (
                     tuple(
                         hashlib.sha256(value.encode()).hexdigest()
-                        for value in (baseline, diagnostics)
+                        for value in (historical, diagnostics)
                     )
                     == expected
                 )

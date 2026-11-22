@@ -2744,19 +2744,79 @@ class PrivacyAckTests(unittest.TestCase):
         self.assertFalse(events.heard_ducked(turn("later", 2, 3, "C")))
         self.assertEqual(events.drain(), [])
 
-    def test_after_sample_already_fed_matches_plain_off(self):
-        for line in (
-            b'{"duck": false}',
-            b'{"duck": false, "after_sample": 0}',
-            b'{"duck": false, "after_sample": 17}',
-        ):
+    def test_positioned_off_rounds_up_the_last_fed_chunk(self):
+        for sample, fed, edge in ((17, 17, 2), (16, 17, 2), (16, 16, 1)):
+            for already_fed in (True, False):
+                with self.subTest(sample=sample, fed=fed, already_fed=already_fed):
+                    controller, events, feed, _shadow = self.sample_session()
+                    if already_fed:
+                        feed(fed)
+                    controller.duck_after_sample(sample)
+                    if not already_fed:
+                        feed(fed)
+                    self.assertEqual(events._duck_spans, [[0, edge]])
+                    self.assertTrue(events.heard_ducked(turn("last", edge - 1, edge, "A")))
+                    self.assertFalse(events.heard_ducked(turn("next", edge, edge + 1, "B")))
+                    controller._processor.end_privacy.assert_called_once_with(fed * 2)
+
+    def test_plain_off_and_position_zero_on_a_partial_millisecond(self):
+        for line, edge in ((b'{"duck": false}', 1), (b'{"duck": false, "after_sample": 0}', 2)):
             with self.subTest(line=line):
                 controller, events, feed, _shadow = self.sample_session()
                 feed(17)
                 self.control(controller, line)
-                self.assertEqual(events._duck_spans, [[0, 1]])
-                self.assertFalse(events.ducked)
-                controller._processor.end_privacy.assert_called_once_with(34)
+                self.assertEqual(events._duck_spans, [[0, edge]])
+
+    def test_positioned_off_uses_only_the_accepted_budget_prefix(self):
+        for sample in (16, 17):
+            with self.subTest(sample=sample):
+                controller, events, _, shadow = self.sample_session()
+                processor = controller._processor
+                controller._budget_ms = 1
+                controller.duck_after_sample(sample)
+                for _ in range(2):
+                    self.assertFalse(
+                        controller._feed(
+                            controller._generation, processor, bytes(34), "stdin", shadow
+                        )
+                    )
+                processor.push_pcm16.assert_called_once_with(bytes(32))
+                if sample == 16:
+                    self.assertEqual(events._duck_spans, [[0, 1]])
+                    processor.end_privacy.assert_called_once_with(32)
+                else:
+                    self.assertTrue(events.ducked)
+                    processor.end_privacy.assert_not_called()
+
+    def test_positioned_off_honors_controls_applied_during_the_push(self):
+        for cancel in (True, False):
+            with self.subTest(cancel=cancel):
+                controller, events, feed, _shadow = self.sample_session()
+                controller.duck_after_sample(16)
+                processor = controller._processor
+                if cancel:
+                    processor.push_pcm16.side_effect = lambda _: controller.duck(True)
+                else:
+                    processor.push_pcm16.side_effect = lambda _: controller.duck_after_sample(32)
+                feed(16)
+                self.assertTrue(events.ducked)
+                processor.end_privacy.assert_not_called()
+                processor.push_pcm16.side_effect = None
+                feed(16)
+                self.assertEqual(events.ducked, cancel)
+
+    def test_positioned_off_only_applies_in_the_pushing_generation(self):
+        controller, events, feed, _shadow = self.sample_session()
+        controller.duck_after_sample(16)
+
+        def next_generation(_pcm):
+            controller._generation += 1
+
+        controller._processor.push_pcm16.side_effect = next_generation
+        feed(16)
+        self.assertTrue(events.ducked)
+        self.assertEqual(controller._pending_off_sample, 16)
+        controller._processor.end_privacy.assert_not_called()
 
     def test_after_sample_keeps_the_largest_pending_position(self):
         controller, events, feed, _shadow = self.sample_session()

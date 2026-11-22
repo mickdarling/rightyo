@@ -1731,10 +1731,6 @@ class PrototypeController:
                 # if one is bypassed, the session ends as an error before this chunk goes on.
                 self._end_private_hosted(generation)
                 return False
-            after_sample = self._pending_off_sample
-            if after_sample is not None and self._received_bytes // 2 >= after_sample:
-                # This entire chunk keeps the privacy state sampled above.
-                self._apply_duck(False, max(self._received_ms, (after_sample + 15) // 16))
         if shadow is not None:
             # Before the processor, so a turn it finalizes on this chunk finds its audio.
             # In privacy mode (hailing-station #735 S-1) the speaker ring keeps silence of
@@ -1743,6 +1739,14 @@ class PrototypeController:
             # may authenticate a matched exit; private audio is never speaker evidence.
             shadow.audio(bytes(len(pcm)) if private else pcm)
         processor.push_pcm16(pcm)
+        with self._lock:
+            after_sample = self._pending_off_sample
+            if (
+                generation == self._generation
+                and after_sample is not None
+                and self._received_bytes // 2 >= after_sample
+            ):
+                self._apply_positioned_off(after_sample)
         if boundary:
             # The budget discards the open utterance, but a turn already finalized and
             # held for a possible continuation stands.
@@ -2109,7 +2113,13 @@ class PrototypeController:
                 if sample > self._received_bytes // 2:
                     self._pending_off_sample = sample
                     return
-            self._apply_duck(False, self._received_ms)
+                self._apply_positioned_off(sample)
+            else:
+                self._apply_duck(False, self._received_ms)
+
+    def _apply_positioned_off(self, sample: int) -> None:
+        end_bytes = max(self._received_bytes, sample * 2)
+        self._apply_duck(False, (end_bytes + PCM_BYTES_PER_MS - 1) // PCM_BYTES_PER_MS)
 
     def duck(self, on: bool) -> None:
         """Forward the host's duck mode (hailing-station #735) to the event publisher.
