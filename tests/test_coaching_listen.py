@@ -64,6 +64,7 @@ class Child:
         provenance="synthetic",
         read_output=True,
         dismissal=None,
+        disable_startup_timeout=False,
     ):
         self.events = []
         self._pending = queue.Queue()
@@ -84,6 +85,15 @@ class Child:
         )
         mock = directory / "suggestions.json"
         mock.write_text(json.dumps(suggestions if suggestions is not None else {"live-1": ADVICE}))
+        entrypoint = ["-m", "rightyo"]
+        if disable_startup_timeout:
+            entrypoint = [
+                "-c",
+                "from rightyo import coaching_listen\n"
+                "from rightyo.cli import main\n"
+                "coaching_listen.STARTUP_SECONDS = float('inf')\n"
+                "raise SystemExit(main())",
+            ]
         read_fd, self.control_fd = os.pipe()
         env = os.environ.copy()
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
@@ -95,8 +105,7 @@ class Child:
             self.process = subprocess.Popen(
                 [
                     sys.executable,
-                    "-m",
-                    "rightyo",
+                    *entrypoint,
                     "listen",
                     "--config",
                     str(config),
@@ -634,7 +643,9 @@ class CoachingListenTests(unittest.TestCase):
             b"x" * 8193,
         ):
             with self.subTest(data=data[:48]):
-                child = self.child()
+                # A qualification timeout produces the same exit and closing state.
+                # Only the parent exit wait should expire if the record is ignored.
+                child = self.child(disable_startup_timeout=True)
                 child.wait_for_initial_state()
                 child.send_bytes(data)
                 child.exited(2)
