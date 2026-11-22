@@ -443,8 +443,14 @@ class TurnMerger:
             if "diarized_head" in held or "diarized_head" in fragment:
                 head, tail = held.get("diarized_head"), fragment.get("diarized_head")
                 if joined != held["text"] + " " + fragment["text"]:
-                    # Restart collapse can replace the name-bearing prefix: unknown.
-                    head = None
+                    # join_restart normalizes whitespace in the retained prefix. Its
+                    # replaced suffix supplies no evidence about the opening words.
+                    if type(head) is int and 0 < head <= len(held["text"]):
+                        retained = joined.removesuffix(fragment["text"]).rstrip()
+                        labelled = " ".join(held["text"][:head].split())
+                        head = min(len(labelled), len(retained)) or None
+                    else:
+                        head = None
                 elif (
                     head == len(held["text"])
                     and type(tail) is int

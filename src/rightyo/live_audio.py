@@ -2434,12 +2434,10 @@ class LiveProcessor:
         for unit in units:
             start, end = unit["start_ms"] + offset, unit["end_ms"] + offset
             attributed.append([unit, start, end, *_attribute(start, end, relevant)])
+        # Only full timeline coverage can establish a unit of the published head.
+        strict = {index for index, entry in enumerate(attributed) if entry[3] is not None}
         coverage = self.config.word_label_coverage
-        if (
-            coverage
-            and provenance == "diarization-timeline"
-            and not any(entry[3] is not None for entry in attributed)
-        ):
+        if coverage and provenance == "diarization-timeline" and not strict:
             # No word has a strict label (#220): let one speaker's coverage label them.
             # Only segments that start inside this utterance (pre-roll included) count: a
             # streaming diarizer switches speaker late, so an earlier speaker's segment can
@@ -2489,16 +2487,15 @@ class LiveProcessor:
                 # Per-request labels are namespaced by utterance so that equal labels
                 # from independent requests can never be merged into one participant.
                 speaker = utterance_scoped_speaker(number, speaker)
-            diarized = (
-                index not in inferred
-                and speaker is not None
-                and not overlap
-                and provenance == "diarization-timeline"
-            )
+            diarized = index in strict and not overlap and provenance == "diarization-timeline"
             if groups and (groups[-1]["speaker"], groups[-1]["overlap"]) == (speaker, overlap):
                 group = groups[-1]
-                if diarized and group["diarized_head"] == len(group["text"]):
-                    group["diarized_head"] += len(unit["text"])
+                # Leading whitespace disappears before publication. The first retained
+                # unit can establish the head even if that whitespace had no label.
+                if diarized and (
+                    group["diarized_head"] == len(group["text"]) or not group["text"].strip()
+                ):
+                    group["diarized_head"] = len(group["text"]) + len(unit["text"])
                 groups[-1]["text"] += unit["text"]
                 groups[-1]["end_ms"] = max(groups[-1]["end_ms"], end)
             else:

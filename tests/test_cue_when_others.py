@@ -475,6 +475,88 @@ class OwnerVocativeBarTests(unittest.TestCase):
         self.assertIn("attention_passed reason=owner_vocative", self.notes)
         self.assertFalse(any(e["type"] == "override" for e in self.output))
 
+    def replay_labelled_span(self, units, start, end, duration, *, speaker=1, coverage=0):
+        from test_edge_attribution import Timeline, Units
+        from test_turn_merge import SILENCE, VOICE, audio
+
+        from rightyo.live_audio import FRAME_BYTES, LiveConfig, LiveProcessor
+
+        self.prepare()
+        self.events._addressing = Addressing.from_names(["x"])
+        offset = 2000
+        turns, heads, spans, inferred = [], {}, {}, []
+        processor = LiveProcessor(
+            LiveConfig(
+                SESSION,
+                provenance="causal-replay",
+                transcriber=Units(*units),
+                diarizer=Timeline((offset + start, offset + end, speaker)),
+                edge_attribution_ms=1000,
+                word_label_coverage=coverage,
+                on_diarized_head=heads.__setitem__,
+                on_labelled_spans=spans.__setitem__,
+                on_inferred=inferred.append,
+            ),
+            turns.append,
+        )
+        self.addCleanup(processor.close)
+        pcm = audio((SILENCE, offset + processor.config.pre_roll_ms), (VOICE, duration))
+        for at in range(0, len(pcm), FRAME_BYTES * 10):
+            processor.push_pcm16(pcm[at : at + FRAME_BYTES * 10])
+        processor.finish()
+        (self.current,) = turns
+        uid = self.current.utterance_id
+        self.assertEqual((self.current.start_ms, self.current.end_ms), (offset, offset + duration))
+        self.assertEqual(spans[uid], ((offset + start, offset + end),))
+        self.assertEqual(inferred, [uid])
+        self.events.transcript(
+            self.current, self.current.end_ms, inferred=True, diarized_head=heads[uid]
+        )
+        return self.decide()
+
+    def test_trimmed_whitespace_before_a_covered_name(self):
+        for labelled, duration in ((1500, 2200), (2700, 3200)):
+            with self.subTest(labelled=labelled):
+                end = 200 + labelled
+                units = [(" ", 0, 100), (" x", 200, 500), (" y", 500, end), (" z", end, duration)]
+                requests = self.replay_labelled_span(units, 200, end, duration)
+                self.assertIn("attention_passed reason=owner_vocative", self.notes)
+                self.assertEqual(len(requests), 1)
+
+    def test_same_labelled_duration_with_an_inferred_or_guest_name_is_held(self):
+        for start, speaker in ((700, 1), (0, 2)):
+            with self.subTest(start=start, speaker=speaker):
+                units = [("x", 0, 400), (" y", 700, 1500), (" z", 1500, 2200)]
+                self.assertEqual(
+                    self.replay_labelled_span(units, start, start + 1500, 2200, speaker=speaker), []
+                )
+                self.assertIs(self.evidence["others_present"], True)
+
+    def test_fractional_coverage_of_the_name_does_not_grant(self):
+        units = [("x", 0, 1700), (" y", 1700, 2200)]
+        self.assertFalse(self.replay_labelled_span(units, 0, 1500, 2200, coverage=0.8))
+        self.assertIn("attention_blocked reason=head_unknown", self.notes)
+
+    def test_a_head_for_another_end_or_id_is_held(self):
+        for delta, same_id in ((-100, True), (100, True), (0, False)):
+            with self.subTest(delta=delta, same_id=same_id):
+                self.prepare()
+                self.accept(head=None)
+                uid = self.current.utterance_id if same_id else "separate"
+                self.events._diarized_heads[uid] = (
+                    self.current.end_ms + delta,
+                    len(self.current.text),
+                )
+                self.assertEqual(self.decide(), [])
+                self.assertIn("attention_blocked reason=head_unknown", self.notes)
+
+    def test_head_comparison_error_is_held(self):
+        self.prepare()
+        self.accept()
+        self.events._diarized_heads[self.current.utterance_id] = (self.current.end_ms, None)
+        self.assertFalse(self.decide())
+        self.assertIn("attention_blocked reason=head_unknown", self.notes)
+
     def test_owner_vocative_with_inferred_tail_promotes_via_named_owner(self):
         for anywhere in (False, True):
             with self.subTest(ask_anywhere=anywhere):

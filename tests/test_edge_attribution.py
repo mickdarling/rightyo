@@ -341,6 +341,34 @@ class DiarizedHeadTests(unittest.TestCase):
         with self.assertRaises(LiveAudioError):
             LiveConfig("x", transcriber=Units(), diarizer=Timeline(), on_diarized_head=True)
 
+    def test_restart_preserves_only_the_retained_labelled_prefix(self):
+        from test_turn_merge import fragment
+
+        from rightyo.turn_merge import TurnMerger
+
+        repeated = "b c d"
+        prefix = "x  y"
+        held = prefix + " " + repeated
+        for head, expected in ((1, 1), (3, 1), (4, 3), (len(held), 3), (None, None), (-1, None)):
+            with self.subTest(head=head):
+                emitted = []
+                merger = TurnMerger(
+                    2000, 24000, emitted.append, complete_hold_ms=1000, collapse_restarts=True
+                )
+                merger.offer({**fragment(held, 0, 1500), "diarized_head": head}, complete=True)
+                merger.offer(
+                    {
+                        **fragment(repeated + " e", 1600, 2200),
+                        "diarized_head": None,
+                        "inferred": True,
+                    }
+                )
+                merger.flush()
+                (joined,) = emitted
+                self.assertEqual(joined["text"], "x y b c d e")
+                self.assertIs(joined["inferred"], True)
+                self.assertEqual(joined["diarized_head"], expected)
+
 
 if __name__ == "__main__":
     unittest.main()
