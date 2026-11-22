@@ -1364,10 +1364,7 @@ class SpeechEvents:
                 raise ContractError("event session turn budget exceeded")
             context = self._memory.snapshot(self._now)
             context["turns"] = [t for t in context["turns"] if t["end_ms"] <= turn.start_ms]
-            # The role is fixed before the first emission and repeated unchanged on the
-            # decision, the request turn and every later context snapshot.
-            # With live identification the role is resolved per turn instead, from the
-            # bindings at this moment, and then repeated unchanged the same way.
+            # Request turns and context retain the role published on this transcript.
             role = None
             if self._per_turn:
                 role = speaker_role(self._priority.role_for(turn))
@@ -2948,13 +2945,28 @@ class SpeechEvents:
             # published before the forget, so it still matches that transcript's fingerprint.
             decided = current if stale else role
             authority = self._authority_role(key, current)
+            # An epoch-zero first bind can inform public attention without changing the
+            # accepted transcript, dismissal authority, supersession or engagement priority.
+            receipt_role = None
+            lookup = getattr(self._priority, "first_bind_role", None)
+            if (
+                self._per_turn
+                and role == "unknown"
+                and not self._duck
+                and not stale
+                and key not in self._inferred
+                and callable(lookup)
+            ):
+                receipt_role = lookup(turn)
+            attention_role = receipt_role or current
+            attention_authority = receipt_role or authority
             if role is not None:
-                evidence["role"] = decided
+                evidence["role"] = receipt_role or decided
                 if key == self._degraded_turn:
                     # The stream shows where model lookups degraded, not only the object.
                     evidence["role_status"] = self.role_status
                 rules = self._priority.priority
-                if rules.owner_only and current != "owner" and evidence["label"] == "attend":
+                if rules.owner_only and attention_role != "owner" and evidence["label"] == "attend":
                     # Owner-only mode: other speakers remain context, never a request.
                     evidence["label"] = "ignore"
                 stop = authority == "owner" and rules.is_stop_phrase(turn.text)
@@ -2994,7 +3006,7 @@ class SpeechEvents:
                 # a follow-up or an acknowledgement here, and it ends this assistant's
                 # conversation with them below. Naming this assistant too keeps it ours.
                 evidence["label"] = "ignore"
-            blocked = self._attention_blocked(turn, authority, current)
+            blocked = self._attention_blocked(turn, attention_authority, attention_role)
             if evidence["label"] == "attend" and blocked is not None:
                 # Shared meeting/media/others-present bars apply to direct attends too.
                 # Like media, only an attend is relabeled:
@@ -3003,7 +3015,7 @@ class SpeechEvents:
                 evidence["label"] = "ignore"
                 evidence[blocked] = True
             elif unavailable is None and not stop and not dismissed:
-                self._meeting_promote(turn, authority, event.decision, evidence)
+                self._meeting_promote(turn, attention_authority, event.decision, evidence)
             if self._answered(turn, event.decision, current):
                 # Another person answered this unnamed turn at once (#199): it is theirs. An
                 # optional key, like media: strict hosts ignore unknown keys.
@@ -3014,12 +3026,13 @@ class SpeechEvents:
                 unavailable is None
                 and event.decision.label == "uncertain"
                 and evidence["label"] == "uncertain"
+                and not evidence.get("answered_by_other")
                 and not stop
                 and not dismissed
-                and self._named_owner(turn, current)
+                and self._named_owner(turn, attention_role)
             )
             if named_owner:
-                blocked = self._attention_blocked(turn, authority, current)
+                blocked = self._attention_blocked(turn, attention_authority, attention_role)
                 if blocked is not None:
                     # A promotion faces the same meeting and media gates as a provider-labeled
                     # attend; those gates relabel only an attend, so this check is the one
@@ -3126,7 +3139,11 @@ class SpeechEvents:
             # #242 round 25: formed with the decided role and the label as decided (none for a
             # stale turn), like everything else derived at the decision; only the request's
             # `turn` and `context` keep what their transcripts published.
-            formed = self._form_request(request_id, turn, decided, context) if attended else {}
+            formed = (
+                self._form_request(request_id, turn, evidence.get("role"), context)
+                if attended
+                else {}
+            )
             ack, ack_note = (
                 self._acknowledge(turn, event.decision, evidence) if attended else ({}, None)
             )
@@ -3396,14 +3413,19 @@ class SpeechEvents:
                         self._report(ack_note)
                     except Exception:  # noqa: BLE001
                         pass
-            if evidence.get("others_present") is True and self._report is not None:
+            if self._report is not None:
+                note = None
+                if evidence.get("others_present") is True:
+                    note = "attention_blocked reason=others_present"
+                elif named_owner:
+                    note = "attention_promoted reason=named_owner"
                 with contextlib.suppress(Exception):
-                    self._report("attention_blocked reason=others_present")
-            if named_owner and self._report is not None:
-                # Content-free and last, like ack/follow-up notes; a failed report never
-                # changes delivery or engagement. One token per promoted decision (#735).
-                with contextlib.suppress(Exception):
-                    self._report("attention_promoted reason=named_owner")
+                    source = getattr(self._priority, "source", None)
+                    if callable(getattr(source, "first_bind_identity", None)):
+                        origin = "receipt" if receipt_role is not None else "accept"
+                        note = f"{note or 'attention_decision'} role_at={origin}"
+                    if note is not None:
+                        self._report(note)
             if follow_up_text is not None:
                 # After the request, if any, is out: a former or queue failure that ends the
                 # session raises before this, so `formed` is never reported for a lost one.
