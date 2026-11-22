@@ -2521,7 +2521,9 @@ class Round27Tests(unittest.TestCase):
                         self.assertEqual(len(made), 2)
                     heard = [d.pushed_ms for d in made]
                     events.duck(True, now_ms=controller._received_ms)
+                    processed = controller._processed_bytes
                     self.assertFalse(controller._feed(generation, processor, voice, "stdin"))
+                    self.assertEqual(controller._processed_bytes, processed)
                     self.assertEqual([d.pushed_ms for d in made], heard)
                     self.assertEqual(processor.received_ms, heard[-1] + (1000 if renewal else 0))
                     self.assertEqual(controller._phase, "error")
@@ -2815,6 +2817,7 @@ class PrivacyAckTests(unittest.TestCase):
         controller._processor.push_pcm16.side_effect = next_generation
         feed(16)
         self.assertTrue(events.ducked)
+        self.assertEqual(controller._processed_bytes, 0)
         self.assertEqual(controller._pending_off_sample, 16)
         controller._processor.end_privacy.assert_not_called()
 

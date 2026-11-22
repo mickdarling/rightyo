@@ -736,6 +736,7 @@ class PrototypeController:
         self._request_limit: int | None = DEFAULT_REQUEST_LIMIT
         self._received_ms = 0
         self._received_bytes = 0
+        self._processed_bytes = 0
         self._pending_off_sample: int | None = None
         # #242 round 27: the stream byte offset the current privacy interval began at, or None
         # when unknown or public; an interval that received no audio forgets no speaker (`duck`).
@@ -1001,6 +1002,7 @@ class PrototypeController:
             self._turn_spans = {}
             self._pending = self._requests = self._received_ms = 0
             self._received_bytes = 0
+            self._processed_bytes = 0
             self._pending_off_sample = None
             # #242 round 27: a session that starts private (`--start-private`, or the mode held
             # from before) has heard nothing in it yet; one that starts public, nothing private.
@@ -1740,13 +1742,11 @@ class PrototypeController:
             shadow.audio(bytes(len(pcm)) if private else pcm)
         processor.push_pcm16(pcm)
         with self._lock:
-            after_sample = self._pending_off_sample
-            if (
-                generation == self._generation
-                and after_sample is not None
-                and self._received_bytes // 2 >= after_sample
-            ):
-                self._apply_positioned_off(after_sample)
+            if generation == self._generation:
+                self._processed_bytes = self._received_bytes
+                after_sample = self._pending_off_sample
+                if after_sample is not None and self._processed_bytes // 2 >= after_sample:
+                    self._apply_positioned_off(after_sample)
         if boundary:
             # The budget discards the open utterance, but a turn already finalized and
             # held for a possible continuation stands.
@@ -1974,6 +1974,7 @@ class PrototypeController:
             self._turn_spans.clear()
             self._pending = self._received_ms = 0
             self._received_bytes = 0
+            self._processed_bytes = 0
             self._pending_off_sample = None
             # #242 round 27: the stream clock restarts; nothing is heard in privacy until audio.
             self._private_from_bytes = 0 if self._private_audio() else None
@@ -2110,7 +2111,7 @@ class PrototypeController:
                 return
             if self._mode == "stdin":
                 sample = max(self._pending_off_sample or 0, sample)
-                if sample > self._received_bytes // 2:
+                if sample > self._processed_bytes // 2:
                     self._pending_off_sample = sample
                     return
                 self._apply_positioned_off(sample)
