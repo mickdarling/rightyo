@@ -79,7 +79,9 @@ RING_MS = 60000
 MIN_RING_MS = 10000
 MAX_RING_MS = 600000
 QUEUE_SIZE = 4
+MAX_BINDING_RECEIPTS = 64
 SELF_BIND_MARGIN = 0.10
+RECEIPT_MARGIN = SELF_BIND_MARGIN
 # A privacy-entry voice check (hailing-station #735) waits at most this long for the worker;
 # a check not done by then refuses, the safe failure. At most this many wait at once.
 ENTRY_CHECK_TIMEOUT_S = 2.0
@@ -295,6 +297,15 @@ class PresenceBinding:
         return eligible and self.revision == entry.revision + 1
 
 
+@dataclass(frozen=True)
+class BindingReceipt:
+    utterance_id: str
+    epoch: int
+    revision: int
+    identity: str
+    kind: str
+
+
 @dataclass
 class LabelState:
     """One session label's accumulated evidence and shadow binding."""
@@ -306,6 +317,7 @@ class LabelState:
     identity: str | None = None  # bound identifier, else the closest enrolled one
     score: float | None = None  # accumulated score against `identity`
     scores: dict[str, float] = field(default_factory=dict)
+    ever_bound: bool = False
 
     self_total: float = 0.0
     self_seconds: float = 0.0
@@ -447,9 +459,9 @@ class ShadowSpeakerId:
         self._report_to = report
         self._embedder_factory = embedder_factory
         self._entries = entries
-        self._queue: queue.Queue[tuple[int, str, int, int, bytes, bool, threading.Event | None]] = (
-            queue.Queue(maxsize=queue_size)
-        )
+        self._queue: queue.Queue[
+            tuple[int, str, int, int, bytes, bool, str | None, threading.Event | None]
+        ] = queue.Queue(maxsize=queue_size)
         # Privacy-entry voice checks (#735), taken before queued turns: a caller waits on one.
         self._checks: queue.Queue[_EntryCheck | _ExitCheck] = queue.Queue(maxsize=ENTRY_CHECKS)
         self._ring = PcmRing(ring_ms)
@@ -472,6 +484,7 @@ class ShadowSpeakerId:
         # A later turn may use a label that was not engaged when an entry was recorded.
         # Rotate on any self-binding change so all three labels are covered across time.
         self._self_generation = object()
+        self._first_binds: dict[str, BindingReceipt] = {}
         self._epoch_lock = threading.Lock()
         self.scored_seconds = 0.0
         self._stop = threading.Event()  # discard pending work and exit
@@ -553,6 +566,19 @@ class ShadowSpeakerId:
                 evidence is not None and evidence.self_bound,
                 self._self_generation,
             )
+
+    def first_bind_identity(self, label: str, utterance_id: str) -> str | None:
+        """Take this turn's first-bind receipt if the original binding still holds."""
+        with self._epoch_lock:
+            receipt = self._first_binds.get(label)
+            if receipt is None or receipt.utterance_id != utterance_id:
+                return None
+            del self._first_binds[label]
+            if (receipt.epoch, receipt.revision) != (self._epoch, self._binding_revisions[label]):
+                return None
+            if not self.active or self.binding(label) != ("bound", receipt.identity):
+                return None
+            return receipt.identity
 
     def owner_evidence(self, owners) -> tuple[bool, bool, float]:
         """Owner-voice evidence for `owners` (rightyo#164); never waits on the worker.
@@ -668,6 +694,7 @@ class ShadowSpeakerId:
                         labelled_ms,
                         pcm,
                         score_self,
+                        turn.utterance_id if self.settings.roles and not inferred else None,
                         done,
                     )
                 )
@@ -830,6 +857,7 @@ class ShadowSpeakerId:
         with self._epoch_lock:
             self._epoch += 1
             self._binding_revisions = {}
+            self._first_binds.clear()
             self._labels = {}
             self._bound_ids = set()
             self.scored_seconds = 0.0
@@ -845,6 +873,7 @@ class ShadowSpeakerId:
         labelled_ms: int,
         pcm: bytes,
         in_window: bool = False,
+        utterance_id: str | None = None,
     ):
         if not prints and not in_window:
             return
@@ -923,6 +952,8 @@ class ShadowSpeakerId:
             self_changed = state.self_bound != (previous is not None and previous.self_bound)
             if self_changed:
                 self._self_generation = object()
+                # Pending decisions and presence entries share this self-binding boundary.
+                self._first_binds.clear()
             if self_changed or (
                 comparable
                 and (
@@ -931,15 +962,38 @@ class ShadowSpeakerId:
                 )
             ):
                 self._binding_revisions[label] = self._binding_revisions.get(label, 0) + 1
+            turn_score = turn_scores.get(state.identity)
+            if state.state == "bound" and state.identity is not None:
+                # Accumulated evidence can bind the label on a different speaker's turn.
+                if (
+                    epoch == 0
+                    and not state.ever_bound
+                    and utterance_id is not None
+                    and turn_score is not None
+                    and math.isfinite(turn_score)
+                    and turn_score >= self.settings.bind_threshold
+                    and len(turn_scores) == len(prints)
+                    and all(
+                        math.isfinite(score) and turn_score >= score + RECEIPT_MARGIN
+                        for identity, score in turn_scores.items()
+                        if identity != state.identity
+                    )
+                ):
+                    if len(self._first_binds) >= MAX_BINDING_RECEIPTS:
+                        del self._first_binds[next(iter(self._first_binds))]
+                    self._first_binds[label] = BindingReceipt(
+                        utterance_id, epoch, self._binding_revisions[label], state.identity, rule
+                    )
+                state.ever_bound = True
+                self._bound_ids.add(state.identity)
             self._labels[label] = state
             self.scored += 1
-            if state.state == "bound" and state.identity is not None:
-                self._bound_ids.add(state.identity)
             # In the same epoch as its binding: never counted after a `forget`.
             if comparable:
                 self.scored_seconds += seconds
         # Report after the bookkeeping, best-effort: a failing channel changes nothing.
-        turn_score = self_score if state.self_bound else turn_scores.get(state.identity)
+        if state.self_bound:
+            turn_score = self_score
         self._report(
             f"speaker_id label={_quoted(label)} turn_ms={turn_ms}"
             f" labelled_ms={labelled_ms} speech_ms={round(seconds * 1000)}"
@@ -1371,6 +1425,22 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         ):
             return count
         return 0
+
+    def first_bind_role(self, turn) -> str | None:
+        """The enrolled role from this turn's score, solely for a public decision."""
+        lookup = getattr(self.source, "first_bind_identity", None)
+        if (
+            not callable(lookup)
+            or turn.speaker_id is None
+            or turn.overlap
+            or turn.speaker_provenance != "diarization-timeline"
+            or self.priority.configured_role(turn.speaker_id) is not None
+        ):
+            return None
+        try:
+            return self.priority.configured_role(lookup(turn.speaker_id, turn.utterance_id))
+        except Exception:  # noqa: BLE001 - missing evidence leaves the acceptance role in effect
+            return None
 
     def resolved_by_voiceprint(self, utterance_id: str) -> bool:
         """Whether the latest `role_for`, for this utterance, came from a live

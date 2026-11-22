@@ -635,8 +635,8 @@ differences:
   that, or only `tentative`, is `unknown`, as is a turn without a label and any
   turn while identification is off or failed. A session label named in `speakers` keeps
   its configured role as before.
-- **Binding is asynchronous and never waited for.** The identifier scores a turn on its
-  own thread after the turn is emitted, so a turn's role reflects the turns before it. A
+- **First binding is asynchronous.** Before any speaker renewal, the identifier scores a
+  turn on its own thread after its transcript is emitted. A
   voice's first turns in a session are therefore `unknown` until its label has
   accumulated `bind_min_seconds` of speech (3 s by default) at or above `bind_threshold`;
   the turns after that carry the role. Optional `speaker_id.single_turn_bind_threshold`
@@ -645,11 +645,22 @@ differences:
   1.5, or `min_turn_seconds` if higher; `min_turn_seconds` to 10.0). It fails closed unless
   the label was unbound before the turn, its best turn identity is also the accumulated
   best identity, and that identity's accumulated mean is at or above `bind_threshold`.
-  A turn keeps the role it was emitted with on its
-  `attention`, its `request` and in every later context snapshot, even if the binding
-  changes before its decision arrives, so a host's fingerprint checks still match. A label
-  that falls below `tentative_threshold` loses its binding, and its later turns lose the
-  role.
+  The request's `turn` and every later context snapshot carry the published transcript
+  role. A label that falls below `tentative_threshold` loses its binding.
+- **A first bind can inform its own public decision.** A turn accepted as `unknown` may
+  use `owner` or `trusted` for attention and request formation when that turn first
+  binds the label in epoch zero. For either binding rule, the turn's own score for
+  the bound identity must reach `bind_threshold` and exceed every other identity's
+  score on that turn by at least 0.10. Every enrollment matched to the active model
+  must have a finite turn score. With just one such enrollment, only the threshold
+  applies. The decision checks the receipt once. A missing
+  receipt, a changed binding revision, inferred attribution or active privacy keeps
+  the acceptance role. A self-binding flip on any label invalidates pending receipts.
+  The `decision` on both the attention and request events carries the role used.
+  The answered-by-other exemption and the enrolled follow-up threshold use the
+  acceptance role. Dismissal, supersession, engagement priority and privacy controls
+  continue to use their original authority checks. In a session with scoring receipts,
+  the attention diagnostic ends with `role_at=receipt` or `role_at=accept`.
 - **Precedence for enrolled owners and trusted speakers
   ([#113](https://github.com/mickdarling/rightyo/issues/113)).** They get the owner and
   trusted behaviours above (override, stop phrases, full dismissal authority). In

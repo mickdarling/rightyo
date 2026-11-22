@@ -2,17 +2,24 @@
 
 import math
 import queue
+import threading
 import unittest
+from dataclasses import replace
+from unittest.mock import Mock, patch
 
 import test_duck_mode as duck
-from test_enrolled_roles import OWNER_ID, SESSION, turn
+from test_answered_by_other import gap
+from test_dismissal import decision as dismissal_decision
+from test_enrolled_roles import OWNER_ID, SESSION, decided, turn
 from test_live_speaker_id import ENTRIES, Harness, ScriptedEmbedder, settings, tone, wait_for
 
-from rightyo.contracts import Addressing, ContractError, Conversation
+from rightyo.contracts import Addressing, ContractError, Conversation, Dismissal
+from rightyo.enroll import cosine
 from rightyo.live_speaker_id import EnrolledRoles
 from rightyo.memory import TranscriptMemory
+from rightyo.pipeline import ReplayRunner
 from rightyo.speaker_id import SpeakerIdConfig
-from rightyo.tool_events import SpeechEvents
+from rightyo.tool_events import PRIVACY_EXIT, SpeechEvents
 
 
 def vector(score):
@@ -257,22 +264,33 @@ class SingleTurnBindTests(unittest.TestCase):
 
 
 class BaseBindingPublicationTests(unittest.TestCase):
-    def arrange(self, *, threshold=None, scores=(0.8,)):
+    def arrange(
+        self,
+        *,
+        threshold=None,
+        scores=(0.8,),
+        gate=None,
+        priority=OWNER_ID,
+        entries=ENTRIES[:1],
+        dismissal=None,
+    ):
         controller = duck.DuckControllerTests.controller(self)
         h = Harness(
-            ScriptedEmbedder([vector(s) for s in scores]),
+            ScriptedEmbedder([vector(s) for s in scores], gate=gate),
             config=settings(roles=True, single_turn_bind_threshold=threshold),
-            entries=ENTRIES[:1],
+            entries=entries,
         )
-        roles = EnrolledRoles(OWNER_ID)
+        roles = EnrolledRoles(priority)
         roles.source = h.shadow
-        events = SpeechEvents()
+        events = SpeechEvents(report=h.lines.append)
         events.start(
             SESSION,
             now_ms=0,
             priority=roles,
             addressing=Addressing(names=("Jarvis",)),
             conversation=Conversation(cue_when_others_ms=120000),
+            dismissal=dismissal,
+            meeting_ask_anywhere=False,
             duck=True,
         )
         controller._decision_status = "ready"
@@ -282,6 +300,8 @@ class BaseBindingPublicationTests(unittest.TestCase):
         h.shadow.start()
         wait_for(lambda: bool(h.shadow._compared))
         self.addCleanup(h.shadow.close)
+        if gate is not None:
+            self.addCleanup(gate.set)
         return controller, events, h
 
     def publish(self, c, h, current):
@@ -321,3 +341,374 @@ class BaseBindingPublicationTests(unittest.TestCase):
                 self.assertEqual(
                     h.fields(h.notes()[-1])["bind"], "single" if single else "accumulated"
                 )
+
+    @staticmethod
+    def sample(index, start=0, end=1500):
+        return turn(str(index), start, end, " ".join((duck.OURS.names[0], str(index), str(end))))
+
+    def decision(self, events, current, *, role, requested, label="attend"):
+        events.decision(decided(current, label), current.end_ms)
+        output = events.drain()
+        attention = next(event for event in output if event["type"] == "attention")
+        self.assertEqual(attention["decision"]["role"], role)
+        requests = [event for event in output if event["type"] == "request"]
+        self.assertEqual(len(requests), int(requested))
+        if requested:
+            self.assertEqual(requests[0]["decision"], attention["decision"])
+            self.assertEqual(requests[0]["turn"]["role"], "unknown")
+        return output
+
+    def test_first_bind_attends_without_changing_presence_or_owner_authority(self):
+        for single in (False, True):
+            with self.subTest(single=single):
+                c, e, h = self.arrange(threshold=0.7 if single else None)
+                other = replace(self.sample(0, end=1000), speaker_id="other")
+                e.transcript(other, 1000)
+                e.decision(decided(other), 1000)
+                witness = replace(self.sample(3, 1000, 2000), speaker_id="third")
+                e.transcript(witness, 2000, expect_decision=False)
+                e.drain()
+                h.shadow.audio(bytes(2000 * 32))
+                if not single:
+                    first = self.sample(1, 2000, 3500)
+                    self.publish(c, h, first)
+                    wait_for(lambda: h.shadow.scored == 1)
+                    self.assertEqual(h.shadow.binding(first.speaker_id)[0], "tentative")
+                    e.drain()
+                start = 2000 if single else 3500
+                current = self.sample(2, start, start + 1500)
+                self.publish(c, h, current)
+                transcript = self.transcript(e)
+                self.assertEqual(transcript["turn"]["role"], "unknown")
+                self.assertNotIn("role_source", transcript)
+                wait_for(lambda: h.shadow.binding(current.speaker_id) == ("bound", "owner"))
+                history = list(e._cue_voices)
+                self.assertEqual(history[-1][:2], (current.end_ms, current.speaker_id))
+                self.assertTrue(e._others_present(current))
+                output = self.decision(
+                    e,
+                    current,
+                    role="owner",
+                    requested=True,
+                    label="uncertain" if single else "attend",
+                )
+                self.assertFalse(any(event["type"] == "override" for event in output))
+                self.assertIn(SESSION + ":" + other.utterance_id, e._open)
+                self.assertIn(SESSION + ":" + current.utterance_id, e._open)
+                self.assertEqual(e._engaged["role"], "unknown")
+                self.assertEqual(list(e._cue_voices), history)
+                self.assertTrue(e._others_present(current))
+                note = "attention_promoted reason=named_owner" if single else "attention_decision"
+                self.assertIn(note + " role_at=receipt", h.lines)
+
+    def check_binding_decision(self, scores, entries, threshold, *, rule, owner_score, receipt):
+        c, e, h = self.arrange(
+            scores=scores,
+            entries=entries,
+            threshold=threshold,
+            priority=replace(OWNER_ID, trusted=("guest",), owner_only=True),
+        )
+        duration = 1500 if rule == "single" else 1000
+        for index in range(len(scores)):
+            current = self.sample(index, index * duration, (index + 1) * duration)
+            self.publish(c, h, current)
+            self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
+            wait_for(lambda: len(h.notes()) == index + 1)
+        note = h.fields(h.notes()[-1])
+        self.assertEqual(note["bind"], rule)
+        self.assertEqual(note["turn_score"], f"{owner_score:.3f}")
+        self.assertEqual(h.shadow.binding(current.speaker_id), ("bound", "owner"))
+        output = self.decision(
+            e, current, role="owner" if receipt else "unknown", requested=receipt
+        )
+        self.assertEqual(output[0]["decision"]["label"], "attend" if receipt else "ignore")
+        self.assertIn("attention_decision role_at=" + ("receipt" if receipt else "accept"), h.lines)
+
+    def test_accumulated_owner_bind_on_guest_turn_has_no_receipt(self):
+        entries = [ENTRIES[0], {**ENTRIES[1], "embedding": vector(0)}]
+        for threshold in (None, 0.70):
+            for score in (0.0, settings().bind_threshold + 0.01):
+                with self.subTest(threshold=threshold, owner_score=score):
+                    self.check_binding_decision(
+                        (1, 1, score),
+                        entries,
+                        threshold,
+                        rule="accumulated",
+                        owner_score=score,
+                        receipt=False,
+                    )
+
+    def test_binding_turn_just_below_threshold_has_no_receipt(self):
+        score = settings().bind_threshold - 0.001
+        self.check_binding_decision(
+            (1, 1, score), ENTRIES[:1], None, rule="accumulated", owner_score=score, receipt=False
+        )
+
+    def test_single_enrollment_at_threshold_receives_receipt(self):
+        score = settings().bind_threshold
+        self.check_binding_decision(
+            (1, 1, score), ENTRIES[:1], None, rule="accumulated", owner_score=score, receipt=True
+        )
+
+    def test_tied_turn_scores_withhold_receipt_for_both_binding_rules(self):
+        owner = {**ENTRIES[0], "embedding": [1, 0, 1]}
+        for rule, scores, threshold, guest_id in (
+            ("accumulated", (0.8, 0.8, 1), None, "guest"),
+            ("single", (1,), 0.70, "participant"),
+        ):
+            with self.subTest(rule=rule):
+                guest = {**ENTRIES[1], "id": guest_id, "embedding": [1, 0, -1]}
+                self.check_binding_decision(
+                    scores,
+                    [guest, owner],
+                    threshold,
+                    rule=rule,
+                    owner_score=1 / math.sqrt(2),
+                    receipt=False,
+                )
+
+    def test_receipt_requires_margin_over_each_competitor(self):
+        owner = {**ENTRIES[0], "embedding": vector(0.85)}
+        for competing_score, receipt in ((0.80, False), (0.75, True), (0.70, True)):
+            with self.subTest(competing_score=competing_score):
+                competitor = {**ENTRIES[1], "id": "third", "embedding": vector(competing_score)}
+                self.check_binding_decision(
+                    (1,),
+                    [owner, ENTRIES[1], competitor],
+                    0.70,
+                    rule="single",
+                    owner_score=0.85,
+                    receipt=receipt,
+                )
+
+    def test_missing_competitor_score_withholds_receipt(self):
+        guest = {**ENTRIES[1], "embedding": [1, 0]}
+        self.check_binding_decision(
+            (1,), [ENTRIES[0], guest], 0.70, rule="single", owner_score=1, receipt=False
+        )
+
+    def test_nonfinite_competitor_score_withholds_receipt(self):
+        def score(vector, profile):
+            return -math.inf if profile == ENTRIES[1]["embedding"] else cosine(vector, profile)
+
+        with patch("rightyo.live_speaker_id.cosine", side_effect=score):
+            self.check_binding_decision(
+                (1,), ENTRIES[:2], 0.70, rule="single", owner_score=1, receipt=False
+            )
+
+    def test_stop_phrase_on_receipt_turn_uses_acceptance_role(self):
+        c, e, h = self.arrange(threshold=0.70)
+        current = replace(self.sample(1), text=OWNER_ID.stop_phrases[0])
+        self.publish(c, h, current)
+        self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
+        wait_for(lambda: h.shadow.scored == 1)
+        self.decision(e, current, role="owner", requested=True)
+        self.assertIn("attention_decision role_at=receipt", h.lines)
+
+    def test_dismissal_on_receipt_turn_uses_acceptance_role(self):
+        c, e, h = self.arrange(threshold=0.70, dismissal=Dismissal())
+        current = self.sample(1)
+        self.publish(c, h, current)
+        self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
+        wait_for(lambda: h.shadow.scored == 1)
+        e.decision(dismissal_decision(current, dismissal=("disengage", 1.0)), current.end_ms)
+        output = e.drain()
+        attention = next(event for event in output if event["type"] == "attention")
+        dismissal = next(event for event in output if event["type"] == "dismiss")
+        self.assertEqual(attention["decision"]["role"], "owner")
+        self.assertIn("attention_decision role_at=receipt", h.lines)
+        self.assertEqual((dismissal["role"], dismissal["scope"]), ("unknown", ["playback"]))
+
+    def test_single_bind_preserves_answered_by_other(self):
+        for label, text in (("attend", "1"), ("uncertain", " ".join(duck.OURS.names[0]))):
+            with self.subTest(provider_label=label):
+                c, e, h = self.arrange(threshold=0.70)
+                current = turn("1", 0, 1500, text)
+                self.publish(c, h, current)
+                self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
+                wait_for(lambda: bool(h.notes()))
+                self.assertEqual(h.fields(h.notes()[-1])["bind"], "single")
+                provider = Mock()
+                provider.decide.return_value = decided(current, label).decision
+                runner = ReplayRunner(
+                    provider, addressing=duck.OURS, post_turn_gaps=True, other_answered_blocks=True
+                )
+                observed = gap("different_speaker")
+                event = runner.process(current, observed)
+                self.assertEqual(event.decision.answered_at_ms, current.end_ms + 400)
+                e.decision(event, current.end_ms + observed["window_ms"])
+                output = e.drain()
+                self.assertEqual([item["type"] for item in output], ["attention"])
+                decision = output[0]["decision"]
+                self.assertEqual((decision["label"], decision["role"]), ("uncertain", "owner"))
+                self.assertIs(decision["answered_by_other"], True)
+                self.assertIn("attention_decision role_at=receipt", h.lines)
+
+    def test_first_bind_uses_the_accepted_follow_up_bar(self):
+        c, e, h = self.arrange()
+        c._enrolled_roles.follow_up_min_probability = 0.2
+        first = self.sample(1)
+        self.publish(c, h, first)
+        wait_for(lambda: h.shadow.scored == 1)
+        self.decision(e, first, role="unknown", requested=True)
+        current = turn("2", 1500, 3000, "2")
+        self.publish(c, h, current)
+        self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
+        wait_for(lambda: h.shadow.scored == 2)
+        e.decision(decided(current, "uncertain", attend=0.25), current.end_ms)
+        output = e.drain()
+        self.assertEqual([item["type"] for item in output], ["attention"])
+        self.assertEqual(output[0]["decision"]["role"], "owner")
+        self.assertIn("follow_up outcome=refused reason=below_bar attend=0.25 bar=0.4", h.lines)
+
+    def test_decision_finishes_while_score_is_pending(self):
+        gate = threading.Event()
+        c, e, h = self.arrange(
+            threshold=0.7, gate=gate, priority=replace(OWNER_ID, owner_only=True)
+        )
+        current = self.sample(1)
+        self.publish(c, h, current)
+        self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
+        self.decision(e, current, role="unknown", requested=False)
+        self.assertEqual(h.shadow.scored, 0)
+        self.assertIn("attention_decision role_at=accept", h.lines)
+        gate.set()
+        wait_for(lambda: h.shadow.scored == 1)
+        self.assertEqual(h.shadow.binding(current.speaker_id), ("bound", "owner"))
+        e.decision(decided(current), current.end_ms)
+        self.assertEqual(e.drain(), [])
+
+    def test_later_turn_receipt_belongs_only_to_its_own_decision(self):
+        c, e, h = self.arrange(priority=replace(OWNER_ID, owner_only=True))
+        first, second = self.sample(1), self.sample(2, 1500, 3000)
+        self.publish(c, h, first)
+        wait_for(lambda: h.shadow.scored == 1)
+        self.publish(c, h, second)
+        wait_for(lambda: h.shadow.scored == 2)
+        self.decision(e, first, role="unknown", requested=False)
+        self.decision(e, second, role="owner", requested=True)
+
+    def test_oldest_unconsumed_receipt_is_pruned(self):
+        c, e, h = self.arrange(threshold=0.7, priority=replace(OWNER_ID, owner_only=True))
+        first = self.sample(1)
+        second = replace(self.sample(2, 1500, 3000), speaker_id="second")
+        with patch("rightyo.live_speaker_id.MAX_BINDING_RECEIPTS", 1):
+            for count, current in enumerate((first, second), 1):
+                self.publish(c, h, current)
+                wait_for(lambda: h.shadow.scored == count)
+        self.decision(e, first, role="unknown", requested=False)
+        self.decision(e, second, role="owner", requested=True)
+
+    def test_binding_dropped_and_restored_invalidates_the_first_receipt(self):
+        gate = threading.Event()
+        c, e, h = self.arrange(
+            threshold=0.7, gate=gate, scores=(1, -1, 1), priority=replace(OWNER_ID, owner_only=True)
+        )
+        first, drop, rebound = (
+            self.sample(1),
+            self.sample(2, 1500, 3500),
+            self.sample(3, 3500, 5500),
+        )
+        for current in (first, drop, rebound):
+            self.publish(c, h, current)
+            self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
+        gate.set()
+        wait_for(lambda: h.shadow.scored == 3)
+        self.assertEqual(h.shadow.binding_snapshot(first.speaker_id), ((0, 3), ("bound", "owner")))
+        self.decision(e, first, role="unknown", requested=False)
+        self.decision(e, rebound, role="unknown", requested=False)
+
+    def test_self_binding_on_another_label_invalidates_a_pending_receipt(self):
+        c, e, h = self.arrange(
+            threshold=0.7, scores=(1, 0), priority=replace(OWNER_ID, owner_only=True)
+        )
+        first = self.sample(1)
+        self.publish(c, h, first)
+        wait_for(lambda: h.shadow.scored == 1)
+        original = h.shadow.presence_snapshot(first.speaker_id)
+        self.assertEqual(original.state, "bound")
+
+        other = replace(self.sample(2, 1500, 4500), speaker_id="second")
+        h.shadow._self_prints = (vector(0),)
+        h.shadow.audio(tone(3))
+        h.shadow.turn(other, spans=((1500, 4500),), in_window=True)
+        wait_for(lambda: h.shadow.scored == 2)
+        self.assertTrue(h.shadow.self_bound(other.speaker_id))
+        current = h.shadow.presence_snapshot(first.speaker_id)
+        self.assertEqual(current.revision, original.revision)
+        self.assertIsNot(current.self_generation, original.self_generation)
+        self.decision(e, first, role="unknown", requested=False)
+
+    def test_forget_invalidates_the_first_receipt(self):
+        c, e, h = self.arrange(threshold=0.7, priority=replace(OWNER_ID, owner_only=True))
+        first, renewed = self.sample(1), self.sample(2, 1500, 3000)
+        self.publish(c, h, first)
+        wait_for(lambda: h.shadow.scored == 1)
+        h.shadow.forget()
+        self.publish(c, h, renewed)
+        self.assertEqual(h.shadow.binding_snapshot(first.speaker_id), ((1, 1), ("bound", "owner")))
+        self.decision(e, first, role="unknown", requested=False)
+        e.decision(decided(renewed), renewed.end_ms)
+        request = next(event for event in e.drain() if event["type"] == "request")
+        self.assertEqual((request["turn"]["role"], request["decision"]["role"]), ("owner", "owner"))
+        self.assertFalse(any(note.endswith(" role_at=receipt") for note in h.lines))
+
+    def test_guest_and_inferred_first_binds_keep_their_acceptance_role(self):
+        for identity, inferred in (("guest", False), ("owner", True)):
+            with self.subTest(identity=identity):
+                c, e, h = self.arrange(
+                    threshold=0.7,
+                    priority=replace(OWNER_ID, owner_only=True),
+                    entries=[{**ENTRIES[0], "id": identity}],
+                )
+                current = self.sample(1)
+                if inferred:
+                    c._observe_inferred(c._generation, current.utterance_id)
+                self.publish(c, h, current)
+                wait_for(lambda: h.shadow.scored == 1)
+                self.assertEqual(h.shadow.binding(current.speaker_id), ("bound", identity))
+                self.decision(e, current, role="unknown", requested=False)
+                self.assertIn("attention_decision role_at=accept", h.lines)
+
+    def test_trusted_first_bind_carries_only_its_configured_role(self):
+        c, e, h = self.arrange(
+            threshold=0.7,
+            priority=replace(OWNER_ID, trusted=("trusted",), owner_only=True),
+            entries=[{**ENTRIES[0], "id": "trusted"}],
+        )
+        current = self.sample(1)
+        self.publish(c, h, current)
+        wait_for(lambda: h.shadow.scored == 1)
+        self.decision(e, current, role="trusted", requested=False)
+
+    def test_pending_binding_turn_cannot_exit_privacy(self):
+        gate = threading.Event()
+        c, e, h = self.arrange(
+            threshold=0.7, gate=gate, priority=replace(OWNER_ID, owner_only=True)
+        )
+        current = replace(self.sample(1), text=" ".join((*duck.OURS.names, *PRIVACY_EXIT[0])))
+        self.publish(c, h, current)
+        self.assertEqual(self.transcript(e)["turn"]["role"], "unknown")
+        e.duck(True, now_ms=current.end_ms + 1)
+        gate.set()
+        wait_for(lambda: h.shadow.scored == 1)
+        self.assertEqual(h.shadow.binding(current.speaker_id), ("bound", "owner"))
+        e.decision(decided(current), current.end_ms + 2)
+        output = e.drain()
+        self.assertFalse(any(event.get("action") == "exit" for event in output))
+        self.assertEqual([event["type"] for event in output], ["attention"])
+        self.assertEqual(output[0]["decision"]["role"], "unknown")
+        self.assertTrue(e.ducked)
+
+    def test_private_exit_never_consults_the_decision_role(self):
+        c, e, h = self.arrange(threshold=0.7)
+        current = replace(self.sample(1), text=" ".join((*duck.OURS.names, *PRIVACY_EXIT[0])))
+        e.duck(True, now_ms=0)
+        e.drain()
+        with patch.object(c._enrolled_roles, "first_bind_role", return_value="owner") as receipt:
+            self.publish(c, h, current)
+            self.assertEqual(e.drain(), [])
+            self.assertEqual(e._private_counts["exit_refused"], 1)
+            receipt.assert_not_called()
+        self.assertTrue(e.ducked)
+        self.assertEqual(h.shadow.offered, 0)
