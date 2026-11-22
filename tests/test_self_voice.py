@@ -673,7 +673,7 @@ class SessionTests(unittest.TestCase):
             output = self.accept(heard("x", 2000, 4000, "Unit x x", "other"))
             self.assertEqual(output[0]["turn"]["role"], "participant")
             self.assertIn("request", [e["type"] for e in output])
-            self.assertEqual(list(self.events._cue_voices), [(4000, "other")])
+            self.assertEqual(list(self.events._cue_voices), [(4000, "other", True)])
             return [encode_json(event) for event in output]
 
         self.assertEqual(sequence(False), sequence(True))

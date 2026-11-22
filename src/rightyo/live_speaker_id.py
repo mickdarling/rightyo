@@ -1251,6 +1251,36 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         """
         return self._lookup(turn)[0]
 
+    def presence_aliases(self, labels, *, current, engaged) -> set[str]:
+        """Eligible history labels sharing a current enrolled identity (#307)."""
+        source = self.source
+        snapshot = getattr(source, "binding_snapshot", None)
+        if not callable(snapshot) or not labels or (current is None and engaged is None):
+            return set()
+        try:
+            keys = labels | {key for key in (current, engaged) if key is not None}
+            before = {key: snapshot(key) for key in keys}
+            bindings = {key: binding for key, (rev, binding) in before.items() if rev is not None}
+            identities = set()
+            for key, states in ((current, ("bound",)), (engaged, ("bound", "tentative"))):
+                binding = bindings.get(key)
+                if binding and binding[0] in states and binding[1] is not None:
+                    identities.add(binding[1])
+            # Conflicting identities are evidence of distinct speakers.
+            if len(identities) != 1:
+                return set()
+            identity = identities.pop()
+            aliases = {key for key in labels if bindings.get(key) == ("bound", identity)}
+            # A common snapshot across labels, including changes away and back. A later
+            # turn reads every binding anew, even for entries already skipped once.
+            if aliases and all(snapshot(key) == value for key, value in before.items()):
+                if self.source is not source:
+                    return set()
+                return aliases
+        except Exception:  # noqa: BLE001 - unavailable evidence preserves the presence bar
+            pass
+        return set()
+
     def resolved_by_voiceprint(self, utterance_id: str) -> bool:
         """Whether the latest `role_for`, for this utterance, came from a live
         identification binding rather than a label configured in `speakers`."""
