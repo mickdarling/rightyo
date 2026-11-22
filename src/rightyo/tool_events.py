@@ -622,7 +622,7 @@ class SpeechEvents:
         # it plays), as the host reports them (#124); bounded.
         self._playbacks = deque(maxlen=MAX_PLAYBACKS)
         self._playback_scopes = {}
-        # Eligible voice times/labels only (#283), independent of decision arrival. The
+        # Eligible voice times, labels and entry-time timeline bindings (#283, #307). The
         # session accepts at most 1,000 turns, so this cannot discard qualifying history.
         self._cue_voices = deque(maxlen=1000)
         # Stream time the latest reply ended with a question to the owner (#199), or None;
@@ -2736,6 +2736,7 @@ class SpeechEvents:
         if self._conversation is None or not self._conversation.cue_when_others_ms:
             return
         speaker_id = self._engaged["speaker_id"] if self._engaged else turn.speaker_id
+        timeline = turn.speaker_provenance == "diarization-timeline" and not turn.overlap
         if (
             turn.speaker_id is not None
             and turn.end_ms - turn.start_ms >= self._conversation.presence_min_ms
@@ -2743,13 +2744,35 @@ class SpeechEvents:
             and not (self._per_turn and role in {"owner", "trusted"})
             and not self._playback_overlaps(turn.start_ms, turn.end_ms)
         ):
-            self._cue_voices.append((turn.end_ms, turn.speaker_id))
+            snapshot = None
+            if timeline and self._per_turn:
+                with contextlib.suppress(Exception):
+                    snapshot = self._priority.presence_entry(turn)
+            self._cue_voices.append((turn.end_ms, turn.speaker_id, snapshot))
         window = self._conversation.cue_when_others_ms
-        if any(
-            speaker != speaker_id and 0 <= turn.start_ms - at <= window
-            for at, speaker in reversed(self._cue_voices)
-        ):
+        candidates = [
+            (speaker, snapshot)
+            for at, speaker, snapshot in self._cue_voices
+            if speaker != speaker_id and 0 <= turn.start_ms - at <= window
+        ]
+        if not candidates:
+            return
+        same_identity = 0
+        if self._per_turn and timeline and role in {"owner", "trusted"}:
+            engaged_key = self._engaged["key"] if self._engaged else None
+            if not self._engaged or engaged_key == ("diarization-timeline", speaker_id):
+                with contextlib.suppress(Exception):
+                    same_identity = self._priority.same_identity_count(
+                        candidates, current=turn.speaker_id, engaged=speaker_id
+                    )
+        others = same_identity < len(candidates)
+        if others:
             self._others_turns[turn.utterance_id] = turn.end_ms
+        if same_identity and self._report is not None:
+            with contextlib.suppress(Exception):
+                self._report(
+                    f"attention_presence others_present={int(others)} same_identity={same_identity}"
+                )
 
     def _others_present(self, turn):
         """The acceptance-time verdict, unaffected by later speech, modes or label resets."""

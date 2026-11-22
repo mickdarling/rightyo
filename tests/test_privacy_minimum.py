@@ -720,7 +720,7 @@ class PrivacyMinimumTests(unittest.TestCase):
         s._bound_ids.add("owner")
         s.scored_seconds = 4
         e._roles["Speaker A"] = "owner"
-        e._cue_voices.append((0, "Speaker A"))
+        e._cue_voices.append((0, "Speaker A", None))
         e._cooldowns["synthetic"] = (0, 100)
         e.last_request = (0, "Authored request.", "u0", "Speaker A")
         e._withdrawn["u0"] = {"speaker_id": "Speaker A"}
@@ -747,7 +747,7 @@ class PrivacyMinimumTests(unittest.TestCase):
         self.assertEqual(e.last_request[3], "Speaker A")
         self.assertEqual(e._pending_ack, {"until_ms": 10000})
         self.assertEqual((e._old_labels, e._label_stale), ({"old"}, {"stale"}))
-        self.assertEqual(tuple(e._cue_voices), ((0, "Speaker A"),))
+        self.assertEqual(tuple(e._cue_voices), ((0, "Speaker A", None),))
         self.assertFalse(e._labels_renewed)
         c._runner.forget_speakers.assert_not_called()
         self.assertEqual(p._unlabelled_before_ms, 0)

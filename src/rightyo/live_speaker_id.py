@@ -268,6 +268,33 @@ class PcmRing:
             self._start = 0
 
 
+@dataclass(frozen=True)
+class PresenceBinding:
+    epoch: int
+    revision: int
+    state: str
+    identity: str | None
+    self_bound: bool
+    self_generation: object
+
+    def matches_entry(self, entry: PresenceBinding, identity: str) -> bool:
+        if (
+            self.state != "bound"
+            or self.identity != identity
+            or self.self_bound
+            or entry.self_bound
+            or self.self_generation is not entry.self_generation
+            or self.epoch != entry.epoch
+        ):
+            return False
+        if entry.state == "bound":
+            return entry.identity == identity and self.revision == entry.revision
+        eligible = entry.state in {"unbound", "unknown", "insufficient"} or (
+            entry.state == "tentative" and entry.identity == identity
+        )
+        return eligible and self.revision == entry.revision + 1
+
+
 @dataclass
 class LabelState:
     """One session label's accumulated evidence and shadow binding."""
@@ -442,6 +469,9 @@ class ShadowSpeakerId:
         # Binding changes invalidate cached authority without resetting label evidence or
         # discarding other queued public turns (the separate forget epoch's job).
         self._binding_revisions: dict[str, int] = {}
+        # A later turn may use a label that was not engaged when an entry was recorded.
+        # Rotate on any self-binding change so all three labels are covered across time.
+        self._self_generation = object()
         self._epoch_lock = threading.Lock()
         self.scored_seconds = 0.0
         self._stop = threading.Event()  # discard pending work and exit
@@ -501,13 +531,28 @@ class ShadowSpeakerId:
     def binding_snapshot(self, label: str):
         """An atomic binding/revision snapshot; detects changes away and back too.
 
-        Only this label's state/identity changes advance its revision, not another
+        Only this label's person or self binding changes advance its revision, not another
         label's binding or new evidence for the same binding. The forget epoch also
         invalidates snapshots across renewal. Never waits for inference; shares the
         brief bookkeeping lock.
         """
         with self._epoch_lock:
             return (self._epoch, self._binding_revisions.get(label, 0)), self.binding(label)
+
+    def presence_snapshot(self, label: str) -> PresenceBinding | None:
+        with self._epoch_lock:
+            if not self.active:
+                return None
+            state, identity = self.binding(label) or ("unbound", None)
+            evidence = self._labels.get(label)
+            return PresenceBinding(
+                self._epoch,
+                self._binding_revisions.get(label, 0),
+                state,
+                identity,
+                evidence is not None and evidence.self_bound,
+                self._self_generation,
+            )
 
     def owner_evidence(self, owners) -> tuple[bool, bool, float]:
         """Owner-voice evidence for `owners` (rightyo#164); never waits on the worker.
@@ -875,9 +920,15 @@ class ShadowSpeakerId:
                     rule = "single"
             if self._self_prints:
                 state.update_self(self_score, seconds, self.settings)
-            if comparable and (
-                previous is None
-                or (previous.state, previous.identity) != (state.state, state.identity)
+            self_changed = state.self_bound != (previous is not None and previous.self_bound)
+            if self_changed:
+                self._self_generation = object()
+            if self_changed or (
+                comparable
+                and (
+                    previous is None
+                    or (previous.state, previous.identity) != (state.state, state.identity)
+                )
             ):
                 self._binding_revisions[label] = self._binding_revisions.get(label, 0) + 1
             self._labels[label] = state
@@ -1250,6 +1301,76 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         (#230): it leaves the binding `name_for` reads untouched. Never blocks or raises.
         """
         return self._lookup(turn)[0]
+
+    @staticmethod
+    def _presence_snapshot(source, label) -> PresenceBinding | None:
+        """Only complete, versioned evidence can support a presence comparison."""
+        try:
+            value = source.presence_snapshot(label)
+            if (
+                isinstance(value, PresenceBinding)
+                and type(value.epoch) is int
+                and value.epoch >= 0
+                and type(value.revision) is int
+                and value.revision >= 0
+                and type(value.self_bound) is bool
+                and type(value.self_generation) is object
+                and (
+                    value.identity is None
+                    and value.state in {"unbound", "unknown", "insufficient"}
+                    or isinstance(value.identity, str)
+                    and value.identity
+                    and value.state in {"bound", "tentative", "unknown", "insufficient"}
+                )
+            ):
+                return value
+        except Exception:  # noqa: BLE001 - unavailable evidence preserves the presence bar
+            pass
+        return None
+
+    def presence_entry(self, turn) -> PresenceBinding | None:
+        entry = self._presence_snapshot(self.source, turn.speaker_id)
+        if entry is None:
+            return None
+        # The worker can rebind between role resolution and insertion into history.
+        binding = None if entry.state == "unbound" else (entry.state, entry.identity)
+        expected = None if binding is None else (turn.utterance_id, turn.speaker_id, binding)
+        return entry if self._resolved == expected else None
+
+    def same_identity_count(self, entries, *, current, engaged) -> int:
+        """Count entries tied to both the bound turn and its engaged comparison partner."""
+        if current is None or engaged is None:
+            return 0
+        keys = {label for label, entry in entries if entry is not None} | {current, engaged}
+        source = self.source
+        before = {key: self._presence_snapshot(source, key) for key in keys}
+        anchor = before[current]
+        partner = before[engaged]
+        if (
+            anchor is None
+            or anchor.self_bound
+            or anchor.state != "bound"
+            or self.priority.configured_role(anchor.identity) not in {"owner", "trusted"}
+            or partner is None
+            or partner.self_bound
+            or partner.state not in {"bound", "tentative"}
+            or partner.identity != anchor.identity
+        ):
+            return 0
+        count = sum(
+            entry is not None
+            and before[label] is not None
+            and before[label].matches_entry(entry, partner.identity)
+            for label, entry in entries
+        )
+        # Require a common read across the labels even if a binding changed away and back.
+        if (
+            count
+            and all(self._presence_snapshot(source, key) == value for key, value in before.items())
+            and self.source is source
+        ):
+            return count
+        return 0
 
     def resolved_by_voiceprint(self, utterance_id: str) -> bool:
         """Whether the latest `role_for`, for this utterance, came from a live
