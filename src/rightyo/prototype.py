@@ -2111,10 +2111,15 @@ class PrototypeController:
                 return
             if self._mode == "stdin":
                 sample = max(self._pending_off_sample or 0, sample)
-                if sample > self._processed_bytes // 2:
+                # The privacy audit covers every received byte, including a later chunk
+                # that may still be in flight after the target was reached.
+                if (
+                    self._processed_bytes == self._received_bytes
+                    and sample <= self._processed_bytes // 2
+                ):
+                    self._apply_positioned_off(sample)
+                else:
                     self._pending_off_sample = sample
-                    return
-                self._apply_positioned_off(sample)
             else:
                 self._apply_duck(False, self._received_ms)
 

@@ -715,7 +715,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                 self.assertEqual(s.offered, 0)
 
     def test_positioned_off_after_a_silent_chunk_preserves_the_bound_owner(self):
-        for timing in ("before", "during", "both"):
+        for timing in ("before", "during", "both", "during_next_chunk"):
             with self.subTest(timing=timing):
                 controller, events, shadow, processor, notes, _ = self.arrange()
                 controller._mode = "stdin"
@@ -726,14 +726,22 @@ class PrivacyMinimumTests(unittest.TestCase):
                 if timing in ("before", "both"):
                     controller.duck_after_sample(3200)
 
+                edge_ms = 200
+                if timing == "during_next_chunk":
+                    controller._feed(
+                        controller._generation, processor, bytes(6400), "stdin", shadow
+                    )
+                    edge_ms = 400
+
                 push_pcm16 = processor.push_pcm16
 
                 def push(pcm):
-                    if timing in ("during", "both"):
+                    if timing != "before":
                         controller.duck_after_sample(3200)
                     self.assertEqual(controller._pending_off_sample, 3200)
                     self.assertTrue(events.ducked)
                     push_pcm16(pcm)
+                    self.assertTrue(events.ducked)
 
                 with (
                     patch.object(processor, "push_pcm16", push),
@@ -742,9 +750,9 @@ class PrivacyMinimumTests(unittest.TestCase):
                     controller._feed(
                         controller._generation, processor, bytes(6400), "stdin", shadow
                     )
-                apply.assert_called_once_with(False, now_ms=200, ack=False)
+                apply.assert_called_once_with(False, now_ms=edge_ms, ack=False)
                 self.assertIsNone(controller._pending_off_sample)
-                self.assertEqual(events._duck_spans, [[0, 200]])
+                self.assertEqual(events._duck_spans, [[0, edge_ms]])
                 self.assertIn("diarizer_private_frames=0 forget=skipped", notes[-1])
                 self.assertEqual(shadow.binding("Speaker A"), ("bound", "owner"))
                 self.assertEqual(events._roles["Speaker A"], "owner")

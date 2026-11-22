@@ -1542,11 +1542,12 @@ and media mode's `{"media": true|false}`
 When `started.capabilities.duck_after_sample` is `1`, the child can apply a privacy-off
 change at an exact stream position. The host sends `{"duck": false, "after_sample": N}`,
 where N is a non-negative integer counting complete 16 kHz mono s16le samples written
-to stdin since session start. If the session has already been fed N samples, the off
-applies immediately. Otherwise privacy stays on through the entire chunk that reaches
-or passes N. In both cases, round the end of the last fed chunk and N/16 up to whole
-milliseconds and use the later value as the off edge. The existing counts report runs
-when the off applies.
+to stdin since session start. If the processor has finished at least N samples and
+no push is in flight, the off applies immediately. If a control arrives during a
+push, that chunk stays private even if an earlier chunk reached N. A pending off
+applies after the first push that finishes with at least N samples processed.
+Round the end of the last fed chunk and N/16 up to whole milliseconds and use the
+later value as the off edge. The existing counts report runs when the off applies.
 
 While an off is pending, another positioned off keeps the larger N. A new
 `{"duck": true}` cancels the pending off and receives the usual on acknowledgement.
