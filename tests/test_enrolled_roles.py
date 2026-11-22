@@ -309,15 +309,17 @@ class EnrolledRolesProviderTests(unittest.TestCase):
         """
         embedder = ToneEmbedder()
         lines = []
+        inferred_turns = (False, True, True, True, True)
         shadow = ShadowSpeakerId(
             settings(bind_min_seconds=1.0),
             report=lines.append,
+            queue_size=len(inferred_turns),
             embedder_factory=lambda _settings: embedder,
             entries=lambda _settings: [dict(entry) for entry in ENTRIES],
         )
-        shadow.start()
         received = 0
-        for index, inferred in enumerate((False, True, True, True, True)):
+        # Admit the entire burst before the worker can free a slot (#264).
+        for index, inferred in enumerate(inferred_turns):
             if inferred:
                 # 2 s of the guest, then 1 s of the owner joined under the guest's label.
                 shadow.audio(tone(2.0, GUEST_F0) + tone(1.0, OWNER_F0))
@@ -328,6 +330,7 @@ class EnrolledRolesProviderTests(unittest.TestCase):
             current = turn(f"g{index}", received, end, "x", "Speaker B")
             shadow.turn(current, inferred=inferred, spans=((received, received + 2000),))
             received = end
+        shadow.start()
         shadow.close(drain=True)
         self.assertEqual(embedder.frames["owner"], 0)
         self.assertEqual((shadow.scored, shadow.inferred, shadow.offered), (5, 4, 5))

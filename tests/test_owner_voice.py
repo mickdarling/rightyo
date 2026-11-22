@@ -334,13 +334,15 @@ class ShadowOwnerEvidenceTests(unittest.TestCase):
         shadow.close(drain=True)
 
     def test_a_guest_binding_is_not_an_owner_binding(self):
-        harness = RouteHarness(VoiceEmbedder(unit(0, 1, 0)), route=None)
-        harness.shadow.start()
-        for _ in range(5):
+        turn_count = 5
+        harness = Harness(VoiceEmbedder(unit(0, 1, 0)), queue_size=turn_count)
+        # All five guest turns must be admitted even if the worker starts late.
+        for _ in range(turn_count):
             harness.speak(5.0)
-        wait_for(lambda: harness.shadow.scored == 5)
+        harness.shadow.start()
+        self.addCleanup(harness.shadow.close, drain=True)
+        wait_for(lambda: harness.shadow.scored == turn_count)
         self.assertEqual(harness.shadow.owner_evidence(("owner",)), (True, False, 25.0))
-        harness.shadow.close(drain=True)
 
     def test_stderr_notes_carry_the_route(self):
         harness = RouteHarness(VoiceEmbedder(unit(1, 0, 0)), route="usb_audio")
