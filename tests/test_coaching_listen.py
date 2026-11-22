@@ -397,6 +397,7 @@ class CoachingListenTests(unittest.TestCase):
         )
         self.assertNotIn("meeting", started)
         self.assertNotIn("duck", started)
+        self.assertNotIn("duck_after_sample", started["capabilities"])
         # No PCM is offered: qualification and startup alone establish the boundary.
         child.process.stdin.close()
         child.exited(0)

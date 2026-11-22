@@ -175,12 +175,13 @@ MAX_CONTROL_LINE = 512
 
 
 def _read_control(fd: int, controller) -> None:
-    """Forward the host's reply reports to the session until EOF (#124).
+    """Forward the host's control lines to the session until EOF (#124).
 
     Bounded lines of `{"reply": "started"}` or `{"reply": "ended"}` (an ended reply may add
     `"asked": true` when it ended with a question, #199), and the host's media mode
     `{"media": true}` or `{"media": false}` (hailing-station #551), and its duck mode
-    `{"duck": true}` or `{"duck": false}` (hailing-station #735), and meeting mode
+    `{"duck": true}`, `{"duck": false}` or `{"duck": false, "after_sample": N}`
+    (N complete stdin samples since session start), and meeting mode
     `{"meeting": true|false}` (hailing-station#735 meeting mode (#227)); anything else is
     reported on stderr (content-free) and skipped. The reader never ends the session.
     """
@@ -256,6 +257,7 @@ def _apply_self_voice(message, controller):
 
 
 def _apply_control(line: bytes, controller) -> None:
+    """Apply one control. Only privacy-off accepts an exact stdin sample position."""
     try:
         message = json.loads(line, object_pairs_hook=_unique_control_keys)
         if not isinstance(message, dict) or set(message) not in (
@@ -263,6 +265,7 @@ def _apply_control(line: bytes, controller) -> None:
             {"reply", "asked"},
             {"media"},
             {"duck"},
+            {"duck", "after_sample"},
             {"meeting"},
             {"request_outcome"},
             WINDOW_KEYS,
@@ -275,6 +278,10 @@ def _apply_control(line: bytes, controller) -> None:
             controller.request_outcome(message["request_outcome"])
         elif "media" in message:
             controller.media(message["media"])
+        elif "after_sample" in message:
+            if message["duck"] is not False:
+                raise ValueError
+            controller.duck_after_sample(message["after_sample"])
         elif "duck" in message:
             controller.duck(message["duck"])
         elif "meeting" in message:

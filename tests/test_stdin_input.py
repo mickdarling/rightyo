@@ -24,7 +24,7 @@ import rightyo
 from rightyo.capture import PCM_CHUNK_BYTES, StdinPcmCapture
 from rightyo.contracts import Turn
 from rightyo.prototype import PrototypeConfig, PrototypeController, PrototypeError
-from rightyo.tool import listen
+from rightyo.tool import _apply_control, listen
 from rightyo.tool_events import SpeechEvents
 
 
@@ -242,7 +242,8 @@ class StdinListenTests(unittest.TestCase):
             {"source": "stdin", "encoding": "s16le", "sample_rate": 16000, "channels": 1},
         )
         self.assertEqual(
-            sorted(events[0]["capabilities"]), ["activation", "context", "partials", "speakers"]
+            sorted(events[0]["capabilities"]),
+            ["activation", "context", "duck_after_sample", "partials", "speakers"],
         )
         self.assertTrue(all(e["turn"]["provenance"] == "causal-replay" for e in events[1:3]))
         self.assertEqual(events[-1]["phase"], "stopped")
@@ -252,6 +253,62 @@ class StdinListenTests(unittest.TestCase):
         (processor,) = Processor.instances
         self.assertEqual(bytes(processor.received), pcm[:-1])
         self.assertTrue(processor.finished and processor.closed)
+
+    def _positioned_off_session(self, chunks, after_sample):
+        notes = []
+        events = SpeechEvents(report=notes.append)
+        events.duck(True, now_ms=0)
+        first_push, resume = threading.Event(), threading.Event()
+
+        class PausedProcessor(Processor):
+            def push_pcm16(self, pcm):
+                if not self.received:
+                    first_push.set()
+                    if not resume.wait(10):
+                        raise AssertionError("first push timed out")
+                super().push_pcm16(pcm)
+
+        controller = PrototypeController(
+            PrototypeConfig.load(self.config),
+            event_publisher=events,
+            processor_factory=PausedProcessor,
+            audio_input=io.BytesIO(bytes(PCM_CHUNK_BYTES * chunks)),
+            audio_provenance="causal-replay",
+            report=notes.append,
+        )
+        self.addCleanup(controller.close)
+        controller.start({"mode": "stdin", "session_id": self.args.session_id})
+        try:
+            self.assertTrue(first_push.wait(5))
+            # The position counts samples fed to the session.
+            reader = controller._stdin_capture._reader
+            reader.join(5)
+            self.assertFalse(reader.is_alive())
+            _apply_control(json.dumps({"duck": False, "after_sample": after_sample}), controller)
+            self.assertTrue(events.ducked)
+            self.assertFalse(any(note.startswith("privacy off:") for note in notes))
+        finally:
+            resume.set()
+        controller._audio_thread.join(5)
+        self.assertEqual(controller.snapshot()["phase"], "complete")
+        controller.stop()
+        stream = events.drain()
+        self.assertEqual(stream[-1]["phase"], "stopped")
+        turns = [e["turn"]["utterance_id"] for e in stream if e["type"] == "transcript"]
+        return events, turns, notes
+
+    def test_after_sample_uses_fed_stdin_and_protects_the_whole_crossing_chunk(self):
+        events, turns, notes = self._positioned_off_session(15, 9 * PCM_CHUNK_BYTES // 2 + 1)
+        # The synthetic processor finalizes turns on chunks 5, 10 (crossing) and 15.
+        self.assertEqual(turns, ["stdin-15"])
+        self.assertEqual(events._duck_spans, [[0, 2000]])
+        self.assertTrue(any(note.startswith("privacy off:") for note in notes))
+
+    def test_eof_before_after_sample_keeps_privacy_on_without_an_off_report(self):
+        events, turns, notes = self._positioned_off_session(5, 5 * PCM_CHUNK_BYTES // 2 + 1)
+        self.assertTrue(events.ducked)
+        self.assertEqual(turns, [])
+        self.assertFalse(any(note.startswith("privacy off:") for note in notes))
 
     def test_stdin_mode_never_reaches_the_web_lab_without_a_stream(self):
         config = PrototypeConfig.load(self.config)

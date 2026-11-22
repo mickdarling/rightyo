@@ -55,6 +55,8 @@ available, or `"disabled"` for transcription-only listening, `partials: false`,
 `speakers: "anonymous"` (or `"enrolled"` when [speaker roles](#speaker-roles-and-owner-override)
 are configured), and `context: true`. With host echo tags enabled, ordinary stdin
 listeners also advertise `self_echo: 1` (see [host echo tags](#host-echo-tags)).
+A `started` event with the top-level `duck` object also advertises
+`duck_after_sample: 1` for [privacy-off at an exact stream position](#privacy-mode-internally-duck-v3).
 Mock replay decisions are identified
 by `provider: "mock"` and `model: "mock-v1"`; they are fixture rules. A local
 listener without Jev opt-in emits no invented attention decisions.
@@ -1535,9 +1537,24 @@ still be sent the audio heard while private: the host then refuses privacy mode 
 why (fail closed). With `listen --mode stdin --control-fd N` the host turns it on and off
 with the JSON lines `{"duck": true}` and `{"duck": false}`, beside the reply lines above
 and media mode's `{"media": true|false}`
-([hailing-station #551](https://github.com/mickdarling/hailing-station/issues/551)). A
-non-boolean value or any other key is a malformed line: skipped with a content-free
-stderr note, like any other.
+([hailing-station #551](https://github.com/mickdarling/hailing-station/issues/551)).
+
+When `started.capabilities.duck_after_sample` is `1`, the child can apply a privacy-off
+change at an exact stream position. The host sends `{"duck": false, "after_sample": N}`,
+where N is a non-negative integer counting complete 16 kHz mono s16le samples written
+to stdin since session start. If the processor has finished at least N samples and
+no push is in flight, the off applies immediately. If a control arrives during a
+push, that chunk stays private even if an earlier chunk reached N. A pending off
+applies after the first push that finishes with at least N samples processed.
+Round the end of the last fed chunk and N/16 up to whole milliseconds and use the
+later value as the off edge. The existing counts report runs when the off applies.
+
+While an off is pending, another positioned off keeps the larger N. A new
+`{"duck": true}` cancels the pending off and receives the usual on acknowledgement.
+Plain `{"duck": false}` applies immediately. Ending the session before N leaves the
+pending off unapplied. The child skips malformed controls with a content-free stderr
+note. The duck value must be boolean. Only false accepts `after_sample`. Duplicate or
+additional keys are invalid.
 
 ### The on ack
 
@@ -1558,10 +1575,9 @@ standard envelope:
 - **One ack per applied on-line**, a redundant one included: an on while already private
   is acked too, since a host counts acks against the on-lines it wrote (two ons before the
   first ack, or an on after an off-write that failed, each get one).
-- **Never** for `{"duck": false}`; for a refused line (malformed, or refused because a hosted
-  transcriber or diarizer is configured); for the `--start-private` duck, whose `started`
-  (`"private": true`) is the proof and whose ack would be an excess the host refuses; or for
-  a session that advertised no `duck` (`--coaching`, `tool-replay`). Only in a running session.
+- **Only a running session that advertised `duck` can ack.** Neither form of privacy-off
+  receives an ack. The child also skips the ack for refused controls. For `--start-private`,
+  the `started` event with `"private": true` confirms the initial state.
 - If the ack cannot be queued (the event backlog is full, which ends the session as any
   backlog failure does), privacy is still applied, the control reader keeps running and
   later lines (an off included) still apply, with the content-free stderr note
@@ -1597,7 +1613,7 @@ The only events a private turn can produce carry no words:
   "<name>, I'm back" (or "I am back"), "<name>, start listening", "<name>, privacy off"
   (or "privacy mode off"). It needs a configured name or variant of up to three words,
   directly followed by the phrase. rightyo does not leave privacy mode itself: the host
-  decides and sends `{"duck": false}`.
+  decides and sends the privacy-off control.
 - **`action: "status"`**: anyone asked "what mode am I in", "are you recording" or "are
   you listening", with or without the name. The host answers from its own state.
 
@@ -1819,9 +1835,8 @@ The single-sentence exit-only RAM buffer described above applies from startup, a
 session's privacy span starts at 0 on the audio clock. `started` reports it:
 `"duck": {"version": 3, "private": true}` (the key is present only when the session
 starts private). That `started` is the proof the session is private: the start-private duck
-is never acked. Only the host's `{"duck": false}` (with `--control-fd`) leaves privacy;
-the option is never a way out, and without a control descriptor the whole session stays
-private. With enrollment and live roles, the local matcher can authenticate an exit
+is never acked. Only the host's privacy-off control (with `--control-fd`) leaves privacy.
+Without a control descriptor the whole session stays private. With enrollment and live roles, the local matcher can authenticate an exit
 from its own buffered sentence without a previous binding, and emits `privacy` `exit`
 for the host to act on. Private speech still builds no label or owner evidence.
 A session that would not
@@ -1925,9 +1940,8 @@ private speech may have happened, though not when.
 
 The mode is held across sessions, like media mode, and emits nothing when it
 changes; a session that starts with it on counts from its start. The host keeps privacy
-and media mode exclusive. After `{"duck": false}`, normal behaviour resumes for speech
-heard after the off, with nothing from the private window in memory or context. Speech
-between the owner's spoken exit and the host's `{"duck": false}` was heard in privacy
+and media mode exclusive. Normal behaviour resumes for speech heard after the off
+applies. Speech between the owner's spoken exit and the applied off was heard in privacy
 mode, so it is dropped, and the owner repeats a request said in that moment.
 
 ### Released at once

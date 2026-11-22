@@ -714,6 +714,50 @@ class PrivacyMinimumTests(unittest.TestCase):
                     self.assertFalse(bool(c._private_sentence.pcm))
                 self.assertEqual(s.offered, 0)
 
+    def test_positioned_off_after_a_silent_chunk_preserves_the_bound_owner(self):
+        for timing in ("before", "during", "both", "during_next_chunk"):
+            with self.subTest(timing=timing):
+                controller, events, shadow, processor, notes, _ = self.arrange()
+                controller._mode = "stdin"
+                shadow._labels["Speaker A"] = LabelState(state="bound", identity="owner", seconds=4)
+                shadow._bound_ids.add("owner")
+                events._roles["Speaker A"] = "owner"
+                controller.duck(True)
+                if timing in ("before", "both"):
+                    controller.duck_after_sample(3200)
+
+                edge_ms = 200
+                if timing == "during_next_chunk":
+                    controller._feed(
+                        controller._generation, processor, bytes(6400), "stdin", shadow
+                    )
+                    edge_ms = 400
+
+                push_pcm16 = processor.push_pcm16
+
+                def push(pcm):
+                    if timing != "before":
+                        controller.duck_after_sample(3200)
+                    self.assertEqual(controller._pending_off_sample, 3200)
+                    self.assertTrue(events.ducked)
+                    push_pcm16(pcm)
+                    self.assertTrue(events.ducked)
+
+                with (
+                    patch.object(processor, "push_pcm16", push),
+                    patch.object(events, "duck", wraps=events.duck) as apply,
+                ):
+                    controller._feed(
+                        controller._generation, processor, bytes(6400), "stdin", shadow
+                    )
+                apply.assert_called_once_with(False, now_ms=edge_ms, ack=False)
+                self.assertIsNone(controller._pending_off_sample)
+                self.assertEqual(events._duck_spans, [[0, edge_ms]])
+                self.assertIn("diarizer_private_frames=0 forget=skipped", notes[-1])
+                self.assertEqual(shadow.binding("Speaker A"), ("bound", "owner"))
+                self.assertEqual(events._roles["Speaker A"], "owner")
+                self.assertFalse(processor._speaker_reset)
+
     def test_silent_privacy_keeps_every_public_label_state_and_next_owner_role(self):
         c, e, s, p, notes, _ = self.arrange()
         s._labels["Speaker A"] = LabelState(state="bound", identity="owner", seconds=4)
