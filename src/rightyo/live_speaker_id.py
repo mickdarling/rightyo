@@ -1448,6 +1448,16 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         resolved = self._resolved
         return resolved is not None and resolved[0] == utterance_id
 
+    def resolved_owner_identity(self, turn) -> str | None:
+        """The enrolled owner from this turn's last role resolution, without a second lookup."""
+        resolved = self._resolved
+        if resolved is None or resolved[:2] != (turn.utterance_id, turn.speaker_id):
+            return None
+        state, identity = resolved[2]
+        if state == "bound" and self.priority.configured_role(identity) == "owner":
+            return identity
+        return None
+
     def note_spans(self, utterance_id: str, spans) -> None:
         """The label's own timeline pieces of the turn about to be published (#148), for its
         entry voice check; only the latest is kept, as `role_for` keeps its binding."""

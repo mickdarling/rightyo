@@ -67,9 +67,13 @@ class Span:
 class SelfVoice:
     """One session. All accesses are serialized by the controller."""
 
-    def __init__(self, config):
+    def __init__(self, config, *, track_spoken_replies=False):
         self.config = config
         self.windows = {}
+        # Veto-only history. Evicting a window removes its echo classification
+        # authority, but cannot establish that a pending owner turn was playback-free.
+        self.evicted_windows = deque(maxlen=MAX_WINDOWS if track_spoken_replies else 0)
+        self.evicted_until = 0
         self.spans = []
         self.mixed_lost_until = 0
         self.empty_closes = deque(maxlen=MAX_WINDOWS)
@@ -129,6 +133,11 @@ class SelfVoice:
             or (end is None and tail != window.tail)
         ):
             return
+        if window is None and end is not None:
+            # A measured close also resolves a matching, evicted open window.
+            for key, old in self.evicted_windows:
+                if key == reply and old.from_sample == from_sample and old.end is None:
+                    old.end, old.tail = end, tail
         if end is not None and end + tail <= start:
             # Remember the explicit close without retaining an empty region.
             self.empty_closes.append(reply)
@@ -153,7 +162,13 @@ class SelfVoice:
                 ]
             return
         if len(self.windows) == MAX_WINDOWS:
-            self._remove_window(next(iter(self.windows)))
+            oldest = next(iter(self.windows))
+            if self.evicted_windows.maxlen:
+                if len(self.evicted_windows) == self.evicted_windows.maxlen:
+                    _, lost = self.evicted_windows[0]
+                    self.evicted_until = max(self.evicted_until, lost.region_end(lost.expires))
+                self.evicted_windows.append((oldest, self.windows[oldest]))
+            self._remove_window(oldest)
         self.windows[reply] = Window(
             start, end, received + OPEN_MS, tail, from_sample, eligible_from=start
         )
@@ -211,6 +226,17 @@ class SelfVoice:
 
     def overlaps_window(self, start, end, received):
         return any(w.start < end and start < w.region_end(received) for w in self.windows.values())
+
+    def overlaps_spoken_reply(self, start, end):
+        """Whether retained or lost playback evidence vetoes the owner exception."""
+        return (
+            start < max(self.mixed_lost_until, self.evicted_until)
+            or self.overlaps_window(start, end, end)
+            or any(
+                max(start, w.start) < min(end, w.region_end(end)) for _, w in self.evicted_windows
+            )
+            or any(s.kind == "mixed" and s.start < end and start < s.end for s in self.spans)
+        )
 
     def contains(self, start, end, received):
         """Read-only window eligibility at turn acceptance."""

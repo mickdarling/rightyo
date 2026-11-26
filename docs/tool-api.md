@@ -803,12 +803,14 @@ of per-turn attention.
 event, no follow-ups, byte-identical fixtures. Turn it on with the configuration's
 `"conversation": {}` object; `session.started` then advertises it as a top-level
 `conversation` object, and a host that accepts that object must accept `conversation`
-events. The object takes ten optional keys:
+events. The object takes the following optional keys:
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
 | `window_ms` | 20,000 | 1,000 to 120,000 | How long after a request turn ends its speaker stays engaged |
 | `follow_up_min_probability` | 0.4 | above 0, up to 1 | The attend probability an engaged speaker's `uncertain` turn needs to become a follow-up |
+| `answer_follow_up_min_probability` | absent (off) | above 0, up to 1 | Optional lower attend floor for the engaged, voiceprint-bound owner's answer or instruction after a spoken reply |
+| `answer_follow_up_window_ms` | 3,000 | 1 to 5,000 | Maximum time from the end of the spoken answer to the start of the owner's turn |
 | `closing_phrases` | "that's all", "that's it", "thanks, that's all", "never mind", and so on | up to 16 | Phrases that end the conversation (see [closings](#closings)) |
 | `appendix_ms` | 0 (off) | 0 to 5,000 | How soon after a request ends the same speaker's next turn counts as an appendix to it (see below) |
 | `cue_when_others_ms` | 0 (off) | 0 to 120,000 | Apply the meeting attention bar automatically while another voice was recently heard (see below) |
@@ -862,7 +864,7 @@ synthetic replay tests do not establish live speaker or addressee accuracy.
 window (after the request that engaged and before the window ends, whatever order
 decisions arrive in) forms a request when all of these hold:
 - its decision is `uncertain` (a confident `ignore` never is a follow-up);
-- Jev's attend probability is at least `follow_up_min_probability`;
+- Jev's attend probability reaches the applicable follow-up floor (see below for the spoken-answer exception and appendices);
 - its recipient is `system` or `unknown` (never `other_human` or another speaker);
 - it is not a closing phrase;
 - it is not courtesy-only, unless it names the assistant or a question the assistant
@@ -892,7 +894,7 @@ decisions arrive in) forms a request when all of these hold:
     sit".
 
   With `cue_min_attend` set, a follow-up whose attend probability reaches it needs no cue.
-  It only matters above `follow_up_min_probability`, which is checked first.
+  The follow-up probability check runs before this cue waiver.
 
   With `continuation_cue` ([#213](https://github.com/mickdarling/rightyo/issues/213)), the
   engaged speaker's own turn needs no cue once the assistant has begun replying to the
@@ -917,6 +919,25 @@ The content-free follow-up diagnostic is
 `follow_up outcome=refused reason=courtesy attend=… bar=…`; it includes no text or ids.
 Existing refusal reasons such as `closing`, `below_bar`, `no_cue`, `no_cue_others` and
 `others_present` retain their meaning. Direct model `attend` decisions are unchanged.
+
+With `answer_follow_up_min_probability` set, a turn below the usual floor can qualify if
+its recipient is `system` and the same enrolled owner held the binding for both the
+engaged request and the new turn. The turn must start within the engagement window and
+within `answer_follow_up_window_ms` of that request's `reply_ended`, measured on the
+received-audio clock. A legacy host can identify a spoken question with `reply: ended`
+and `asked: true`. The latest delivered request must still hold the engagement, with
+no other request awaiting an identifiable reply. A reported start and end must agree
+on the request. Scoped reporting retires earlier legacy questions.
+Publication alone and acknowledgement clips provide no playback confirmation for this rule.
+The turn must reach the configured lower floor and either answer a pending host-marked
+question or give a directed instruction such as “Check the schedule” or “Repeat your
+last answer”. The English cue matches complete, short constructions. Extra clauses,
+trailing names, and richer objects such as “the revised summer timetable” need the
+ordinary floor. A later clip takes effect at its audio boundary, so an earlier completed
+answer can still qualify while its decision is pending. Inferred speaker
+labels and turns overlapping playback, including host-reported sample windows, are
+ineligible for the lower floor. The follow-up diagnostic records the floor used for the
+comparison. All other follow-up checks still apply.
 
 **Appendices** ([#199](https://github.com/mickdarling/rightyo/issues/199)). With
 `appendix_ms` above 0, the engaged speaker's `uncertain` turn that starts within that long

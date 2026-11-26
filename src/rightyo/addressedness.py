@@ -320,6 +320,78 @@ def answer_shaped(text: str) -> bool:
     return bool(words) and (words[0] in _ANSWER_WORDS or tuple(words[:2]) in _ANSWER_PAIRS)
 
 
+# These match the *whole* complement of an imperative. Extra words may be a
+# vocative or narration. Leave richer, ambiguous noun phrases to the ordinary bar.
+_SIMPLE_OBJECT = re.compile(r"(?:the|a|an|my|our) [a-z]+(?: for [a-z]+)?")
+_REPLY_OBJECT = re.compile(r"(?:the|your) (?:(?:last|previous) )?(?:answer|reply|response|summary)")
+_TASK_OBJECT = {
+    "set": re.compile(r"a timer for (?:[a-z]+|[0-9]+) (?:seconds?|minutes?|hours?)"),
+    "add": re.compile(r"[a-z]+ to (?:the|my|our) (?:[a-z]+ )?list"),
+}
+_SELECTED_OPTION = re.compile(
+    r"(?:(?:keep|use|do) )?"
+    r"(?:(?:both|either|neither)(?: copies| options)?|the (?:first|second|other) one)"
+)
+
+
+def _instruction(words: list[str]) -> bool:
+    first = next((i for i, word in enumerate(words) if word not in _VERB_LEAD), len(words))
+    words = words[first:]
+    if len(words) >= 2 and words[0] in _MODALS and words[1] == "you":
+        words = words[2:]
+        if words[:1] == ["please"]:
+            words = words[1:]
+    if len(words) < 2:
+        return False
+    verb, obj = words[0], words[1:]
+    if verb not in _REQUEST_VERBS and verb not in _OUTPUT_VERBS:
+        return False
+    phrase = " ".join(obj)
+    if phrase in _OBJECTS:
+        return True
+    if "your" in obj or verb == "repeat":
+        return bool(_REPLY_OBJECT.fullmatch(phrase))
+    if verb == "make" and len(obj) == 2:
+        return obj[0] in _OBJECTS and obj[1] in _ADJUSTMENTS and obj[1].endswith("er")
+    return bool(
+        (verb in _TASK_OBJECT and _TASK_OBJECT[verb].fullmatch(phrase))
+        or (
+            verb in _REQUEST_VERBS
+            and (phrase in {"both", "all", "either", "neither"} or _SIMPLE_OBJECT.fullmatch(phrase))
+        )
+    )
+
+
+def spoken_reply_cue(text: str, *, asked: bool) -> str | None:
+    """Positive evidence for the lower floor only: a directed answer or an imperative (#326)."""
+    # Only commas introduce a separate courtesy or answer. Preserve other internal
+    # punctuation so two sentences cannot look like one imperative.
+    parts = [part.split() for part in text.strip().lower().rstrip(".!?").split(",")]
+    if not all(parts):
+        return None
+    if parts[-1] in (["please"], ["thanks"]):
+        parts.pop()
+    if asked and parts:
+        first = parts[0]
+        prefix = 1 if first[0] in _ANSWER_WORDS else 2
+        if first[0] in _ANSWER_WORDS or tuple(first[:2]) in _ANSWER_PAIRS:
+            tail = [words for words in (first[prefix:], *parts[1:]) if words]
+            if not tail:
+                return "answer"
+            if len(tail) == 1:
+                words = tail[0]
+                if (
+                    _SELECTED_OPTION.fullmatch(" ".join(words))
+                    or _instruction(words)
+                    or tuple(words) in _ANSWER_PAIRS
+                    or words in (["please"], ["i", "do"], ["thank", "you"])
+                ):
+                    return "answer"
+    if len(parts) == 2 and all(word in _VERB_LEAD for word in parts[0]):
+        parts = parts[1:]
+    return "instruction" if len(parts) == 1 and _instruction(parts[0]) else None
+
+
 def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
     """Whether a turn carries a cue that it continues an exchange with the assistant (#199).
 
