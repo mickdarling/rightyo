@@ -30,7 +30,14 @@ ANSWER = "Yes, both copies."
 
 class AnswerFollowUpTests(unittest.TestCase):
     def prepare(
-        self, mode=MODE, *, scoped=True, label_owner=False, identity="owner", self_voice=False
+        self,
+        mode=MODE,
+        *,
+        scoped=True,
+        label_owner=False,
+        identity="owner",
+        self_voice=False,
+        other_agents=("Vega",),
     ):
         self.bindings = {"Speaker A": ("bound", identity), "Speaker B": ("bound", "guest")}
         owners = ("Speaker A",) if label_owner else ("owner", "second-owner")
@@ -43,7 +50,7 @@ class AnswerFollowUpTests(unittest.TestCase):
             conversation=mode,
             priority=roles,
             acknowledgement=Acknowledgement(),
-            other_agents=Addressing.from_names(["Vega"]),
+            other_agents=Addressing.from_names(other_agents) if other_agents else None,
             self_voice=SelfVoiceConfig(enabled=self_voice),
         )
         opening = turn("opening", 0, 800, "List the departures.", provenance="diarization-timeline")
@@ -451,3 +458,179 @@ class AnswerFollowUpTests(unittest.TestCase):
         self.prepare(mode=replace(BASE, continuation_cue=False))
         self.playback(asked=True)
         self.assert_dispatched(self.candidate("No, sit.", attend=0.51), "No, sit.")
+
+    def test_legacy_playback_needs_one_identifiable_delivered_request(self):
+        for late in (False, True):
+            for end_only in (False, True):
+                with self.subTest(late=late, end_only=end_only):
+                    self.prepare(scoped=False)
+                    self.events.reply("ended", 850, asked=True)
+                    older = turn(
+                        "older", 900, 1100, "List the stops.", provenance="diarization-timeline"
+                    )
+                    self.events.transcript(older, 1100)
+                    if not late:
+                        self.events.decision(decided(older, "attend"), 1150)
+                    self.direct_request("newer", 1200, 1600)
+                    if late:
+                        self.events.decision(decided(older, "attend"), 1700)
+                    self.events.drain()
+                    if not end_only:
+                        self.events.reply("started", 1800)
+                    self.events.reply("ended", 2200, asked=True)
+                    self.assertEqual(self.candidate(ANSWER), [])
+
+    def test_next_ordinary_follow_up_uses_revived_audio_window(self):
+        mode = replace(MODE, window_ms=1000, continuation_cue=False)
+        for scoped in (False, True):
+            for start in (3500, 4199, 4200, 5500):
+                with self.subTest(scoped=scoped, start=start):
+                    self.playback_with_clock_gap(mode, scoped, end_only=True)
+                    self.assert_dispatched(self.candidate(ANSWER), ANSWER)
+                    requests = self.candidate(
+                        "And tomorrow?", start=start, attend=0.51, name="next"
+                    )
+                    self.assertEqual(
+                        [r["request_id"] for r in requests],
+                        [SESSION + ":next"] if start < 4200 else [],
+                    )
+
+    def test_delayed_decision_uses_the_question_at_speech_time(self):
+        for asked in (False, True):
+            for start in (2600, 3600):
+                with self.subTest(asked=asked, start=start):
+                    self.prepare(scoped=False)
+                    self.events.reply("ended", 2200, asked=True)
+                    current = turn(
+                        "candidate", start, start + 600, ANSWER, provenance="diarization-timeline"
+                    )
+                    if start == 2600:
+                        self.events.transcript(current, current.end_ms)
+                    self.events.reply("started", 3300)
+                    self.events.reply("ended", 3500, asked=asked)
+                    if start == 3600:
+                        self.events.transcript(current, current.end_ms)
+                    self.events.decision(decided(current, "uncertain", attend=0.44), 4400)
+                    requests = [e for e in self.events.drain() if e["type"] == "request"]
+                    self.assertEqual(
+                        [r["request_id"] for r in requests],
+                        [SESSION + ":candidate"] if start == 2600 or asked else [],
+                    )
+
+    def test_end_only_ack_boundary_vetoes_a_straddling_turn(self):
+        for end, passes in ((2600, True), (2900, False), (3200, True)):
+            with self.subTest(end=end):
+                self.prepare()
+                self.playback()
+                self.events.reply("ended", end)
+                self.assertEqual(bool(self.candidate()), passes)
+
+    def test_later_clip_churn_preserves_pending_evidence_and_overlap(self):
+        for straddled in (True, False):
+            with self.subTest(straddled=straddled):
+                self.prepare(scoped=False)
+                self.events.reply("ended", 2200, asked=True)
+                current = turn("candidate", 2600, 3200, ANSWER, provenance="diarization-timeline")
+                if straddled:
+                    self.events.reply("ended", 2900)
+                self.events.transcript(current, 3200)
+                for at in range(3300, 3500, 10):
+                    self.events.reply("started", at)
+                    self.events.reply("ended", at + 1, asked=True)
+                self.events.decision(decided(current, "uncertain", attend=0.44), 3600)
+                self.assertEqual(
+                    any(e["type"] == "request" for e in self.events.drain()), not straddled
+                )
+
+    def test_evicted_sample_window_and_mixed_tags_veto_only_the_exception(self):
+        for evidence in ("evicted_open", "evicted_closed", "closed_after_eviction", "mixed"):
+            for start in (2600, 3600):
+                with self.subTest(evidence=evidence, start=start):
+                    self.prepare(self_voice=True)
+                    self.playback()
+                    store = self.events.self_voice
+                    if evidence == "mixed":
+                        store.self_echo("clip", 2700, 2800, "mixed", 3200)
+                    else:
+                        end = 3200 if evidence == "evicted_closed" else None
+                        store.reply_window("clip", 2700, end, 0, 2700)
+                        for i in range(8):
+                            store.reply_window(f"other-{i}", 3400 + i, 3500 + i, 0, 3500 + i)
+                        if evidence == "closed_after_eviction":
+                            store.reply_window("clip", 2700, 3200, 0, 3510)
+                    passes = start == 3600 and evidence != "evicted_open"
+                    self.assertEqual(bool(self.candidate(start=start)), passes)
+
+    def test_scoped_negotiation_retires_the_legacy_question(self):
+        self.prepare(scoped=False)
+        self.events.reply("ended", 2200, asked=True)
+        self.report("accepted", 2250)
+        self.events.duck(True, now_ms=2300)
+        self.report("reply_ended", 2400, asked=False)
+        self.events.duck(False, now_ms=2500)
+        self.assertEqual(self.candidate(ANSWER), [])
+
+    def test_narration_and_unpunctuated_vocatives_stay_below_bar(self):
+        for text in (
+            "Read it last summer. Great book!",
+            "Read it last summer.",
+            "Check this out Fido!",
+            "Please check the timetable fido.",
+            "Check the timetable. Fetch!",
+        ):
+            with self.subTest(text=text):
+                self.prepare()
+                self.playback()
+                self.assertEqual(self.candidate(text), [])
+        # A richer object can be a real instruction. It still needs the ordinary floor.
+        for attend in (0.44, 0.51):
+            self.prepare()
+            self.playback()
+            self.assertEqual(
+                bool(self.candidate("Please check the revised summer timetable.", attend=attend)),
+                attend >= 0.5,
+            )
+
+    def test_complete_instructions_supply_their_own_cue(self):
+        for text in (
+            "Please repeat the last answer.",
+            "Please set a timer for five minutes.",
+            "Please add milk to the shopping list.",
+        ):
+            with self.subTest(text=text):
+                self.prepare(mode=replace(MODE, continuation_cue=False))
+                self.playback()
+                self.assert_dispatched(self.candidate(text), text)
+
+    def test_pet_talk_and_exclamations_keep_the_ordinary_floor(self):
+        for mode in (BASE, MODE):
+            for text, ordinary in (("Yes, that's a good boy!", 0.69), ("What a sight!", 0.51)):
+                for attend in (0.44, ordinary):
+                    with self.subTest(mode=mode, text=text, attend=attend):
+                        self.prepare(mode=mode)
+                        self.playback(asked=True)
+                        self.assertEqual(
+                            bool(self.candidate(text, attend=attend)), attend == ordinary
+                        )
+
+    def test_question_needs_a_complete_answer(self):
+        for text, passes in (
+            ("Yes, that’s a good boy!", False),
+            ("Yes, both dogs are tired.", False),
+            ("Yes, I do.", True),
+            ("No, thank you.", True),
+            ("Yes, keep both copies.", True),
+        ):
+            for asked in (False, True):
+                with self.subTest(text=text, asked=asked):
+                    self.prepare(mode=replace(MODE, continuation_cue=False))
+                    self.playback(asked=asked)
+                    self.assertEqual(bool(self.candidate(text)), asked and passes)
+
+    def test_other_agent_veto_on_an_otherwise_eligible_instruction(self):
+        for text in ("Please check the timetable for Vega.", "Please add Vega to the guest list."):
+            for agents in ((), ("Vega",)):
+                with self.subTest(text=text, agents=agents):
+                    self.prepare(other_agents=agents)
+                    self.playback()
+                    self.assertEqual(bool(self.candidate(text)), not agents)

@@ -925,11 +925,16 @@ its recipient is `system` and the same enrolled owner held the binding for both 
 engaged request and the new turn. The turn must start within the engagement window and
 within `answer_follow_up_window_ms` of that request's `reply_ended`, measured on the
 received-audio clock. A legacy host can identify a spoken question with `reply: ended`
-and `asked: true`. If it also reports the start, the same request must own both edges.
+and `asked: true`. The latest delivered request must still hold the engagement, with
+no other request awaiting an identifiable reply. A reported start and end must agree
+on the request. Scoped reporting retires earlier legacy questions.
 Publication alone and acknowledgement clips provide no playback confirmation for this rule.
 The turn must reach the configured lower floor and either answer a pending host-marked
 question or give a directed instruction such as “Check the schedule” or “Repeat your
-last answer”. Either supplies its own cue when `require_cue` is on. Inferred speaker
+last answer”. The English cue matches complete, short constructions. Extra clauses,
+trailing names, and richer objects such as “the revised summer timetable” need the
+ordinary floor. A later clip takes effect at its audio boundary, so an earlier completed
+answer can still qualify while its decision is pending. Inferred speaker
 labels and turns overlapping playback, including host-reported sample windows, are
 ineligible for the lower floor. The follow-up diagnostic records the floor used for the
 comparison. All other follow-up checks still apply.

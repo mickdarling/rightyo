@@ -320,12 +320,18 @@ def answer_shaped(text: str) -> bool:
     return bool(words) and (words[0] in _ANSWER_WORDS or tuple(words[:2]) in _ANSWER_PAIRS)
 
 
-def _request_object(words: list[str]) -> bool:
-    """A pointing word or explicitly introduced noun phrase, e.g. 'both' or 'the schedule'."""
-    return bool(words) and (
-        words[0] in _OBJECTS | {"both", "all", "either", "neither", "me"}
-        or (len(words) > 1 and words[0] in {"the", "a", "an", "my", "our"})
-    )
+# These match the *whole* complement of an imperative. Extra words may be a
+# vocative or narration. Leave richer, ambiguous noun phrases to the ordinary bar.
+_SIMPLE_OBJECT = re.compile(r"(?:the|a|an|my|our) [a-z]+(?: for [a-z]+)?")
+_REPLY_OBJECT = re.compile(r"(?:the|your) (?:(?:last|previous) )?(?:answer|reply|response|summary)")
+_TASK_OBJECT = {
+    "set": re.compile(r"a timer for (?:[a-z]+|[0-9]+) (?:seconds?|minutes?|hours?)"),
+    "add": re.compile(r"[a-z]+ to (?:the|my|our) (?:[a-z]+ )?list"),
+}
+_SELECTED_OPTION = re.compile(
+    r"(?:(?:keep|use|do) )?"
+    r"(?:(?:both|either|neither)(?: copies| options)?|the (?:first|second|other) one)"
+)
 
 
 def _instruction(words: list[str]) -> bool:
@@ -338,28 +344,32 @@ def _instruction(words: list[str]) -> bool:
     if len(words) < 2:
         return False
     verb, obj = words[0], words[1:]
-    if "your" in obj:
-        # 'Repeat your last answer' acts on assistant output. 'Call your mom' does not.
-        if obj[0] != "your":
-            return False
-        output = obj[2:] if obj[1:2] in (["last"], ["previous"]) else obj[1:]
-        return verb in _REQUEST_VERBS | _OUTPUT_VERBS and output in (
-            ["answer"],
-            ["reply"],
-            ["response"],
-            ["summary"],
+    if verb not in _REQUEST_VERBS and verb not in _OUTPUT_VERBS:
+        return False
+    phrase = " ".join(obj)
+    if phrase in _OBJECTS:
+        return True
+    if "your" in obj or verb == "repeat":
+        return bool(_REPLY_OBJECT.fullmatch(phrase))
+    if verb == "make" and len(obj) == 2:
+        return obj[0] in _OBJECTS and obj[1] in _ADJUSTMENTS and obj[1].endswith("er")
+    return bool(
+        (verb in _TASK_OBJECT and _TASK_OBJECT[verb].fullmatch(phrase))
+        or (
+            verb in _REQUEST_VERBS
+            and (phrase in {"both", "all", "either", "neither"} or _SIMPLE_OBJECT.fullmatch(phrase))
         )
-    return (verb in _REQUEST_VERBS and _request_object(obj)) or (
-        verb in _OUTPUT_VERBS and obj[0] in _OBJECTS
     )
 
 
 def spoken_reply_cue(text: str, *, asked: bool) -> str | None:
     """Positive evidence for the lower floor only: a directed answer or an imperative (#326)."""
-    # Keep comma boundaries: a vocative or a second, redirected command is not part of
-    # the object. Allow a courtesy lead/tail and the content of an affirmative or negative.
-    parts = [words for part in text.lower().split(",") if (words := _LETTERS.findall(part))]
-    if parts and parts[-1] in (["please"], ["thanks"]):
+    # Only commas introduce a separate courtesy or answer. Preserve other internal
+    # punctuation so two sentences cannot look like one imperative.
+    parts = [part.split() for part in text.strip().lower().rstrip(".!?").split(",")]
+    if not all(parts):
+        return None
+    if parts[-1] in (["please"], ["thanks"]):
         parts.pop()
     if asked and parts:
         first = parts[0]
@@ -371,9 +381,10 @@ def spoken_reply_cue(text: str, *, asked: bool) -> str | None:
             if len(tail) == 1:
                 words = tail[0]
                 if (
-                    _request_object(words)
+                    _SELECTED_OPTION.fullmatch(" ".join(words))
                     or _instruction(words)
-                    or words in (["please"], ["go", "ahead"], ["do", "it"], ["do", "both"])
+                    or tuple(words) in _ANSWER_PAIRS
+                    or words in (["please"], ["i", "do"], ["thank", "you"])
                 ):
                     return "answer"
     if len(parts) == 2 and all(word in _VERB_LEAD for word in parts[0]):
