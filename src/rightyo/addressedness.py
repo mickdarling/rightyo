@@ -12,9 +12,9 @@ for the assistant, without making a name a trigger:
   meant for the assistant; a different speaker starting to talk is evidence it was meant
   for that person.
 
-`request_shaped` is a small deterministic placeholder for the per-turn intent of #85: it
-only decides which turns are worth holding a little longer to observe the gap. It is not
-an addressedness judgement and never forms a request on its own.
+`request_shaped` identifies possible requests for the post-turn gap hold. The opt-in
+guest policy also uses it to distinguish short owner requests from ambiguous fragments.
+It never forms a request on its own.
 
 `dismissal_shaped` is its counterpart for natural dismissals (#98): a short turn that
 sounds like "stop", "never mind" or "go away" is released at once instead of waiting for
@@ -307,6 +307,106 @@ _CORRECTIONS = frozenset({("you", "mean"), ("i", "meant")})
 # How an answer to the assistant's own question opens ("Yes, do both", "Go ahead") (#199).
 _ANSWER_WORDS = frozenset("yes yeah yep yup sure no nope okay ok".split())
 _ANSWER_PAIRS = frozenset({("go", "ahead"), ("do", "it"), ("sounds", "good")})
+
+# After an undelimited name, an auxiliary can introduce a statement about its subject
+# ("Beacon was offline", "Beacon can read"). Look for question word order there.
+_AUXILIARIES = frozenset(
+    "can could would will should shall may might is are am was were does did has".split()
+)
+_RELATIVE_OPENERS = frozenset({"which", "who", "whom", "whose", "when", "where"})
+_STATEMENT_PREDICATE = re.compile(
+    r"(?:(?:is|was|are|were|has|had|does)(?:n't)?|didn't|seems|seemed|appears|appeared|"
+    r"looks|looked|sounds|sounded|works|worked|says|said|used\s+to)\b"
+)
+
+
+def vocative_request_tail(text: str, *, delimited: bool = False) -> bool:
+    """After an opening name, a delimiter supplies address evidence on its own."""
+    if not delimited:
+        return vocative_request_clause(text, delimited=False)
+
+    clause = text.strip().lower().replace("’", "'")
+    words = _WORDS.findall(clause)
+    if not words or words[0] in _RELATIVE_OPENERS or words[:2] == ["that", "is"]:
+        return False
+    if _STATEMENT_PREDICATE.match(clause):
+        return False
+    if words[0] == "did":
+        # With an inverted subject, "did you describe ..." can use any verb.
+        # In "did you a favor", 'you' is the object and a noun phrase follows.
+        return (
+            len(words) >= 3
+            and words[1] in {"you", "i", "we", "he", "she", "it", "they"}
+            and words[2] not in {"a", "an", "the"}
+        )
+    # In "Beacon, my old assistant, was offline", the predicate resumes after
+    # the appositive. A trailing question ("..., was it slow?") can still be directed.
+    parts = re.split(r"[,—–]\s*", clause, maxsplit=1)
+    if len(parts) == 2 and _STATEMENT_PREDICATE.match(parts[1]):
+        return parts[1].endswith("?") and vocative_request_clause(parts[1], delimited=True)
+    return True
+
+
+def vocative_request_clause(text: str, *, delimited: bool) -> bool:
+    """Require request evidence before a closing name or after an undelimited name."""
+    words = _WORDS.findall(text.lower())
+    if not words:
+        return False
+    first = words[0]
+    question = text.rstrip().endswith("?")
+    if first in {"did", "does", "has"}:
+        # "Did you a favor" and "has you on file" take 'you' as their object.
+        # Require a clear inverted question with an agreeing subject and a verb.
+        return (
+            first == "did"
+            and question
+            and len(words) >= 3
+            and words[1] in {"you", "i", "we"}
+            and (words[2] in _REQUEST_VERBS or words[2] in _OUTPUT_VERBS)
+        )
+    if first in _AUXILIARIES:
+        return len(words) >= 3 and (
+            words[1] in {"you", "i", "we"}
+            or (question and words[1] in {"it", "there", "the", "this", "that", "my"})
+        )
+    # These can open a relative clause describing the name. A comma alone is
+    # insufficient evidence of an address, even when it follows the wake name.
+    if first in _RELATIVE_OPENERS:
+        return False
+    # These command verbs also spell their own past tense. With no vocative
+    # delimiter, keep the short command ("read the chart") but abstain on a
+    # longer clause ("read the chart yesterday") unless it explicitly asks.
+    if not delimited and first in {"read", "set", "put", "let"} and len(words) > 3:
+        return words[-1] == "please"
+    if (
+        words[-1] == "please"
+        and first in {"a", "an", "the", "my", "this", "that"}
+        and len(words) <= 4
+        and "," not in text
+    ):
+        return True
+    # Reuse known output verbs. The fixed reflexive request is
+    # unambiguous; arbitrary words before "yourself" need not be commands.
+    return (
+        first in _OPENERS
+        or first in _REQUEST_VERBS
+        or first in _OUTPUT_VERBS
+        or first in {"be", "display", "draw"}
+        or words == ["introduce", "yourself"]
+    )
+
+
+def possible_aside(text: str) -> bool:
+    """Uncertain owner fragments, exclamations and possible closing vocatives.
+
+    A short uncued fragment can be side talk even when ASR drops punctuation.
+    Longer ordinary follow-ups need no extra cue when the operator disabled it.
+    """
+    return (
+        text.rstrip().endswith("!")
+        or re.search(r",\s*[\w'-]+[.!?]?\s*$", text) is not None
+        or (len(text.split()) <= 3 and not request_shaped(text))
+    )
 
 
 def answer_shaped(text: str) -> bool:

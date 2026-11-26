@@ -803,7 +803,7 @@ of per-turn attention.
 event, no follow-ups, byte-identical fixtures. Turn it on with the configuration's
 `"conversation": {}` object; `session.started` then advertises it as a top-level
 `conversation` object, and a host that accepts that object must accept `conversation`
-events. The object takes the following optional keys:
+events. The object accepts the following optional keys.
 
 | Key | Default | Range | Meaning |
 | --- | --- | --- | --- |
@@ -816,11 +816,12 @@ events. The object takes the following optional keys:
 | `cue_when_others_ms` | 0 (off) | 0 to 120,000 | Apply the meeting attention bar automatically while another voice was recently heard (see below) |
 | `presence_min_ms` | 1,000 | 0 to 120,000 | Minimum other-turn duration (`end_ms - start_ms`) for presence evidence |
 | `presence_min_words` | 3 | 0 to 1,000 | Minimum whitespace-separated word count for presence evidence |
+| `require_guest_address` | false | true or false | In ambient listening, require a direct address from anyone other than the voiceprint-bound owner and reserve follow-ups for that owner |
 | `require_cue` | false | true or false | Whether a follow-up must also carry a cue that it continues the exchange (see below) |
 | `cue_min_attend` | absent (off) | above 0 to 1 | With `require_cue`, the attend probability at which a follow-up needs no cue |
 | `continuation_cue` | false | true or false | With `require_cue`, whether the requester continuing after a reply needs no cue (see below) |
 
-With `cue_when_others_ms` above zero ([#283](https://github.com/mickdarling/rightyo/issues/283)),
+With the default guest policy and `cue_when_others_ms` above zero ([#283](https://github.com/mickdarling/rightyo/issues/283)),
 while another voice is present, RightyO applies the meeting bar automatically to **all
 attention**, including direct model `attend` decisions. Every request needs owner
 authority and the configured assistant's name; inferred and unlabelled turns fail closed,
@@ -852,6 +853,45 @@ precedence. Existing follow-up diagnostics retain `no_cue_others` for a missing 
 unchanged. Once the window lapses, follow-ups work as before. The started
 event advertises `cue_when_others_ms` only when nonzero. This is a transcript policy;
 synthetic replay tests do not establish live speaker or addressee accuracy.
+
+With `require_guest_address` enabled, a fully attributed turn from the voiceprint-bound
+owner can form an unnamed ambient request while another voice is present. The existing
+`ask_anywhere` promotion also applies when the owner names the assistant. Owner
+follow-ups retain their configured probability floor and the optional spoken-answer
+exception described below. With `require_cue` off, an ordinary instruction such as
+“Use the wider column” passes the same checks with guests present
+as it does alone. In the presence window, an uncertain turn below 0.70 attend probability
+still needs a cue if it reads as an exclamation, has a possible closing vocative (a comma
+followed by one word), or has at most three words with no request shape. A response to
+a pending question can supply that cue.
+With `require_cue` on, the configured cues and waivers apply to every follow-up.
+
+All other ambient speakers, including unknown voices, label-only owners and turns with
+inferred attribution, need a direct model `attend` to `system` and a configured name or
+variant used as an address. Examples include “Beacon?”, “Hey Beacon”, “Beacon, the chart
+please”, “Beacon read the chart” and “Read the chart, Beacon”. The clause beside the
+name matters. “Beacon did you a favor” and “Beacon, which is our old assistant, is
+offline” stay in context. For an unfamiliar imperative, an explicit request such as
+“Beacon can you rewind ten seconds” provides address evidence. This rule applies from
+the first turn. A direct `attend`
+held for a missing address carries `guest_unaddressed: true`.
+
+An addressed guest request carries its own request ID. The owner keeps their pending
+question and deadline, including when the diarizer reuses their label for a guest.
+When both policies are enabled, only a spoken reply confirmed for the owner's engaged
+request can start `answer_follow_up_window_ms`. Guest playback still counts for overlap
+detection.
+A guest dismissal may stop playback. Withdrawing a pending or delivered request also
+requires the same identified guest binding as at transcript acceptance.
+Legacy playback for a single outstanding guest request advances its acknowledgement
+and completes its answer independently of the owner's engagement. An override can
+arrive before the guest's playback. When an outstanding guest and an owner could both
+explain an unscoped report, it records echo timing and may advance the sole guest's
+acknowledgement. The owner's question and deadline are preserved. A request-scoped
+outcome can identify the owner's reply immediately. An unscoped end stays paired with
+its start. If a new start replaces owner playback, the owner's follow-up window runs
+from that replacement.
+Explicit meeting, media and privacy controls keep their existing rules.
 
 **States.**
 - **Ambient**, the default: a turn forms a request only on a confident `attend`, as

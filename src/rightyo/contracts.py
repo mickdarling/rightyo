@@ -558,6 +558,8 @@ class Conversation:
     # Optional attend floor for a verified owner's directed turn after a spoken answer.
     answer_follow_up_min_probability: float | None = None
     answer_follow_up_window_ms: int = DEFAULT_ANSWER_FOLLOW_UP_WINDOW_MS
+    # In ambient mode only, guests need a direct address and only a bound owner engages.
+    require_guest_address: bool = False
 
     def __post_init__(self) -> None:
         if (
@@ -591,6 +593,8 @@ class Conversation:
             or not 0 <= self.presence_min_words <= 1000
         ):
             raise ContractError("invalid other-voice presence minimum")
+        if type(self.require_guest_address) is not bool:
+            raise ContractError("invalid guest address requirement")
         if type(self.require_cue) is not bool:
             raise ContractError("invalid follow-up cue requirement")
         if self.cue_min_attend is not None and probability(self.cue_min_attend) <= 0:
@@ -658,6 +662,7 @@ class Conversation:
             "presence_min_words",
             "answer_follow_up_min_probability",
             "answer_follow_up_window_ms",
+            "require_guest_address",
         }
         if not isinstance(raw, dict) or set(raw) - allowed:
             raise ContractError("conversation must be an object with known keys only")
@@ -688,6 +693,7 @@ class Conversation:
             **({"require_cue": True} if self.require_cue else {}),
             **({"cue_min_attend": self.cue_min_attend} if self.cue_min_attend is not None else {}),
             **({"continuation_cue": True} if self.continuation_cue else {}),
+            **({"require_guest_address": True} if self.require_guest_address else {}),
             **({"cue_when_others_ms": self.cue_when_others_ms} if self.cue_when_others_ms else {}),
             **({"presence_min_ms": self.presence_min_ms} if self.presence_min_ms != 1000 else {}),
             **(
