@@ -3689,6 +3689,7 @@ class SpeechEvents:
                         other in self._label_stale
                         or self._authority_role(other, self._current_role(earlier, other_role))
                         != "owner"
+                        or self._ambient_guest(earlier, other_role)
                     ) and earlier.end_ms <= turn.end_ms:
                         self._superseded.setdefault(other, key)
             if plan is not None:
@@ -3800,7 +3801,7 @@ class SpeechEvents:
                     self._delivered[request_id] = self._facts(turn)
                     if guest_binding is not None and guest:
                         self._delivered[request_id]["guest_binding"] = guest_binding
-                if role is not None and authority != "owner":
+                if role is not None and (guest or authority != "owner"):
                     if len(self._open) >= self.max_open:
                         # Fail closed before an owner's override burst could overflow the
                         # queue; nothing is silently dropped.

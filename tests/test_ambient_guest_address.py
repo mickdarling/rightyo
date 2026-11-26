@@ -593,6 +593,54 @@ class AmbientGuestAddressTests(unittest.TestCase):
                 self.say("unasked", 7500, "Yes", "uncertain", attend=0.9)
                 self.say("expired", 14500, "And the legend?", "uncertain", attend=0.9)
 
+    def test_bound_owner_supersedes_open_label_only_request_with_guest_policy(self):
+        for enabled in (True, False):
+            with self.subTest(require_guest_address=enabled):
+                self.start(replace(MODE, require_guest_address=enabled))
+                self.say("guest", 0, "Beacon, read the scale", speaker=LABEL_OWNER, context=[])
+                request_id = SESSION + ":guest"
+                control = {"session_id": SESSION, "version": 1, "request_id": request_id}
+                self.assertTrue(self.events.request_outcome(dict(control, state="accepted"), 1200))
+
+                output = self.say("owner", 2000, "Beacon, draw the grid", context=["guest"])
+                overrides = [
+                    (e["superseded_request_id"], e["by_utterance_id"])
+                    for e in output
+                    if e["type"] == "override"
+                ]
+                self.assertEqual(overrides, [(request_id, "owner")] if enabled else [])
+                started = self.events.request_outcome(dict(control, state="reply_started"), 3100)
+                self.assertEqual(bool(started), not enabled)
+
+    def test_bound_owner_supersedes_pending_label_only_turn_with_guest_policy(self):
+        for enabled in (True, False):
+            with self.subTest(require_guest_address=enabled):
+                self.start(replace(MODE, require_guest_address=enabled))
+                guest = turn(
+                    "guest",
+                    0,
+                    1000,
+                    "Beacon, read the scale",
+                    LABEL_OWNER,
+                    provenance="diarization-timeline",
+                )
+                self.events.transcript(guest, 1000)
+                (transcript,) = self.events.drain()
+                self.transcripts["guest"] = transcript["turn"]
+                self.say("owner", 2000, "Beacon, draw the grid", context=["guest"])
+
+                self.events.decision(decided(guest, "attend"), 3100)
+                output = self.events.drain()
+                request_id = SESSION + ":guest"
+                overrides = [
+                    (e["superseded_request_id"], e["by_utterance_id"])
+                    for e in output
+                    if e["type"] == "override"
+                ]
+                self.assertEqual(overrides, [(request_id, "owner")] if enabled else [])
+                requests = [e["request_id"] for e in output if e["type"] == "request"]
+                self.assertEqual(requests, [] if enabled else [request_id])
+
     def test_label_only_guest_cannot_override_first_bound_owner(self):
         for phrase in ("Stop", "Beacon, read the scale"):
             with self.subTest(phrase=phrase):
