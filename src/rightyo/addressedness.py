@@ -320,18 +320,65 @@ def answer_shaped(text: str) -> bool:
     return bool(words) and (words[0] in _ANSWER_WORDS or tuple(words[:2]) in _ANSWER_PAIRS)
 
 
-def instruction_cued(text: str) -> bool:
-    """An opening request verb or an instruction acting on the assistant's output (#326)."""
-    words = _LETTERS.findall(text.lower())
-    if "your" in words:
-        return False
-    command = iter(words)
-    verb = next((word for word in command if word not in _VERB_LEAD), None)
-    if verb in _MODALS and next(command, None) == "you":
-        verb = next((word for word in command if word != "please"), None)
-    return (len(words) >= 3 and verb in _REQUEST_VERBS) or (
-        verb in _OUTPUT_VERBS and next(command, None) in _OBJECTS
+def _request_object(words: list[str]) -> bool:
+    """A pointing word or explicitly introduced noun phrase, e.g. 'both' or 'the schedule'."""
+    return bool(words) and (
+        words[0] in _OBJECTS | {"both", "all", "either", "neither", "me"}
+        or (len(words) > 1 and words[0] in {"the", "a", "an", "my", "our"})
     )
+
+
+def _instruction(words: list[str]) -> bool:
+    first = next((i for i, word in enumerate(words) if word not in _VERB_LEAD), len(words))
+    words = words[first:]
+    if len(words) >= 2 and words[0] in _MODALS and words[1] == "you":
+        words = words[2:]
+        if words[:1] == ["please"]:
+            words = words[1:]
+    if len(words) < 2:
+        return False
+    verb, obj = words[0], words[1:]
+    if "your" in obj:
+        # 'Repeat your last answer' acts on assistant output. 'Call your mom' does not.
+        if obj[0] != "your":
+            return False
+        output = obj[2:] if obj[1:2] in (["last"], ["previous"]) else obj[1:]
+        return verb in _REQUEST_VERBS | _OUTPUT_VERBS and output in (
+            ["answer"],
+            ["reply"],
+            ["response"],
+            ["summary"],
+        )
+    return (verb in _REQUEST_VERBS and _request_object(obj)) or (
+        verb in _OUTPUT_VERBS and obj[0] in _OBJECTS
+    )
+
+
+def spoken_reply_cue(text: str, *, asked: bool) -> str | None:
+    """Positive evidence for the lower floor only: a directed answer or an imperative (#326)."""
+    # Keep comma boundaries: a vocative or a second, redirected command is not part of
+    # the object. Allow a courtesy lead/tail and the content of an affirmative or negative.
+    parts = [words for part in text.lower().split(",") if (words := _LETTERS.findall(part))]
+    if parts and parts[-1] in (["please"], ["thanks"]):
+        parts.pop()
+    if asked and parts:
+        first = parts[0]
+        prefix = 1 if first[0] in _ANSWER_WORDS else 2
+        if first[0] in _ANSWER_WORDS or tuple(first[:2]) in _ANSWER_PAIRS:
+            tail = [words for words in (first[prefix:], *parts[1:]) if words]
+            if not tail:
+                return "answer"
+            if len(tail) == 1:
+                words = tail[0]
+                if (
+                    _request_object(words)
+                    or _instruction(words)
+                    or words in (["please"], ["go", "ahead"], ["do", "it"], ["do", "both"])
+                ):
+                    return "answer"
+    if len(parts) == 2 and all(word in _VERB_LEAD for word in parts[0]):
+        parts = parts[1:]
+    return "instruction" if len(parts) == 1 and _instruction(parts[0]) else None
 
 
 def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:

@@ -921,14 +921,18 @@ Existing refusal reasons such as `closing`, `below_bar`, `no_cue`, `no_cue_other
 `others_present` retain their meaning. Direct model `attend` decisions are unchanged.
 
 With `answer_follow_up_min_probability` set, a turn below the usual floor can qualify if
-its recipient is `system`, its owner binding is verified, and its start falls within
-`answer_follow_up_window_ms` of the host's `reply_ended` for the engaged request. A legacy
-host can identify a spoken answer by reporting `reply: ended` with `asked: true`.
+its recipient is `system` and the same enrolled owner held the binding for both the
+engaged request and the new turn. The turn must start within the engagement window and
+within `answer_follow_up_window_ms` of that request's `reply_ended`, measured on the
+received-audio clock. A legacy host can identify a spoken question with `reply: ended`
+and `asked: true`. If it also reports the start, the same request must own both edges.
 Publication alone and acknowledgement clips provide no playback confirmation for this rule.
 The turn must reach the configured lower floor and either answer a pending host-marked
-question or open with an instruction such as “Check the schedule” or “Make it shorter”.
-Inferred speaker labels and turns overlapping playback are ineligible. All other follow-up
-checks still apply.
+question or give a directed instruction such as “Check the schedule” or “Repeat your
+last answer”. Either supplies its own cue when `require_cue` is on. Inferred speaker
+labels and turns overlapping playback, including host-reported sample windows, are
+ineligible for the lower floor. The follow-up diagnostic records the floor used for the
+comparison. All other follow-up checks still apply.
 
 **Appendices** ([#199](https://github.com/mickdarling/rightyo/issues/199)). With
 `appendix_ms` above 0, the engaged speaker's `uncertain` turn that starts within that long

@@ -2274,6 +2274,12 @@ class PrototypeController:
                 if method == "transcript"
                 else fields
             )
+            if (
+                method in {"reply", "request_outcome"}
+                and self.config.conversation is not None
+                and self.config.conversation.answer_follow_up_min_probability is not None
+            ):
+                options["audio_ms"] = self._received_ms
             if method == "decision" and self.config.self_voice.enabled:
                 store = getattr(self._events, "self_voice", None)
                 if store is not None:
