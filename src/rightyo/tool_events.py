@@ -30,6 +30,7 @@ from rightyo.contracts import (
     Dismissal,
     SpeakerPriority,
     Turn,
+    WordAttribution,
     formed_request_text,
     identifier,
     integer,
@@ -1520,6 +1521,7 @@ class SpeechEvents:
             self._seen[turn.utterance_id] = digest
             if turn.end_ms <= self._now - self.retention_ms:
                 return
+            standing, guest = self._attention_standing(turn, role)
             # A guest may withdraw only work heard under this same binding. Capture
             # it at acceptance, before another turn can reuse the diarizer label.
             guest_binding = None
@@ -1528,7 +1530,7 @@ class SpeechEvents:
                 and not inferred
                 and turn.speaker_provenance == "diarization-timeline"
                 and checks_current
-                and self._ambient_guest(turn, role)
+                and guest
                 and self._binding_unchanged(voice_checks, turn)
             ):
                 _revision, binding = voice_checks.binding[3]
@@ -1541,7 +1543,7 @@ class SpeechEvents:
                     self._clear_content()
                     self._active = False
                     raise ContractError("pending attention context budget exceeded")
-                owner = self._answer_owner(turn, role)
+                owner = self._answer_owner(turn, standing)
                 if owner is not None:
                     self._spoken_replies.accept_owner(owner, turn, self._engaged)
                 self._pending[turn.utterance_id] = (turn, context, size, role)
@@ -1560,7 +1562,6 @@ class SpeechEvents:
             if self._dismissal is not None and self._stop_rules.is_stop_phrase(turn.text):
                 # The deterministic fast path (#98): an exact stop phrase dismisses at
                 # once, without waiting for (or depending on) the decision model.
-                guest = self._ambient_guest(turn, role)
                 plan = self._plan(
                     turn,
                     role,
@@ -1686,13 +1687,8 @@ class SpeechEvents:
             now = "unknown"
         return role if now == role else "unknown"
 
-    def _answer_owner(self, turn, role):
-        if (
-            self._spoken_replies is not None
-            and self._per_turn
-            and role == "owner"
-            and turn.utterance_id not in self._inferred
-        ):
+    def _answer_owner(self, turn, standing):
+        if self._spoken_replies is not None and standing == "strict_owner":
             with contextlib.suppress(Exception):
                 owner = self._priority.resolved_owner_identity(turn)
                 if isinstance(owner, str) and owner:
@@ -3129,11 +3125,30 @@ class SpeechEvents:
             and not self._media_for(turn)
         )
 
+    def _attention_standing(self, turn, role):
+        """Snapshot standing and guest policy against the same binding lookup."""
+        guest_policy = self._ambient_guest_policy(turn)
+        if not guest_policy and self._spoken_replies is None:
+            return None, False
+        reason = self._standing_reason(turn, role)
+        return reason, guest_policy and reason != "strict_owner"
+
+    def _standing_reason(self, turn, role):
+        words = turn.word_attribution
+        if words is None:
+            # Older callers supply only a whole-turn label and the inference flag.
+            # A mixed turn from them cannot demonstrate which words were strict.
+            if turn.utterance_id in self._inferred:
+                return "attribution_unknown"
+        elif not words.strict_word_count:
+            return "no_strict_words"
+        elif words.strict_speakers != {turn.speaker_id}:
+            return "strict_other"
+        return "strict_owner" if self._verified_owner(turn, role) else "strict_other"
+
     def _ambient_guest(self, turn, role):
-        # Inferred words can belong to someone else on the owner's bound label.
-        # The older named-owner promotion outside this policy still accepts them.
-        return self._ambient_guest_policy(turn) and (
-            turn.utterance_id in self._inferred or not self._verified_owner(turn, role)
+        return (
+            self._ambient_guest_policy(turn) and self._standing_reason(turn, role) != "strict_owner"
         )
 
     def _automatic_meeting(self, turn):
@@ -3277,7 +3292,7 @@ class SpeechEvents:
                 # now name someone else, so it is treated as unlabelled for everything keyed by
                 # the label. The request itself still carries the turn as heard.
                 self._label_stale.discard(key)
-                turn = replace(turn, speaker_id=None)
+                turn = replace(turn, speaker_id=None, word_attribution=WordAttribution())
             # Keep public evidence separate from recipient-based host target selection.
             evidence = {
                 name: value
@@ -3299,8 +3314,6 @@ class SpeechEvents:
             # The published role stays as emitted (the host fingerprints it); policy uses
             # the role re-checked now (#137), and authority also drops inferred labels.
             current = self._current_role(turn, role)
-            if owner is not None and self._answer_owner(turn, current) != owner.identity:
-                owner = None
             if stale and current in {"owner", "trusted"} and not self._voiceprinted(heard):
                 # #242 round 23: a configured label's owner or trusted role was fixed before the
                 # speakers were forgotten, and the label may now name someone else. Like a turn
@@ -3330,7 +3343,17 @@ class SpeechEvents:
                 receipt_role = lookup(turn)
             attention_role = receipt_role or current
             attention_authority = receipt_role or authority
-            guest = self._ambient_guest(turn, attention_role)
+            standing, guest = self._attention_standing(turn, attention_role)
+            if owner is not None and self._answer_owner(turn, standing) != owner.identity:
+                owner = None
+            words = turn.word_attribution
+            if standing is not None and words is not None:
+                evidence.update(
+                    strict_word_count=words.strict_word_count,
+                    inferred_word_count=words.inferred_word_count,
+                    strict_speakers=sorted(words.strict_speakers),
+                    standing_reason=standing,
+                )
             if role is not None:
                 evidence["role"] = receipt_role or decided
                 if key == self._degraded_turn:

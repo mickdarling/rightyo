@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .addressedness import reply_wait
-from .contracts import PROVENANCE, Turn, identifier, utterance_scoped_speaker
+from .contracts import PROVENANCE, Turn, WordAttribution, identifier, utterance_scoped_speaker
 from .providers import Diarizer, Transcriber
 from .turn_merge import TurnMerger, complete_hold, merge_gap, owner_pause, tail_join
 
@@ -2434,7 +2434,7 @@ class LiveProcessor:
         for unit in units:
             start, end = unit["start_ms"] + offset, unit["end_ms"] + offset
             attributed.append([unit, start, end, *_attribute(start, end, relevant)])
-        # Only full timeline coverage can establish a unit of the published head.
+        # Save full coverage before the coverage and edge passes can assign labels.
         strict = {index for index, entry in enumerate(attributed) if entry[3] is not None}
         coverage = self.config.word_label_coverage
         if coverage and provenance == "diarization-timeline" and not strict:
@@ -2488,30 +2488,38 @@ class LiveProcessor:
                 # from independent requests can never be merged into one participant.
                 speaker = utterance_scoped_speaker(number, speaker)
             diarized = index in strict and not overlap and provenance == "diarization-timeline"
-            if groups and (groups[-1]["speaker"], groups[-1]["overlap"]) == (speaker, overlap):
-                group = groups[-1]
-                # Leading whitespace disappears before publication. The first retained
-                # unit can establish the head even if that whitespace had no label.
-                if diarized and (
-                    group["diarized_head"] == len(group["text"]) or not group["text"].strip()
-                ):
-                    group["diarized_head"] = len(group["text"]) + len(unit["text"])
-                groups[-1]["text"] += unit["text"]
-                groups[-1]["end_ms"] = max(groups[-1]["end_ms"], end)
-            else:
+            if not groups or (groups[-1]["speaker"], groups[-1]["overlap"]) != (speaker, overlap):
                 groups.append(
                     {
-                        "text": unit["text"],
-                        "diarized_head": len(unit["text"]) if diarized else None,
+                        "text": "",
+                        "diarized_head": None,
+                        "strict_word_labels": [],
                         "start_ms": start,
                         "end_ms": end,
                         "speaker": speaker,
                         "overlap": overlap,
                     }
                 )
+            group = groups[-1]
+            previous, piece = group["text"], unit["text"]
+            # Leading whitespace disappears before publication.
+            if diarized and (group["diarized_head"] == len(previous) or not previous.strip()):
+                group["diarized_head"] = len(previous) + len(piece)
+            # Units can contain several words, or continue a word without whitespace.
+            # A split word is strict only if every piece has the same strict label.
+            label = speaker if diarized else None
+            labels = group["strict_word_labels"]
+            count = len(piece.split())
+            if count and previous and not previous[-1].isspace() and not piece[0].isspace():
+                if labels[-1] != label:
+                    labels[-1] = None
+                count -= 1
+            labels.extend([label] * count)
+            group["text"] += piece
+            group["end_ms"] = max(group["end_ms"], end)
             if index in inferred:
                 # Edge-attributed words make the group's label partly inferred (#137).
-                groups[-1]["inferred"] = True
+                group["inferred"] = True
         kept = [group for group in groups if group["text"].strip()]
         for index, group in enumerate(kept):
             if self.closed or packet.discarded:
@@ -2564,6 +2572,7 @@ class LiveProcessor:
         inferred = group.pop("inferred", False) is True
         spans = group.pop("labelled_spans", None)
         head = group.pop("diarized_head", None)
+        attribution = WordAttribution()
         if group["start_ms"] < self._unlabelled_before_ms or self._heard_private(
             group["start_ms"], group["end_ms"]
         ):
@@ -2572,6 +2581,21 @@ class LiveProcessor:
             # Private PCM was replaced by silence: even a stale timeline's owner label
             # cannot authenticate that voice. Full exits use the isolated sentence check.
             group["speaker"], inferred, spans, head = None, False, None, None
+        elif group["speaker"] is not None and group["speaker_provenance"] == "diarization-timeline":
+            # Count spoken words only. A punctuation-only token cannot establish standing.
+            labels = [
+                label
+                for label, word in zip(
+                    group["strict_word_labels"], group["text"].split(), strict=True
+                )
+                if any(ch.isalnum() for ch in word)
+            ]
+            inferred_count = labels.count(None)
+            attribution = WordAttribution(
+                len(labels) - inferred_count,
+                inferred_count,
+                frozenset(label for label in labels if label is not None),
+            )
         turn = Turn(
             session_id=self.config.session_id,
             utterance_id=f"live-{self._counter}",
@@ -2585,6 +2609,7 @@ class LiveProcessor:
             recognizer_id=self._transcriber.recognizer_id,
             provenance=self.config.provenance,
             speaker_provenance=group["speaker_provenance"],
+            word_attribution=attribution,
         )
         if gap is not None and self.config.on_post_turn_gap is not None:
             self.config.on_post_turn_gap(turn.utterance_id, gap)

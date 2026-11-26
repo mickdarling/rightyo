@@ -434,12 +434,24 @@ class TurnMerger:
                 # The name's speaker is inferred from the continuation: no owner authority.
                 joined["inferred"] = True
                 joined["diarized_head"] = None
+                if "strict_word_labels" in fragment:
+                    joined["strict_word_labels"] = (
+                        wake["strict_word_labels"] + fragment["strict_word_labels"]
+                    )
                 self.offer(joined, complete=complete)
                 return
         elif self._continues(fragment):
             held = self._held
             joined = self._join_text(held["text"], fragment["text"], self._held_complete)
             complete = complete and not self._looks_unfinished(joined)
+            if "strict_word_labels" in held:
+                # A collapsed restart replaces a suffix of the held words. Keep
+                # exactly the prefix still present, then the continuation's labels.
+                tail_labels = fragment["strict_word_labels"]
+                retained_words = len(joined.split()) - len(tail_labels)
+                held["strict_word_labels"] = (
+                    held["strict_word_labels"][:retained_words] + tail_labels
+                )
             if "diarized_head" in held or "diarized_head" in fragment:
                 head, tail = held.get("diarized_head"), fragment.get("diarized_head")
                 if joined != held["text"] + " " + fragment["text"]:
