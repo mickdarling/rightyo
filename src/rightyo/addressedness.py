@@ -12,9 +12,9 @@ for the assistant, without making a name a trigger:
   meant for the assistant; a different speaker starting to talk is evidence it was meant
   for that person.
 
-`request_shaped` is a small deterministic placeholder for the per-turn intent of #85: it
-only decides which turns are worth holding a little longer to observe the gap. It is not
-an addressedness judgement and never forms a request on its own.
+`request_shaped` identifies possible requests for the post-turn gap hold. The opt-in
+guest policy also uses it to distinguish short owner requests from ambiguous fragments.
+It never forms a request on its own.
 
 `dismissal_shaped` is its counterpart for natural dismissals (#98): a short turn that
 sounds like "stop", "never mind" or "go away" is released at once instead of waiting for
@@ -160,14 +160,18 @@ _WORDS = re.compile(r"[a-z']+")
 _FILLERS = frozenset(
     "hey ok okay so and um uh oh well now then also actually alright right yeah yes".split()
 )
-_OPENERS = frozenset(
+_IMPERATIVES = frozenset(
+    """
+    tell show give make set turn open close play stop start pause resume skip remind find
+    search look check call send read add remove delete create write let put get take bring
+    help schedule cancel email text message note book order explain summarize translate
+    """.split()
+)
+_OPENERS = _IMPERATIVES | frozenset(
     """
     can could would will should shall may might please
     what what's whats when where where's which who who's whom whose why how how's
     is are am was were do does did have has
-    tell show give make set turn open close play stop start pause resume skip remind find
-    search look check call send read add remove delete create write let put get take bring
-    help schedule cancel email text message note book order explain summarize translate
     """.split()
 )
 
@@ -307,6 +311,44 @@ _CORRECTIONS = frozenset({("you", "mean"), ("i", "meant")})
 # How an answer to the assistant's own question opens ("Yes, do both", "Go ahead") (#199).
 _ANSWER_WORDS = frozenset("yes yeah yep yup sure no nope okay ok".split())
 _ANSWER_PAIRS = frozenset({("go", "ahead"), ("do", "it"), ("sounds", "good")})
+
+_GUEST_REQUEST_OPENERS = (
+    _IMPERATIVES
+    | _REQUEST_VERBS
+    | _OUTPUT_VERBS
+    | frozenset("be describe display do draw introduce please".split())
+)
+
+
+def guest_address_tail(text: str) -> bool:
+    """Check the words after a configured opening name on an ambient guest turn."""
+    tail = text.strip()
+    if not tail or tail[0] in ".:!?—–":
+        return True
+    # One comma marks a vocative. Two can enclose a description ("which we retired"),
+    # so require the same request evidence there as for an undelimited name.
+    if tail.startswith(",") and tail.count(",") == 1:
+        return True
+    words = _WORDS.findall(tail.lower())
+    return bool(words) and (
+        tail.endswith("?")
+        or words[0] in _GUEST_REQUEST_OPENERS
+        or words[-1] == "please"
+        or (words[0] in _MODALS and words[1:2] == ["you"])
+    )
+
+
+def possible_aside(text: str) -> bool:
+    """Uncertain owner fragments, exclamations and possible closing vocatives.
+
+    A short uncued fragment can be side talk even when ASR drops punctuation.
+    Longer ordinary follow-ups need no extra cue when the operator disabled it.
+    """
+    return (
+        text.rstrip().endswith("!")
+        or re.search(r",\s*[\w'-]+[.!?]?\s*$", text) is not None
+        or (len(text.split()) <= 3 and not request_shaped(text))
+    )
 
 
 def answer_shaped(text: str) -> bool:

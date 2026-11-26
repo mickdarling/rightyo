@@ -95,7 +95,14 @@ With `cue_when_others_ms` on, while another voice is present, RightyO applies th
 automatically: every request needs owner authority and the assistant's name, even a direct
 model `attend`. There are no follow-ups in this window; owner + name anywhere may promote
 abstention through the same meeting policy. Static cue shapes and waivers never bypass it.
-With the owner alone, behavior is unchanged. An optional
+The opt-in `conversation.require_guest_address` replaces this automatic meeting bar in
+ambient listening. The voiceprint-bound owner can make unnamed requests and follow-ups
+at the usual probability floor. With another voice present, a low-scoring ambiguous
+aside still needs a cue. Guests and turns with inferred attribution must open each request
+with a configured name or variant. The [tool contract](tool-api.md#conversation-mode)
+describes the cue checks.
+
+An optional
 `"acknowledgement": {}` object turns on [acknowledgement gating](tool-api.md#acknowledgement-gating)
 (#132): each request carries `acknowledge`, true only when the turn uses a configured name
 or its attend confidence reaches `min_confidence` (default 0.7, 0 to 1), so the host skips

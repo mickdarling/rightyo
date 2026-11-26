@@ -12,7 +12,14 @@ from collections import deque
 from dataclasses import dataclass, replace
 from threading import RLock
 
-from rightyo.addressedness import answer_shaped, follow_up_cued, mentions_name, spoken_reply_cue
+from rightyo.addressedness import (
+    answer_shaped,
+    follow_up_cued,
+    guest_address_tail,
+    mentions_name,
+    possible_aside,
+    spoken_reply_cue,
+)
 from rightyo.contracts import (
     DISMISSING,
     Acknowledgement,
@@ -35,6 +42,9 @@ from rightyo.request_outcomes import validate as validate_request_outcome
 from rightyo.self_voice import MAX_SPANS, SelfVoice
 
 MAX_EVENT_BYTES = 1200000
+# #326: the reported uncued asides scored 0.69 and 0.51. Limit the opt-in
+# aside check to that weak evidence band; the configured follow-up floor is separate.
+ASIDE_CUE_BELOW_ATTEND = 0.70
 # The duck-mode control version advertised on `started` (hailing-station #735). Version 2
 # is privacy mode, which keeps nothing; version 3 (S-8) also acks every `{"duck": true}`
 # line it applies with a `privacy` `on` event, and a host enters privacy only for 3+.
@@ -451,13 +461,14 @@ def _starts_named(text, addressing):
 
 
 def _starts_named_end(text, addressing):
-    """End offset of an opening name in the original text, including leading edge words.
+    """Earliest end of an opening name, in original text offsets (#292)."""
+    return min((end for _, end in _opening_names(text, addressing)), default=None)
 
-    Use the same word normalization as `_privacy_words`, retaining original offsets
-    before lower/casefold can expand Unicode characters (#292).
-    """
+
+def _opening_names(text, addressing):
+    """Yield opening name spans before lower/casefold can expand Unicode characters."""
     if addressing is None:
-        return None
+        return
     cleaned = "".join(c if c.isalnum() or c == "'" else " " for c in text.replace("\u2019", "'"))
     tokens = list(re.finditer(r"\S+", cleaned))
     words = [token.group().lower() for token in tokens]
@@ -479,23 +490,18 @@ def _starts_named_end(text, addressing):
     }
     named_keys.discard("")
     if not named_keys:
-        return None
+        return
     # A name may be split anywhere ("Righty O"), so each character can be a word.
     # Drop apostrophe-only words after locating starts; they add no name characters.
     word_keys = [key(word) for word in words]
     starts = {sum(bool(word) for word in word_keys[:at]) for at in starts}
-    ends = [token.end() for token, word in zip(tokens, word_keys) if word]
+    tokens = [token for token, word in zip(tokens, word_keys) if word]
     words = [word for word in word_keys if word]
     max_width = max(map(len, named_keys))
-    return min(
-        (
-            ends[at + width - 1]
-            for at in starts
-            for width in range(1, min(max_width, len(words) - at) + 1)
-            if "".join(words[at : at + width]) in named_keys
-        ),
-        default=None,
-    )
+    for at in starts:
+        for width in range(1, min(max_width, len(words) - at) + 1):
+            if "".join(words[at : at + width]) in named_keys:
+                yield tokens[at].start(), tokens[at + width - 1].end()
 
 
 def _named_handoff(text, addressing):
@@ -605,6 +611,22 @@ class _VoiceChecks:
     entry: bool = False
 
 
+@dataclass
+class _LegacyRequest:
+    end_ms: int
+    guest: bool
+    awaiting: str  # ack_end, answer_start, or answer_end
+
+    def completed_by(self, phase):
+        if self.awaiting == "ack_end" and phase == "ended":
+            self.awaiting = "answer_start"
+        elif self.awaiting == "answer_start" and phase == "started":
+            self.awaiting = "answer_end"
+        elif self.awaiting == "answer_end" and phase == "ended":
+            return True
+        return False
+
+
 class SpeechEvents:
     """Local v1 producer. Frozen request context never observes later turns.
 
@@ -670,6 +692,7 @@ class SpeechEvents:
         self._queue = deque()
         self._queue_bytes = 0
         self._pending = {}
+        self._pending_guest_bindings = {}
         self._pending_bytes = 0
         self._seen = {}
         self._decided = set()
@@ -695,6 +718,12 @@ class SpeechEvents:
         # (end_ms, text, utterance_id, speaker_id) of the latest request formed this session,
         # or None, also after a dismissal or an explicit end (#199).
         self.last_request = None
+        # Unanswered legacy requests under the ambient policy, bounded by retention.
+        # Supersession retires host authority, but late playback can still arrive.
+        self._legacy_requests = {}
+        self._legacy_playback_request = None
+        self._last_request_was_guest = False
+        self._legacy_echo_only = False
         # Recent [start, end] stream times of the assistant's own playback (end None while
         # it plays), as the host reports them (#124); bounded.
         self._playbacks = deque(maxlen=MAX_PLAYBACKS)
@@ -902,6 +931,7 @@ class SpeechEvents:
     def _clear_content(self):
         self._memory.clear()
         self._pending.clear()
+        self._pending_guest_bindings.clear()
         self._pending_bytes = 0
         self._queue.clear()
         self._queue_bytes = 0
@@ -909,6 +939,10 @@ class SpeechEvents:
         self._superseded.clear()
         self._appendix_from.clear()
         self.last_request = None
+        self._legacy_requests.clear()
+        self._legacy_playback_request = None
+        self._last_request_was_guest = False
+        self._legacy_echo_only = False
         self._cue_voices.clear()
         self._others_turns.clear()
         self._playbacks.clear()
@@ -1136,6 +1170,7 @@ class SpeechEvents:
                     del self._pending[key]
                     if self._spoken_replies is not None:
                         self._spoken_replies.pending_owners.pop(key, None)
+                    self._pending_guest_bindings.pop(key, None)
                     self._pending_bytes -= size
             # Reclaim accounting as well as plaintext when a frozen context shrinks.
             self._pending_bytes = 0
@@ -1150,6 +1185,9 @@ class SpeechEvents:
             for request_id, end_ms in list(self._open.items()):
                 if end_ms <= cutoff:
                     del self._open[request_id]
+            for request_id, request in list(self._legacy_requests.items()):
+                if request.end_ms <= cutoff:
+                    del self._legacy_requests[request_id]
             for request_id, facts in list(self._delivered.items()):
                 if facts["end_ms"] <= cutoff:
                     del self._delivered[request_id]
@@ -1482,6 +1520,21 @@ class SpeechEvents:
             self._seen[turn.utterance_id] = digest
             if turn.end_ms <= self._now - self.retention_ms:
                 return
+            # A guest may withdraw only work heard under this same binding. Capture
+            # it at acceptance, before another turn can reuse the diarizer label.
+            guest_binding = None
+            if (
+                self._dismissal is not None
+                and not inferred
+                and turn.speaker_provenance == "diarization-timeline"
+                and checks_current
+                and self._ambient_guest(turn, role)
+                and self._binding_unchanged(voice_checks, turn)
+            ):
+                _revision, binding = voice_checks.binding[3]
+                match binding:
+                    case ("bound", str(identity)) if identity:
+                        guest_binding = voice_checks.binding
             if expect_decision and self._attention_enabled:
                 size = len(encode_json(context))
                 if len(self._pending) >= 32 or self._pending_bytes + size > MAX_PENDING_BYTES:
@@ -1492,6 +1545,8 @@ class SpeechEvents:
                 if owner is not None:
                     self._spoken_replies.accept_owner(owner, turn, self._engaged)
                 self._pending[turn.utterance_id] = (turn, context, size, role)
+                if guest_binding is not None:
+                    self._pending_guest_bindings[turn.utterance_id] = guest_binding
                 self._pending_bytes += size
             self._hear_other_voice(turn, role)
             self._emit_transcript(
@@ -1505,6 +1560,7 @@ class SpeechEvents:
             if self._dismissal is not None and self._stop_rules.is_stop_phrase(turn.text):
                 # The deterministic fast path (#98): an exact stop phrase dismisses at
                 # once, without waiting for (or depending on) the decision model.
+                guest = self._ambient_guest(turn, role)
                 plan = self._plan(
                     turn,
                     role,
@@ -1512,6 +1568,8 @@ class SpeechEvents:
                     "stop-phrase",
                     None,
                     loose=False,
+                    guest=guest,
+                    guest_binding=guest_binding,
                     authority=self._authority_role(turn.utterance_id, role),
                 )
                 if plan is not None:
@@ -1520,7 +1578,7 @@ class SpeechEvents:
                     # Ending one's own engagement affects no one else, so even a dismissal
                     # limited to playback ends it; an inferred label's dismissal may not
                     # be the engaged speaker's own (#137), so it leaves it.
-                    if turn.utterance_id not in self._inferred:
+                    if not guest and turn.utterance_id not in self._inferred:
                         self._disengage(turn, "dismissed")
 
     def _emit_transcript(self, turn, role, inferred, *, entry_voice):
@@ -1657,20 +1715,25 @@ class SpeechEvents:
             turn.text, self._addressing
         )
 
-    def _named_owner(self, turn, role):
-        """A direct named address by the voiceprint-bound owner (#735), never a configured
-        owner label. Inferred words are allowed, as for ordinary attend requests.
-        Privacy stays closed; identification fails closed.
-        """
+    def _verified_owner(self, turn, role):
+        """Require the owner's role and its current enrolled voiceprint binding."""
         check = getattr(self._priority, "enrolled_owner", None)
-        if self._duck or role != "owner" or not self._per_turn or not callable(check):
+        if role != "owner" or not self._per_turn or not callable(check):
             return False
         try:
-            return check(turn) is True and _starts_named(turn.text, self._addressing)
+            return check(turn) is True
         except Exception:  # noqa: BLE001 - identification never fails the session
             return False
 
-    def _plan(self, turn, role, kind, reason, confidence, *, loose, authority=None):
+    def _guest_addressed_us(self, turn):
+        return any(
+            guest_address_tail(turn.text[end:])
+            for _, end in _opening_names(turn.text, self._addressing)
+        )
+
+    def _plan(
+        self, turn, role, kind, reason, confidence, *, loose, guest, guest_binding, authority=None
+    ):
         """What a dismissal does, without changing state; None when it does nothing.
 
         `role` is the turn's published role; `authority`, when given, is the role it acts
@@ -1682,29 +1745,41 @@ class SpeechEvents:
         dismisser = self._facts(turn)
         # Only a model-judged dismissal by a fully trusted speaker withdraws on
         # incomparable attribution; the fast path never does.
-        loose = loose and authority == "full" and self._priority is None
+        loose = loose and not guest and authority == "full" and self._priority is None
         # A turn with inferred-label words (#137) may be another voice under the
         # speaker's label: it withdraws nothing, delivered or pending.
-        inferred = turn.utterance_id in self._inferred
+        can_withdraw = turn.utterance_id not in self._inferred and (
+            not guest
+            or (guest_binding is not None and guest_binding == self._binding_snapshot(turn))
+        )
         delivered = [
             request_id
             for request_id, facts in self._delivered.items()
-            if not inferred and self._withdrawable(turn, facts, loose)
+            if can_withdraw
+            and (not guest or facts.get("guest_binding") == guest_binding)
+            and self._withdrawable(turn, facts, loose)
         ]
         pending = [
             key
             for key, (earlier, _context, _size, _role) in self._pending.items()
-            if not inferred
+            if can_withdraw
+            and (not guest or self._pending_guest_bindings.get(key) == guest_binding)
             and key != turn.utterance_id
-            and key not in self._withdrawn
+            and (
+                key not in self._withdrawn or (not guest and self._withdrawn[key].get("guest_only"))
+            )
             # Its label may now name someone else (round 17): no dismissal by label reaches it.
             and key not in self._label_stale
             and self._withdrawable(turn, self._facts(earlier), loose)
         ]
         # The stop-phrase fast path from a speaker whose label cannot be compared only
         # stops playback; so does any dismissal from a speaker without full authority.
-        limited = authority != "full" or (
-            reason == "stop-phrase" and self._cooldown_key(dismisser) is None
+        # A guest can still stop playback and withdraw their own requests. A
+        # reused label never grants a blanket withdrawal or an owner cooldown.
+        limited = (
+            guest
+            or authority != "full"
+            or (reason == "stop-phrase" and self._cooldown_key(dismisser) is None)
         )
         scope = ["playback"] if limited else list(DISMISS_SCOPES[kind])
         fields = {
@@ -1720,8 +1795,14 @@ class SpeechEvents:
         if kind == "disengage" and not limited and self._dismissal.cooldown_ms:
             fields["cooldown_until_ms"] = turn.end_ms + self._dismissal.cooldown_ms
         # Only a limit from incomparable attribution can be lifted by the turn's decision.
-        upgradable = limited and authority == "full"
-        return {"fields": fields, "pending": pending, "limited": limited, "upgradable": upgradable}
+        upgradable = limited and authority == "full" and not guest
+        return {
+            "fields": fields,
+            "pending": pending,
+            "limited": limited,
+            "upgradable": upgradable,
+            "guest": guest,
+        }
 
     def _apply(self, turn, plan):
         """Withdraw what a planned dismissal covers and return its `dismiss` fields."""
@@ -1738,6 +1819,7 @@ class SpeechEvents:
                 "scope": ["pending_request"],
                 "reason": fields["reason"],
                 "confidence": fields["confidence"],
+                **({"guest_only": True} if plan["guest"] else {}),
             }
         if "cooldown_until_ms" in fields:
             key = self._cooldown_key(self._facts(turn))
@@ -2110,6 +2192,7 @@ class SpeechEvents:
             self._ended.clear()
             self._appendix_from.clear()
             self._delivered.clear()
+            self._pending_guest_bindings.clear()
             # A turn accepted under the old labels and decided later keeps nothing by its label
             # either (round 17): its request still goes, without engagement, appendix,
             # explicit end, cool-down or a withdrawable record.
@@ -2220,7 +2303,7 @@ class SpeechEvents:
             return "meeting"
         if self._media_blocks(turn, authority):
             return "media"
-        if self._others_present(turn) and not self._meeting_attends(turn, authority):
+        if self._automatic_meeting(turn) and not self._meeting_attends(turn, authority):
             reason = self._owner_vocative_bar(turn, role)
             passed = reason == "owner_vocative"
             if role is not None and self._report is not None:
@@ -2246,6 +2329,7 @@ class SpeechEvents:
             mode is not None
             and self._meeting_ask_anywhere
             and not self._duck
+            and self._meeting_attends(turn, authority)
             and self._attention_blocked(turn, authority) is None
             and decision.label == "uncertain"
             and evidence["label"] == "uncertain"
@@ -2307,6 +2391,8 @@ class SpeechEvents:
                 # Negotiation retires legacy semantic authority (an ack may already play).
                 # Its physical spans remain until their own actual end is reported.
                 self._asked_at = self._replied_at = None
+                self._legacy_requests.clear()
+                self._legacy_playback_request = None
                 for engagement in (self._engaged, (self._dormant or {}).get("engaged")):
                     if engagement is not None:
                         engagement.pop("replying_since", None)
@@ -2401,6 +2487,25 @@ class SpeechEvents:
         with self._lock:
             return self._scoped_replies
 
+    def _legacy_guest_reply(self, phase):
+        """Pair legacy phases before updating echo spans or the owner's conversation."""
+        if phase == "started" or "legacy" not in self._playback_scopes:
+            # An end without a start has the same attribution problem as a new start.
+            # With competing requests, only a scoped outcome can identify the answer.
+            self._legacy_playback_request = (
+                next(iter(self._legacy_requests)) if len(self._legacy_requests) == 1 else None
+            )
+            guests = [key for key, request in self._legacy_requests.items() if request.guest]
+            self._legacy_echo_only = self._last_request_was_guest or bool(guests)
+            if self._pending_ack is not None:
+                # The sole guest's clip/answer cadence can release its own ack hold
+                # even when a competing owner makes the reply itself ambiguous.
+                self._pending_ack["guest_playback"] = guests == [self._pending_ack["request_id"]]
+        request = self._legacy_requests.get(self._legacy_playback_request)
+        if request is not None and not self._duck and request.completed_by(phase):
+            del self._legacy_requests[self._legacy_playback_request]
+        return self._legacy_echo_only
+
     def reply(self, phase, now_ms, asked=False, *, request_id=None, audio_ms=None):
         """The host's report that the assistant's spoken reply `started` or `ended` (#124).
 
@@ -2430,6 +2535,14 @@ class SpeechEvents:
             unscoped = self._scoped_replies and (
                 request_id is None or current is None or current.get("request_id") != request_id
             )
+            guest_reply = (
+                self._active
+                and not self._scoped_replies
+                and request_id is None
+                and self._conversation is not None
+                and self._conversation.require_guest_address
+                and self._legacy_guest_reply(phase)
+            )
             if self._active and self._spoken_replies is not None:
                 clip_request = request_id
                 pending = self._spoken_replies.legacy_pending
@@ -2439,8 +2552,13 @@ class SpeechEvents:
                         clip_request = last
                 started_for = self._spoken_replies.report(phase, request_id, at, clip_request)
                 if not self._scoped_replies and asked and not self._duck:
-                    pending.discard(started_for)
-            if self._active and not unscoped and not self._duck:
+                    # An ambiguous guest clip cannot resolve an outstanding owner request.
+                    if (
+                        not guest_reply
+                        or clip_request == started_for == self._legacy_playback_request
+                    ):
+                        pending.discard(started_for)
+            if self._active and not unscoped and not guest_reply and not self._duck:
                 self._asked_at = now_ms if asked else None
                 if self._replied_at is None:
                     # The first phase reported since the request: a host may forward only
@@ -2453,6 +2571,8 @@ class SpeechEvents:
                     old = self._playback_scopes.pop(scope, None)
                     if old is not None:
                         old[1] = now_ms
+                        if guest_reply:
+                            self._end_replaced_hold(at)
                     if len(self._playback_scopes) >= MAX_PLAYBACKS:
                         del self._playback_scopes[next(iter(self._playback_scopes))]
                     span = [now_ms, None]
@@ -2463,6 +2583,11 @@ class SpeechEvents:
                     if span is not None:
                         span[1] = now_ms
             if unscoped:
+                return
+            if guest_reply:
+                self.expire(now_ms)
+                if not self._duck and self._pending_ack and self._pending_ack.get("guest_playback"):
+                    self._answer_ack(phase)
                 return
             if self._duck:
                 # Privacy keeps the public conversation but suppresses its events.
@@ -2518,6 +2643,19 @@ class SpeechEvents:
                 engaged.pop("replying_since", None)
                 engaged["until_ms"] = max(engaged["until_ms"], at + self._conversation.window_ms)
                 self._reply_note(phase, action or "extended", self._window_end(engaged) - at)
+
+    def _end_replaced_hold(self, now_ms):
+        """The replacement start is the physical end of the preceding owner reply."""
+        engaged = self._engaged
+        if engaged is None or "replying_since" not in engaged:
+            return
+        deadline = self._window_end(engaged)
+        del engaged["replying_since"]
+        if now_ms >= deadline:
+            # A guest report cannot revive a hold that already reached its time cap.
+            engaged["until_ms"] = deadline
+        else:
+            engaged["until_ms"] = max(engaged["until_ms"], now_ms + self._conversation.window_ms)
 
     def _forget_dormant(self, turn, reason):
         """An explicit end by the lapsed speaker, even after the lapse, is never revived (#158).
@@ -2761,14 +2899,14 @@ class SpeechEvents:
             until_ms=until,
         )
 
-    def _follow_up_refusal(self, turn, role, decision, evidence, unavailable, owner):
+    def _follow_up_refusal(self, turn, role, decision, evidence, unavailable, owner, *, guest):
         """The refusal reason (None when eligible) and the probability floor used for this turn.
 
         `not_engaged` covers conversation mode off and any turn but the engaged speaker's
         within the window; every other token is about the engaged speaker's own turn (#153).
         """
         conversation = self._conversation
-        if conversation is None:
+        if conversation is None or guest:
             return "not_engaged", None
         cue = self._spoken_reply_cue(turn, owner, decision)
         attend = decision.probabilities["attend"]
@@ -2811,18 +2949,25 @@ class SpeechEvents:
         ):
             # Courtesy alone is not a follow-up, even with appendix or cue waivers (#296).
             return "courtesy", bar
-        needs_cue = (
-            not spoken_cue
-            and not self._cue_waived(decision)
-            and not follow_up_cued(turn.text, self._addressing)
-            and not self._answers_question(turn)
-            and not self._continues(turn, decision)
+        presence_cue = (
+            conversation.require_guest_address
+            and self._others_present(turn)
+            and attend < ASIDE_CUE_BELOW_ATTEND
+            and possible_aside(turn.text)
         )
-        if conversation.require_cue and needs_cue:
-            # Talk to a pet or a passer-by in the window carries no cue that it continues
-            # the exchange with the assistant (#199). It applies to an appendix too.
-            return "no_cue", bar
-        if self._others_present(turn):
+        if (conversation.require_cue or presence_cue) and not (
+            spoken_cue
+            or follow_up_cued(turn.text, self._addressing)
+            or self._answers_question(turn)
+            or (
+                conversation.require_cue
+                and (self._cue_waived(decision) or self._continues(turn, decision))
+            )
+        ):
+            # Preserve the configured floor; an ambiguous aside around another
+            # speaker still needs evidence that it continues this exchange.
+            return ("no_cue" if conversation.require_cue else "no_cue_others"), bar
+        if self._automatic_meeting(turn):
             # Like explicit meeting, automatic meeting never admits a follow-up. A named
             # owner abstention may already have passed the shared promotion above.
             return ("others_present" if self._named(turn) else "no_cue_others"), bar
@@ -2975,6 +3120,25 @@ class SpeechEvents:
         """The acceptance-time verdict, unaffected by later speech, modes or label resets."""
         return turn.utterance_id in self._others_turns
 
+    def _ambient_guest_policy(self, turn):
+        # Only public turns reach decision. Meeting and media use their heard-time modes.
+        return (
+            self._conversation is not None
+            and self._conversation.require_guest_address
+            and not self._meeting_for(turn)
+            and not self._media_for(turn)
+        )
+
+    def _ambient_guest(self, turn, role):
+        # Inferred words can belong to someone else on the owner's bound label.
+        # The older named-owner promotion outside this policy still accepts them.
+        return self._ambient_guest_policy(turn) and (
+            turn.utterance_id in self._inferred or not self._verified_owner(turn, role)
+        )
+
+    def _automatic_meeting(self, turn):
+        return self._others_present(turn) and not self._ambient_guest_policy(turn)
+
     def _answered(self, turn, decision, role):
         """Whether another person's answer withholds `turn` (#199): the pipeline saw a
         different speaker start within the reply window, no playback of the assistant's own
@@ -3095,6 +3259,7 @@ class SpeechEvents:
             if key in self._decided:
                 return
             pending = self._pending.pop(key, None)
+            guest_binding = self._pending_guest_bindings.pop(key, None)
             if pending is None:
                 return
             turn, context, size, role = pending
@@ -3165,19 +3330,28 @@ class SpeechEvents:
                 receipt_role = lookup(turn)
             attention_role = receipt_role or current
             attention_authority = receipt_role or authority
+            guest = self._ambient_guest(turn, attention_role)
             if role is not None:
                 evidence["role"] = receipt_role or decided
                 if key == self._degraded_turn:
                     # The stream shows where model lookups degraded, not only the object.
                     evidence["role_status"] = self.role_status
                 rules = self._priority.priority
-                if rules.owner_only and attention_role != "owner" and evidence["label"] == "attend":
+                if (
+                    rules.owner_only
+                    and (guest or attention_role != "owner")
+                    and evidence["label"] == "attend"
+                ):
                     # Owner-only mode: other speakers remain context, never a request.
                     evidence["label"] = "ignore"
                 stop = authority == "owner" and rules.is_stop_phrase(turn.text)
             request_id = self._session + ":" + key
             superseded_by = self._superseded.pop(key, None)
             withdrawn_by = self._withdrawn.pop(key, None)
+            # A pending turn's final attention role may arrive after the guest
+            # dismissal. Only an actual guest request is eligible for it.
+            if withdrawn_by is not None and withdrawn_by.pop("guest_only", False) and not guest:
+                withdrawn_by = None
             # A model-judged dismissal (#98), unless the stop-phrase fast path already
             # dismissed this turn at its transcript.
             kind = None
@@ -3212,6 +3386,8 @@ class SpeechEvents:
                 # conversation with them below. Naming this assistant too keeps it ours.
                 evidence["label"] = "ignore"
             blocked = self._attention_blocked(turn, attention_authority, attention_role)
+            if guest and not self._guest_addressed_us(turn):
+                blocked = "guest_unaddressed"
             if evidence["label"] == "attend" and blocked is not None:
                 # Shared meeting/media/others-present bars apply to direct attends too.
                 # Like media, only an attend is relabeled:
@@ -3219,7 +3395,7 @@ class SpeechEvents:
                 # and it never ends a conversation), and both promotions re-check this bar.
                 evidence["label"] = "ignore"
                 evidence[blocked] = True
-            elif unavailable is None and not stop and not dismissed:
+            elif unavailable is None and not stop and not dismissed and not guest:
                 self._meeting_promote(turn, attention_authority, event.decision, evidence)
             if self._answered(turn, event.decision, current):
                 # Another person answered this unnamed turn at once (#199): it is theirs. An
@@ -3234,7 +3410,10 @@ class SpeechEvents:
                 and not evidence.get("answered_by_other")
                 and not stop
                 and not dismissed
-                and self._named_owner(turn, attention_role)
+                and not self._duck
+                and not guest
+                and self._verified_owner(turn, attention_role)
+                and _starts_named(turn.text, self._addressing)
             )
             if named_owner:
                 blocked = self._attention_blocked(turn, attention_authority, attention_role)
@@ -3262,7 +3441,7 @@ class SpeechEvents:
                 refusal = None
                 if not would_attend:
                     refusal, bar = self._follow_up_refusal(
-                        turn, current, event.decision, evidence, unavailable, owner
+                        turn, current, event.decision, evidence, unavailable, owner, guest=guest
                     )
                     if refusal != "not_engaged":
                         # Noted once the hold-backs below have had their say (#153).
@@ -3308,7 +3487,7 @@ class SpeechEvents:
                     )
                 # Written last, like the acknowledgement note, once the request is out.
                 follow_up_text = self._follow_up_note(follow_up_note, held, bar, event.decision)
-            overriding = authority == "owner" and (attended or stop or dismissed)
+            overriding = not guest and authority == "owner" and (attended or stop or dismissed)
             plan = None
             if kind is not None:
                 plan = self._plan(
@@ -3318,6 +3497,8 @@ class SpeechEvents:
                     "decision",
                     event.decision.dismissal_confidence,
                     loose=event.decision.recipient == "system",
+                    guest=guest,
+                    guest_binding=guest_binding,
                     authority=authority,
                 )
             # A pending turn withdrawn earlier only produces an event when it would have
@@ -3494,12 +3675,14 @@ class SpeechEvents:
                         other in self._label_stale
                         or self._authority_role(other, self._current_role(earlier, other_role))
                         != "owner"
+                        or self._ambient_guest(earlier, other_role)
                     ) and earlier.end_ms <= turn.end_ms:
                         self._superseded.setdefault(other, key)
             if plan is not None:
                 self._dismissed[key] = plan["upgradable"]
                 self._emit("dismiss", **self._apply(turn, plan))
-            if self._conversation is not None and self._engaged_with(turn):
+            manages_conversation = self._conversation is not None and not guest
+            if manages_conversation and self._engaged_with(turn):
                 # A close ends engagement even if the closing turn itself was attended,
                 # and never re-engages. With the timeout above (emitted before any
                 # reservation), this decision emits at most one more `conversation`
@@ -3517,11 +3700,11 @@ class SpeechEvents:
                     )
                 ):
                     self._disengage(turn, "other_human")
-            elif self._conversation is not None and self._unattributed_closing(turn):
+            elif manages_conversation and self._unattributed_closing(turn):
                 # A closing with no speaker label inside the window ends the one engagement
                 # (#167); a dismissal or a turn to another person still needs the label.
                 self._disengage(turn, "closed")
-            elif self._conversation is not None:
+            elif manages_conversation:
                 # The same explicit ends, said after the conversation lapsed (#158), whether
                 # it is still dormant or a reply already revived it before this decision.
                 if plan is not None:
@@ -3549,7 +3732,8 @@ class SpeechEvents:
                         # when another speaker holds the engagement now: decided in order,
                         # such a request would have engaged first and then ended here.
                         self._mark_ended(own, turn)
-            if attended and self._conversation is not None and self._conversation.appendix_ms:
+            conversational_request = attended and manages_conversation
+            if conversational_request and self._conversation.appendix_ms:
                 own = self._cooldown_key(self._facts(turn))
                 if evidence.get("follow_up"):
                     # One appendix per direct request (#199): a follow-up never reopens it.
@@ -3564,10 +3748,21 @@ class SpeechEvents:
                     self._spoken_replies.last_delivered = request_id
                 # The latest request formed, for a decision's context (#199): the heard
                 # words, as past turns carry them, not a former's rewrite. A short tag on
-                # it ("right?") leaves it in place. Any request answers or replaces the
-                # assistant's question; the next reply answers this request.
-                self._asked_at = None
-                self._replied_at = None
+                # it ("right?") leaves it in place. A guest's direct request is delivered
+                # independently of the owner's question and follow-up window.
+                self._last_request_was_guest = guest
+                if (
+                    self._conversation is not None
+                    and self._conversation.require_guest_address
+                    and not self._scoped_replies
+                ):
+                    self._legacy_requests[request_id] = _LegacyRequest(
+                        turn.end_ms, guest, "ack_end" if ack.get("acknowledge") else "answer_end"
+                    )
+                if not guest:
+                    self._asked_at = None
+                    self._replied_at = None
+                    self._dormant = None
                 if not self._is_tag(turn):
                     self.last_request = (
                         turn.end_ms,
@@ -3575,10 +3770,6 @@ class SpeechEvents:
                         turn.utterance_id,
                         turn.speaker_id,
                     )
-                # Any delivered request makes the next reply that request's, so no lapsed
-                # conversation is revived by it (rightyo#158); a request that engages its own
-                # speaker replaces the dormant one anyway.
-                self._dormant = None
                 self._emit(
                     "request",
                     request_id=request_id,
@@ -3594,7 +3785,9 @@ class SpeechEvents:
                         # Bounded: the oldest delivered request can no longer be withdrawn.
                         del self._delivered[next(iter(self._delivered))]
                     self._delivered[request_id] = self._facts(turn)
-                if role is not None and authority != "owner":
+                    if guest_binding is not None and guest:
+                        self._delivered[request_id]["guest_binding"] = guest_binding
+                if role is not None and (guest or authority != "owner"):
                     if len(self._open) >= self.max_open:
                         # Fail closed before an owner's override burst could overflow the
                         # queue; nothing is silently dropped.
@@ -3602,7 +3795,7 @@ class SpeechEvents:
                         self._active = False
                         raise ContractError("open request budget exceeded")
                     self._open[request_id] = turn.end_ms
-                if self._conversation is not None and not self._conversation.is_closing(turn.text):
+                if conversational_request and not self._conversation.is_closing(turn.text):
                     self._engage(turn, request_id, decided, owner.identity if owner else None)
                 if self.request_control:
                     if len(self._request_outcomes) >= 128:
@@ -3759,10 +3952,13 @@ class SpeechEvents:
                 self._formed.clear()
             self._memory.clear()
             self._pending.clear()
+            self._pending_guest_bindings.clear()
             self._pending_bytes = 0
             self._cue_voices.clear()
             self._others_turns.clear()
             self._open.clear()
+            self._legacy_requests.clear()
+            self._legacy_playback_request = None
             self._delivered.clear()
             self._withdrawn.clear()
             self._private_seen.clear()
