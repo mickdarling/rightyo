@@ -320,6 +320,20 @@ def answer_shaped(text: str) -> bool:
     return bool(words) and (words[0] in _ANSWER_WORDS or tuple(words[:2]) in _ANSWER_PAIRS)
 
 
+def instruction_cued(text: str) -> bool:
+    """An opening request verb or an instruction acting on the assistant's output (#326)."""
+    words = _LETTERS.findall(text.lower())
+    if "your" in words:
+        return False
+    command = iter(words)
+    verb = next((word for word in command if word not in _VERB_LEAD), None)
+    if verb in _MODALS and next(command, None) == "you":
+        verb = next((word for word in command if word != "please"), None)
+    return (len(words) >= 3 and verb in _REQUEST_VERBS) or (
+        verb in _OUTPUT_VERBS and next(command, None) in _OBJECTS
+    )
+
+
 def follow_up_cued(text: str, addressing: Addressing | None = None) -> bool:
     """Whether a turn carries a cue that it continues an exchange with the assistant (#199).
 

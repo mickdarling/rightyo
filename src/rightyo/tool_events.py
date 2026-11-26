@@ -12,7 +12,7 @@ from collections import deque
 from dataclasses import dataclass, replace
 from threading import RLock
 
-from rightyo.addressedness import answer_shaped, follow_up_cued, mentions_name
+from rightyo.addressedness import answer_shaped, follow_up_cued, instruction_cued, mentions_name
 from rightyo.contracts import (
     DISMISSING,
     Acknowledgement,
@@ -2244,6 +2244,14 @@ class SpeechEvents:
                         asked=value.get("asked", False),
                         request_id=request,
                     )
+                    if (
+                        state == "reply_ended"
+                        and not self._duck
+                        and self._engaged is not None
+                        and self._engaged["request_id"] == request
+                        and self._conversation.answer_follow_up_min_probability is not None
+                    ):
+                        self._engaged["spoken_answer_end_ms"] = now_ms
             self._emit("request_outcome", request_id=request, state=state, version=1)
             return result
 
@@ -2633,8 +2641,10 @@ class SpeechEvents:
             return "label"
         if decision.recipient not in {"system", "unknown"}:
             return "recipient"
-        if decision.probabilities["attend"] < self._follow_up_bar(role) and not self._appendix(
-            turn
+        if (
+            decision.probabilities["attend"] < self._follow_up_bar(role)
+            and not self._appendix(turn)
+            and not self._answer_follow_up(turn, role, decision)
         ):
             return "below_bar"
         if conversation.is_closing(turn.text):
@@ -2679,6 +2689,40 @@ class SpeechEvents:
     def _answers_question(self, turn):
         """Whether a turn starting after a reply that asked the owner a question answers it."""
         return self._question_pending(turn) and answer_shaped(turn.text)
+
+    def _answer_follow_up(self, turn, role, decision):
+        """The lower floor for the engaged owner's directed reply to a spoken answer (#326)."""
+        floor = self._conversation.answer_follow_up_min_probability
+        if (
+            floor is None
+            or decision.probabilities["attend"] < floor
+            or decision.recipient != "system"
+            or role != "owner"
+            or turn.utterance_id in self._inferred
+        ):
+            return False
+        if self._scoped_replies:
+            if self._request_outcomes.get(self._engaged["request_id"]) != "reply_ended":
+                return False
+            ended = self._engaged.get("spoken_answer_end_ms")
+        else:
+            # Only a host-marked question identifies a legacy playback as an answer.
+            ended = self._asked_at
+        window = self._conversation.answer_follow_up_window_ms
+        if ended is None or not 0 <= turn.start_ms - ended <= window:
+            return False
+        # A different clip can still be playing. An onset at the reported end is eligible.
+        if any(
+            start < turn.end_ms and (end is None or turn.start_ms < end)
+            for start, end in self._playbacks
+        ):
+            return False
+        if not (self._answers_question(turn) or instruction_cued(turn.text)):
+            return False
+        try:
+            return self._voiceprinted(turn) and self._priority.enrolled_owner(turn) is True
+        except Exception:  # noqa: BLE001 - missing or failed identification keeps the usual floor
+            return False
 
     def _continues(self, turn, decision):
         """Whether the engaged speaker's own turn continues the exchange (#213): with
@@ -3363,6 +3407,8 @@ class SpeechEvents:
                 # assistant's question; the next reply answers this request.
                 self._asked_at = None
                 self._replied_at = None
+                if self._engaged is not None:
+                    self._engaged.pop("spoken_answer_end_ms", None)
                 if not self._is_tag(turn):
                     self.last_request = (
                         turn.end_ms,

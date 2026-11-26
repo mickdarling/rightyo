@@ -24,6 +24,8 @@ DEFAULT_CONVERSATION_WINDOW_MS = 20000
 MAX_CONVERSATION_WINDOW_MS = 120000
 # An appendix (#199) is a quick continuation of a just-formed request; keep it short.
 MAX_APPENDIX_MS = 5000
+DEFAULT_ANSWER_FOLLOW_UP_WINDOW_MS = 3000
+MAX_ANSWER_FOLLOW_UP_WINDOW_MS = 5000
 DEFAULT_FOLLOW_UP_MIN_PROBABILITY = 0.4
 DEFAULT_CLOSING_PHRASES = (
     "that's all",
@@ -553,6 +555,9 @@ class Conversation:
     cue_when_others_ms: int = 0
     presence_min_ms: int = 1000
     presence_min_words: int = 3
+    # Optional attend floor for a verified owner's directed turn after a spoken answer.
+    answer_follow_up_min_probability: float | None = None
+    answer_follow_up_window_ms: int = DEFAULT_ANSWER_FOLLOW_UP_WINDOW_MS
 
     def __post_init__(self) -> None:
         if (
@@ -562,6 +567,16 @@ class Conversation:
             raise ContractError("invalid conversation window")
         if probability(self.follow_up_min_probability) <= 0:
             raise ContractError("invalid follow-up probability")
+        if (
+            self.answer_follow_up_min_probability is not None
+            and probability(self.answer_follow_up_min_probability) <= 0
+        ):
+            raise ContractError("invalid answer follow-up probability")
+        if (
+            type(self.answer_follow_up_window_ms) is not int
+            or not 1 <= self.answer_follow_up_window_ms <= MAX_ANSWER_FOLLOW_UP_WINDOW_MS
+        ):
+            raise ContractError("invalid answer follow-up window")
         if type(self.appendix_ms) is not int or not 0 <= self.appendix_ms <= MAX_APPENDIX_MS:
             raise ContractError("invalid appendix window")
         if (
@@ -641,6 +656,8 @@ class Conversation:
             "cue_when_others_ms",
             "presence_min_ms",
             "presence_min_words",
+            "answer_follow_up_min_probability",
+            "answer_follow_up_window_ms",
         }
         if not isinstance(raw, dict) or set(raw) - allowed:
             raise ContractError("conversation must be an object with known keys only")
@@ -657,6 +674,14 @@ class Conversation:
             "version": 1,
             "window_ms": self.window_ms,
             "follow_up_min_probability": self.follow_up_min_probability,
+            **(
+                {
+                    "answer_follow_up_min_probability": self.answer_follow_up_min_probability,
+                    "answer_follow_up_window_ms": self.answer_follow_up_window_ms,
+                }
+                if self.answer_follow_up_min_probability is not None
+                else {}
+            ),
             "closing_phrases": list(self.closing_phrases),
             # An added key, only when on: hosts ignore keys they do not know.
             **({"appendix_ms": self.appendix_ms} if self.appendix_ms else {}),
