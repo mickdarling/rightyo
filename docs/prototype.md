@@ -98,8 +98,10 @@ abstention through the same meeting policy. Static cue shapes and waivers never 
 The opt-in `conversation.require_guest_address` replaces this automatic meeting bar in
 ambient listening. The voiceprint-bound owner can make unnamed requests and follow-ups
 at the usual probability floor. With another voice present, a low-scoring ambiguous
-aside still needs a cue. Guests and turns with inferred attribution must open each request
-with a configured name or variant. The [tool contract](tool-api.md#conversation-mode)
+aside still needs a cue. Owner standing requires at least one strictly diarized word,
+with all strict words on the enrolled owner's bound label. Inferred opening names and
+trailing words preserve that standing. Guests must open each request with a configured
+name or variant. The [tool contract](tool-api.md#conversation-mode)
 describes the cue checks.
 
 An optional

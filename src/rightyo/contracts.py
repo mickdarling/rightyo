@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 LABELS = frozenset({"attend", "ignore", "uncertain"})
@@ -759,6 +759,15 @@ class Acknowledgement:
 
 
 @dataclass(frozen=True)
+class WordAttribution:
+    """Text-free timeline evidence for the words retained in a processor turn."""
+
+    strict_word_count: int = 0
+    inferred_word_count: int = 0
+    strict_speakers: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
 class Turn:
     session_id: str
     utterance_id: str
@@ -772,6 +781,8 @@ class Turn:
     recognizer_id: str
     provenance: str
     speaker_provenance: str = "unknown"
+    # Internal evidence from the processor, outside the transcript/replay contract.
+    word_attribution: WordAttribution | None = field(default=None, kw_only=True, compare=False)
 
     def __post_init__(self) -> None:
         for name in ("session_id", "utterance_id", "recognizer_id", "speaker_provenance"):
@@ -812,13 +823,15 @@ class Turn:
     def from_dict(cls, raw: Any) -> Turn:
         if not isinstance(raw, dict):
             raise ContractError("turn must be an object")
+        if "word_attribution" in raw:
+            raise ContractError("unrecognized turn field")
         try:
             return cls(**raw)
         except TypeError:
             raise ContractError("missing or unrecognized turn fields") from None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {f.name: getattr(self, f.name) for f in fields(self) if f.name != "word_attribution"}
 
 
 @dataclass(frozen=True)

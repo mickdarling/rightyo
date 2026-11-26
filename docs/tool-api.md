@@ -854,9 +854,12 @@ unchanged. Once the window lapses, follow-ups work as before. The started
 event advertises `cue_when_others_ms` only when nonzero. This is a transcript policy;
 synthetic replay tests do not establish live speaker or addressee accuracy.
 
-With `require_guest_address` enabled, a fully attributed turn from the voiceprint-bound
-owner can form an unnamed ambient request while another voice is present. The existing
-`ask_anywhere` promotion also applies when the owner names the assistant. Owner
+With `require_guest_address` enabled, an unnamed ambient request can pass while another
+voice is present if at least one word has full, single-speaker timeline coverage and
+every such word carries the voiceprint-bound owner's label. An inferred edge word or
+joined tail preserves this standing. An inferred opening wake name or vocative also
+counts as the owner's address when the strict body meets this rule. The existing
+`ask_anywhere` promotion for a name elsewhere in the turn requires owner authority. Owner
 follow-ups retain their configured probability floor and the optional spoken-answer
 exception described below. With `require_cue` off, an ordinary instruction such as
 “Use the wider column” passes the same checks with guests present
@@ -866,9 +869,10 @@ followed by one word), or has at most three words with no request shape. A respo
 a pending question can supply that cue.
 With `require_cue` on, the configured cues and waivers apply to every follow-up.
 
-All other ambient speakers, including unknown voices, label-only owners and turns with
-inferred attribution, need a direct model `attend` to `system` and an opening configured
-name or spelling variant on each request. The usual lead-ins, such as “Hey Beacon”, count.
+All other ambient speakers, including unknown voices, label-only owners and turns
+without a strictly attributed word, need a direct model `attend` to `system` and an
+opening configured name or spelling variant on each request. The usual lead-ins, such
+as “Hey Beacon”, count.
 A name can stand alone or take a delimiter, as in “Beacon, where is the chart?” and
 “Beacon: translate this”. Without a delimiter, or when two commas could enclose a
 description, the turn needs a recognized command opener, a polite request ending in
@@ -876,6 +880,13 @@ description, the turn needs a recognized command opener, a polite request ending
 the grid” qualifies. “Beacon was offline yesterday”, “Beacon, which we retired, was
 slow” and “Where is the chart, Beacon?” stay in context. A direct `attend` held for a
 missing address carries `guest_unaddressed: true`.
+
+Processor turns evaluated for guest addressing or the spoken-answer floor carry
+`strict_word_count`, `inferred_word_count`, `strict_speakers` and `standing_reason`
+in their attention decision. The counts cover the retained words. A word assigned a
+timeline label by partial coverage, edge attribution or a join counts as inferred.
+Unlabelled words count toward neither total. The speaker list contains only diarizer
+labels. The reason is `strict_owner`, `strict_other` or `no_strict_words`.
 
 An addressed guest request carries its own request ID. The owner keeps their pending
 question and deadline, including when the diarizer reuses their label for a guest.
@@ -975,10 +986,11 @@ question or give a directed instruction such as “Check the schedule” or “R
 last answer”. The English cue matches complete, short constructions. Extra clauses,
 trailing names, and richer objects such as “the revised summer timetable” need the
 ordinary floor. A later clip takes effect at its audio boundary, so an earlier completed
-answer can still qualify while its decision is pending. Inferred speaker
-labels and turns overlapping playback, including host-reported sample windows, are
-ineligible for the lower floor. The follow-up diagnostic records the floor used for the
-comparison. All other follow-up checks still apply.
+answer can still qualify while its decision is pending. Both requests use the strict-word
+owner rule above, including when guest addressing is off. Overlap with playback,
+including host-reported sample windows, makes a turn ineligible for the lower floor.
+The follow-up diagnostic records the floor used for the comparison. All other
+follow-up checks still apply.
 
 **Appendices** ([#199](https://github.com/mickdarling/rightyo/issues/199)). With
 `appendix_ms` above 0, the engaged speaker's `uncertain` turn that starts within that long

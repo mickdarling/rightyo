@@ -39,6 +39,7 @@ from rightyo.contracts import (
     RequestForming,
     SpeakerPriority,
     Turn,
+    WordAttribution,
     identifier,
 )
 from rightyo.credentials import CredentialError
@@ -1424,7 +1425,12 @@ class PrototypeController:
             with self._lock:
                 if scored_before and shadow.epoch != epoch:
                     # Renewed while scoring: this turn's old label has no authority now.
-                    turn = replace(turn, speaker_id=None, speaker_provenance="unknown")
+                    turn = replace(
+                        turn,
+                        speaker_id=None,
+                        speaker_provenance="unknown",
+                        word_attribution=WordAttribution(),
+                    )
                     self._inferred_turns.discard(turn.utterance_id)
                 # Sample before acceptance/scoring: any intervening forget invalidates the
                 # queued evidence rather than binding an old label in the new epoch.
