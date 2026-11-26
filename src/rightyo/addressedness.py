@@ -314,10 +314,38 @@ _AUXILIARIES = frozenset(
     "can could would will should shall may might is are am was were does did has".split()
 )
 _RELATIVE_OPENERS = frozenset({"which", "who", "whom", "whose", "when", "where"})
+_QUESTION_WORDS = frozenset("what where when why how who which whose".split())
+_QUESTION_AUXILIARIES = _AUXILIARIES | {"do", "have", "had", "must"}
+_SUBJECT_PRONOUNS = frozenset("i you we he she it they this that these those".split())
+_DETERMINERS = frozenset("a an the my your his her its our their".split())
 _STATEMENT_PREDICATE = re.compile(
     r"(?:(?:is|was|are|were|has|had|does)(?:n't)?|didn't|seems|seemed|appears|appeared|"
     r"looks|looked|sounds|sounded|works|worked|says|said|used\s+to)\b"
 )
+
+
+def _inverted_question(words: list[str]) -> bool:
+    """Look for an auxiliary before its subject in an unpunctuated question."""
+    if len(words) < 3:
+        return False
+    auxiliary, subject, predicate = words[0].removesuffix("n't"), words[1], words[2]
+    if auxiliary not in _QUESTION_AUXILIARIES:
+        return False
+    if subject in _SUBJECT_PRONOUNS:
+        # "has you on file" and "did you a favor" use 'you' as an object.
+        if auxiliary in {"does", "has"} and subject in {"i", "you", "we", "they"}:
+            return False
+        return auxiliary not in {"did", "does", "has", "had"} or predicate not in _DETERMINERS
+    if subject in _DETERMINERS:
+        # With a lexical "did" or "has", this may just be an object ("did a
+        # great job"). Require verb evidence after the noun in ambiguous cases.
+        if auxiliary in {"did", "does", "has", "had"}:
+            if len(words) < 4:
+                return False
+            verb = words[3]
+            return verb in _REQUEST_VERBS or verb in _OUTPUT_VERBS or verb.endswith(("ed", "en"))
+        return True
+    return subject == "there" and predicate in _DETERMINERS
 
 
 def vocative_request_tail(text: str, *, delimited: bool = False) -> bool:
@@ -326,25 +354,44 @@ def vocative_request_tail(text: str, *, delimited: bool = False) -> bool:
         return vocative_request_clause(text, delimited=False)
 
     clause = text.strip().lower().replace("’", "'")
-    words = _WORDS.findall(clause)
-    if not words or words[0] in _RELATIVE_OPENERS or words[:2] == ["that", "is"]:
+    parts = re.split(r"[,—–]\s*", clause, maxsplit=1)
+    words = _WORDS.findall(parts[0])
+    if not words:
         return False
-    if _STATEMENT_PREDICATE.match(clause):
-        return False
-    if words[0] == "did":
-        # With an inverted subject, "did you describe ..." can use any verb.
-        # In "did you a favor", 'you' is the object and a noun phrase follows.
-        return (
-            len(words) >= 3
-            and words[1] in {"you", "i", "we", "he", "she", "it", "they"}
-            and words[2] not in {"a", "an", "the"}
-        )
     # In "Beacon, my old assistant, was offline", the predicate resumes after
     # the appositive. A trailing question ("..., was it slow?") can still be directed.
-    parts = re.split(r"[,—–]\s*", clause, maxsplit=1)
-    if len(parts) == 2 and _STATEMENT_PREDICATE.match(parts[1]):
-        return parts[1].endswith("?") and vocative_request_clause(parts[1], delimited=True)
-    return True
+    if len(parts) == 2:
+        if words[0] in _RELATIVE_OPENERS:
+            # "where is the chart, exactly?" has inversion inside the first clause.
+            # A subject relative ("which is our old assistant, ...") is ambiguous.
+            if not _inverted_question(words[1:]) or (
+                words[0] not in {"where", "when"} and words[2] not in _SUBJECT_PRONOUNS
+            ):
+                return False
+        if _STATEMENT_PREDICATE.match(parts[1]):
+            return parts[1].endswith("?") and vocative_request_clause(parts[1], delimited=True)
+    if clause.endswith("?") or _inverted_question(words):
+        return True
+    if words[0] in _QUESTION_WORDS and len(words) >= 2:
+        # A wh-phrase can include a noun before the auxiliary ("what time is it").
+        # A subject wh-word can also lead straight into a verb ("who called").
+        if words[0] == "who" and words[1] not in _SUBJECT_PRONOUNS | _DETERMINERS:
+            return True
+        predicate = words[1:] if words[0] in {"what", "which", "whose", "how"} else words[1:2]
+        if words[1] not in _SUBJECT_PRONOUNS and any(
+            word.removesuffix("n't") in _QUESTION_AUXILIARIES
+            or word in _REQUEST_VERBS
+            or word in _OUTPUT_VERBS
+            or word.endswith(("ed", "s"))
+            for word in predicate
+        ):
+            return True
+    return (
+        words[0] not in _RELATIVE_OPENERS
+        and words[:2] != ["that", "is"]
+        and words[0] != "did"
+        and not _STATEMENT_PREDICATE.match(clause)
+    )
 
 
 def vocative_request_clause(text: str, *, delimited: bool) -> bool:
