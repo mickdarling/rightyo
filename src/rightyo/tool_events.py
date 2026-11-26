@@ -15,11 +15,10 @@ from threading import RLock
 from rightyo.addressedness import (
     answer_shaped,
     follow_up_cued,
+    guest_address_tail,
     mentions_name,
     possible_aside,
     spoken_reply_cue,
-    vocative_request_clause,
-    vocative_request_tail,
 )
 from rightyo.contracts import (
     DISMISSING,
@@ -1727,22 +1726,9 @@ class SpeechEvents:
             return False
 
     def _guest_addressed_us(self, turn):
-        for _, end in _opening_names(turn.text, self._addressing):
-            tail = turn.text[end:].strip()
-            clause = tail.lstrip(".,:!?—–").strip()
-            if not clause or vocative_request_tail(clause, delimited=clause != tail):
-                return True
-        head, comma, tail = turn.text.rpartition(",")
-        return bool(
-            comma
-            and self._addressing
-            and self._addressing.name_for(tail)
-            and (
-                vocative_request_clause(
-                    head + ("?" if turn.text.rstrip().endswith("?") else ""), delimited=True
-                )
-                or self._conversation.is_closing(turn.text)
-            )
+        return any(
+            guest_address_tail(turn.text[end:])
+            for _, end in _opening_names(turn.text, self._addressing)
         )
 
     def _plan(

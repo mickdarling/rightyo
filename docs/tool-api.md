@@ -816,7 +816,7 @@ events. The object accepts the following optional keys.
 | `cue_when_others_ms` | 0 (off) | 0 to 120,000 | Apply the meeting attention bar automatically while another voice was recently heard (see below) |
 | `presence_min_ms` | 1,000 | 0 to 120,000 | Minimum other-turn duration (`end_ms - start_ms`) for presence evidence |
 | `presence_min_words` | 3 | 0 to 1,000 | Minimum whitespace-separated word count for presence evidence |
-| `require_guest_address` | false | true or false | In ambient listening, require a direct address from anyone other than the voiceprint-bound owner and reserve follow-ups for that owner |
+| `require_guest_address` | false | true or false | In ambient listening, require an opening name from anyone other than the voiceprint-bound owner and reserve follow-ups for that owner |
 | `require_cue` | false | true or false | Whether a follow-up must also carry a cue that it continues the exchange (see below) |
 | `cue_min_attend` | absent (off) | above 0 to 1 | With `require_cue`, the attend probability at which a follow-up needs no cue |
 | `continuation_cue` | false | true or false | With `require_cue`, whether the requester continuing after a reply needs no cue (see below) |
@@ -867,14 +867,15 @@ a pending question can supply that cue.
 With `require_cue` on, the configured cues and waivers apply to every follow-up.
 
 All other ambient speakers, including unknown voices, label-only owners and turns with
-inferred attribution, need a direct model `attend` to `system` and a configured name or
-variant used as an address. Examples include “Beacon?”, “Hey Beacon”, “Beacon, the chart
-please”, “Beacon read the chart” and “Read the chart, Beacon”. The clause beside the
-name matters. “Beacon did you a favor” and “Beacon, which is our old assistant, is
-offline” stay in context. For an unfamiliar imperative, an explicit request such as
-“Beacon can you rewind ten seconds” provides address evidence. This rule applies from
-the first turn. A direct `attend`
-held for a missing address carries `guest_unaddressed: true`.
+inferred attribution, need a direct model `attend` to `system` and an opening configured
+name or spelling variant on each request. The usual lead-ins, such as “Hey Beacon”, count.
+A name can stand alone or take a delimiter, as in “Beacon, where is the chart?” and
+“Beacon: translate this”. Without a delimiter, or when two commas could enclose a
+description, the turn needs a recognized command opener, a polite request ending in
+“please”, a modal such as “can you”, or a question mark at the end. “Beacon describe
+the grid” qualifies. “Beacon was offline yesterday”, “Beacon, which we retired, was
+slow” and “Where is the chart, Beacon?” stay in context. A direct `attend` held for a
+missing address carries `guest_unaddressed: true`.
 
 An addressed guest request carries its own request ID. The owner keeps their pending
 question and deadline, including when the diarizer reuses their label for a guest.

@@ -160,14 +160,18 @@ _WORDS = re.compile(r"[a-z']+")
 _FILLERS = frozenset(
     "hey ok okay so and um uh oh well now then also actually alright right yeah yes".split()
 )
-_OPENERS = frozenset(
+_IMPERATIVES = frozenset(
+    """
+    tell show give make set turn open close play stop start pause resume skip remind find
+    search look check call send read add remove delete create write let put get take bring
+    help schedule cancel email text message note book order explain summarize translate
+    """.split()
+)
+_OPENERS = _IMPERATIVES | frozenset(
     """
     can could would will should shall may might please
     what what's whats when where where's which who who's whom whose why how how's
     is are am was were do does did have has
-    tell show give make set turn open close play stop start pause resume skip remind find
-    search look check call send read add remove delete create write let put get take bring
-    help schedule cancel email text message note book order explain summarize translate
     """.split()
 )
 
@@ -308,138 +312,29 @@ _CORRECTIONS = frozenset({("you", "mean"), ("i", "meant")})
 _ANSWER_WORDS = frozenset("yes yeah yep yup sure no nope okay ok".split())
 _ANSWER_PAIRS = frozenset({("go", "ahead"), ("do", "it"), ("sounds", "good")})
 
-# After an undelimited name, an auxiliary can introduce a statement about its subject
-# ("Beacon was offline", "Beacon can read"). Look for question word order there.
-_AUXILIARIES = frozenset(
-    "can could would will should shall may might is are am was were does did has".split()
-)
-_RELATIVE_OPENERS = frozenset({"which", "who", "whom", "whose", "when", "where"})
-_QUESTION_WORDS = frozenset("what where when why how who which whose".split())
-_QUESTION_AUXILIARIES = _AUXILIARIES | {"do", "have", "had", "must"}
-_SUBJECT_PRONOUNS = frozenset("i you we he she it they this that these those".split())
-_DETERMINERS = frozenset("a an the my your his her its our their".split())
-_STATEMENT_PREDICATE = re.compile(
-    r"(?:(?:is|was|are|were|has|had|does)(?:n't)?|didn't|seems|seemed|appears|appeared|"
-    r"looks|looked|sounds|sounded|works|worked|says|said|used\s+to)\b"
+_GUEST_REQUEST_OPENERS = (
+    _IMPERATIVES
+    | _REQUEST_VERBS
+    | _OUTPUT_VERBS
+    | frozenset("be describe display do draw introduce please".split())
 )
 
 
-def _inverted_question(words: list[str]) -> bool:
-    """Look for an auxiliary before its subject in an unpunctuated question."""
-    if len(words) < 3:
-        return False
-    auxiliary, subject, predicate = words[0].removesuffix("n't"), words[1], words[2]
-    if auxiliary not in _QUESTION_AUXILIARIES:
-        return False
-    if subject in _SUBJECT_PRONOUNS:
-        # "has you on file" and "did you a favor" use 'you' as an object.
-        if auxiliary in {"does", "has"} and subject in {"i", "you", "we", "they"}:
-            return False
-        return auxiliary not in {"did", "does", "has", "had"} or predicate not in _DETERMINERS
-    if subject in _DETERMINERS:
-        # With a lexical "did" or "has", this may just be an object ("did a
-        # great job"). Require verb evidence after the noun in ambiguous cases.
-        if auxiliary in {"did", "does", "has", "had"}:
-            if len(words) < 4:
-                return False
-            verb = words[3]
-            return verb in _REQUEST_VERBS or verb in _OUTPUT_VERBS or verb.endswith(("ed", "en"))
+def guest_address_tail(text: str) -> bool:
+    """Check the words after a configured opening name on an ambient guest turn."""
+    tail = text.strip()
+    if not tail or tail[0] in ".:!?—–":
         return True
-    return subject == "there" and predicate in _DETERMINERS
-
-
-def vocative_request_tail(text: str, *, delimited: bool = False) -> bool:
-    """After an opening name, a delimiter supplies address evidence on its own."""
-    if not delimited:
-        return vocative_request_clause(text, delimited=False)
-
-    clause = text.strip().lower().replace("’", "'")
-    parts = re.split(r"[,—–]\s*", clause, maxsplit=1)
-    words = _WORDS.findall(parts[0])
-    if not words:
-        return False
-    # In "Beacon, my old assistant, was offline", the predicate resumes after
-    # the appositive. A trailing question ("..., was it slow?") can still be directed.
-    if len(parts) == 2:
-        if words[0] in _RELATIVE_OPENERS:
-            # "where is the chart, exactly?" has inversion inside the first clause.
-            # A subject relative ("which is our old assistant, ...") is ambiguous.
-            if not _inverted_question(words[1:]) or (
-                words[0] not in {"where", "when"} and words[2] not in _SUBJECT_PRONOUNS
-            ):
-                return False
-        if _STATEMENT_PREDICATE.match(parts[1]):
-            return parts[1].endswith("?") and vocative_request_clause(parts[1], delimited=True)
-    if clause.endswith("?") or _inverted_question(words):
+    # One comma marks a vocative. Two can enclose a description ("which we retired"),
+    # so require the same request evidence there as for an undelimited name.
+    if tail.startswith(",") and tail.count(",") == 1:
         return True
-    if words[0] in _QUESTION_WORDS and len(words) >= 2:
-        # A wh-phrase can include a noun before the auxiliary ("what time is it").
-        # A subject wh-word can also lead straight into a verb ("who called").
-        if words[0] == "who" and words[1] not in _SUBJECT_PRONOUNS | _DETERMINERS:
-            return True
-        predicate = words[1:] if words[0] in {"what", "which", "whose", "how"} else words[1:2]
-        if words[1] not in _SUBJECT_PRONOUNS and any(
-            word.removesuffix("n't") in _QUESTION_AUXILIARIES
-            or word in _REQUEST_VERBS
-            or word in _OUTPUT_VERBS
-            or word.endswith(("ed", "s"))
-            for word in predicate
-        ):
-            return True
-    return (
-        words[0] not in _RELATIVE_OPENERS
-        and words[:2] != ["that", "is"]
-        and words[0] != "did"
-        and not _STATEMENT_PREDICATE.match(clause)
-    )
-
-
-def vocative_request_clause(text: str, *, delimited: bool) -> bool:
-    """Require request evidence before a closing name or after an undelimited name."""
-    words = _WORDS.findall(text.lower())
-    if not words:
-        return False
-    first = words[0]
-    question = text.rstrip().endswith("?")
-    if first in {"did", "does", "has"}:
-        # "Did you a favor" and "has you on file" take 'you' as their object.
-        # Require a clear inverted question with an agreeing subject and a verb.
-        return (
-            first == "did"
-            and question
-            and len(words) >= 3
-            and words[1] in {"you", "i", "we"}
-            and (words[2] in _REQUEST_VERBS or words[2] in _OUTPUT_VERBS)
-        )
-    if first in _AUXILIARIES:
-        return len(words) >= 3 and (
-            words[1] in {"you", "i", "we"}
-            or (question and words[1] in {"it", "there", "the", "this", "that", "my"})
-        )
-    # These can open a relative clause describing the name. A comma alone is
-    # insufficient evidence of an address, even when it follows the wake name.
-    if first in _RELATIVE_OPENERS:
-        return False
-    # These command verbs also spell their own past tense. With no vocative
-    # delimiter, keep the short command ("read the chart") but abstain on a
-    # longer clause ("read the chart yesterday") unless it explicitly asks.
-    if not delimited and first in {"read", "set", "put", "let"} and len(words) > 3:
-        return words[-1] == "please"
-    if (
-        words[-1] == "please"
-        and first in {"a", "an", "the", "my", "this", "that"}
-        and len(words) <= 4
-        and "," not in text
-    ):
-        return True
-    # Reuse known output verbs. The fixed reflexive request is
-    # unambiguous; arbitrary words before "yourself" need not be commands.
-    return (
-        first in _OPENERS
-        or first in _REQUEST_VERBS
-        or first in _OUTPUT_VERBS
-        or first in {"be", "display", "draw"}
-        or words == ["introduce", "yourself"]
+    words = _WORDS.findall(tail.lower())
+    return bool(words) and (
+        tail.endswith("?")
+        or words[0] in _GUEST_REQUEST_OPENERS
+        or words[-1] == "please"
+        or (words[0] in _MODALS and words[1:2] == ["you"])
     )
 
 
