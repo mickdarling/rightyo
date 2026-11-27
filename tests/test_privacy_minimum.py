@@ -592,10 +592,10 @@ class PrivacyMinimumTests(unittest.TestCase):
         e.drain()
         finalize = p._finalize
 
-        def off_before_registration(timeline, complete=False):
+        def off_before_registration(timeline, **boundary):
             # All private frames are audited, but no finalized packet exists yet.
             c.duck(False)
-            finalize(timeline, complete)
+            finalize(timeline, **boundary)
 
         with patch.object(p, "_finalize", side_effect=off_before_registration):
             self.feed(c, p, VOICE * 10 + SILENCE * 72, s)
@@ -681,14 +681,18 @@ class PrivacyMinimumTests(unittest.TestCase):
                     p._drain_results()
         self.assertEqual(e.drain(), [])
 
-    def replay_private_windows(self, *documents, retry=None):
+    def replay_private_windows(self, *windows, retry=None, timeline=None, audio=None):
+        """Replay authored Whisper documents or a replaceable adapter's unit lists."""
         c, e, s, p, _, units = self.arrange()
         c._enrolled_roles.exit_audio = c._private_sentence
         s.exit_score = Mock(return_value=EntryScore(0.9, None, 0, "scored"))
-        pending = iter(documents)
+        pending = iter(windows)
 
         def decode(pcm, register=None):
-            units._window = _recognizer_window(next(pending), len(pcm) // 32)
+            result = next(pending)
+            if isinstance(result, list):
+                return result
+            units._window = _recognizer_window(result, len(pcm) // 32)
             return units._window.units
 
         def private_audio(turn, pcm):
@@ -702,11 +706,16 @@ class PrivacyMinimumTests(unittest.TestCase):
         )
         c.duck(True)
         e.drain()
+        if timeline is not None:
+            p._diarizer.segments = Mock(return_value=timeline)
+        if audio is None:
+            audio = [VOICE * 10 + SILENCE * 72] * len(windows)
         with patch("rightyo.live_audio._transcribe", return_value=retry) as redecode:
-            for _ in documents:
-                self.feed(c, p, VOICE * 10 + SILENCE * 72, s)
+            for pcm in audio:
+                self.feed(c, p, pcm, s)
                 p._drain_results(wait=True)
             p.finish()
+        self.assertEqual(list(pending), [])
         self.assertEqual(redecode.call_count, int(retry is not None))
         self.assertFalse(c._private_sentence.pcm)
         return [event["action"] for event in e.drain()], s.exit_score.call_count
@@ -718,6 +727,89 @@ class PrivacyMinimumTests(unittest.TestCase):
                 window = doc(command, segment(" to the podcast", start, 200))
                 self.assertEqual(self.replay_private_windows(window), ([], 0))
         self.assertEqual(self.replay_private_windows(doc(command)), (["exit"], 1))
+
+    def test_partial_speaker_coverage_cannot_separate_an_exit_from_its_window(self):
+        phrase = segment("Jarvis, start listening", 0, 100)
+        prefix = segment("Did you hear ", 0, 50)
+        timeline = [{"speaker": 1, "start_ms": 0, "end_ms": 100}]
+        for window in (
+            doc(phrase, segment(" to the podcast", 100, 200)),
+            doc(prefix, segment("Jarvis, start listening", 100, 200)),
+            doc(segment("Jarvis", 0, 100), segment(" start listening", 100, 200)),
+        ):
+            with self.subTest(window=window):
+                self.assertEqual(self.replay_private_windows(window, timeline=timeline), ([], 0))
+        self.assertEqual(self.replay_private_windows(doc(phrase), timeline=timeline), (["exit"], 1))
+
+    def test_only_a_naturally_ended_whole_utterance_can_exit(self):
+        phrase = doc(segment("I heard Jarvis start listening", 0, 200))
+        suffix = doc(segment(" to the podcast", 0, 200))
+        pause = SILENCE * 72
+        self.assertEqual(self.replay_private_windows(phrase, audio=[VOICE * 10]), ([], 0))
+        self.assertEqual(
+            self.replay_private_windows(phrase, suffix, audio=[VOICE * 600, VOICE * 10 + pause]),
+            ([], 0),
+        )
+        # A naturally ended continuation still has a clipped beginning. A fresh
+        # utterance following the pause can authorize an exit again.
+        self.assertEqual(
+            self.replay_private_windows(suffix, phrase, audio=[VOICE * 600, VOICE * 10 + pause]),
+            ([], 0),
+        )
+        self.assertEqual(
+            self.replay_private_windows(
+                suffix, phrase, audio=[VOICE * 600, pause + VOICE * 10 + pause]
+            ),
+            (["exit"], 1),
+        )
+
+    def test_blank_segment_cannot_hide_tokens_or_timed_silence(self):
+        command = segment("Jarvis, start listening", 0, 100)
+        for blank in (
+            {**segment("", 100, 100), "tokens": [segment(" to the podcast", 100, 200)]},
+            {**segment("  ", 100, 200), "tokens": [segment(" to the podcast", 100, 200)]},
+            segment("  ", 100, 200),
+        ):
+            with self.subTest(blank=blank):
+                self.assertEqual(self.replay_private_windows(doc(command, blank)), ([], 0))
+
+    def test_token_timing_is_checked_before_joining_words(self):
+        for start, end in ((40, 60), (90, 150), (110, 160)):
+            with self.subTest(start=start, end=end):
+                phrase = segment("Jarvis, start listening", 0, 200)
+                phrase["tokens"] = [
+                    segment("Jarvis, start", 0, 90),
+                    segment(" listen", 90, 150),
+                    segment("ing", start, end),
+                ]
+                self.assertEqual(self.replay_private_windows(doc(phrase)), ([], 0))
+        for middle, start, last in ((" start", 40, " listening"), (" ", 50, "start listening")):
+            with self.subTest(middle=middle):
+                parts = [
+                    segment("Jarvis,", 0, 50),
+                    segment(middle, start, 100),
+                    segment(last, 100, 200),
+                ]
+                phrase = segment("Jarvis, start listening", 0, 200)
+                self.assertEqual(
+                    self.replay_private_windows(doc({**phrase, "tokens": parts})), ([], 0)
+                )
+
+    def test_replaceable_adapter_cannot_hide_a_textless_or_overlapping_unit(self):
+        def piece(text, start, end):
+            return {"text": text, "start_ms": start, "end_ms": end}
+
+        name, rest = piece("Jarvis", 0, 50), piece(" start listening", 100, 150)
+        blank = piece(" \t ", 50, 100)
+        for units in (
+            [name, blank, rest],
+            [name, rest, piece(" ", 150, 200)],
+            [name, piece(" start listening", 40, 100)],
+        ):
+            with self.subTest(units=units):
+                self.assertEqual(self.replay_private_windows(units), ([], 0))
+        self.assertEqual(self.replay_private_windows([name], [blank], [rest]), ([], 1))
+        self.assertEqual(self.replay_private_windows([name], [rest]), (["exit"], 2))
 
     def test_exit_refuses_an_untimed_word_inside_or_after_the_phrase(self):
         for parts in (

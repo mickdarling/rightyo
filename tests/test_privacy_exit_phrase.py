@@ -68,6 +68,39 @@ class NamedPrivacyExitTests(unittest.TestCase):
         self.assertEqual(self.hear("start listening, please?", 4000), [])
         self.assertEqual(self.hear("start listening.", 5000), [])
 
+    def test_question_marks_anywhere_and_unpunctuated_questions_stay_private(self):
+        for index, text in enumerate(
+            (
+                "Did you hear Jarvis start listening?!",
+                "She asked, “did Jarvis start listening?”  ",
+                "(Jarvis, start listening？)  ",
+                "¿Jarvis, start listening",
+                "Really? Jarvis, start listening.",
+                "Did you hear Jarvis start listening",
+                "Well, could you hear Jarvis start listening",
+                "Yesterday did you hear Jarvis start listening",
+                "She asked did Jarvis start listening",
+            )
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.hear(text, index * 1000), [])
+        (event,) = self.hear("Yesterday I heard Jarvis start listening.", 10000)
+        self.assertEqual(event["action"], "exit")
+
+    def test_marked_questions_disarm_each_split_fragment(self):
+        for index, (name, rest) in enumerate(
+            (
+                ("“Jarvis?!”", "start listening"),
+                ("Jarvis", "[start listening？]"),
+                ("Jarvis", "¿start listening"),
+            )
+        ):
+            with self.subTest(name=name, rest=rest):
+                at = index * 3000
+                self.assertEqual(self.hear(name, at), [])
+                self.assertEqual(self.hear(rest, at + 1000), [])
+                self.assertEqual(self.hear("start listening", at + 2000), [])
+
     def test_timing_loss_blocks_a_bound_owner_exit_and_preserves_status(self):
         turn = replace(
             duck.heard("partial", 0, 100, "Jarvis, start listening"), recognition_loss_end_ms=200

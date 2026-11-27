@@ -826,7 +826,7 @@ class Turn:
 
     @property
     def recognition_complete(self) -> bool:
-        """Every part of this turn follows the last incompletely timed ASR window."""
+        """The turn has duration and follows the last incomplete recognition window."""
         return self.recognition_loss_end_ms <= self.start_ms < self.end_ms
 
     @classmethod

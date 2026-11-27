@@ -25,6 +25,7 @@ assistant is the decision model's judgement (or the exact configured stop phrase
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 from .contracts import Addressing, ContractError, normalize_phrase
@@ -167,13 +168,42 @@ _IMPERATIVES = frozenset(
     help schedule cancel email text message note book order explain summarize translate
     """.split()
 )
-_OPENERS = _IMPERATIVES | frozenset(
-    """
-    can could would will should shall may might please
-    what what's whats when where where's which who who's whom whose why how how's
-    is are am was were do does did have has
-    """.split()
+_AUXILIARIES = frozenset(
+    "can could would will should shall may might is are am was were do does did have has".split()
 )
+_QUESTION_OPENERS = _AUXILIARIES | frozenset(
+    "what what's whats when where where's which who who's whom whose why how how's".split()
+)
+_OPENERS = _IMPERATIVES | _QUESTION_OPENERS | {"please"}
+
+
+def question_shaped(text: str) -> bool:
+    """Question punctuation anywhere, or an English interrogative clause in ASR text."""
+    for char in text:
+        if char == "?":
+            return True
+        if not char.isascii():
+            name = unicodedata.name(char, "")
+            if "QUESTION" in name or "INTERROBANG" in name:
+                return True
+    for clause in re.split(r"[^\w\s']+", text.lower().replace("’", "'")):
+        at_head, after_auxiliary = True, False
+        for token in _WORDS.findall(clause):
+            word = token.strip("'")
+            if not word or (at_head and (word in _FILLERS or word == "please")):
+                continue
+            if after_auxiliary and word in {"i", "you", "he", "she", "it", "we", "they", "there"}:
+                return True  # "Yesterday did you hear ..." without ASR punctuation.
+            base = word.removesuffix("n't").partition("'")[0]
+            after_auxiliary = (
+                base in _AUXILIARIES
+                or base in {"must", "had"}
+                or word in {"can't", "won't", "shan't", "ain't"}
+            )
+            if at_head and (after_auxiliary or base in _QUESTION_OPENERS):
+                return True
+            at_head = word in {"ask", "asked", "asking"}
+    return False
 
 
 def request_shaped(text: str) -> bool:

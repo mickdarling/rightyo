@@ -1108,9 +1108,15 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
         text, offsets = segment.get("text"), segment.get("offsets")
         if not isinstance(text, str) or len(text) > 4000 or not isinstance(offsets, dict):
             raise LiveAudioError("Invalid local recognizer result")
-        if not text.strip():
-            continue
         start, end = offsets.get("from"), offsets.get("to")
+        if not text.strip():
+            # An empty, instantaneous placeholder carries no speech. Tokens or a
+            # nonempty/unknown interval could hide words that never reach the matcher.
+            if segment.get("tokens") not in (None, []) or not (
+                type(start) is int and type(end) is int and 0 <= start == end <= duration_ms
+            ):
+                window.unreliable_token_timing = True
+            continue
         previous_start = fallbacks[-1]["start_ms"] if fallbacks else 0
         previous_end = fallbacks[-1]["end_ms"] if fallbacks else 0
         reason = 0
@@ -1169,7 +1175,13 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
             ):
                 usable = False
                 break
-            if right > end or (left == right and any(c.isalnum() for c in value)):
+            if (
+                right > end
+                or (left == right and any(c.isalnum() for c in value))
+                or (left < right and not value.strip())
+                or (words and left < words[-1]["end_ms"])
+            ):
+                # Check each token before coalescing subwords can hide a reversal.
                 window.unreliable_token_timing = True
             left, right = min(left, end), min(right, end)
             if not words or (value[:1].isspace() and value.strip()):
@@ -1259,6 +1271,8 @@ class _FinalizedWindow:
     barrier_after: str | None = None
     discarded: bool = False
     private_cleared_through: int = 0
+    # Exit evidence only. A natural end and an unclipped onset are both required.
+    whole_utterance: bool = False
 
     def release(self) -> None:
         """Discard owned PCM/text evidence; safe to repeat during shutdown."""
@@ -1441,6 +1455,18 @@ def _checked_units(units: Any, duration_ms: int) -> list[dict[str, Any]] | None:
     return units
 
 
+def _complete_exit_units(units: list[dict[str, Any]] | None) -> bool:
+    """Every retained unit must supply text on its own positive-duration interval."""
+    if not units:
+        return False
+    previous_end = 0
+    for unit in units:
+        if not unit["text"].strip() or not previous_end <= unit["start_ms"] < unit["end_ms"]:
+            return False
+        previous_end = unit["end_ms"]
+    return True
+
+
 def _select(value: Any, default: Callable[[LiveConfig], Any], config: LiveConfig, method: str):
     if value is None:
         return default(config)
@@ -1542,6 +1568,8 @@ class LiveProcessor:
         self._utterance = bytearray()
         self._utterance_start = 0
         self._last_voice_ms = 0
+        # Speech resuming before this point after a forced cut has a clipped onset.
+        self._continuation_until_ms = 0
         self._received_ms = 0
         self._counter = 0
         self._utterances = 0
@@ -1983,11 +2011,11 @@ class LiveProcessor:
             if voiced:
                 self._last_voice_ms = self._received_ms
                 self._end_of_turn_asked = self._complete = False
-            if (
-                self._received_ms - self._last_voice_ms >= self.config.hangover_ms
-                or self._received_ms - self._utterance_start >= self.config.max_utterance_ms
-            ):
-                self._finalize(self._diarizer.segments(), complete=self._complete)
+            at_cap = self._received_ms - self._utterance_start >= self.config.max_utterance_ms
+            if at_cap or self._received_ms - self._last_voice_ms >= self.config.hangover_ms:
+                self._finalize(
+                    self._diarizer.segments(), complete=self._complete, natural_end=not at_cap
+                )
             elif self._complete or self._ask_end_of_turn():
                 self._finalize_when_attributed()
         else:
@@ -2068,7 +2096,7 @@ class LiveProcessor:
             f"end_of_turn finalized silence_ms={self._received_ms - self._last_voice_ms}",
             span=(self._utterance_start, self._received_ms),
         )
-        self._finalize(timeline, complete=True)
+        self._finalize(timeline, complete=True, natural_end=True)
 
     def _diagnostic(self, message: str, *, span: tuple[int, int] | None = None) -> None:
         """Report `message`; one about the utterance heard over `span` is withheld if that
@@ -2087,7 +2115,9 @@ class LiveProcessor:
         except Exception:  # noqa: BLE001 - fail closed: withhold the diagnostic
             return True
 
-    def _finalize(self, timeline: list[dict[str, Any]], complete: bool = False) -> None:
+    def _finalize(
+        self, timeline: list[dict[str, Any]], complete: bool = False, *, natural_end: bool = False
+    ) -> None:
         self._complete = False
         if not self._utterance:
             return
@@ -2095,6 +2125,10 @@ class LiveProcessor:
         offset = self._utterance_start
         before = (self.skipped_segments, self.skipped_utterances)
         self._utterances += 1
+        whole_utterance = natural_end and self._voice_start >= self._continuation_until_ms
+        self._continuation_until_ms = (
+            0 if natural_end else self._last_voice_ms + self.config.hangover_ms
+        )
         with self._recovery_lock:
             pcm = bytearray(self._utterance)
             packet = _FinalizedWindow(
@@ -2116,6 +2150,7 @@ class LiveProcessor:
                 before,
                 len(pcm) // BYTES_PER_MS,
                 bool(timeline),
+                whole_utterance=whole_utterance,
                 private_cleared_through=self._private_cleared_through,
             )
             self._finalizing = packet
@@ -2332,7 +2367,7 @@ class LiveProcessor:
             window, complete, provenance = packet.window, packet.complete, packet.provenance
             checked = _checked_units(packet.units, packet.duration_ms)
             unit_count = len(checked) if checked is not None else 0
-            untimed = not checked or any(unit["start_ms"] == unit["end_ms"] for unit in checked)
+            whole = packet.whole_utterance and _complete_exit_units(checked)
         if window is not None:
             skipped = window.rejected
             self._skipped_segments += skipped
@@ -2345,7 +2380,7 @@ class LiveProcessor:
                 self._skipped_utterances += 1
             skipped = self.skipped_segments - packet.before[0]
             suppressed = self.skipped_utterances > packet.before[1]
-        if skipped or suppressed or untimed or (window is not None and window.timing_incomplete):
+        if skipped or suppressed or not whole or (window is not None and window.timing_incomplete):
             # The valid pieces can still be published. No part of this window, or
             # split exit spanning it, can prove what the owner said at the end.
             self._recognition_loss_end_ms = offset + packet.duration_ms
@@ -2535,6 +2570,10 @@ class LiveProcessor:
                 # Edge-attributed words make the group's label partly inferred (#137).
                 group["inferred"] = True
         kept = [group for group in groups if group["text"].strip()]
+        if len(kept) > 1:
+            # Speaker boundaries divided this recognition window. None of the
+            # groups can authenticate the statement without the other words.
+            self._recognition_loss_end_ms = offset + packet.duration_ms
         for index, group in enumerate(kept):
             if self.closed or packet.discarded:
                 return

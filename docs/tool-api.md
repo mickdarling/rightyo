@@ -1841,9 +1841,13 @@ the three words before the name (before the phrase for status) blocks the match.
 
 For either kind of exit, only "now", "please" and "again" may follow the phrase, in
 any combination. "Jarvis, I'm back, please" qualifies. "Jarvis, I'm back, okay" and
-"Jarvis, start listening to the podcast" stay private. A turn ending in `?` cannot
-start or complete an exit. The same applies when recognition is incomplete, including
-missing, invalid or repaired unit timing, lost text, or a recognizer retry.
+"Jarvis, start listening to the podcast" stay private. Question punctuation anywhere
+in the turn, or a question opener such as "did you hear", blocks a named exit and
+either fragment of a split exit. Each must contain the whole recognised utterance
+and end at an observed speech pause. A speaker boundary that divides the text, a
+forced ASR cut or its continuation, and an end-of-input flush all make a fragment
+ineligible. So do lost text, a recognizer retry, textless timed units, and missing,
+repaired or overlapping word or token timing.
 
 A split exit is the enrolled owner's lone name fragment ("Jarvis,") heard while privacy
 is on, followed within 4 seconds by a turn consisting of the exit phrase and any

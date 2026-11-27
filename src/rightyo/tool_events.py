@@ -18,6 +18,7 @@ from rightyo.addressedness import (
     guest_address_tail,
     mentions_name,
     possible_aside,
+    question_shaped,
     spoken_reply_cue,
 )
 from rightyo.contracts import (
@@ -427,8 +428,7 @@ def privacy_phrase(text, addressing, *, recognition_complete=True):
     unfiltered = _privacy_words(text, ())
     words = _matched_words(unfiltered, addressing)
     kinds = set()
-    question = text.rstrip().endswith("?")
-    if recognition_complete and not question:
+    if recognition_complete and not question_shaped(text):
         if addressing is not None and words and addressing.name_for(" ".join(words)) is not None:
             kinds.add("name")
         exit_kind = _exit_kind(words, unfiltered, addressing)
@@ -436,7 +436,7 @@ def privacy_phrase(text, addressing, *, recognition_complete=True):
             kinds.add(exit_kind)
     if _phrase_in(words, PRIVACY_STATUS):
         kinds.add("status")
-    if not question and _standalone_entry(unfiltered, addressing):
+    if not text.rstrip().endswith("?") and _standalone_entry(unfiltered, addressing):
         kinds.add("entry")
     return frozenset(kinds)
 
