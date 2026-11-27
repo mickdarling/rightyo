@@ -6,11 +6,13 @@ worker script only: no model, capture, native inference, hosted calls or recorde
 
 from __future__ import annotations
 
+import io
 import json
 import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, Mock, patch
 
 from test_turn_merge import (
     SILENCE,
@@ -23,6 +25,7 @@ from test_turn_merge import (
     fragment,
 )
 
+from rightyo import smart_turn
 from rightyo.live_audio import FRAME_BYTES, LiveAudioError, LiveConfig, LiveProcessor
 from rightyo.prototype import PrototypeConfig, PrototypeError
 from rightyo.smart_turn import EndOfTurn, SmartTurn, SmartTurnError
@@ -339,6 +342,34 @@ class EndOfTurnSectionTests(unittest.TestCase):
                 config.write_text(json.dumps(base | {"end_of_turn": invalid}))
                 with self.assertRaises(PrototypeError):
                     PrototypeConfig.load(config)
+
+
+class SmartTurnWorkerTests(unittest.TestCase):
+    def test_score_wipes_request_pcm_features_and_output_before_next_read(self):
+        source = io.BytesIO(b'{"command":"score","pcm":"AQI="}\n')
+        request = json.loads(source.getvalue())
+        protocol, np, session = io.StringIO(), Mock(), Mock()
+        samples, features, output = MagicMock(), Mock(), Mock()
+        np.zeros.return_value = samples
+        samples.__itruediv__.return_value = samples
+        np.asarray.return_value.reshape.return_value = [0.75]
+        session.run.return_value = [output]
+
+        def decode_samples(pcm, dtype):
+            self.assertEqual(pcm, b"\x01\x02")
+            return [513]
+
+        np.frombuffer.side_effect = decode_samples
+        with (
+            patch.object(smart_turn.json, "loads", return_value=request),
+            patch.object(smart_turn, "_features", return_value=features),
+        ):
+            self.assertTrue(smart_turn._score_request(source, protocol, np, session))
+        self.assertEqual(request, {})
+        self.assertEqual(np.frombuffer.call_args.args[0], bytearray(2))
+        for scratch in (samples, features, output):
+            scratch.fill.assert_called_once_with(0)
+        self.assertEqual(json.loads(protocol.getvalue()), {"ok": True, "p": 0.75})
 
 
 class SmartTurnClientTests(unittest.TestCase):

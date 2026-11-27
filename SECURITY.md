@@ -11,22 +11,20 @@ mutable RAM buffer (10 s / 320,000 bytes at mono 16 kHz s16le), exclusively to c
 named exit phrase or either fragment of a split exit. Each fragment must independently
 pass the owner check; unlabelled private processor turns use only their isolated voice.
 Oversized or incomplete sentences refuse the voice check.
-Replacement, every exit-check outcome, privacy changes, speaker forget, Stop and session
-teardown overwrite this buffer with zeros before release. Private audio never enters
-speaker binding/accumulation, disk, logs or hosted speech; only fixed diagnostic tokens
-and the exit score number may be reported. Local ASR still assembles the current
-utterance in bounded memory. See [the exact retention contract](docs/tool-api.md#audio-and-logs).
+The matcher immediately zeros and releases the buffer when the turn is ineligible for
+an exit check. For a candidate, verification wipes the buffer on every outcome.
+Replacement, privacy changes, speaker forget, Stop and session teardown also wipe it.
+Private audio never enters speaker binding/accumulation, disk, logs or hosted speech.
+Only fixed diagnostic tokens and the exit score number may be reported. Local ASR
+assembles the current utterance in bounded memory. See [the exact retention contract](docs/tool-api.md#audio-and-logs).
 Local ASR recovery also has bounded queued windows. Privacy boundaries zero owned
 mutable recovery PCM, drop intersecting held text/results, and cancel private retries;
 an unaccountable in-flight decoder copy requires full speaker forget.
 
-Retained while private: the single rolling buffer holding the most recent finalized
-private turn, in RAM, zeroed on overwrite, after any exit check and at privacy-off or
-stop. Some owned scratch copies (the scorer input, returned samples, worker PCM and
-features) are zeroed; transient library copies (speech filtering, NumPy feature
-extraction, ONNX Runtime internals) are freed, not zeroed, when the check returns.
-These transient copies exist only for the check's duration. They never reach disk, logs
-or the network. Python cannot guarantee that freed memory is overwritten.
+The local Smart Turn and owner-verification workers zero their mutable private PCM,
+sample, feature and model output arrays. Each worker releases its request and serialized
+reply before reading again. Python cannot guarantee overwriting freed immutable data
+or temporary allocations inside NumPy and ONNX Runtime.
 
 Attention and transcript events are untrusted input, never authorization to execute privileged commands. Playback/echo must not fabricate user authority. Validate all event fields, lengths, timestamps, IDs, and bounds. Fail closed on malformed input.
 

@@ -103,6 +103,46 @@ def _read_private_pcm(source, size: int) -> bytearray:
         raise
 
 
+def _embed_request(source, protocol, np, session, name) -> bool:
+    """Keep the request and its serialized embedding local to a single exchange."""
+    line = source.readline(MAX_REQUEST_BYTES)
+    if not line or not line.endswith(b"\n"):
+        return False
+    request = json.loads(line)
+    del line
+    private = request.get("command") == "embed_private"
+    if private:
+        pcm = _read_private_pcm(source, request.get("size"))
+    elif request.get("command") == "embed":
+        pcm = base64.b64decode(request["pcm"], validate=True)
+    else:
+        return False
+    request.clear()
+    samples = features = vector = None
+    outputs = []
+    embedding = []
+    try:
+        if not pcm or len(pcm) > MAX_PCM_BYTES or len(pcm) % 2:
+            raise SpeakerIdError("Invalid audio")
+        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+        samples /= 32768.0
+        features = _kaldi_fbank(np, samples)
+        outputs = session.run(None, {name: features[None]})
+        vector = np.asarray(outputs[0], dtype=np.float64).reshape(-1)
+        embedding = vector.tolist()
+        response = json.dumps({"ok": True, "embedding": embedding}) + "\n"
+    finally:
+        if private:
+            pcm[:] = b"\0" * len(pcm)
+            embedding.clear()
+            for scratch in (samples, features, vector, *outputs):
+                if scratch is not None:
+                    scratch.fill(0)
+    # A successful response must not release the caller before the worker's wipes.
+    protocol.write(response)
+    return True
+
+
 def _worker(model: str, threads: int) -> int:
     protocol = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
     with open(os.devnull, "wb") as sink:
@@ -121,38 +161,8 @@ def _worker(model: str, threads: int) -> int:
         )
         name = session.get_inputs()[0].name
         protocol.write('{"ok":true}\n')
-        while True:
-            line = sys.stdin.buffer.readline(MAX_REQUEST_BYTES)
-            if not line or not line.endswith(b"\n"):
-                break
-            request = json.loads(line)
-            private = request.get("command") == "embed_private"
-            if private:
-                pcm = _read_private_pcm(sys.stdin.buffer, request.get("size"))
-            elif request.get("command") == "embed":
-                pcm = base64.b64decode(request["pcm"], validate=True)
-            else:
-                break
-            if not pcm or len(pcm) > MAX_PCM_BYTES or len(pcm) % 2:
-                raise SpeakerIdError("Invalid audio")
-            samples = features = None
-            try:
-                samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
-                samples /= 32768.0
-                features = _kaldi_fbank(np, samples)
-                output = session.run(None, {name: features[None]})
-                vector = np.asarray(output[0], dtype=np.float64).reshape(-1)
-                response = json.dumps({"ok": True, "embedding": vector.tolist()}) + "\n"
-            finally:
-                if private:
-                    pcm[:] = b"\0" * len(pcm)
-                    if samples is not None:
-                        samples.fill(0)
-                    if features is not None:
-                        features.fill(0)
-            # A successful response must not release the caller before the worker's
-            # private PCM has been wiped too.
-            protocol.write(response)
+        while _embed_request(sys.stdin.buffer, protocol, np, session, name):
+            pass
         return 0
     except Exception:
         protocol.write('{"ok":false}\n')

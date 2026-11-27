@@ -81,6 +81,37 @@ def _mel_filters(np, bands=80, n_fft=400):
     return filters * (2.0 / (edges[2 : bands + 2] - edges[:bands]))[None, :]
 
 
+def _score_request(source, protocol, np, session) -> bool:
+    """Process one request so no audio or model result survives into the next read."""
+    line = source.readline(MAX_REQUEST_BYTES)
+    if not line or not line.endswith(b"\n"):
+        return False
+    request = json.loads(line)
+    del line
+    if request.get("command") != "score":
+        return False
+    pcm = bytearray(base64.b64decode(request["pcm"], validate=True))
+    request.clear()
+    samples = features = None
+    outputs = []
+    try:
+        if not pcm or len(pcm) > MAX_PCM_BYTES or len(pcm) % 2:
+            raise SmartTurnError("Invalid audio")
+        samples = np.zeros(WINDOW_SAMPLES, dtype=np.float32)
+        samples[-(len(pcm) // 2) :] = np.frombuffer(pcm, dtype="<i2")
+        samples /= 32768.0
+        features = _features(np, samples)
+        outputs = session.run(None, {"input_features": features})
+        probability = float(np.asarray(outputs[0]).reshape(-1)[0])
+    finally:
+        pcm[:] = b"\0" * len(pcm)
+        for scratch in (samples, features, *outputs):
+            if scratch is not None:
+                scratch.fill(0)
+    protocol.write(json.dumps({"ok": True, "p": probability}) + "\n")
+    return True
+
+
 def _worker(model: str, threads: int) -> int:
     protocol = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
     with open(os.devnull, "wb") as sink:
@@ -97,23 +128,8 @@ def _worker(model: str, threads: int) -> int:
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         session = ort.InferenceSession(model, sess_options=options)
         protocol.write('{"ok":true}\n')
-        while True:
-            line = sys.stdin.buffer.readline(MAX_REQUEST_BYTES)
-            if not line or not line.endswith(b"\n"):
-                break
-            request = json.loads(line)
-            if request.get("command") != "score":
-                break
-            pcm = base64.b64decode(request["pcm"], validate=True)
-            if not pcm or len(pcm) > MAX_PCM_BYTES or len(pcm) % 2:
-                raise SmartTurnError("Invalid audio")
-            samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
-            samples = np.concatenate(
-                [np.zeros(WINDOW_SAMPLES - len(samples), dtype=np.float32), samples]
-            )
-            output = session.run(None, {"input_features": _features(np, samples)})
-            probability = float(np.asarray(output[0]).reshape(-1)[0])
-            protocol.write(json.dumps({"ok": True, "p": probability}) + "\n")
+        while _score_request(sys.stdin.buffer, protocol, np, session):
+            pass
         return 0
     except Exception:
         protocol.write('{"ok":false}\n')
