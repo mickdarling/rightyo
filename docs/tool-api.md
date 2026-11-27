@@ -881,12 +881,24 @@ the grid” qualifies. “Beacon was offline yesterday”, “Beacon, which we r
 slow” and “Where is the chart, Beacon?” stay in context. A direct `attend` held for a
 missing address carries `guest_unaddressed: true`.
 
-Processor turns evaluated for guest addressing or the spoken-answer floor carry
-`strict_word_count`, `inferred_word_count`, `strict_speakers` and `standing_reason`
-in their attention decision. The counts cover the retained words. A word assigned a
-timeline label by partial coverage, edge attribution or a join counts as inferred.
-Unlabelled words count toward neither total. The speaker list contains only diarizer
-labels. The reason is `strict_owner`, `strict_other` or `no_strict_words`.
+Public attention decisions carry speaker diagnostics with any guest-address and
+spoken-answer settings. Processor turns also carry the four standing fields.
+Transcript-only callers that supply no word attribution omit those four fields.
+A request carries the same decision as its attention event. These fields grant no authority.
+
+| Evidence field | Meaning |
+| --- | --- |
+| `strict_word_count`, `inferred_word_count` | Counts of retained words with strict timeline coverage or an inferred label, respectively. Partial coverage, edge attribution and joins can supply inferred labels. Unlabelled words count toward neither total. |
+| `strict_speakers` | Sorted, distinct diarizer labels on strictly covered words. |
+| `standing_reason` | `strict_owner`, `strict_other` or `no_strict_words`. |
+| `speaker_label`, `speaker_provenance` | The label and its provenance on the turn used for the decision. The label is `null` for an unlabelled turn, including one whose label expired on speaker forget. |
+| `speaker_bound_to_owner` | Whether the binding used for this role resolved to an enrolled owner. A configured owner label alone yields `false`. |
+| `speaker_binding_state` | The state from the role resolution (`bound`, `tentative`, `insufficient` or `unknown`), or `null` when it supplied no binding. |
+| `speaker_binding_source` | `voiceprint` for a speaker-ID binding, `first_bind_receipt` when the decision used a first-bind receipt, `configured_label` for a configured owner or trusted label, otherwise `null`. |
+| `voiceprint_owner_score`, `voiceprint_speech_ms`, `voiceprint_unavailable` | On unlabelled public turns, both measurements are `null` and the reason is `no_turn_embedding`. The public speaker-ID worker skips these turns before extracting audio. |
+| `diagnostic_error` | `true` if a diagnostic failed. Its fields may be absent. |
+
+Turns heard in privacy produce no attention decision or diagnostic voiceprint score.
 
 An addressed guest request carries its own request ID. The owner keeps their pending
 question and deadline, including when the diarizer reuses their label for a guest.

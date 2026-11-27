@@ -284,6 +284,11 @@ class LiveDecisionTests(unittest.TestCase):
                 "model": "jev-1.13.0",
                 "decision_status": "unavailable",
                 "reason": "timeout",
+                "speaker_label": "Speaker A",
+                "speaker_provenance": "authored-fixture",
+                "speaker_bound_to_owner": False,
+                "speaker_binding_state": None,
+                "speaker_binding_source": None,
             },
         )
         # The failed turn never becomes a request; the turns around it still do.

@@ -392,6 +392,12 @@ class BaseBindingPublicationTests(unittest.TestCase):
                     requested=True,
                     label="uncertain" if single else "attend",
                 )
+                evidence = next(
+                    event["decision"] for event in output if event["type"] == "attention"
+                )
+                self.assertEqual(evidence["speaker_binding_source"], "first_bind_receipt")
+                self.assertEqual(evidence["speaker_binding_state"], "bound")
+                self.assertIs(evidence["speaker_bound_to_owner"], True)
                 self.assertFalse(any(event["type"] == "override" for event in output))
                 self.assertIn(SESSION + ":" + other.utterance_id, e._open)
                 self.assertIn(SESSION + ":" + current.utterance_id, e._open)

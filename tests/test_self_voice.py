@@ -397,6 +397,15 @@ class SessionTests(unittest.TestCase):
                 )
             self.events.end("stopped", 2000)
             payloads += self.events.drain()
+            # Verify the additive decision fields before checking the historical wire bytes.
+            for payload in payloads:
+                if "decision" in payload:
+                    decision = payload["decision"] = payload["decision"].copy()
+                    self.assertEqual(decision.pop("speaker_label"), "a")
+                    self.assertEqual(decision.pop("speaker_provenance"), "authored-fixture")
+                    self.assertIs(decision.pop("speaker_bound_to_owner"), False)
+                    self.assertIsNone(decision.pop("speaker_binding_state"))
+                    self.assertEqual(decision.pop("speaker_binding_source"), "configured_label")
             wire = "".join(encode_json(p) + "\n" for p in payloads).encode("ascii")
             # SHA-256 of the identical authored script at origin/main 2ae361c.
             self.assertEqual(
