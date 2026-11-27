@@ -2,6 +2,7 @@
 
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 from test_conversation import SESSION, decided
 from test_edge_attribution import SPEECH, Timeline, Units
@@ -17,15 +18,35 @@ OWNER, OTHER = "Speaker A", "Speaker B"
 MODE = Conversation(require_guest_address=True, follow_up_min_probability=0.5)
 BODY_TAIL = ((" Show the", 0, 400), (" chart", 480, 700))
 OWNER_BODY = ((0, 420, 1),)
+DIAGNOSTIC_KEYS = {
+    "strict_word_count",
+    "inferred_word_count",
+    "strict_speakers",
+    "standing_reason",
+    "speaker_label",
+    "speaker_bound_to_owner",
+    "speaker_binding_state",
+    "speaker_binding_source",
+    "speaker_provenance",
+    "diagnostic_error",
+    "voiceprint_owner_score",
+    "voiceprint_speech_ms",
+    "voiceprint_unavailable",
+}
 
 
 class StrictOwnerStandingTests(unittest.TestCase):
-    def start(self, mode=MODE):
-        roles = EnrolledRoles(SpeakerPriority(owners=("owner",)))
-        roles.source = BoundShadow({OWNER: ("bound", "owner"), OTHER: ("bound", "guest")})
+    def start(self, mode=MODE, *, roles=None, **options):
+        if roles is None:
+            roles = EnrolledRoles(SpeakerPriority(owners=("owner",)))
+            roles.source = BoundShadow({OWNER: ("bound", "owner"), OTHER: ("bound", "guest")})
         self.events = SpeechEvents(request_control=True)
         self.events.start(
-            SESSION, conversation=mode, priority=roles, addressing=Addressing.from_names(["Jarvis"])
+            SESSION,
+            conversation=mode,
+            priority=roles,
+            addressing=Addressing.from_names(["Jarvis"]),
+            **options,
         )
         self.events.drain()
 
@@ -57,7 +78,7 @@ class StrictOwnerStandingTests(unittest.TestCase):
         processor.finish()
         return [(t, t.utterance_id in inferred, heads[t.utterance_id]) for t in turns]
 
-    def publish(self, replayed, *, label="attend", score=0.98, dispatch=True):
+    def submit(self, replayed, *, label="attend", score=0.98):
         turn, inferred, head = replayed
         self.assertFalse(turn.overlap)
         self.events.transcript(turn, turn.end_ms, inferred=inferred, diarized_head=head)
@@ -71,7 +92,10 @@ class StrictOwnerStandingTests(unittest.TestCase):
             )
             event = replace(event, decision=decision)
         self.events.decision(event, turn.end_ms)
-        output = self.events.drain()
+        return self.events.drain()
+
+    def publish(self, replayed, *, label="attend", score=0.98, dispatch=True):
+        output = self.submit(replayed, label=label, score=score)
         (transcript,) = [e["turn"] for e in output if e["type"] == "transcript"]
         self.assertNotIn("word_attribution", transcript)
         (attention,) = [e for e in output if e["type"] == "attention"]
@@ -181,6 +205,9 @@ class StrictOwnerStandingTests(unittest.TestCase):
                     )
                 )
                 answer = ((" Repeat your last", 40, 480), (" answer.", 700, 920))
+                if floor is None:
+                    # Preserve the original keys-off baseline assertions below.
+                    self.events._publish_standing_diagnostics = False
                 opening, follow = self.replay((BODY_TAIL, OWNER_BODY), (answer, ((3000, 3500, 1),)))
                 self.assertTrue(opening[1] and follow[1])
                 self.publish(opening)
@@ -208,6 +235,7 @@ class StrictOwnerStandingTests(unittest.TestCase):
                 self.start(replace(MODE, require_guest_address=False))
                 (turn,) = self.replay((BODY_TAIL, ((0, 420, channel),)))
                 self.assertTrue(turn[1])
+                speaker = OWNER if channel == 1 else OTHER
                 self.assertEqual(
                     self.publish(turn),
                     {
@@ -217,5 +245,134 @@ class StrictOwnerStandingTests(unittest.TestCase):
                         "model": "mock-v1",
                         "provider": "mock",
                         "role": role,
+                        "strict_word_count": 2,
+                        "inferred_word_count": 1,
+                        "strict_speakers": [speaker],
+                        "standing_reason": "strict_owner" if channel == 1 else "strict_other",
+                        "speaker_label": speaker,
+                        "speaker_bound_to_owner": channel == 1,
+                        "speaker_binding_state": "bound",
+                        "speaker_binding_source": "voiceprint",
+                        "speaker_provenance": "diarization-timeline",
                     },
                 )
+
+    def test_keys_off_publish_standing_and_speaker_evidence(self):
+        self.start(replace(MODE, require_guest_address=False))
+        owner, unlabelled = self.replay((BODY_TAIL, OWNER_BODY), (BODY_TAIL, ()))
+        evidence = self.publish(owner)
+        self.assert_standing(evidence, 2, 1, [OWNER], "strict_owner")
+        self.assertEqual(evidence["speaker_label"], OWNER)
+        self.assertIs(evidence["speaker_bound_to_owner"], True)
+        self.assertEqual(evidence["speaker_binding_state"], "bound")
+        self.assertEqual(evidence["speaker_binding_source"], "voiceprint")
+        self.assertEqual(evidence["speaker_provenance"], "diarization-timeline")
+        self.assertNotIn("voiceprint_owner_score", evidence)
+        self.assertNotIn("diagnostic_error", evidence)
+
+        evidence = self.publish(unlabelled)
+        self.assert_standing(evidence, 0, 0, [], "no_strict_words")
+        self.assertIsNone(evidence["speaker_label"])
+        self.assertIs(evidence["speaker_bound_to_owner"], False)
+        self.assertIsNone(evidence["speaker_binding_source"])
+        self.assertIsNone(evidence["speaker_binding_state"])
+        self.assertEqual(evidence["speaker_provenance"], unlabelled[0].speaker_provenance)
+        self.assertIsNone(evidence["voiceprint_owner_score"])
+        self.assertIsNone(evidence["voiceprint_speech_ms"])
+        self.assertEqual(evidence["voiceprint_unavailable"], "no_turn_embedding")
+
+    def test_pending_turn_uses_its_accepted_binding(self):
+        self.start(replace(MODE, require_guest_address=False))
+        first, later = self.replay((BODY_TAIL, ((0, 1000, 2),)), (BODY_TAIL, ((3000, 4000, 2),)))
+        first, later = first[0], later[0]
+        source = self.events._priority.source
+        source.labels[OTHER] = ("tentative", "owner")
+        self.events.transcript(first, first.end_ms)
+        source.labels[OTHER] = ("bound", "owner")
+        self.events.transcript(later, later.end_ms)
+        self.events.decision(decided(first, "attend"), later.end_ms)
+        evidence = next(e["decision"] for e in self.events.drain() if e["type"] == "attention")
+        self.assertEqual(evidence["speaker_binding_state"], "tentative")
+        self.assertEqual(evidence["speaker_binding_source"], "voiceprint")
+        self.assertIs(evidence["speaker_bound_to_owner"], False)
+
+    def test_configured_owner_label_has_no_enrolled_binding(self):
+        self.start(roles=EnrolledRoles(SpeakerPriority(owners=(OWNER,))))
+        (turn,) = self.replay((BODY_TAIL, OWNER_BODY))
+        evidence = self.publish(turn, dispatch=False)
+        self.assertEqual(evidence["role"], "owner")
+        self.assertEqual(evidence["standing_reason"], "strict_other")
+        self.assertEqual(evidence["speaker_binding_source"], "configured_label")
+        self.assertIsNone(evidence["speaker_binding_state"])
+        self.assertIs(evidence["speaker_bound_to_owner"], False)
+
+    def test_diagnostic_failure_preserves_request(self):
+        self.start(replace(MODE, require_guest_address=False))
+        (turn,) = self.replay((BODY_TAIL, OWNER_BODY))
+        with patch.object(
+            self.events._priority, "resolved_binding_evidence", side_effect=ValueError
+        ):
+            evidence = self.publish(turn)
+        self.assertIs(evidence["diagnostic_error"], True)
+        self.assertEqual(evidence["label"], "attend")
+        self.assert_standing(evidence, 2, 1, [OWNER], "strict_owner")
+
+    def test_diagnostics_preserve_full_decision_stream(self):
+        full = ((0, 1000, 1),)
+        turns = self.replay(
+            (BODY_TAIL, full),
+            (((" Repeat your last", 40, 480), (" answer.", 700, 920)), ((3000, 3500, 1),)),
+            (BODY_TAIL, ((6000, 7000, 2),)),
+            (BODY_TAIL, ()),
+            (BODY_TAIL, ()),
+            (BODY_TAIL, ((15000, 16000, 1),)),
+        )
+        opening, follow, other, unlabelled, private, after = turns
+        self.assertTrue(follow[1])
+        self.assertIsNone(unlabelled[0].speaker_id)
+        self.assertIsNone(private[0].speaker_id)
+
+        def scene(keys_on, diagnostics):
+            self.start(
+                replace(
+                    MODE,
+                    require_guest_address=keys_on,
+                    answer_follow_up_min_probability=0.4 if keys_on else None,
+                    answer_follow_up_window_ms=5000,
+                ),
+                duck=True,
+            )
+            self.events._publish_standing_diagnostics = diagnostics
+            stream = self.submit(opening)
+            for state, at in (("accepted", 1100), ("reply_started", 1400), ("reply_ended", 1900)):
+                self.assertTrue(
+                    self.events.request_outcome(outcome(opening[0].utterance_id, state), at)
+                )
+            stream.extend(self.submit(follow, label="uncertain", score=0.44))
+            stream.extend(self.submit(other))
+            stream.extend(self.submit(unlabelled))
+            self.events.duck(True, now_ms=private[0].start_ms, ack=True)
+            privacy = self.events.drain()
+            self.assertEqual([e["type"] for e in privacy], ["privacy"])
+            stream.extend(privacy)
+            self.assertEqual(self.submit(private), [])
+            self.events.duck(False, now_ms=private[0].end_ms)
+            stream.extend(self.submit(after))
+            self.events.end("stopped", after[0].end_ms)
+            stream.extend(self.events.drain())
+            evidence = [e["decision"] for e in stream if e["type"] == "attention"]
+            self.assertEqual(len(evidence), 5)
+            self.assertEqual(evidence[1].get("follow_up", False), keys_on)
+            self.assertEqual(evidence[2].get("guest_unaddressed", False), keys_on)
+            for e in stream:
+                if "decision" in e:
+                    decision = e["decision"]
+                    self.assertEqual("standing_reason" in decision, diagnostics)
+                    if not diagnostics:
+                        self.assertTrue(DIAGNOSTIC_KEYS.isdisjoint(decision))
+                    e["decision"] = {k: v for k, v in decision.items() if k not in DIAGNOSTIC_KEYS}
+            return stream
+
+        for keys_on in (False, True):
+            with self.subTest(keys_on=keys_on):
+                self.assertEqual(scene(keys_on, True), scene(keys_on, False))

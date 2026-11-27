@@ -636,6 +636,8 @@ class SpeechEvents:
     releases pending plaintext; a normal end preserves already queued delivery.
     """
 
+    _publish_standing_diagnostics = True  # Suppressed only by differential tests.
+
     def __init__(
         self,
         *,
@@ -1166,7 +1168,7 @@ class SpeechEvents:
             self._now = max(self._now, now_ms)
             self._memory.expire(self._now)
             cutoff = self._now - self.retention_ms
-            for key, (turn, _context, size, _role) in list(self._pending.items()):
+            for key, (turn, _context, size, _role, _binding) in list(self._pending.items()):
                 if turn.end_ms <= cutoff:
                     del self._pending[key]
                     if self._spoken_replies is not None:
@@ -1175,10 +1177,10 @@ class SpeechEvents:
                     self._pending_bytes -= size
             # Reclaim accounting as well as plaintext when a frozen context shrinks.
             self._pending_bytes = 0
-            for key, (turn, context, _size, role) in list(self._pending.items()):
+            for key, (turn, context, _size, role, binding) in list(self._pending.items()):
                 context["turns"] = [t for t in context["turns"] if t["end_ms"] > cutoff]
                 size = len(encode_json(context))
-                self._pending[key] = (turn, context, size, role)
+                self._pending[key] = (turn, context, size, role, binding)
                 self._pending_bytes += size
             for request_id, end_ms in list(self._request_outcome_ends.items()):
                 if end_ms <= cutoff:
@@ -1550,7 +1552,14 @@ class SpeechEvents:
                 owner = self._answer_owner(turn, standing)
                 if owner is not None:
                     self._spoken_replies.accept_owner(owner, turn, self._engaged)
-                self._pending[turn.utterance_id] = (turn, context, size, role)
+                # A delayed decision can use this acceptance role after another turn
+                # has replaced the provider's last resolution. Keep only public fields.
+                binding = None
+                if self._publish_standing_diagnostics and not (
+                    self._per_turn and role in {"owner", "trusted"}
+                ):
+                    binding = self._speaker_binding_evidence(turn, role)
+                self._pending[turn.utterance_id] = (turn, context, size, role, binding)
                 if guest_binding is not None:
                     self._pending_guest_bindings[turn.utterance_id] = guest_binding
                 self._pending_bytes += size
@@ -1761,7 +1770,7 @@ class SpeechEvents:
         ]
         pending = [
             key
-            for key, (earlier, _context, _size, _role) in self._pending.items()
+            for key, (earlier, *_) in self._pending.items()
             if can_withdraw
             and (not guest or self._pending_guest_bindings.get(key) == guest_binding)
             and key != turn.utterance_id
@@ -3153,6 +3162,67 @@ class SpeechEvents:
             return "strict_other"
         return "strict_owner" if self._verified_owner(turn, role) else "strict_other"
 
+    def _speaker_binding_evidence(self, turn, role):
+        """Read the resolution already used for policy. Never resolve a role or take a receipt."""
+        try:
+            state = source = None
+            bound_owner = False
+            if turn.speaker_id is not None and self._priority is not None:
+                resolved = getattr(self._priority, "resolved_binding_evidence", None)
+                binding = resolved(turn) if callable(resolved) else None
+                if binding is not None:
+                    state, bound_owner = binding
+                    states = {"bound", "tentative", "insufficient", "unknown"}
+                    if (
+                        type(state) is not str
+                        or state not in states
+                        or type(bound_owner) is not bool
+                    ):
+                        raise ValueError("invalid binding state")
+                    source = "voiceprint"
+                elif role in {"owner", "trusted"}:
+                    rules = getattr(self._priority, "priority", None)
+                    configured = getattr(rules, "configured_role", None)
+                    if callable(configured) and configured(turn.speaker_id) == role:
+                        source = "configured_label"
+            return {
+                "speaker_bound_to_owner": bound_owner,
+                "speaker_binding_state": state,
+                "speaker_binding_source": source,
+            }
+        except Exception:  # noqa: BLE001 - never expose provider failures or their contents
+            return {"diagnostic_error": True}
+
+    def _standing_evidence(self, turn, role, standing):
+        """Explain a public decision without supplying standing to any policy."""
+        try:
+            evidence = {
+                "speaker_label": turn.speaker_id,
+                "speaker_provenance": turn.speaker_provenance,
+            }
+            words = turn.word_attribution
+            if words is not None:
+                reason = standing if standing is not None else self._standing_reason(turn, role)
+                evidence.update(
+                    standing_reason=reason,
+                    strict_word_count=integer(words.strict_word_count, "strict_word_count"),
+                    inferred_word_count=integer(words.inferred_word_count, "inferred_word_count"),
+                    strict_speakers=sorted(
+                        identifier(s, "speaker_id") for s in words.strict_speakers
+                    ),
+                )
+            if turn.speaker_id is None:
+                # ShadowSpeakerId.turn skips unlabelled turns before taking PCM from
+                # the ring. There is no public turn embedding or measured speech time.
+                evidence.update(
+                    voiceprint_owner_score=None,
+                    voiceprint_speech_ms=None,
+                    voiceprint_unavailable="no_turn_embedding",
+                )
+            return evidence
+        except Exception:  # noqa: BLE001 - diagnostic failures never abort a decision
+            return {"diagnostic_error": True}
+
     def _ambient_guest(self, turn, role):
         return (
             self._ambient_guest_policy(turn) and self._standing_reason(turn, role) != "strict_owner"
@@ -3284,7 +3354,7 @@ class SpeechEvents:
             guest_binding = self._pending_guest_bindings.pop(key, None)
             if pending is None:
                 return
-            turn, context, size, role = pending
+            turn, context, size, role, binding_evidence = pending
             owner = None
             if self._spoken_replies is not None:
                 owner = self._spoken_replies.pending_owners.pop(key, None)
@@ -3353,14 +3423,18 @@ class SpeechEvents:
             standing, guest = self._attention_standing(turn, attention_role)
             if owner is not None and self._answer_owner(turn, standing) != owner.identity:
                 owner = None
-            words = turn.word_attribution
-            if standing is not None and words is not None:
-                evidence.update(
-                    strict_word_count=words.strict_word_count,
-                    inferred_word_count=words.inferred_word_count,
-                    strict_speakers=sorted(words.strict_speakers),
-                    standing_reason=standing,
-                )
+            diagnostics = {}
+            if self._publish_standing_diagnostics:
+                if receipt_role is not None:
+                    binding_evidence = {
+                        "speaker_bound_to_owner": receipt_role == "owner",
+                        "speaker_binding_state": "bound",
+                        "speaker_binding_source": "first_bind_receipt",
+                    }
+                elif binding_evidence is None or stale:
+                    binding_evidence = self._speaker_binding_evidence(turn, current)
+                diagnostics = self._standing_evidence(turn, attention_role, standing)
+                diagnostics.update(binding_evidence)
             if role is not None:
                 evidence["role"] = receipt_role or decided
                 if key == self._degraded_turn:
@@ -3561,6 +3635,7 @@ class SpeechEvents:
             ack, ack_note = (
                 self._acknowledge(turn, event.decision, evidence) if attended else ({}, None)
             )
+            evidence.update(diagnostics)
             to_supersede = []
             if overriding:
                 # Earlier is decided by turn time (end_ms at or before the owner's), not by
@@ -3697,7 +3772,7 @@ class SpeechEvents:
                     del self._open[superseded]
                     self._delivered.pop(superseded, None)
                     self._retire_request_outcome(superseded)
-                for other, (earlier, _context, _size, other_role) in self._pending.items():
+                for other, (earlier, _, _, other_role, _) in self._pending.items():
                     if (
                         # #242 round 24: a turn pending across a forget has no owner's
                         # exemption, as it has no owner authority at its decision (round

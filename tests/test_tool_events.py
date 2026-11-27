@@ -7,6 +7,26 @@ from rightyo.contracts import ContractError, DecisionEvent, ProviderDecision, Tu
 from rightyo.tool_events import SpeechEvents
 
 
+def expected_label_evidence(fixture):
+    """Extend the two byte-pinned, transcript-only host fixtures with their known label evidence."""
+    events = [json.loads(line) for line in fixture.read_text().splitlines()]
+    turns = {e["turn"]["utterance_id"]: e["turn"] for e in events if e["type"] == "transcript"}
+    for event in events:
+        if event["type"] in {"attention", "request"}:
+            turn = event["turn"] if event["type"] == "request" else turns[event["utterance_id"]]
+            decision = event["decision"]
+            decision.update(
+                speaker_label=turn["speaker_id"],
+                speaker_provenance=turn["speaker_provenance"],
+                speaker_bound_to_owner=False,
+                speaker_binding_state=None,
+                speaker_binding_source="configured_label"
+                if decision.get("role") == "owner"
+                else None,
+            )
+    return events
+
+
 def turn(name="request", start=1000, end=2000, text="Rightyo, check our discussion.", **extra):
     return Turn(
         session_id=extra.pop("session_id", "tool-demo"),
@@ -281,7 +301,7 @@ class SpeechEventsTests(unittest.TestCase):
         events.end("stopped", 2200)
         actual = events.drain()
         fixture = Path(__file__).resolve().parents[1] / "examples/tool-events.jsonl"
-        self.assertEqual(actual, [json.loads(line) for line in fixture.read_text().splitlines()])
+        self.assertEqual(actual, expected_label_evidence(fixture))
 
 
 if __name__ == "__main__":

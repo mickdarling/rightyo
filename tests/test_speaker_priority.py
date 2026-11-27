@@ -14,6 +14,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from test_tool_events import expected_label_evidence
+
 from rightyo.cli import main, priority_from_args
 from rightyo.contracts import (
     Acknowledgement,
@@ -1198,7 +1200,7 @@ class EnrolledEventTests(unittest.TestCase):
         self.events.end("stopped", 2700)
         actual = self.events.drain()
         fixture = ROOT / "examples" / "enrolled-override.jsonl"
-        expected = [json.loads(line) for line in fixture.read_text().splitlines()]
+        expected = expected_label_evidence(fixture)
         self.assertEqual([self.events_started(), *actual], expected)
         self.assertEqual(
             [e["type"] for e in expected][5:9], ["request", "transcript", "attention", "override"]

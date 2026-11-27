@@ -1450,6 +1450,14 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         resolved = self._resolved
         return resolved is not None and resolved[0] == utterance_id
 
+    def resolved_binding_evidence(self, turn) -> tuple[str, bool] | None:
+        """State and owner match from one role snapshot, without exposing the identity."""
+        resolved = self._resolved
+        if resolved is not None and resolved[:2] == (turn.utterance_id, turn.speaker_id):
+            state, identity = resolved[2]
+            return state, state == "bound" and self.priority.configured_role(identity) == "owner"
+        return None
+
     def resolved_owner_identity(self, turn) -> str | None:
         """The enrolled owner from this turn's last role resolution, without a second lookup."""
         resolved = self._resolved
