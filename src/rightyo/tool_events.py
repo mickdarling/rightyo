@@ -73,6 +73,7 @@ PRIVACY_EXIT = (
     ("privacy", "off"),
     ("privacy", "mode", "off"),
 )
+PRIVACY_EXIT_TRAILING = frozenset({"now", "please", "again"})
 PRIVACY_STATUS = (
     ("what", "mode", "am", "i", "in"),
     ("are", "you", "recording"),
@@ -352,12 +353,12 @@ def _filler_for(addressing):
     return PRIVACY_FILLER - named
 
 
-def _matched_words(text, addressing):
-    """`text` as privacy words with filler dropped, except where a filler word is part of a
+def _matched_words(words, addressing):
+    """Privacy words with filler dropped, except where a filler word is part of a
     configured name or variant matched at that place (round 18): "please" stays in "Please
     Jarvis, I'm back", but is still filler in "Jarvis, please, I'm back"."""
     filler = _filler_for(addressing)
-    words = _privacy_words(text, filler)
+    words = [word for word in words if word not in filler]
     if filler == PRIVACY_FILLER:
         return words
     named = set()
@@ -388,36 +389,51 @@ def _phrase_in(words, phrases):
     )
 
 
+def _named_exit(words, unfiltered, addressing):
+    """Match an exit from the end, then check the name immediately before it."""
+    # Check the actual ending before filler removal can hide a word like "um".
+    last_word = next(
+        (word for word in reversed(unfiltered) if word not in PRIVACY_EXIT_TRAILING), None
+    )
+    end = len(words)
+    while end and words[end - 1] in PRIVACY_EXIT_TRAILING:
+        end -= 1
+    for phrase in PRIVACY_EXIT:
+        start = end - len(phrase)
+        if start < 1 or last_word != phrase[-1] or tuple(words[start:end]) != phrase:
+            continue
+        for at in range(max(0, start - 3), start):
+            name = addressing.name_for(" ".join(words[at:start]))
+            if name is not None and not _negated(words, at):
+                return True
+    return False
+
+
 def privacy_phrase(text, addressing):
     """Which of privacy mode's local phrases `text` holds (hailing-station #735 S-1).
 
     A set of: "exit" (a configured name or variant of up to three words, then an exit
-    phrase), "rest" (the turn starts with an exit phrase, for a split name), "name" (the
-    turn is only a name), "status" (named or not) and "entry". For all but the entry,
-    case, punctuation and filler are ignored, and the phrase may come anywhere in the turn;
+    phrase ending the turn apart from `PRIVACY_EXIT_TRAILING` words), "rest" (the turn
+    starts with an exit phrase, for a split name), "name" (the turn is only a name),
+    "status" (named or not) and "entry". For all but the entry,
+    case, punctuation and filler are ignored when matching the phrase itself;
     "don't" or "do not" in the three words before it (before the name, for the exit) means
     no match. The entry counts only as the whole turn (`_standalone_entry`) and never as a
     question. Nothing is kept: the words exist only inside this call.
     """
-    words = _matched_words(text, addressing)
+    unfiltered = _privacy_words(text, ())
+    words = _matched_words(unfiltered, addressing)
     kinds = set()
     if addressing is not None:
         if words and addressing.name_for(" ".join(words)) is not None:
             kinds.add("name")
-        for at in range(len(words)):
-            for width in range(1, 4):
-                if (
-                    at + width < len(words)
-                    and addressing.name_for(" ".join(words[at : at + width])) is not None
-                    and _phrase_at(words, at + width, PRIVACY_EXIT)
-                    and not _negated(words, at)
-                ):
-                    kinds.add("exit")
+        if _named_exit(words, unfiltered, addressing):
+            kinds.add("exit")
     if _phrase_at(words, 0, PRIVACY_EXIT):
         kinds.add("rest")
     if _phrase_in(words, PRIVACY_STATUS):
         kinds.add("status")
-    if not text.rstrip().endswith("?") and _standalone_entry(_privacy_words(text, ()), addressing):
+    if not text.rstrip().endswith("?") and _standalone_entry(unfiltered, addressing):
         kinds.add("entry")
     return frozenset(kinds)
 
