@@ -767,7 +767,9 @@ class WordAttribution:
     strict_speakers: frozenset[str] = frozenset()
 
 
-_INTERNAL_TURN_FIELDS = frozenset({"word_attribution", "recognition_loss_end_ms"})
+_INTERNAL_TURN_FIELDS = frozenset(
+    {"word_attribution", "recognition_loss_end_ms", "acoustic_span_ms"}
+)
 
 
 @dataclass(frozen=True)
@@ -787,6 +789,8 @@ class Turn:
     # Internal evidence from the processor, outside the transcript/replay contract.
     word_attribution: WordAttribution | None = field(default=None, kw_only=True, compare=False)
     recognition_loss_end_ms: int = field(default=0, kw_only=True, compare=False)
+    # Stream-relative observed speech edges for the private split clock.
+    acoustic_span_ms: tuple[int, int] | None = field(default=None, kw_only=True, compare=False)
 
     def __post_init__(self) -> None:
         for name in ("session_id", "utterance_id", "recognizer_id", "speaker_provenance"):
@@ -797,6 +801,15 @@ class Turn:
         integer(self.start_ms, "start_ms")
         integer(self.end_ms, "end_ms")
         integer(self.recognition_loss_end_ms, "recognition_loss_end_ms")
+        if self.acoustic_span_ms is not None:
+            span = self.acoustic_span_ms
+            if (
+                type(span) is not tuple
+                or len(span) != 2
+                or any(type(ms) is not int for ms in span)
+                or not 0 <= span[0] < span[1]
+            ):
+                raise ContractError("invalid acoustic span")
         if self.end_ms < self.start_ms:
             raise ContractError("turn timestamps are reversed")
         if not isinstance(self.text, str) or len(self.text) > MAX_TEXT_CHARS:

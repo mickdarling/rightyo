@@ -1846,7 +1846,9 @@ the name and the phrase. "Um, ok Jarvis, so, I'm back" qualifies. "I heard
 Jarvis start listening" stays private. A nearby negation before the name also
 blocks the exit.
 
-Only "now", "please" and "again" may follow the phrase, in any combination.
+The words of the exit phrase must belong to one sentence. "Jarvis, start;
+listening." keeps privacy on. Only "now", "please" and "again" may follow
+the phrase, in any combination.
 "Jarvis, I'm back, please" qualifies. "Jarvis, I'm back, okay" and "Jarvis,
 start listening to the podcast" stay private. Words in any script count.
 Question punctuation in the exit sentence or a question opener after the
@@ -1859,8 +1861,11 @@ pause. Before the onset, the stream must have had at least 200 consecutive
 milliseconds judged speech-absent and well below the candidate's speech level.
 Steady background noise can qualify. The local experimental endpointer uses
 frame energy and periodicity and estimates a noise floor from nonzero background
-frames. A pause after the onset cannot qualify it retroactively. Voice in a gap
-between original spoken tokens or beyond the final spoken token keeps privacy on.
+frames. A quiet period qualifies only the onset immediately following it.
+The supplied intervals for the name and each exit word must overlap observed
+speech. If the adapter supplies one interval for several words, that interval is
+the available timing evidence. Voice in a gap between original spoken tokens
+or beyond the final spoken token keeps privacy on.
 Coverage checks use the actual samples up to each timestamp, including partial
 20 ms frames. Punctuation supplies no speech timing. A speaker boundary
 that divides the text, a forced ASR cut or its continuation, and an end-of-input
@@ -1868,7 +1873,9 @@ flush also disqualify the fragment. So do lost text, a recognizer retry, textles
 units, and missing, repaired or overlapping word or token timing.
 
 A split exit accepts the name at the beginning of its sentence under the same
-rule. "We're done. Jarvis," followed within 4 seconds by "Privacy off." qualifies
+rule. The processor measures the 4 seconds from the observed acoustic end of
+the name utterance to the onset of the next utterance. "We're done. Jarvis,"
+followed within that window by "Privacy off." qualifies
 when both turns are heard in privacy and authenticate as the owner. The same fillers
 may surround the name or precede the phrase, and the same trailing words may
 follow it. For example, "May," followed by "I'm back." qualifies when "May"

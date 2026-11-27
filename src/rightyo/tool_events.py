@@ -35,6 +35,7 @@ from rightyo.contracts import (
     formed_request_text,
     identifier,
     integer,
+    name_key,
     speaker_role,
 )
 from rightyo.live_speaker_id import BYTES_PER_MS
@@ -403,49 +404,61 @@ def _exit_kinds(text, addressing):
     tokens = list(re.finditer(r"\S+", cleaned))
     words = [token.group().lower() for token in tokens]
     name_keys = {
-        "".join(c.lower() for c in spelling if c.isalnum())
+        name_key(spelling)
         for name in (addressing.names if addressing else ())
         for spelling in (name, *addressing.spellings(name))
     }
+    # Retain the source sentence of each word through phrase and name matching.
+    sentences = []
+    sentence = 0
+    for at, token in enumerate(tokens):
+        if at:
+            for i in range(tokens[at - 1].end(), token.start()):
+                if text[i] in ".!?;\r\n":
+                    sentence = i + 1
+        sentences.append(sentence)
 
-    def addressed(end):
+    def addressed(end, sentence_end):
         # A name of at most three words must consume the last non-filler before
         # the phrase. Try filler words as names too (including configured variants).
         last = max((i for i in range(end) if words[i] not in PRIVACY_EXIT_FILLER), default=-1)
         head = True
-        sentence = 0
         for at in range(end):
-            if at:
-                for i in range(tokens[at - 1].end(), tokens[at].start()):
-                    if text[i] in ".!?;\r\n":
-                        sentence = i + 1
-                        head = True
+            sentence = sentences[at]
+            if at and sentence != sentences[at - 1]:
+                head = True
             if head and at + 3 > last:
                 for stop in range(max(at + 1, last + 1), min(end, at + 3) + 1):
-                    key = "".join(words[at:stop]).replace("'", "")
-                    if key not in name_keys:
+                    key = "".join(words[at:stop]).casefold().replace("'", "")
+                    if key not in name_keys or sentences[stop - 1] != sentence:
                         continue
-                    before = text[: tokens[at].start()]
-                    prior = _matched_words(_privacy_words(before, ()), addressing)
-                    return not _negated(prior, len(prior)) and not question_shaped(
-                        text[sentence:], address_end=tokens[stop - 1].end() - sentence
-                    )
+                    # At a sentence head only the approved fillers can precede
+                    # the address, which also excludes any in-sentence negation.
+                    if not question_shaped(
+                        text[sentence:sentence_end], address_end=tokens[stop - 1].end() - sentence
+                    ):
+                        return True
             head = head and words[at] in PRIVACY_EXIT_FILLER
         return False
 
     kinds = set()
-    if addressed(len(words)):
+    if addressed(len(words), len(text)):
         kinds.add("name")
     end = len(words)
     while end and words[end - 1] in PRIVACY_EXIT_TRAILING:
         end -= 1
     for phrase in PRIVACY_EXIT:
         start = end - len(phrase)
-        if start < 0 or tuple(words[start:end]) != phrase:
+        if start < 0 or tuple(words[start:end]) != phrase or sentences[start] != sentences[end - 1]:
             continue
-        if addressed(start):
+        sentence_end = next((s for s in sentences[end:] if s != sentences[end - 1]), len(text))
+        if addressed(start, sentence_end):
             kinds.add("exit")
-        elif all(w in PRIVACY_EXIT_FILLER for w in words[:start]) and not question_shaped(text):
+        elif (
+            sentences[0] == sentences[start]
+            and all(w in PRIVACY_EXIT_FILLER for w in words[:start])
+            and not question_shaped(text[:sentence_end])
+        ):
             kinds.add("rest")
         break
     return kinds
@@ -468,10 +481,11 @@ def privacy_phrase(text, addressing, *, recognition_complete=True):
 
 def _completes_split(turn, name_end):
     """Both fragments must follow the last ASR loss, even if it emitted no turn."""
+    onset = turn.acoustic_span_ms[0] if turn.acoustic_span_ms else turn.start_ms
     return (
         name_end is not None
         and name_end >= turn.recognition_loss_end_ms
-        and 0 <= turn.start_ms - name_end <= PRIVACY_SPLIT_NAME_MS
+        and 0 <= onset - name_end <= PRIVACY_SPLIT_NAME_MS
     )
 
 
@@ -2110,16 +2124,6 @@ class SpeechEvents:
         # Only a turn heard entirely since the mode last went on, while it is still on, is
         # matched at all (#242 round 23, see `transcript`): one heard in an earlier private
         # period and released late can never end this one, answer its status or be counted.
-        if "name" in kinds:
-            # Authenticate both split fragments independently. Private processor turns
-            # are unlabelled: only their own isolated voice can authenticate them.
-            allowed, reason = outcome
-            if allowed:
-                self._private_name_end = turn.end_ms
-            else:
-                self._private_counts["exit_name_refused"] += 1
-                self._count_exit_refused(reason)
-            return
         named = "exit" in kinds or ("rest" in kinds and _completes_split(turn, split))
         if named:
             allowed, reason = outcome
@@ -2128,6 +2132,17 @@ class SpeechEvents:
                 self._emit("privacy", action="exit")
                 return
             self._count_exit_refused(reason)
+        elif "name" in kinds:
+            # Authenticate both split fragments independently. Private processor turns
+            # are unlabelled: only their own isolated voice can authenticate them.
+            allowed, reason = outcome
+            if allowed:
+                self._private_name_end = (
+                    turn.acoustic_span_ms[1] if turn.acoustic_span_ms else turn.end_ms
+                )
+            else:
+                self._private_counts["exit_name_refused"] += 1
+                self._count_exit_refused(reason)
         elif "rest" in kinds:
             self._private_counts["exit_unnamed"] += 1
         if "status" in kinds:

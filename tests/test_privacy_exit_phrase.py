@@ -112,6 +112,39 @@ class NamedPrivacyExitTests(unittest.TestCase):
                     privacy_phrase(f"Ready. Jarvis, {word} Alice start listening", duck.OURS)
                 )
 
+    def test_sentence_break_between_phrase_words_refuses_single_and_split_exit(self):
+        for i, boundary in enumerate((".", "!", "?", ";", "\n")):
+            with self.subTest(boundary=boundary):
+                at = 3000 * i
+                phrase = f"start{boundary} listening."
+                self.assertEqual(self.hear("Jarvis, " + phrase, at), [])
+                self.assertEqual(self.hear("Jarvis,", at + 1000), [])
+                self.assertEqual(self.hear(phrase, at + 2000), [])
+
+    def test_earlier_negated_question_or_refused_address_does_not_veto_exit(self):
+        for name, text in (
+            ("Jarvis", "Don't you agree? Jarvis, privacy off."),
+            ("Hey", "Hey? Hey, privacy off."),
+        ):
+            with self.subTest(text=text):
+                self.start(Addressing((name,)))
+                self.assertEqual([event["action"] for event in self.hear(text, 0)], ["exit"])
+
+    def test_name_fragment_does_not_suppress_status(self):
+        self.assertEqual(
+            [event["action"] for event in self.hear("Are you recording? Jarvis.", 0)], ["status"]
+        )
+
+    def test_complete_exit_wins_even_when_the_phrase_is_another_name(self):
+        self.start(Addressing(("Hey", "Privacy Off")))
+        self.assertEqual([event["action"] for event in self.hear("Hey, privacy off.", 0)], ["exit"])
+
+    def test_configured_name_uses_addressing_casefold(self):
+        self.start(Addressing(("Strasse",)))
+        self.assertEqual(
+            [event["action"] for event in self.hear("Straße, privacy off.", 0)], ["exit"]
+        )
+
     def test_split_after_a_sentence_opening_name_matches_the_single_turn(self):
         for i, (intro, allowed) in enumerate(
             (
@@ -213,3 +246,9 @@ class NamedPrivacyExitTests(unittest.TestCase):
         self.assertNotIn("recognition_loss_end_ms", turn.to_dict())
         with self.assertRaises(ContractError):
             Turn.from_dict({**turn.to_dict(), "recognition_loss_end_ms": 0})
+
+    def test_acoustic_split_clock_is_private_processor_evidence(self):
+        turn = replace(duck.heard("name", 100, 1900, "Jarvis"), acoustic_span_ms=(200, 1200))
+        self.assertNotIn("acoustic_span_ms", turn.to_dict())
+        with self.assertRaises(ContractError):
+            Turn.from_dict({**turn.to_dict(), "acoustic_span_ms": (200, 1200)})

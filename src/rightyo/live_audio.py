@@ -20,6 +20,7 @@ import io
 import json
 import math
 import os
+import re
 import secrets
 import selectors
 import stat
@@ -401,8 +402,9 @@ class _PrivateEndpoint:
     MARGIN = 1.5
 
     def __init__(self):
-        self.background: deque[float] = deque(maxlen=100)
+        self.background: deque[tuple[float, int]] = deque(maxlen=100)
         self.quiet_rms = 0.0
+        self.quiet_peak = 0
         self.quiet_run: deque[tuple[float, _NoiseProfile]] = deque(maxlen=10)
         self.quiet_period: _QuietPeriod | None = None
 
@@ -443,12 +445,14 @@ class _PrivateEndpoint:
         if rms and noise is not None:
             # A single low reading cannot lock out subsequent background frames.
             # The spectral check admits floor observations independently of gain.
-            self.background.append(rms)
+            self.background.append((rms, max(map(abs, _pcm_samples(frame)))))
             levels = sorted(self.background)
-            self.quiet_rms = levels[len(levels) // 10] * self.MARGIN
+            floor_rms, self.quiet_peak = levels[len(levels) // 10]
+            self.quiet_rms = floor_rms * self.MARGIN
         voiced = noise is None or (len(self.background) >= 10 and rms > self.quiet_rms)
         if voiced:
             self.quiet_run.clear()
+            self.quiet_period = None
         else:
             self.quiet_run.append((rms, noise))
             if len(self.quiet_run) == self.quiet_run.maxlen:
@@ -1197,9 +1201,9 @@ class _RecognizerWindow:
     retried: bool = False
     elapsed_ms: int = 0
     unreliable_token_timing: bool = False
-    # Original speech coverage when Whisper supplied tokens. Published words
-    # still coalesce subwords and punctuation for transcript attribution.
-    spoken_intervals: list[tuple[int, int]] | None = None
+    # (start_ms, end_ms, first_word, last_word) before Whisper subwords are
+    # coalesced. Multiple words can also share a single supplied timestamp.
+    spoken_intervals: list[tuple[int, int, int, int]] | None = None
 
     @property
     def rejected(self) -> int:
@@ -1214,6 +1218,11 @@ def _counted_units(document: dict[str, Any], duration_ms: int) -> tuple[list[dic
     """Compatibility view of the validated units and rejected segment count."""
     window = _recognizer_window(document, duration_ms)
     return window.units, window.rejected
+
+
+def _punctuation(text: str) -> bool:
+    value = text.strip()
+    return bool(value) and all(unicodedata.category(c).startswith("P") for c in value)
 
 
 def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _RecognizerWindow:
@@ -1236,16 +1245,17 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
     if any(isinstance(s, dict) and s.get("tokens") is not None for s in segments):
         window.spoken_intervals = []
 
-    def record_spoken(left: int, right: int) -> None:
+    def record_spoken(
+        left: int, right: int, word_count: int = 1, continues_word: bool = False
+    ) -> None:
         intervals = window.spoken_intervals
         if intervals is None or left >= right or window.unreliable_token_timing:
             return
         if intervals and left < intervals[-1][1]:
             window.unreliable_token_timing = True
-        elif intervals and left == intervals[-1][1]:
-            intervals[-1] = (intervals[-1][0], right)
         else:
-            intervals.append((left, right))
+            first_word = intervals[-1][3] + int(not continues_word) if intervals else 0
+            intervals.append((left, right, first_word, first_word + word_count - 1))
 
     reasons = [0] * 6
     for segment in segments:
@@ -1284,12 +1294,18 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
             window.gaps.add(len(result))
             segment_gaps.add(len(fallbacks))
             continue
-        repaired = (start, end) != original or start == end
+        repaired = (start, end) != original or (start == end and not _punctuation(text))
         window.repaired += int(repaired)
         fallback = {"text": text, "start_ms": start, "end_ms": end}
         fallbacks.append(fallback)
         tokens = segment.get("tokens")
-        if start != original[0] or end > original[1] or start == end or tokens is None:
+        if (
+            start != original[0]
+            or end > original[1]
+            or (repaired and start == end)
+            or tokens is None
+            or (tokens == [] and _punctuation(text))
+        ):
             result.append(fallback)
             if any(c.isalnum() for c in text):
                 record_spoken(start, end)
@@ -1310,6 +1326,11 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
                 value.startswith("<|") and value.endswith("|>")
             ):
                 continue
+            # Tokens can split a word, or start another immediately after a
+            # comma. Preserve this distinction independently of published units.
+            continues_word = (
+                reconstructed[-1:].isalnum() or reconstructed.endswith(("'", "’"))
+            ) and (value[:1].isalnum() or value.startswith(("'", "’")))
             reconstructed += value
             interval = token.get("offsets", {})
             if not isinstance(interval, dict):
@@ -1327,14 +1348,15 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
             if (
                 right > end
                 or (left == right and spoken)
-                or (left < right and not spoken)
+                or (left < right and not spoken and not _punctuation(value))
                 or (words and left < words[-1]["end_ms"])
             ):
                 # Check each token before coalescing subwords can hide a reversal.
                 window.unreliable_token_timing = True
             left, right = min(left, end), min(right, end)
             if spoken:
-                record_spoken(left, right)
+                word_count = len(re.findall(r"[^\W_]+(?:['’]+[^\W_]+)*", value))
+                record_spoken(left, right, word_count, continues_word)
             if not words or (value[:1].isspace() and value.strip()):
                 words.append({"text": value, "start_ms": left, "end_ms": right})
             else:
@@ -1425,6 +1447,7 @@ class _FinalizedWindow:
     # Exit evidence only. A natural end and an unclipped onset are both required.
     exit_voice_span: tuple[int, int] | None = None  # window-relative milliseconds
     private_quiet_rms: float | None = None
+    private_quiet_peak: int = 0
 
     def release(self) -> None:
         """Discard owned PCM/text evidence; safe to repeat during shutdown."""
@@ -1442,6 +1465,7 @@ class _FinalizedWindow:
         self.timeline = []
         self.exit_voice_span = None
         self.private_quiet_rms = None
+        self.private_quiet_peak = 0
         # A released barrier has no recognizer metadata left to coalesce into.
         self.overflow = False
 
@@ -1457,7 +1481,7 @@ class _FinalizedWindow:
             + sum(512 + 4 * len(unit["text"]) for unit in self.units)
             + (512 * len(self.window.gaps) if self.window is not None else 0)
             + (
-                128 * len(self.window.spoken_intervals)
+                192 * len(self.window.spoken_intervals)
                 if self.window and self.window.spoken_intervals
                 else 0
             )
@@ -1623,18 +1647,20 @@ def _complete_exit_span(
     if not units or packet.exit_voice_span is None:
         return None
     intervals = []
+    previous_end = 0
     for unit in units:
         start, end = unit["start_ms"], unit["end_ms"]
         value = unit["text"].strip()
-        if start == end and value and all(unicodedata.category(c).startswith("P") for c in value):
+        if start < end:
+            if start < previous_end:
+                return None
+            previous_end = end
+        if _punctuation(value) and (start == end or packet.window is not None):
             continue
-        if (
-            not any(c.isalnum() for c in value)
-            or start >= end
-            or (intervals and start < intervals[-1][1])
-        ):
+        if not any(c.isalnum() for c in value) or start >= end:
             return None
-        intervals.append((start, end))
+        word = len(intervals)
+        intervals.append((start, end, word, word))
     if packet.window and packet.window.spoken_intervals is not None:
         intervals = packet.window.spoken_intervals
     if not intervals:
@@ -1644,25 +1670,41 @@ def _complete_exit_span(
     if packet.private_quiet_rms is None:
         return span if span[0] <= first and span[-1] >= last else None
 
-    def quiet(start: int, end: int) -> bool:
-        # Check only the uncovered samples, including partial edge frames.
+    def voiced_frame(frame: bytes) -> bool:
+        rms = _frame_rms(frame)
+        return rms > packet.private_quiet_rms or bool(
+            rms and _PrivateEndpoint.noise_profile(frame) is None
+        )
+
+    def has_voice(start: int, end: int, *, require_observed_frame: bool = False) -> bool:
         while start < end:
-            stop = min(end, (start // 20 + 1) * 20)
+            frame_start = start // 20 * 20
+            stop = min(end, frame_start + 20)
             frame = packet.pcm[start * BYTES_PER_MS : stop * BYTES_PER_MS]
-            rms = _frame_rms(frame)
-            if rms > packet.private_quiet_rms or (
-                rms and len(frame) == FRAME_BYTES and _PrivateEndpoint.noise_profile(frame) is None
-            ):
-                return False
+            if len(frame) == FRAME_BYTES:
+                if voiced_frame(frame):
+                    return True
+            # A short slice can consist entirely of background peaks. Compare
+            # its sample peak to the observed background peak in the same units.
+            elif max(map(abs, _pcm_samples(frame))) > packet.private_quiet_peak:
+                if not require_observed_frame or voiced_frame(
+                    packet.pcm[frame_start * BYTES_PER_MS : (frame_start + 20) * BYTES_PER_MS]
+                ):
+                    return True
             start = stop
-        return True
+        return False
 
     previous = first
-    for start, end in intervals:
-        if not quiet(previous, min(start, last)):
+    covered_word = -1
+    for start, end, first_word, last_word in intervals:
+        if first_word > covered_word + 1 or has_voice(previous, min(start, last)):
             return None
+        if last_word > covered_word and has_voice(
+            max(first, start), min(last, end), require_observed_frame=True
+        ):
+            covered_word = last_word
         previous = max(previous, end)
-    return span if quiet(previous, last) else None
+    return span if covered_word == intervals[-1][3] and not has_voice(previous, last) else None
 
 
 def _select(value: Any, default: Callable[[LiveConfig], Any], config: LiveConfig, method: str):
@@ -1750,6 +1792,7 @@ class LiveProcessor:
         self._private_endpoint = _PrivateEndpoint() if config.private is not None else None
         self._quiet_before_onset: _QuietPeriod | None = None
         self._onset_quiet_rms = 0.0
+        self._onset_quiet_peak = 0
         self._frame_private = False
         self._diarizer_private_frames = 0
         self._privacy_uncertain = False
@@ -2180,6 +2223,7 @@ class LiveProcessor:
         rms = _frame_rms(frame)
         endpoint_voice = False
         if self._private_endpoint is not None:
+            prior = self._private_endpoint.quiet_period
             endpoint_voice = self._private_endpoint.voiced(frame, rms, self._received_ms + 20)
         if self._private_until is not None:
             frame = self._private_cutoff(frame)
@@ -2206,8 +2250,9 @@ class LiveProcessor:
         voiced = endpoint_voice if private else rms >= self.config.energy_threshold
         if voiced and not self._utterance:
             if self._private_endpoint is not None:
-                self._quiet_before_onset = self._private_endpoint.quiet_period
+                self._quiet_before_onset = prior
                 self._onset_quiet_rms = self._private_endpoint.quiet_rms
+                self._onset_quiet_peak = self._private_endpoint.quiet_peak
             self._voice_start = frame_start
             self._utterance_start = frame_start - len(self._pre_roll) * 20
             self._utterance.extend(b"".join(self._pre_roll))
@@ -2221,9 +2266,10 @@ class LiveProcessor:
                 self._last_voice_ms = self._received_ms
                 self._end_of_turn_asked = self._complete = False
             at_cap = self._received_ms - self._utterance_start >= self.config.max_utterance_ms
-            if at_cap or self._received_ms - self._last_voice_ms >= self.config.hangover_ms:
+            ending_pause = self._received_ms - self._last_voice_ms >= self.config.hangover_ms
+            if at_cap or ending_pause:
                 self._finalize(
-                    self._diarizer.segments(), complete=self._complete, natural_end=not at_cap
+                    self._diarizer.segments(), complete=self._complete, natural_end=ending_pause
                 )
             elif self._complete or self._ask_end_of_turn():
                 self._finalize_when_attributed()
@@ -2328,8 +2374,8 @@ class LiveProcessor:
         """Record the next continuation barrier and qualify this window's acoustic edges."""
         offset = self._utterance_start
         continuation = self._continuation_until_ms
-        self._continuation_until_ms = self._last_voice_ms + self.config.hangover_ms
         if not natural_end:
+            self._continuation_until_ms = self._last_voice_ms + self.config.hangover_ms
             return None
         endpoint = self._private_endpoint if self._frame_private else None
         span = (self._voice_start - offset, self._last_voice_ms - offset)
@@ -2338,9 +2384,12 @@ class LiveProcessor:
                 return None
             # The ending pause can lower the floor. A louder interval during the
             # decode window cannot retroactively turn its own samples into noise.
-            self._onset_quiet_rms = min(self._onset_quiet_rms, endpoint.quiet_rms)
+            if not self._onset_quiet_rms or 0 < endpoint.quiet_rms < self._onset_quiet_rms:
+                self._onset_quiet_rms = endpoint.quiet_rms
+                self._onset_quiet_peak = endpoint.quiet_peak
             span = endpoint.voice_span(pcm, self._quiet_before_onset, self._onset_quiet_rms)
         if span is None:
+            self._continuation_until_ms = self._last_voice_ms + self.config.hangover_ms
             return None
         first, last = span
         if offset + last > self._last_voice_ms:
@@ -2395,6 +2444,7 @@ class LiveProcessor:
                     if exit_span and self._frame_private and self._private_endpoint is not None
                     else None
                 ),
+                private_quiet_peak=self._onset_quiet_peak,
                 private_cleared_through=self._private_cleared_through,
             )
             self._finalizing = packet
@@ -2782,6 +2832,21 @@ class LiveProcessor:
             inferred = _attribute_edges(
                 attributed, evidence, self.config.edge_attribution_ms, blockers=edges
             )
+        if spoken_span is not None and packet.private_quiet_rms is not None:
+            # A punctuation point can lack a timeline label. Keep its text and
+            # original privacy bounds with the private speech it punctuates.
+            # An actual speaker division still disqualifies the entire window.
+            marks = [entry for entry in attributed if _punctuation(entry[0]["text"])]
+            if marks and self._heard_private(offset + spoken_span[0], offset + spoken_span[1]):
+                voices = {
+                    (speaker, overlap)
+                    for unit, _, _, speaker, overlap in attributed
+                    if not _punctuation(unit["text"])
+                }
+                if len(voices) == 1:
+                    voice = voices.pop()
+                    for entry in marks:
+                        entry[3:] = voice
         groups: list[dict[str, Any]] = []
         for index, (unit, start, end, speaker, overlap) in enumerate(attributed):
             if speaker is not None and provenance == "diarization-utterance":
@@ -2858,12 +2923,14 @@ class LiveProcessor:
             with self._recovery_lock:
                 if self.closed or packet.discarded:
                     return
+                acoustic_span = packet.exit_voice_span
             if private_turn:
                 # Privacy wins a continuation tie: discard the held public prefix without
                 # publishing it, while keeping only this private sentence's PCM for exit.
                 self._merger.discard()
                 if len(kept) == 1 and spoken_span is not None:
                     group["start_ms"], group["end_ms"] = (offset + ms for ms in spoken_span)
+                    group["acoustic_span_ms"] = tuple(offset + ms for ms in acoustic_span)
                 start = (group["start_ms"] - offset) * BYTES_PER_MS
                 end = (group["end_ms"] - offset) * BYTES_PER_MS
                 self._emit(group, memoryview(pcm)[start:end])
@@ -2918,6 +2985,7 @@ class LiveProcessor:
             speaker_provenance=group["speaker_provenance"],
             word_attribution=attribution,
             recognition_loss_end_ms=self._recognition_loss_end_ms,
+            acoustic_span_ms=group.get("acoustic_span_ms"),
         )
         if gap is not None and self.config.on_post_turn_gap is not None:
             self.config.on_post_turn_gap(turn.utterance_id, gap)
