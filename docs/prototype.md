@@ -232,20 +232,67 @@ failure disables voice exits for the session. The diagnostic on stderr gives the
 reason without paths, audio or transcript content. Host privacy controls and the
 status question remain available.
 
-The adversarial tests use generated tones and authored recognition. To run the four
-real-model cases against a provisioned interpreter, use the following command from
-the checkout. The tests default to the current interpreter and the cache path above.
-Set `RIGHTYO_SILERO_MODEL` to test a different local copy of the pinned file.
+### Reproduce the Silero test worker on Apple Silicon
+
+The #350 round-8 replay used an existing CPython 3.11.14 on macOS 15.8.3 arm64,
+NumPy 2.2.6 and ONNX Runtime 1.24.4 with the CPU provider. ONNX Runtime also
+requires flatbuffers, packaging, protobuf and SymPy. SymPy requires mpmath.
+The requirements file pins all seven versions and records the PyPI SHA-256 of
+each wheel alongside the model SHA-256. [Test requirements](silero-test-macos-arm64.txt)
+
+From the checkout root, start with a fresh `.cache/vad-venv`. The existing
+interpreter's pip (25.3 in this run) installs the wheels into the test venv.
+
+```sh
+(
+  set -e
+  test "$(python3.11 -I -B --version)" = "Python 3.11.14"
+  mkdir -p .cache/test-home .cache/tmp
+  python3.11 -I -B -m venv --without-pip .cache/vad-venv
+  env -i PATH="$PATH" HOME="$PWD/.cache/test-home" TMPDIR="$PWD/.cache/tmp" \
+    PIP_CONFIG_FILE=/dev/null python3.11 -I -B -m pip \
+    --disable-pip-version-check --no-cache-dir --python .cache/vad-venv/bin/python \
+    install --index-url https://pypi.org/simple --only-binary=:all: --require-hashes \
+    -r docs/silero-test-macos-arm64.txt
+)
+```
+
+Run the generated-tone fixtures with authored recognition and a stand-in owner.
+The tests use the cache model above by default. Set `RIGHTYO_SILERO_MODEL` to
+test a different local copy of the pinned file.
 
 ```sh
 cd tests
-RIGHTYO_SILERO_PYTHON=/absolute/path/to/worker/bin/python PYTHONPATH=../src \
-  python3 -m unittest -v test_silero_vad.RealModelDecisions
+HOME="$PWD/../.cache/test-home" TMPDIR="$PWD/../.cache/tmp" \
+  RIGHTYO_SILERO_PYTHON="$PWD/../.cache/vad-venv/bin/python" PYTHONPATH=../src \
+  taskpolicy -b python3 -m unittest -v test_silero_vad.RealModelDecisions
 ```
 
 The cases skip when the model or runtime is absent. A failed inference or an
 unexpected adversarial decision fails the test. The fake worker covers the same
 decision path in CI. Its results provide no measure of Silero's accuracy.
+
+### Round-8 synthetic replay results (2026-11-27)
+
+All four real-model tests failed on the five replays below. Privacy stayed on and
+the owner verifier received zero calls in every replay. The test threshold was
+0.5. In a separate run of the same fixtures, a test-only observer sampled the ONNX
+speech probability inside the worker. Thresholding each score reproduced every
+32 ms label on the worker socket. Counts below include blocks wholly inside each
+stated interval. Times are relative to the start of generated audio.
+
+| Synthetic input | Peak speech probability and timing | Observed decision |
+| --- | --- | --- |
+| Persistent 100 Hz fundamental, louder third harmonic | Peak 0.1661 in the first 400 ms, 0.4890 in the louder section (400–1400 ms). | All 100 blocks over 3200 ms scored absent, certifying a false onset gap. No exit. |
+| Low-pitched voiced tail at 1.47× fan RMS | Command peaked at 0.9896. Tail peaked at 0.4159 with 0/62 full blocks labelled speech from 1200–3200 ms. | No exit. The recognition window ended at 2220 ms, 980 ms before the authored tail ended. |
+| Steady 200 Hz machinery, then command | First machine block (0–32 ms) scored 0.5733, the only positive in 24 s. Command peaked at 0.1656 with 0/50 speech blocks from 24000–25600 ms. | Machinery alone opened a 0–1480 ms recognition window. The expected exit never occurred by 27200 ms. |
+| Clean command over the same 50 Hz fan (tail control) | Command peaked at 0.9896 at 224–256 ms. The last speech block ended at 768 ms. The command continued to 1200 ms. | The expected exit never occurred by 2800 ms. |
+| Command sharing the fan's 100 Hz fundamental | Fan peaked at 0.0477 in 24 s. Command peaked at 0.2619 with 0/50 speech blocks from 24000–25600 ms. | No recognition window or exit by 27200 ms. |
+
+With the uninstrumented worker, unittest took 9.964 s for all four methods.
+Wall times including worker startup were 1.104 s for the persistent fundamental,
+3.014 s for the tail and its control together, 3.443 s for 200 Hz machinery and
+2.401 s for the shared 100 Hz fundamental.
 
 ## Speech backends
 
