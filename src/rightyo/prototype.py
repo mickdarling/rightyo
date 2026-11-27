@@ -27,7 +27,12 @@ from rightyo.addressedness import (
     scene_text,
     unfinished_shaped,
 )
-from rightyo.capture import CaptureError, MacMicrophoneCapture, StdinPcmCapture
+from rightyo.capture import (
+    CaptureError,
+    MacMicrophoneCapture,
+    QueuedPcmCapture,
+    StdinPcmCapture,
+)
 from rightyo.contracts import (
     PROVENANCE,
     Acknowledgement,
@@ -90,7 +95,7 @@ from rightyo.speech_backends import (
     utterance_local_labels,
 )
 from rightyo.state_log import DecisionStateLog
-from rightyo.tool_events import privacy_phrase
+from rightyo.tool_events import SpeechEvents, privacy_phrase
 from rightyo.turn_merge import (
     DEFAULT_TURN_MERGE_GAP_MS,
     complete_hold,
@@ -691,6 +696,8 @@ class PrototypeController:
         self._stdin_used = False
         # Optional host-facing stream. The lab retains its browser lease and UI controls.
         self._events = event_publisher
+        # Stream start and positioned stdin exits have a known sample boundary.
+        self._positioned_capture_epoch = getattr(event_publisher, "capture_epoch", None)
         # #242 round 27: a publisher already private (as `--start-private` makes it) is refused
         # here with hosted speech, as the CLI and `duck(True)` refuse it: the audio heard while
         # private would still be sent to the hosted backend. Checked again at every start.
@@ -1067,6 +1074,7 @@ class PrototypeController:
                     ),
                 )
                 self._event_terminal = False
+                self._positioned_capture_epoch = getattr(self._events, "capture_epoch", None)
                 if self.owner_voice is not None and not voiceprint and self.report is not None:
                     with contextlib.suppress(Exception):
                         self.report("owner_voice off: speaker identification roles are not on")
@@ -1480,6 +1488,10 @@ class PrototypeController:
             with self._lock:
                 if generation == self._generation:
                     self._shadow = shadow
+                    if isinstance(self._events, SpeechEvents):
+                        self._events.unlabelled_scorer = getattr(
+                            shadow, "try_unlabelled_score", None
+                        )
             settings = self.config.end_of_turn
             wake_word, owner = self._wake_join()
             if owner is None and self.config.turn_owner_pause_ms:
@@ -1566,6 +1578,7 @@ class PrototypeController:
                     if generation != self._generation or stop.is_set():
                         return
                     self._capture = capture
+                    self._attach_capture_mask(capture)
                     capture.start()
                 while not stop.is_set():
                     pcm = capture.read(timeout=0.25)
@@ -1579,6 +1592,7 @@ class PrototypeController:
                     if generation != self._generation or stop.is_set():
                         return
                     self._capture = self._stdin_capture = capture
+                    self._attach_capture_mask(capture)
                     capture.start()
                 accepted = True
                 while accepted and not stop.is_set():
@@ -1703,10 +1717,28 @@ class PrototypeController:
             with self._lock:
                 if self._shadow is shadow:
                     self._shadow = None
+                    if isinstance(self._events, SpeechEvents):
+                        self._events.unlabelled_scorer = None
                 if generation == self._generation:
                     self._capture = self._processor = None
                 elif generation + 1 == self._generation and self._phase == "stopping":
                     self._phase = "idle"
+
+    def _attach_capture_mask(self, capture):
+        events = self._events
+        if (
+            isinstance(capture, QueuedPcmCapture)
+            and isinstance(events, SpeechEvents)
+            and events.unlabelled_scorer is not None
+        ):
+
+            def snapshot():
+                # Observe a positioned off and its epoch together, before the blocking read.
+                with self._lock:
+                    epoch = events.capture_epoch
+                    return epoch, epoch is self._positioned_capture_epoch
+
+            capture.voiceprint_epoch = snapshot
 
     def _feed(self, generation, processor, pcm, mode, shadow=None) -> bool:
         """Push audio up to the session budget; False once the session accepts no more."""
@@ -1732,6 +1764,20 @@ class PrototypeController:
             # Read with the clock under the lock, so a change stamped after this chunk
             # never leaves a chunk heard in privacy in the speaker ring.
             private = self._private_audio()
+            if (
+                isinstance(self._events, SpeechEvents)
+                and self._events.unlabelled_scorer is not None
+            ):
+                # A chunk may have been read or queued during an earlier privacy epoch.
+                # Demo files go directly to _feed. Unstamped live input fails closed.
+                queued_private = mode != "demo" and (
+                    getattr(self._capture, "last_read_epoch", None)
+                    is not self._events.capture_epoch
+                )
+                if private or queued_private:
+                    self._events.exclude_voiceprint_audio(
+                        self._received_bytes - len(pcm), self._received_bytes
+                    )
             if private and self.config.hosted_speech:
                 # #242 round 27, the one choke point every audio consumer is fed through: in
                 # privacy, a hosted consumer (`hosted_audio_consumers`) receives nothing, by
@@ -2131,7 +2177,10 @@ class PrototypeController:
 
     def _apply_positioned_off(self, sample: int) -> None:
         end_bytes = max(self._received_bytes, sample * 2)
+        ending = self._events.ducked is True
         self._apply_duck(False, (end_bytes + PCM_BYTES_PER_MS - 1) // PCM_BYTES_PER_MS)
+        if ending:
+            self._positioned_capture_epoch = getattr(self._events, "capture_epoch", None)
 
     def duck(self, on: bool) -> None:
         """Forward the host's duck mode (hailing-station #735) to the event publisher.

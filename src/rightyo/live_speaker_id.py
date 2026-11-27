@@ -6,12 +6,14 @@ timeline, it takes only the pieces of the turn's span that the timeline gave tha
 and no other speaker (#148) from a bounded in-memory ring of the session's PCM, joins
 them, embeds them the way `rightyo enroll verify` does (silence trimmed, 3 s windows,
 renormalised mean), and accumulates a duration-weighted mean per session label. A turn
-without such pieces is counted, never scored. So the audio of inferred-label words (edge
-attribution, tail join), of overlap, and of another voice the timeline marks inside the
-span is never voiceprint evidence, while a turn with inferred words can still contribute
+with a label but without such pieces is counted, never scored. Inferred-label words,
+overlap, and another voice inside the span supply no binding evidence. A turn can contribute
 its own labelled audio. The accumulated vector is scored against the enrolled voiceprints
 made with the same model, and each label gets a shadow binding state: `bound` to an
 enrolled identifier, `tentative` or `unknown`.
+
+Unlabelled public decisions may take an idle-only cosine against the configured owners.
+Their whole turn is measured in isolation and discarded without touching label evidence.
 
 In scores-only mode the
 result is a content-free stderr note per scored turn (labels, enrolled identifiers,
@@ -48,6 +50,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 import queue
 import sys
 import threading
@@ -173,6 +176,100 @@ class EntryScore:
     longest_gap_ms: int = 0
 
 
+class TurnVoiceprint:
+    """A single pending decision owns this scalar result. Never holds audio or a vector."""
+
+    def __init__(self):
+        self.cancelled = False
+        self.result = (None, None, "busy")
+        self._lock = threading.Lock()
+        self._cancel_writer = None
+
+    def _stop(self):
+        self.cancelled = True
+        if self._cancel_writer is not None:
+            os.close(self._cancel_writer)
+            self._cancel_writer = None
+
+    @contextlib.contextmanager
+    def cancellation_fd(self):
+        with self._lock:
+            reader, self._cancel_writer = os.pipe()
+            if self.cancelled:
+                self._stop()
+        try:
+            yield reader
+        finally:
+            with self._lock:
+                if self._cancel_writer is not None:
+                    os.close(self._cancel_writer)
+                    self._cancel_writer = None
+            os.close(reader)
+
+    def cancel(self, reason):
+        with self._lock:
+            if reason == "busy" and self.result[2] != "busy":
+                return  # The score finished before foreground work arrived.
+            self._stop()
+            if self.result[2] != "private":
+                self.result = (None, None, reason)
+
+    def take(self):
+        # Publication never waits on scoring. Stop any remaining windows.
+        with self._lock:
+            self._stop()
+            return self.result
+
+    def finish(self, score, speech_ms, reason):
+        with self._lock:
+            if not self.cancelled:
+                self.result = (score, speech_ms, reason)
+
+
+def _isolated_owner_score(pcm, embed, references, min_seconds, cancelled):
+    """Silence-trimmed, windowed owner cosine. Borrowed PCM and all windows are wiped."""
+    raw, samples, parts, vectors = array("h"), array("h"), [], []
+    try:
+        raw.frombytes(memoryview(pcm))
+        if sys.byteorder != "little":
+            raw.byteswap()
+        samples = speech(raw)
+        wipe(raw)
+        if not samples or len(samples) / SAMPLE_RATE < min_seconds:
+            return None, None, "short"
+        speech_ms = round(len(samples) * 1000 / SAMPLE_RATE)
+        parts = windows(samples)
+        for part in parts:
+            if cancelled():
+                return None, None, "busy"
+            if sys.byteorder != "little":
+                part.byteswap()
+            vector = embed(memoryview(part).cast("B"))
+            try:
+                vectors.append(normalize(vector))
+            finally:
+                vector[:] = [0.0] * len(vector)
+                wipe(part)
+        if len({len(vector) for vector in vectors}) == 1:
+            mean = normalize([sum(column) / len(vectors) for column in zip(*vectors)])
+            try:
+                score = max(
+                    (cosine(mean, ref) for ref in references if len(ref) == len(mean)),
+                    default=None,
+                )
+                if score is not None:
+                    return score, speech_ms, None
+            finally:
+                mean[:] = [0.0] * len(mean)
+        return None, None, "no_turn_embedding"
+    finally:
+        for part in (raw, samples, *parts):
+            wipe(part)
+        for vector in vectors:
+            vector[:] = [0.0] * len(vector)
+        wipe(pcm)
+
+
 CLOSE_DRAIN_SECONDS = 3.0
 # The input route kinds a host may name for diagnostics (rightyo#164): exactly
 # HailProtocol's diagnostic `route` tokens, never a port or device name.
@@ -262,6 +359,16 @@ class PcmRing:
                 return b"", want_end > want_start
             pcm = bytes(self._buffer[start - self._start : end - self._start])
             return pcm, start > want_start or end < want_end
+
+    def diagnostic_span(self, start_ms: int, end_ms: int) -> bytearray | None:
+        """One complete public turn in wipeable storage, bounded like enrollment verify."""
+        with self._lock:
+            start, end = (ms * BYTES_PER_MS - self._start for ms in (start_ms, end_ms))
+            if not 0 <= start < end <= len(self._buffer) or end - start > (
+                MAX_VERIFY_SECONDS * SAMPLE_RATE * 2
+            ):
+                return None
+            return self._buffer[start:end]
 
     def clear(self) -> None:
         """Drop all held audio; the ring is then exactly a fresh ring of its size (#226)."""
@@ -425,7 +532,9 @@ def _pieces(spans: Any, start_ms: int, end_ms: int) -> list[tuple[int, int]]:
 
 
 def _default_embedder(settings: SpeakerIdConfig):
-    return SpeakerEmbedder(settings.python, settings.model, threads=settings.threads)
+    return SpeakerEmbedder(
+        settings.python, settings.model, threads=settings.threads, diagnostics=True
+    )
 
 
 def _default_entries(settings: SpeakerIdConfig) -> list[dict[str, Any]]:
@@ -492,6 +601,11 @@ class ShadowSpeakerId:
         self._off = threading.Event()  # failed or nothing to compare against
         self._embedder = None
         self._embedder_lock = threading.Lock()
+        self._admission = threading.Condition()
+        self._foreground_jobs = 0  # Includes work already taken from either queue.
+        self._diagnostic = None
+        self._diagnostic_thread = None
+        self._diagnostic_idle = False
         self._thread = threading.Thread(target=self._run, name="rightyo-speaker-id", daemon=True)
         self.offered = self.scored = self.short = self.overlap = 0
         self.dropped = self.clipped = self.inferred = 0
@@ -686,7 +800,8 @@ class ShadowSpeakerId:
                 return
             try:
                 done = threading.Event() if wait else None
-                self._queue.put_nowait(
+                self._offer(
+                    self._queue,
                     (
                         epoch,
                         turn.speaker_id,
@@ -696,7 +811,7 @@ class ShadowSpeakerId:
                         score_self,
                         turn.utterance_id if self.settings.roles and not inferred else None,
                         done,
-                    )
+                    ),
                 )
                 if done is not None:
                     while not done.wait(0.05):
@@ -711,6 +826,73 @@ class ShadowSpeakerId:
                     self._report("speaker_id worker busy; dropping turns (counted)")
         except Exception:  # noqa: BLE001 - shadow work never affects the session
             pass
+
+    def _offer(self, target, item):
+        with self._admission:
+            self._foreground_jobs += 1
+            if self._diagnostic is not None:
+                self._diagnostic[0].cancel("busy")
+        try:
+            target.put_nowait(item)
+        except queue.Full:
+            self._foreground_done()
+            raise
+
+    def _foreground_done(self):
+        with self._admission:
+            self._foreground_jobs -= 1
+
+    def try_unlabelled_score(self, start_ms, end_ms, owners):
+        """Try once, without using either foreground queue or waiting for a result."""
+        ticket = TurnVoiceprint()
+        if not self._admission.acquire(blocking=False):
+            return ticket
+        try:
+            if not self.active:
+                ticket.cancel("no_turn_embedding")
+                return ticket
+            if self._compared is None or self._foreground_jobs:
+                return ticket
+            if self._diagnostic_thread is None or self._owners_unavailable(owners):
+                ticket.cancel("no_turn_embedding")
+                return ticket
+            if self._diagnostic_idle:
+                self._diagnostic_idle = False
+                self._diagnostic = (ticket, start_ms, end_ms, owners)
+                self._admission.notify()
+        finally:
+            self._admission.release()
+        return ticket
+
+    def _diagnostics(self, embed, prints):
+        while True:
+            with self._admission:
+                self._diagnostic = None
+                if self._off.is_set():
+                    return
+                self._diagnostic_idle = True
+                self._admission.wait_for(lambda: self._diagnostic is not None or self._off.is_set())
+                if self._diagnostic is None:
+                    return
+                ticket, start_ms, end_ms, owners = self._diagnostic
+            refs = [prints[o] for o in owners if o in prints]
+            self._measure_unlabelled(ticket, start_ms, end_ms, refs, embed)
+
+    def _measure_unlabelled(self, ticket, start_ms, end_ms, refs, embed):
+        try:
+            if ticket.cancelled:
+                return
+            with ticket.cancellation_fd() as fd:
+                pcm = self._ring.diagnostic_span(start_ms, end_ms)
+                if pcm is None:
+                    ticket.finish(None, None, "no_turn_embedding")
+                    return
+                result = _isolated_owner_score(
+                    pcm, lambda window: embed(window, fd), refs, 0, lambda: ticket.cancelled
+                )
+            ticket.finish(*result)
+        except Exception:  # Diagnostics cannot switch off identification.
+            ticket.finish(None, None, "no_turn_embedding")
 
     # ------------------------------------------------------------------ worker thread
 
@@ -784,6 +966,18 @@ class ShadowSpeakerId:
                 for entry in matched
                 if isinstance(entry.get("display_name"), str)
             }
+            embed = getattr(embedder, "embed_diagnostic", None)
+            if prints and callable(embed):
+                try:
+                    self._diagnostic_thread = threading.Thread(
+                        target=self._diagnostics,
+                        args=(embed, prints),
+                        name="rightyo-turn-voiceprint",
+                        daemon=True,
+                    )
+                    self._diagnostic_thread.start()
+                except RuntimeError:
+                    self._diagnostic_thread = None
             self._compared = frozenset(prints)
             if profile_pending:
                 try:
@@ -812,13 +1006,16 @@ class ShadowSpeakerId:
                 except queue.Empty:
                     pass
                 else:
-                    if self._owners_unavailable(check.owners):
-                        # A check queued during startup had no enrollment snapshot yet.
-                        check.done.set()
-                    elif isinstance(check, _ExitCheck):
-                        self._exit_check(embedder, prints, check)
-                    else:
-                        self._check(embedder, prints, check)
+                    try:
+                        if self._owners_unavailable(check.owners):
+                            # A check queued during startup had no enrollment snapshot yet.
+                            check.done.set()
+                        elif isinstance(check, _ExitCheck):
+                            self._exit_check(embedder, prints, check)
+                        else:
+                            self._check(embedder, prints, check)
+                    finally:
+                        self._foreground_done()
                     continue
                 try:
                     item = self._queue.get(timeout=0.05)
@@ -831,6 +1028,7 @@ class ShadowSpeakerId:
                         break
                     self._score(embedder, prints, *item[:-1])
                 finally:
+                    self._foreground_done()
                     if item[-1] is not None:
                         item[-1].set()
         except Exception:  # noqa: BLE001 - any failure switches shadow ID off, once
@@ -843,6 +1041,13 @@ class ShadowSpeakerId:
             self._off.set()
             self._discard_queue()
             self._release_checks()
+            with self._admission:
+                if self._diagnostic is not None and not self._closing.is_set():
+                    self._diagnostic[0].cancel("no_turn_embedding")
+                self._admission.notify_all()
+            if self._diagnostic_thread is not None:
+                # Let normal drain finish a final score and its wipes before closing the model.
+                self._diagnostic_thread.join(CLOSE_DRAIN_SECONDS)
             if embedder is not None:
                 with contextlib.suppress(Exception):
                     embedder.close()
@@ -861,6 +1066,9 @@ class ShadowSpeakerId:
             self._labels = {}
             self._bound_ids = set()
             self.scored_seconds = 0.0
+        with self._admission:
+            if self._diagnostic is not None:
+                self._diagnostic[0].cancel("no_turn_embedding")
         self._discard_queue()
 
     def _score(
@@ -1046,7 +1254,7 @@ class ShadowSpeakerId:
                     parts[index].append(pcm)
             check = _EntryCheck(b"".join(parts[0]), tuple(parts[1]), owners)
             try:
-                self._checks.put_nowait(check)
+                self._offer(self._checks, check)
             except queue.Full:
                 return EntryScore(None, None, 0, "busy")
             if not check.done.wait(ENTRY_CHECK_TIMEOUT_S):
@@ -1072,7 +1280,7 @@ class ShadowSpeakerId:
             ):
                 return check.result
             try:
-                self._checks.put_nowait(check)
+                self._offer(self._checks, check)
             except queue.Full:
                 return check.result
             if not check.done.wait(ENTRY_CHECK_TIMEOUT_S):
@@ -1092,51 +1300,21 @@ class ShadowSpeakerId:
             if check.cancelled:
                 check.done.set()
                 return
-            raw, samples, parts, vectors = array("h"), array("h"), [], []
             try:
-                raw.frombytes(memoryview(check.pcm))
-                if sys.byteorder != "little":
-                    raw.byteswap()
-                samples = speech(raw)
-                wipe(raw)
-                if len(samples) / SAMPLE_RATE < self.settings.entry_min_seconds:
-                    check.result = EntryScore(None, None, 0, "short")
-                    return
-                # Same silence gate, windows, normalisation and owner cosine as entry;
-                # mutable windows avoid voiceprint()'s immutable .tobytes() copies.
-                parts = windows(samples)
-                embed = getattr(embedder, "embed_private", embedder.embed)
-                for part in parts:
-                    if check.cancelled:
-                        return
-                    if sys.byteorder != "little":
-                        part.byteswap()
-                    vector = embed(memoryview(part).cast("B"))
-                    try:
-                        vectors.append(normalize(vector))
-                    finally:
-                        vector[:] = [0.0] * len(vector)
-                        wipe(part)
-                if len({len(vector) for vector in vectors}) != 1:
-                    return
-                mean = normalize([sum(column) / len(vectors) for column in zip(*vectors)])
-                try:
-                    scores = [
-                        cosine(mean, prints[owner])
-                        for owner in check.owners
-                        if owner in prints and len(prints[owner]) == len(mean)
-                    ]
-                    if scores:
-                        check.result = EntryScore(max(scores), None, 0, "scored")
-                finally:
-                    mean[:] = [0.0] * len(mean)
+                score, _, reason = _isolated_owner_score(
+                    check.pcm,
+                    getattr(embedder, "embed_private", embedder.embed),
+                    [prints[o] for o in check.owners if o in prints],
+                    self.settings.entry_min_seconds,
+                    lambda: check.cancelled,
+                )
+                outcome = "scored" if score is not None else "unavailable"
+                if reason == "short":
+                    outcome = "short"
+                check.result = EntryScore(score, None, 0, outcome)
             except Exception:  # noqa: BLE001 - failures reveal no content and never bind
                 check.result = EntryScore(None, None, 0, "unavailable")
             finally:
-                for part in (raw, samples, *parts):
-                    wipe(part)
-                for vector in vectors:
-                    vector[:] = [0.0] * len(vector)
                 wipe(check.pcm)
                 check.done.set()
 
@@ -1204,6 +1382,7 @@ class ShadowSpeakerId:
                 check = self._checks.get_nowait()
             except queue.Empty:
                 return
+            self._foreground_done()
             check.done.set()
 
     def _discard_queue(self) -> None:
@@ -1212,6 +1391,7 @@ class ShadowSpeakerId:
                 item = self._queue.get_nowait()
             except queue.Empty:
                 return
+            self._foreground_done()
             if item[-1] is not None:
                 item[-1].set()
 
@@ -1226,6 +1406,9 @@ class ShadowSpeakerId:
             if self._thread.is_alive():
                 self._thread.join(CLOSE_DRAIN_SECONDS)
         self._stop.set()
+        with self._admission:
+            if self._diagnostic is not None:
+                self._diagnostic[0].cancel("no_turn_embedding")
         if self._thread.is_alive():
             self._thread.join(0.5)
         if self._thread.is_alive():
@@ -1244,6 +1427,8 @@ class ShadowSpeakerId:
             loader.join(3)
             if loader.is_alive():
                 self._report("self_profile shutdown incomplete reason=timeout")
+        if self._diagnostic_thread is not None:
+            self._diagnostic_thread.join(2)
         self._ring.clear()
         if not self.offered and not self_count and not tag_summary and self._manifest is None:
             return

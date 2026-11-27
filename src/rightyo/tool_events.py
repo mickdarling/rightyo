@@ -36,6 +36,7 @@ from rightyo.contracts import (
     integer,
     speaker_role,
 )
+from rightyo.live_speaker_id import BYTES_PER_MS
 from rightyo.memory import TranscriptMemory
 from rightyo.providers import ConfiguredPriorityProvider, ProviderError
 from rightyo.request_outcomes import TERMINAL, OutcomeApplied
@@ -637,6 +638,7 @@ class SpeechEvents:
     """
 
     _publish_standing_diagnostics = True  # Suppressed only by differential tests.
+    _score_unlabelled = True  # Private differential-test switch.
 
     def __init__(
         self,
@@ -696,6 +698,8 @@ class SpeechEvents:
         self._queue_bytes = 0
         self._pending = {}
         self._pending_guest_bindings = {}
+        self._pending_voiceprints = {}
+        self.unlabelled_scorer = None  # Attached to the current live worker, if provisioned.
         self._pending_bytes = 0
         self._seen = {}
         self._decided = set()
@@ -772,6 +776,8 @@ class SpeechEvents:
         # for the local exit and status phrases (see `duck`). Like media mode it outlasts
         # sessions.
         self._duck = False
+        self.capture_epoch = object()
+        self._voiceprint_masks = []  # Exact stream byte ranges, including capture backlog.
         # The stream time the enrolled owner's lone name fragment ended, heard while privacy
         # was on (a split exit), or None; a time only, never the words. Cleared by every
         # other turn, private or not, and whenever the mode changes.
@@ -935,6 +941,7 @@ class SpeechEvents:
         self._memory.clear()
         self._pending.clear()
         self._pending_guest_bindings.clear()
+        self._discard_voiceprints()
         self._pending_bytes = 0
         self._queue.clear()
         self._queue_bytes = 0
@@ -1038,12 +1045,15 @@ class SpeechEvents:
             self._meeting_ask_anywhere = meeting_ask_anywhere
             # A new session's stream clock starts again; a mode still on covers all of it.
             self._duck_spans = [[0, None]] if self._duck else []
+            self.capture_epoch = None if self._duck else object()
+            self._voiceprint_masks.clear()
             self._private_name_end = None
             self._voice_generation += 1
             self._private_seen.clear()
             self._role_sources = duck and priority is not None
             self._duck_acks = duck
             self._priority = priority
+            self.unlabelled_scorer = None
             self._per_turn = (
                 priority is not None
                 and getattr(priority, "per_turn", False) is True
@@ -1174,6 +1184,9 @@ class SpeechEvents:
                     if self._spoken_replies is not None:
                         self._spoken_replies.pending_owners.pop(key, None)
                     self._pending_guest_bindings.pop(key, None)
+                    ticket = self._pending_voiceprints.pop(key, None)
+                    if ticket is not None:
+                        ticket.cancel("no_turn_embedding")
                     self._pending_bytes -= size
             # Reclaim accounting as well as plaintext when a frozen context shrinks.
             self._pending_bytes = 0
@@ -1559,6 +1572,8 @@ class SpeechEvents:
                     self._per_turn and role in {"owner", "trusted"}
                 ):
                     binding = self._speaker_binding_evidence(turn, role)
+                if turn.speaker_id is None and self._publish_standing_diagnostics:
+                    self._offer_voiceprint(turn)
                 self._pending[turn.utterance_id] = (turn, context, size, role, binding)
                 if guest_binding is not None:
                     self._pending_guest_bindings[turn.utterance_id] = guest_binding
@@ -1970,6 +1985,9 @@ class SpeechEvents:
             self._private_name_end = None
             self._voice_generation += 1
             if on and not self._duck:
+                self.capture_epoch = None
+                for ticket in self._pending_voiceprints.values():
+                    ticket.cancel("private")
                 # Keep the entry/ack clock identical to the former conversation end,
                 # without ending or otherwise changing the public engagement.
                 if self._engaged is not None and self._active:
@@ -1996,6 +2014,8 @@ class SpeechEvents:
                             + " ".join(f"{key}={value}" for key, value in counts.items())
                         )
             self._duck = on
+            if not on and self.capture_epoch is None:
+                self.capture_epoch = object()
             if on and ack and self._active and self._duck_acks:
                 self._emit("privacy", action="on", at_ms=at)
 
@@ -2188,6 +2208,8 @@ class SpeechEvents:
         integer(now_ms, "now_ms")
         with self._lock:
             self._voice_generation += 1
+            for ticket in self._pending_voiceprints.values():
+                ticket.cancel("no_turn_embedding")
             ended = (
                 self._engaged["speaker_id"] if self._engaged is not None and self._active else None
             )
@@ -3193,7 +3215,48 @@ class SpeechEvents:
         except Exception:  # noqa: BLE001 - never expose provider failures or their contents
             return {"diagnostic_error": True}
 
-    def _standing_evidence(self, turn, role, standing):
+    def exclude_voiceprint_audio(self, start_byte, end_byte):
+        """Capture and controller clocks share byte zero. Never retain PCM here."""
+        if start_byte >= end_byte:
+            return
+        with self._lock:
+            spans = self._voiceprint_masks
+            if spans and spans[-1][1] == start_byte:
+                spans[-1][1] = end_byte
+            else:
+                spans.append([start_byte, end_byte])
+                if len(spans) > MAX_DUCK_SPANS:
+                    spans[0][1] = spans.pop(1)[1]  # Conservatively cover the oldest gap.
+
+    def _voiceprint_masked(self, turn):
+        return any(
+            turn.start_ms * BYTES_PER_MS < right and turn.end_ms * BYTES_PER_MS > left
+            for left, right in self._voiceprint_masks
+        )
+
+    def _offer_voiceprint(self, turn):
+        # transcript() already excluded turns heard in privacy. Also exclude raw
+        # input that waited in a capture queue across a change of privacy epoch.
+        if (
+            not self._score_unlabelled
+            or self.unlabelled_scorer is None
+            or self._priority is None
+            or self._voiceprint_masked(turn)
+        ):
+            return
+        with contextlib.suppress(Exception):  # A diagnostic cannot fail admission.
+            owners = self._priority.priority.owners
+            if owners:
+                self._pending_voiceprints[turn.utterance_id] = self.unlabelled_scorer(
+                    turn.start_ms, turn.end_ms, owners
+                )
+
+    def _discard_voiceprints(self):
+        for ticket in self._pending_voiceprints.values():
+            ticket.cancel("no_turn_embedding")
+        self._pending_voiceprints.clear()
+
+    def _standing_evidence(self, turn, role, standing, voiceprint=None):
         """Explain a public decision without supplying standing to any policy."""
         try:
             evidence = {
@@ -3212,13 +3275,14 @@ class SpeechEvents:
                     ),
                 )
             if turn.speaker_id is None:
-                # ShadowSpeakerId.turn skips unlabelled turns before taking PCM from
-                # the ring. There is no public turn embedding or measured speech time.
-                evidence.update(
-                    voiceprint_owner_score=None,
-                    voiceprint_speech_ms=None,
-                    voiceprint_unavailable="no_turn_embedding",
-                )
+                score, speech_ms, reason = None, None, "no_turn_embedding"
+                if self.heard_ducked(turn) or self._voiceprint_masked(turn):
+                    reason = "private"
+                elif voiceprint is not None:
+                    score, speech_ms, reason = voiceprint.take()
+                evidence.update(voiceprint_owner_score=score, voiceprint_speech_ms=speech_ms)
+                if reason is not None:
+                    evidence["voiceprint_unavailable"] = reason
             return evidence
         except Exception:  # noqa: BLE001 - diagnostic failures never abort a decision
             return {"diagnostic_error": True}
@@ -3336,7 +3400,7 @@ class SpeechEvents:
         forms a request, and its evidence carries `decision_status: "unavailable"` and
         that `reason` beside the unchanged keys.
         """
-        with self._lock:
+        with self._lock, contextlib.ExitStack() as cleanup:
             if not self._active or not self._attention_enabled:
                 return
             if not isinstance(event, DecisionEvent) or event.turn.session_id != self._session:
@@ -3351,6 +3415,9 @@ class SpeechEvents:
             if key in self._decided:
                 return
             pending = self._pending.pop(key, None)
+            voiceprint = self._pending_voiceprints.pop(key, None)
+            if voiceprint is not None:
+                cleanup.callback(voiceprint.cancel, "no_turn_embedding")
             guest_binding = self._pending_guest_bindings.pop(key, None)
             if pending is None:
                 return
@@ -3433,7 +3500,7 @@ class SpeechEvents:
                     }
                 elif binding_evidence is None or stale:
                     binding_evidence = self._speaker_binding_evidence(turn, current)
-                diagnostics = self._standing_evidence(turn, attention_role, standing)
+                diagnostics = self._standing_evidence(turn, attention_role, standing, voiceprint)
                 diagnostics.update(binding_evidence)
             if role is not None:
                 evidence["role"] = receipt_role or decided
@@ -4058,6 +4125,7 @@ class SpeechEvents:
             self._memory.clear()
             self._pending.clear()
             self._pending_guest_bindings.clear()
+            self._discard_voiceprints()
             self._pending_bytes = 0
             self._cue_voices.clear()
             self._others_turns.clear()

@@ -16,13 +16,17 @@ Nyquist, int16-scaled samples, per-utterance mean removal), as in the spike harn
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import math
 import os
+import select
 import selectors
+import socket
 import subprocess
 import sys
+import threading
 import time
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
@@ -86,7 +90,7 @@ def _kaldi_fbank(np, x, bins=80):
 
 
 def _read_private_pcm(source, size: int) -> bytearray:
-    """Read local exit-only PCM directly into mutable storage; wipe a partial failure."""
+    """Read a local isolated window directly into mutable storage; wipe a partial failure."""
     if type(size) is not int or not 0 < size <= 10 * SAMPLE_RATE * 2 or size % 2:
         raise SpeakerIdError("Invalid audio")
     pcm = bytearray(size)
@@ -101,6 +105,31 @@ def _read_private_pcm(source, size: int) -> bytearray:
     except BaseException:
         pcm[:] = b"\0" * len(pcm)
         raise
+
+
+@contextlib.contextmanager
+def _embedding(np, session, name, pcm, *, wipe_input):
+    """The local WeSpeaker forward pass; wipe owned scratch before returning a result."""
+    samples = features = vector = None
+    outputs = []
+    embedding = []
+    try:
+        if not pcm or len(pcm) > MAX_PCM_BYTES or len(pcm) % 2:
+            raise SpeakerIdError("Invalid audio")
+        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
+        samples /= 32768.0
+        features = _kaldi_fbank(np, samples)
+        outputs = session.run(None, {name: features[None]})
+        vector = np.asarray(outputs[0], dtype=np.float64).reshape(-1)
+        embedding = vector.tolist()
+        yield embedding
+    finally:
+        if wipe_input:
+            pcm[:] = b"\0" * len(pcm)
+            embedding.clear()
+            for scratch in (samples, features, vector, *outputs):
+                if scratch is not None:
+                    scratch.fill(0)
 
 
 def _embed_request(source, protocol, np, session, name) -> bool:
@@ -118,32 +147,73 @@ def _embed_request(source, protocol, np, session, name) -> bool:
     else:
         return False
     request.clear()
-    samples = features = vector = None
-    outputs = []
-    embedding = []
-    try:
-        if not pcm or len(pcm) > MAX_PCM_BYTES or len(pcm) % 2:
-            raise SpeakerIdError("Invalid audio")
-        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
-        samples /= 32768.0
-        features = _kaldi_fbank(np, samples)
-        outputs = session.run(None, {name: features[None]})
-        vector = np.asarray(outputs[0], dtype=np.float64).reshape(-1)
-        embedding = vector.tolist()
+    with _embedding(np, session, name, pcm, wipe_input=private) as embedding:
         response = json.dumps({"ok": True, "embedding": embedding}) + "\n"
-    finally:
-        if private:
-            pcm[:] = b"\0" * len(pcm)
-            embedding.clear()
-            for scratch in (samples, features, vector, *outputs):
-                if scratch is not None:
-                    scratch.fill(0)
     # A successful response must not release the caller before the worker's wipes.
     protocol.write(response)
     return True
 
 
-def _worker(model: str, threads: int) -> int:
+class _DiagnosticSession:
+    """Use the existing CPU session; a revoked turn cannot start another native run."""
+
+    def __init__(self, session, options, cancel_fd):
+        self.session = session
+        self.options = options
+        self.cancel_fd = cancel_fd
+
+    def run(self, outputs, inputs):
+        if select.select([self.cancel_fd], [], [], 0)[0]:
+            raise SpeakerIdError("Diagnostic cancelled")
+        # EOF on the turn's pipe signals privacy, foreground work or publication.
+        # ORT checks terminate between kernels. The normal worker pipe is independent.
+        done, signal_done = os.pipe()
+
+        def watch():
+            ready, _, _ = select.select([self.cancel_fd, done], [], [])
+            if self.cancel_fd in ready:
+                self.options.terminate = True
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        try:
+            watcher.start()
+            return self.session.run(outputs, inputs, self.options)
+        finally:
+            os.close(signal_done)
+            if watcher.ident is not None:
+                watcher.join()
+            os.close(done)
+
+
+def _diagnostic_requests(fd, np, session, name, ort):
+    # Unnamed Unix IPC in the already-loaded worker. Each window borrows its turn's
+    # cancellation fd. Only one turn can own this channel, and it never carries a queue.
+    with socket.socket(fileno=fd) as channel, channel.makefile("rb") as source:
+        with channel.makefile("w", encoding="ascii") as protocol:
+            while True:
+                marker, fds, _, _ = socket.recv_fds(channel, 1, 1)
+                if not marker or not fds:
+                    return
+                try:
+                    run = _DiagnosticSession(session, ort.RunOptions(), fds[0])
+                    if not _embed_request(source, protocol, np, run, name):
+                        return
+                except Exception:  # A cancelled/failed window affects only this diagnostic.
+                    protocol.write('{"ok":false}\n')
+                finally:
+                    os.close(fds[0])
+                protocol.flush()
+
+
+def _cpu_session(ort, model, threads):
+    options = ort.SessionOptions()
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    options.inter_op_num_threads = 1
+    options.intra_op_num_threads = threads
+    return ort.InferenceSession(model, sess_options=options, providers=["CPUExecutionProvider"])
+
+
+def _worker(model: str, threads: int, diagnostic_fd: int | None = None) -> int:
     protocol = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
     with open(os.devnull, "wb") as sink:
         os.dup2(sink.fileno(), 1)
@@ -152,14 +222,17 @@ def _worker(model: str, threads: int) -> int:
         import numpy as np
         import onnxruntime as ort
 
-        options = ort.SessionOptions()
-        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        options.inter_op_num_threads = 1
-        options.intra_op_num_threads = threads
-        session = ort.InferenceSession(
-            model, sess_options=options, providers=["CPUExecutionProvider"]
-        )
+        session = _cpu_session(ort, model, threads)
         name = session.get_inputs()[0].name
+        if diagnostic_fd is not None:
+            try:
+                threading.Thread(
+                    target=_diagnostic_requests,
+                    args=(diagnostic_fd, np, session, name, ort),
+                    daemon=True,
+                ).start()
+            except RuntimeError:
+                os.close(diagnostic_fd)
         protocol.write('{"ok":true}\n')
         while _embed_request(sys.stdin.buffer, protocol, np, session, name):
             pass
@@ -403,6 +476,7 @@ class SpeakerEmbedder:
         threads: int = 4,
         timeout_seconds: float = 10,
         identity: dict[str, str] | None = None,
+        diagnostics: bool = False,
     ):
         if (
             not Path(python).is_file()
@@ -415,7 +489,15 @@ class SpeakerEmbedder:
         # Tests inject an identity for a stand-in worker; real use checks the file hash.
         self.model = model_identity(model) if identity is None else dict(identity)
         self.timeout = timeout_seconds
+        self._diagnostic_socket = self._diagnostic_reader = None
+        child = None
         try:
+            if diagnostics:
+                # Optional local IPC failure must leave ordinary identification usable.
+                with contextlib.suppress(OSError):
+                    self._diagnostic_socket, child = socket.socketpair(socket.AF_UNIX)
+                    self._diagnostic_socket.settimeout(self.timeout)
+                    self._diagnostic_reader = self._diagnostic_socket.makefile("rb")
             self.process = subprocess.Popen(
                 [
                     str(python),
@@ -424,7 +506,9 @@ class SpeakerEmbedder:
                     "--worker",
                     str(Path(model).resolve()),
                     str(threads),
+                    *([str(child.fileno())] if child else []),
                 ],
+                pass_fds=(child.fileno(),) if child else (),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -432,7 +516,11 @@ class SpeakerEmbedder:
                 env={"PATH": os.defpath},
             )
         except OSError:
+            self._close_diagnostic()
             raise SpeakerIdError("The speaker model could not start") from None
+        finally:
+            if child is not None:
+                child.close()
         self.buffer = bytearray()
         try:
             on_spawn = self.on_spawn.get()
@@ -487,6 +575,36 @@ class SpeakerEmbedder:
         header = (json.dumps({"command": "embed_private", "size": len(pcm)}) + "\n").encode()
         return self._embed_request(header, pcm)
 
+    def embed_diagnostic(self, pcm: memoryview, cancel_fd: int) -> list[float]:
+        channel, reader = self._diagnostic_socket, self._diagnostic_reader
+        if channel is None or reader is None:
+            raise SpeakerIdError("Diagnostic unavailable")
+        try:
+            socket.send_fds(channel, [b"W"], [cancel_fd])
+            header = json.dumps({"command": "embed_private", "size": len(pcm)})
+            channel.sendall((header + "\n").encode("ascii"))
+            channel.sendall(pcm)
+            response = json.loads(reader.readline(MAX_RESPONSE_BYTES))
+        except (ValueError, OSError):
+            # A partial exchange cannot be reused. Never close the labelled channel.
+            self._close_diagnostic()
+            raise SpeakerIdError("Diagnostic unavailable") from None
+        vector = response.get("embedding")
+        if (
+            response.get("ok") is not True
+            or not isinstance(vector, list)
+            or not 1 <= len(vector) <= MAX_EMBEDDING_DIM
+            or not all(finite_number(item) for item in vector)
+        ):
+            raise SpeakerIdError("Diagnostic unavailable")
+        return vector
+
+    def _close_diagnostic(self):
+        for stream in (self._diagnostic_reader, self._diagnostic_socket):
+            if stream is not None:
+                stream.close()
+        self._diagnostic_socket = self._diagnostic_reader = None
+
     def embed(self, pcm: bytes) -> list[float]:
         """One embedding for mono PCM16 at 16 kHz, at most 30 s."""
         if not isinstance(pcm, bytes) or not pcm or len(pcm) % 2 or len(pcm) > MAX_PCM_BYTES:
@@ -531,12 +649,17 @@ class SpeakerEmbedder:
 
     def close(self) -> None:
         self.terminate()
+        self._close_diagnostic()
         for stream in (self.process.stdin, self.process.stdout):
             if stream is not None:
                 stream.close()
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "--worker" and sys.argv[3].isdigit():
-        raise SystemExit(_worker(sys.argv[2], int(sys.argv[3])))
+    if (
+        len(sys.argv) in (4, 5)
+        and sys.argv[1] == "--worker"
+        and all(arg.isdigit() for arg in sys.argv[3:])
+    ):
+        raise SystemExit(_worker(sys.argv[2], *map(int, sys.argv[3:])))
     raise SystemExit(2)

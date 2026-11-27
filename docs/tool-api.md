@@ -895,10 +895,43 @@ A request carries the same decision as its attention event. These fields grant n
 | `speaker_bound_to_owner` | Whether the binding used for this role resolved to an enrolled owner. A configured owner label alone yields `false`. |
 | `speaker_binding_state` | The state from the role resolution (`bound`, `tentative`, `insufficient` or `unknown`), or `null` when it supplied no binding. |
 | `speaker_binding_source` | `voiceprint` for a speaker-ID binding, `first_bind_receipt` when the decision used a first-bind receipt, `configured_label` for a configured owner or trusted label, otherwise `null`. |
-| `voiceprint_owner_score`, `voiceprint_speech_ms`, `voiceprint_unavailable` | On unlabelled public turns, both measurements are `null` and the reason is `no_turn_embedding`. The public speaker-ID worker skips these turns before extracting audio. |
+| `voiceprint_owner_score` | On an unlabelled public turn, the full-precision maximum cosine similarity to a configured owner's enrollment from the same model, or `null`. A cosine is a diagnostic measurement and has no authentication threshold. |
+| `voiceprint_speech_ms` | Milliseconds retained by the enrollment silence trim for the scored turn, including retained short pauses. `null` when no score is available. |
+| `voiceprint_unavailable` | Omitted on success. `busy` means the worker was occupied, higher-priority work interrupted scoring, or the decision was ready first. `private` covers privacy and excluded capture audio. `short` means the trim retained no speech. `no_turn_embedding` covers missing local runtime, comparable owner enrollment or complete turn audio, including spans beyond the 30 s limit. |
 | `diagnostic_error` | `true` if a diagnostic failed. Its fields may be absent. |
 
-Turns heard in privacy produce no attention decision or diagnostic voiceprint score.
+Live speaker ID uses its existing local CPU model for this measurement. When a final
+turn has a pending decision and no label, an idle worker can embed its complete span
+in enrollment windows. Labelled turns and entry/exit checks take priority. Decisions
+use the scalar result available at publication and never wait for inference. Scoring
+wipes the PCM copy, window vectors and model scratch. It supplies no label, binding,
+role or request authority. Only the local attention/request decision carries the
+measurement. Agent inputs and formed requests receive no voiceprint fields.
+
+Turns heard in privacy produce no attention decision. For the unlabelled voiceprint
+diagnostic, microphone and stdin chunks are also excluded if any contributing read
+started outside the public privacy epoch in which the chunk is fed. This covers
+in-flight reads, partial chunks and chunks waiting in the capture queue.
+
+After a microphone privacy-off, or a stdin privacy-off without `after_sample`, the
+first read in the new epoch starts an additional exclusion. It covers any partial
+chunk already held and the next 6,400 bytes (200 ms) of reads. If the input
+descriptor reports more than 6,400 bytes already waiting at that first read, the
+exclusion covers all of them. Every chunk touching those bytes is excluded,
+including a short final stdin chunk. A positioned stdin off keeps the existing
+sample boundary and adds no such guard.
+
+If a public turn overlaps any excluded chunk, its voiceprint measurements are null
+with reason `private` and its audio is never offered to the diagnostic worker.
+Privacy entry also revokes pending measurements and interrupts any diagnostic
+already running on earlier public audio.
+
+For a synthetic CPU measurement, run
+`PYTHONPATH=src python3 scripts/measure_unlabelled_voiceprint.py --model /path/to/model.onnx`
+with the provisioned model interpreter. It measures 0.5–6 s turns, with one measured
+turn per three turns of stream time, and prints elapsed milliseconds and incremental
+CPU time as a percentage of one core over that stream. Model loading and IPC are
+outside the timed interval. Without local assets the script prints a skip.
 
 An addressed guest request carries its own request ID. The owner keeps their pending
 question and deadline, including when the diarizer reuses their label for a guest.
