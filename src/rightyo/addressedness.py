@@ -174,14 +174,11 @@ _AUXILIARIES = frozenset(
 _QUESTION_OPENERS = _AUXILIARIES | frozenset(
     "what what's whats when where where's which who who's whom whose why how how's".split()
 )
-_QUESTION_SUBJECTS = frozenset(
-    "i you he she it we they there anyone anybody someone somebody everyone everybody".split()
-)
 _OPENERS = _IMPERATIVES | _QUESTION_OPENERS | {"please"}
 
 
-def question_shaped(text: str, *, address: tuple[int, int] | None = None) -> bool:
-    """Question punctuation anywhere, or an English interrogative clause in ASR text."""
+def question_shaped(text: str, *, address_end: int = 0) -> bool:
+    """Check the exit sentence's punctuation and its first words after the vocative."""
     for char in text:
         if char == "?":
             return True
@@ -189,27 +186,16 @@ def question_shaped(text: str, *, address: tuple[int, int] | None = None) -> boo
             name = unicodedata.name(char, "")
             if "QUESTION" in name or "INTERROBANG" in name:
                 return True
-    if address is not None:
-        # Only the matched vocative is exempt. Question marks anywhere still veto it.
-        start, end = address
-        text = text[:start] + " listener " + text[end:]
-    for clause in re.split(r"[^\w\s']+", text.lower().replace("’", "'")):
-        at_head, after_auxiliary = True, False
-        for token in _WORDS.findall(clause):
-            word = token.strip("'")
-            if not word or (at_head and (word in _FILLERS or word == "please")):
-                continue
-            if after_auxiliary and word in _QUESTION_SUBJECTS:
-                return True  # "Yesterday did you hear ..." without ASR punctuation.
+    for token in _WORDS.findall(text[address_end:].lower().replace("’", "'")):
+        word = token.strip("'")
+        if word and word not in _FILLERS and word != "please":
             base = word.removesuffix("n't").partition("'")[0]
-            after_auxiliary = (
-                base in _AUXILIARIES
-                or base in {"must", "had"}
-                or word in {"can't", "won't", "shan't", "ain't"}
-            )
-            if at_head and (after_auxiliary or base in _QUESTION_OPENERS):
-                return True
-            at_head = word in {"ask", "asked", "asking"}
+            return base in _QUESTION_OPENERS | {"must", "had"} or word in {
+                "can't",
+                "won't",
+                "shan't",
+                "ain't",
+            }
     return False
 
 

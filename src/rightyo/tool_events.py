@@ -408,15 +408,18 @@ def _exit_kinds(text, addressing):
         for spelling in (name, *addressing.spellings(name))
     }
 
-    def addressed(end, *, whole_turn):
+    def addressed(end):
         # A name of at most three words must consume the last non-filler before
         # the phrase. Try filler words as names too (including configured variants).
         last = max((i for i in range(end) if words[i] not in PRIVACY_EXIT_FILLER), default=-1)
         head = True
+        sentence = 0
         for at in range(end):
-            if at and not whole_turn:
-                between = text[tokens[at - 1].end() : tokens[at].start()]
-                head = head or any(c in ".!?;\r\n" for c in between)
+            if at:
+                for i in range(tokens[at - 1].end(), tokens[at].start()):
+                    if text[i] in ".!?;\r\n":
+                        sentence = i + 1
+                        head = True
             if head and at + 3 > last:
                 for stop in range(max(at + 1, last + 1), min(end, at + 3) + 1):
                     key = "".join(words[at:stop]).replace("'", "")
@@ -425,13 +428,13 @@ def _exit_kinds(text, addressing):
                     before = text[: tokens[at].start()]
                     prior = _matched_words(_privacy_words(before, ()), addressing)
                     return not _negated(prior, len(prior)) and not question_shaped(
-                        text, address=(tokens[at].start(), tokens[stop - 1].end())
+                        text[sentence:], address_end=tokens[stop - 1].end() - sentence
                     )
             head = head and words[at] in PRIVACY_EXIT_FILLER
         return False
 
     kinds = set()
-    if addressed(len(words), whole_turn=True):
+    if addressed(len(words)):
         kinds.add("name")
     end = len(words)
     while end and words[end - 1] in PRIVACY_EXIT_TRAILING:
@@ -440,7 +443,7 @@ def _exit_kinds(text, addressing):
         start = end - len(phrase)
         if start < 0 or tuple(words[start:end]) != phrase:
             continue
-        if addressed(start, whole_turn=False):
+        if addressed(start):
             kinds.add("exit")
         elif all(w in PRIVACY_EXIT_FILLER for w in words[:start]) and not question_shaped(text):
             kinds.add("rest")

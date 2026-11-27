@@ -1839,9 +1839,9 @@ Status phrases can occur anywhere in the turn. "Don't" or "do not" in the three
 words before a status phrase blocks it.
 
 For an exit, the name must open the turn or a new sentence. A period, exclamation
-mark, question mark, semicolon or newline marks a sentence break. The question
-guard still applies to the whole turn. Only "um", "uh", "ok", "okay", "hey",
-"so", "please" and "well" may come before the name in its sentence or between
+mark, question mark, semicolon or newline marks a sentence break. Only "um",
+"uh", "ok", "okay", "hey", "so", "please" and "well" may come before the name
+in its sentence or between
 the name and the phrase. "Um, ok Jarvis, so, I'm back" qualifies. "I heard
 Jarvis start listening" stays private. A nearby negation before the name also
 blocks the exit.
@@ -1849,20 +1849,27 @@ blocks the exit.
 Only "now", "please" and "again" may follow the phrase, in any combination.
 "Jarvis, I'm back, please" qualifies. "Jarvis, I'm back, okay" and "Jarvis,
 start listening to the podcast" stay private. Words in any script count.
-Question punctuation anywhere in the turn, or a question form such as "did
-anyone hear", blocks a named exit and either split fragment. A configured
-name such as "Will" or "May" can open an exit statement.
+Question punctuation in the exit sentence or a question opener after the
+name blocks the exit. "Really? Jarvis, start listening." qualifies.
+"Jarvis, start listening?" stays private. A configured name or variant such
+as "Will" or "May" can open an exit statement.
 
 Each fragment needs a complete utterance with an observed onset and a speech
-pause. Private endpointing measures speech relative to the surrounding noise
-level. Speech already active when the stream starts, or voice in a gap between
-recognised words or beyond the final word, keeps privacy on. A speaker boundary
+pause. Before the onset, the stream must have had at least 200 consecutive
+milliseconds judged speech-absent and well below the candidate's speech level.
+Steady background noise can qualify. The local experimental endpointer uses
+frame energy and periodicity and estimates a noise floor from nonzero background
+frames. A pause after the onset cannot qualify it retroactively. Voice in a gap
+between original spoken tokens or beyond the final spoken token keeps privacy on.
+Coverage checks use the actual samples up to each timestamp, including partial
+20 ms frames. Punctuation supplies no speech timing. A speaker boundary
 that divides the text, a forced ASR cut or its continuation, and an end-of-input
 flush also disqualify the fragment. So do lost text, a recognizer retry, textless timed
 units, and missing, repaired or overlapping word or token timing.
 
-A split exit is the enrolled owner's lone name fragment ("Jarvis,") heard while
-privacy is on, followed within 4 seconds by the exit phrase. The same fillers
+A split exit accepts the name at the beginning of its sentence under the same
+rule. "We're done. Jarvis," followed within 4 seconds by "Privacy off." qualifies
+when both turns are heard in privacy and authenticate as the owner. The same fillers
 may surround the name or precede the phrase, and the same trailing words may
 follow it. For example, "May," followed by "I'm back." qualifies when "May"
 is configured. A recognition loss between the fragments breaks the pair.

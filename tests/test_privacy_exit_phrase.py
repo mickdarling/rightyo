@@ -71,24 +71,64 @@ class NamedPrivacyExitTests(unittest.TestCase):
         self.assertEqual(self.hear("start listening, please?", 4000), [])
         self.assertEqual(self.hear("start listening.", 5000), [])
 
-    def test_question_marks_anywhere_and_unpunctuated_questions_stay_private(self):
+    def test_question_marks_and_unpunctuated_questions_in_the_exit_sentence_stay_private(self):
         for index, text in enumerate(
             (
                 "Did you hear Jarvis start listening?!",
                 "She asked, “did Jarvis start listening?”  ",
                 "(Jarvis, start listening？)  ",
                 "¿Jarvis, start listening",
-                "Really? Jarvis, start listening.",
                 "Did you hear Jarvis start listening",
                 "Well, could you hear Jarvis start listening",
                 "Yesterday did you hear Jarvis start listening",
                 "After lunch did anyone hear Jarvis start listening",
-                "After lunch did anyone hear that. Jarvis, start listening",
+                "After lunch did Alice hear Jarvis start listening",
                 "She asked did Jarvis start listening",
             )
         ):
             with self.subTest(text=text):
                 self.assertEqual(self.hear(text, index * 1000), [])
+
+    def test_earlier_sentences_do_not_question_the_exit(self):
+        # #350 round 5: question punctuation and interrogatives belong to their sentence.
+        for intro in (
+            "Really?",
+            "After lunch did anyone hear that.",
+            "After lunch did Alice call.",
+            "The train arrived\nDid the meeting end\n",
+            "When I finish, I’ll call.",
+            "What a relief!",
+        ):
+            with self.subTest(intro=intro):
+                self.assertEqual(
+                    privacy_phrase(f"{intro} Jarvis, start listening.", duck.OURS), {"exit"}
+                )
+                self.assertFalse(privacy_phrase(f"{intro} ¿Jarvis, start listening.", duck.OURS))
+
+    def test_auxiliary_question_after_the_name_stays_private(self):
+        for word in "did do does can could will would is are should may might".split():
+            with self.subTest(word=word):
+                self.assertFalse(
+                    privacy_phrase(f"Ready. Jarvis, {word} Alice start listening", duck.OURS)
+                )
+
+    def test_split_after_a_sentence_opening_name_matches_the_single_turn(self):
+        for i, (intro, allowed) in enumerate(
+            (
+                ("We’re done. ", True),
+                ("Really? ", True),
+                ("Did Alice hear ", False),
+                ("We're done, ", False),
+                ("We're done. ¿", False),
+            )
+        ):
+            with self.subTest(intro=intro):
+                name = f"{intro}Jarvis,"
+                at = i * 4000
+                self.assertEqual(bool(self.hear(name + " privacy off.", at)), allowed)
+                self.assertEqual(self.hear(name, at + 1000), [])
+                events = self.hear("Privacy off.", at + 2000)
+                self.assertEqual([e["action"] for e in events], ["exit"] if allowed else [])
 
     def test_address_starts_a_sentence(self):
         for index, sep in enumerate((".", "!", ";", "\n")):
@@ -142,7 +182,9 @@ class NamedPrivacyExitTests(unittest.TestCase):
                 (event,) = self.hear("I'm back.", 2000)
                 self.assertEqual(event["action"], "exit")
                 self.assertEqual(self.hear("Will, start listening?", 3000), [])
-                self.assertEqual(self.hear("May I ask. Will, start listening.", 4000), [])
+                (event,) = self.hear("May I ask. Will, start listening.", 4000)
+                self.assertEqual(event["action"], "exit")
+                self.assertEqual(self.hear("May I ask Will, start listening.", 5000), [])
 
     def test_marked_questions_disarm_each_split_fragment(self):
         for index, (name, rest) in enumerate(

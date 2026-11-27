@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import wave
 from collections import deque
 from dataclasses import dataclass, replace
@@ -366,56 +367,127 @@ def _frame_rms(frame: bytes) -> float:
     return math.sqrt(sum(value * value for value in values) / len(values)) / 32768
 
 
+@dataclass(frozen=True)
+class _NoiseProfile:
+    # A Goertzel coefficient and power, when a low-frequency hum dominates.
+    hum: tuple[float, float] | None = None
+
+
+_NO_HUM = _NoiseProfile()
+# The three lowest non-DC bins of a 320-sample frame (50, 100 and 150 Hz).
+_HUM_COEFFICIENTS = tuple(2 * math.cos(2 * math.pi * k / 320) for k in (1, 2, 3))
+
+
+def _tone_power(samples: array.array, coefficient: float) -> float:
+    """Goertzel power in one frequency bin of a 20 ms frame."""
+    previous = older = 0.0
+    for sample in samples:
+        current = sample + coefficient * previous - older
+        older, previous = previous, current
+    return previous**2 + older**2 - coefficient * previous * older
+
+
+@dataclass(frozen=True)
+class _QuietPeriod:
+    peak_rms: float
+    end_ms: int
+    noise: _NoiseProfile
+
+
 class _PrivateEndpoint:
-    """Measure 20 ms frames against the quiet level around this private utterance."""
+    """Causal, local speech-absence evidence for a private recognition window."""
 
     # RMS ratio (~3.5 dB), independent of microphone gain.
     MARGIN = 1.5
 
     def __init__(self):
-        self.floor: float | None = None
-        self.unresolved = True
+        self.background: deque[float] = deque(maxlen=100)
+        self.quiet_rms = 0.0
+        self.quiet_run: deque[tuple[float, _NoiseProfile]] = deque(maxlen=10)
+        self.quiet_period: _QuietPeriod | None = None
 
-    def voiced(self, rms: float, active: bool) -> bool:
-        if self.floor is None:
-            self.floor = rms
-        if self.unresolved:
-            # With no prior quiet, capture possible speech from the very first frame.
-            # A steady initial level alone proves neither an onset nor a pause.
-            if rms and self.floor / self.MARGIN <= rms <= self.floor * self.MARGIN:
-                return True
-            self.unresolved = False
-        if rms > self.floor * self.MARGIN:
-            return True
-        # Follow the local background between turns. During a turn a quieter frame
-        # can lower the estimate, but continuing speech must never raise it.
-        self.floor = min(self.floor, rms) if active else rms
-        return False
-
-    @property
-    def quiet_rms(self) -> float:
-        # Read only after this endpoint has received frames.
-        assert self.floor is not None
-        return self.floor * self.MARGIN
-
-    def voice_span(self, pcm: bytearray) -> tuple[int, int] | None:
-        # Re-evaluate both edges against the final floor. For example, the stream
-        # might have opened on a steady fan, or in the middle of continuous speech.
-        if self.unresolved or self.floor is None:
+    @staticmethod
+    def noise_profile(frame: bytes) -> _NoiseProfile | None:
+        """Recognize rumble or aperiodic noise. Other frames may contain speech."""
+        samples = _pcm_samples(frame)
+        # A transition within the frame is not a steady background observation.
+        quarters = [sum(x * x for x in samples[i : i + 80]) for i in range(0, len(samples), 80)]
+        if min(quarters) < 0.05 * max(quarters):
             return None
-        threshold = self.quiet_rms
-        frames = range(0, len(pcm), FRAME_BYTES)
-
-        def first_voiced(offsets):
-            return next(
-                (i for i in offsets if _frame_rms(pcm[i : i + FRAME_BYTES]) > threshold), None
+        # Average to 4 kHz for the pitch check. A large DC component, including
+        # a constant-amplitude replay signal, supplies no noise evidence.
+        band = [sum(samples[i : i + 4]) for i in range(0, len(samples), 4)]
+        power = sum(v * v for v in band)
+        if not power or sum(band) ** 2 > 0.2 * len(band) * power:
+            return None
+        # A smooth low-frequency hum can be present throughout the stream.
+        # First-difference energy bounds its RMS frequency at about 120 Hz.
+        delta = sum((a - b) ** 2 for a, b in zip(band, band[1:]))
+        if delta < 0.036 * power:
+            hum = max(
+                ((c, _tone_power(samples, c)) for c in _HUM_COEFFICIENTS),
+                key=lambda item: item[1],
             )
+            return _NoiseProfile(hum)
+        # Normalized autocorrelation over voice pitch periods (2 to 12 ms).
+        # A periodic frame cannot establish its own noise floor, at any gain.
+        for lag in range(8, 49):
+            left, right = band[:-lag], band[lag:]
+            dot = sum(a * b for a, b in zip(left, right))
+            if dot > 0 and dot * dot > 0.5 * sum(a * a for a in left) * sum(b * b for b in right):
+                return None
+        return _NO_HUM
 
-        first = first_voiced(frames)
-        if first is None:
+    def voiced(self, frame: bytes, rms: float, end_ms: int) -> bool:
+        noise = self.noise_profile(frame) if rms else _NO_HUM
+        if rms and noise is not None:
+            # A single low reading cannot lock out subsequent background frames.
+            # The spectral check admits floor observations independently of gain.
+            self.background.append(rms)
+            levels = sorted(self.background)
+            self.quiet_rms = levels[len(levels) // 10] * self.MARGIN
+        voiced = noise is None or (len(self.background) >= 10 and rms > self.quiet_rms)
+        if voiced:
+            self.quiet_run.clear()
+        else:
+            self.quiet_run.append((rms, noise))
+            if len(self.quiet_run) == self.quiet_run.maxlen:
+                peak, profile = max(self.quiet_run, key=lambda item: item[0])
+                self.quiet_period = _QuietPeriod(peak, end_ms, profile)
+        return voiced
+
+    def voice_span(
+        self, pcm: bytearray, prior: _QuietPeriod, quiet_rms: float
+    ) -> tuple[int, int] | None:
+        # Re-evaluate the retained audio against the final floor. A rise in the
+        # level of background noise alone supplies no positive speech evidence.
+        first = last = None
+        peak_rms = max(quiet_rms, prior.peak_rms * self.MARGIN)
+        peak_at = None
+        for i in range(0, len(pcm), FRAME_BYTES):
+            frame = pcm[i : i + FRAME_BYTES]
+            rms = _frame_rms(frame)
+            if not rms:
+                continue
+            noise = self.noise_profile(frame)
+            if noise is not None and rms <= quiet_rms:
+                continue
+            if first is None:
+                first = i // BYTES_PER_MS
+            last = (i + len(frame)) // BYTES_PER_MS
+            if noise is None and rms > peak_rms:
+                peak_rms, peak_at = rms, i
+        if peak_at is None:
             return None
-        last = first_voiced(reversed(frames))
-        return first // BYTES_PER_MS, (last + FRAME_BYTES) // BYTES_PER_MS
+        if prior.noise.hum:
+            # A low pitched voice can resemble machinery. Require the putative
+            # hum to persist under the speech at its former level (within 3 dB).
+            # A tone that simply got louder or changed pitch is ambiguous.
+            coefficient, baseline = prior.noise.hum
+            peak = _pcm_samples(pcm[peak_at : peak_at + FRAME_BYTES])
+            if not baseline / 2 <= _tone_power(peak, coefficient) <= baseline * 2:
+                return None
+        return first, last
 
 
 class _ModelConfig(ctypes.Structure):
@@ -1125,6 +1197,9 @@ class _RecognizerWindow:
     retried: bool = False
     elapsed_ms: int = 0
     unreliable_token_timing: bool = False
+    # Original speech coverage when Whisper supplied tokens. Published words
+    # still coalesce subwords and punctuation for transcript attribution.
+    spoken_intervals: list[tuple[int, int]] | None = None
 
     @property
     def rejected(self) -> int:
@@ -1158,6 +1233,20 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
     fallbacks: list[dict[str, Any]] = []
     segment_gaps: set[int] = set()
     window = _RecognizerWindow(result, set(), segments=len(segments))
+    if any(isinstance(s, dict) and s.get("tokens") is not None for s in segments):
+        window.spoken_intervals = []
+
+    def record_spoken(left: int, right: int) -> None:
+        intervals = window.spoken_intervals
+        if intervals is None or left >= right or window.unreliable_token_timing:
+            return
+        if intervals and left < intervals[-1][1]:
+            window.unreliable_token_timing = True
+        elif intervals and left == intervals[-1][1]:
+            intervals[-1] = (intervals[-1][0], right)
+        else:
+            intervals.append((left, right))
+
     reasons = [0] * 6
     for segment in segments:
         if not isinstance(segment, dict):
@@ -1202,6 +1291,8 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
         tokens = segment.get("tokens")
         if start != original[0] or end > original[1] or start == end or tokens is None:
             result.append(fallback)
+            if any(c.isalnum() for c in text):
+                record_spoken(start, end)
             continue
         if not isinstance(tokens, list) or len(tokens) > 4000:
             window.unreliable_token_timing = True
@@ -1232,15 +1323,18 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
             ):
                 usable = False
                 break
+            spoken = any(c.isalnum() for c in value)
             if (
                 right > end
-                or (left == right and any(c.isalnum() for c in value))
-                or (left < right and not any(c.isalnum() for c in value))
+                or (left == right and spoken)
+                or (left < right and not spoken)
                 or (words and left < words[-1]["end_ms"])
             ):
                 # Check each token before coalescing subwords can hide a reversal.
                 window.unreliable_token_timing = True
             left, right = min(left, end), min(right, end)
+            if spoken:
+                record_spoken(left, right)
             if not words or (value[:1].isspace() and value.strip()):
                 words.append({"text": value, "start_ms": left, "end_ms": right})
             else:
@@ -1341,6 +1435,8 @@ class _FinalizedWindow:
             self.units.clear()
         if self.window is not None:
             self.window.units.clear()
+            if self.window.spoken_intervals is not None:
+                self.window.spoken_intervals.clear()
         self.units = []
         self.window = None
         self.timeline = []
@@ -1360,6 +1456,11 @@ class _FinalizedWindow:
             + 512 * len(self.timeline)
             + sum(512 + 4 * len(unit["text"]) for unit in self.units)
             + (512 * len(self.window.gaps) if self.window is not None else 0)
+            + (
+                128 * len(self.window.spoken_intervals)
+                if self.window and self.window.spoken_intervals
+                else 0
+            )
         )
 
 
@@ -1515,29 +1616,53 @@ def _checked_units(units: Any, duration_ms: int) -> list[dict[str, Any]] | None:
     return units
 
 
-def _complete_exit_units(units: list[dict[str, Any]] | None, packet: _FinalizedWindow) -> bool:
-    """Check spoken unit timings against this window's observed voice."""
+def _complete_exit_span(
+    units: list[dict[str, Any]] | None, packet: _FinalizedWindow
+) -> tuple[int, int] | None:
+    """The original spoken bounds, only if all observed voice has timing coverage."""
     if not units or packet.exit_voice_span is None:
-        return False
-    first, last = packet.exit_voice_span
-    if units[0]["start_ms"] > first or units[-1]["end_ms"] < last:
-        return False
-    previous_end = 0
+        return None
+    intervals = []
     for unit in units:
-        if not any(c.isalnum() for c in unit["text"]):
-            return False
         start, end = unit["start_ms"], unit["end_ms"]
-        if not previous_end <= start < end:
-            return False
-        if previous_end and previous_end < start and packet.private_quiet_rms is not None:
-            # A later allowed word must not cover an omitted spoken tail. Only a
-            # quiet gap can separate two units in a complete private utterance.
-            for ms in range(previous_end // 20 * 20, start, 20):
-                at = ms * BYTES_PER_MS
-                if _frame_rms(packet.pcm[at : at + FRAME_BYTES]) > packet.private_quiet_rms:
-                    return False
-        previous_end = end
-    return True
+        value = unit["text"].strip()
+        if start == end and value and all(unicodedata.category(c).startswith("P") for c in value):
+            continue
+        if (
+            not any(c.isalnum() for c in value)
+            or start >= end
+            or (intervals and start < intervals[-1][1])
+        ):
+            return None
+        intervals.append((start, end))
+    if packet.window and packet.window.spoken_intervals is not None:
+        intervals = packet.window.spoken_intervals
+    if not intervals:
+        return None
+    first, last = packet.exit_voice_span
+    span = (intervals[0][0], intervals[-1][1])
+    if packet.private_quiet_rms is None:
+        return span if span[0] <= first and span[-1] >= last else None
+
+    def quiet(start: int, end: int) -> bool:
+        # Check only the uncovered samples, including partial edge frames.
+        while start < end:
+            stop = min(end, (start // 20 + 1) * 20)
+            frame = packet.pcm[start * BYTES_PER_MS : stop * BYTES_PER_MS]
+            rms = _frame_rms(frame)
+            if rms > packet.private_quiet_rms or (
+                rms and len(frame) == FRAME_BYTES and _PrivateEndpoint.noise_profile(frame) is None
+            ):
+                return False
+            start = stop
+        return True
+
+    previous = first
+    for start, end in intervals:
+        if not quiet(previous, min(start, last)):
+            return None
+        previous = max(previous, end)
+    return span if quiet(previous, last) else None
 
 
 def _select(value: Any, default: Callable[[LiveConfig], Any], config: LiveConfig, method: str):
@@ -1622,7 +1747,9 @@ class LiveProcessor:
         self._private_ranges: list[tuple[int, int]] = []
         self._private_cleared_through = 0  # audio-owner watermark, snapshotted per window
         self._private_lock = threading.Lock()
-        self._private_endpoint: _PrivateEndpoint | None = None
+        self._private_endpoint = _PrivateEndpoint() if config.private is not None else None
+        self._quiet_before_onset: _QuietPeriod | None = None
+        self._onset_quiet_rms = 0.0
         self._frame_private = False
         self._diarizer_private_frames = 0
         self._privacy_uncertain = False
@@ -2048,9 +2175,15 @@ class LiveProcessor:
                 # No frame between toggles means no private audio and no new text.
                 self._queue_merger_barrier("privacy")
                 self._frame_private = private
-                self._private_endpoint = _PrivateEndpoint() if private else None
+        # Qualify absence on the continuous input clock, before a privacy cutoff
+        # can substitute zeros. Public ASR keeps its configured energy gate.
+        rms = _frame_rms(frame)
+        endpoint_voice = False
+        if self._private_endpoint is not None:
+            endpoint_voice = self._private_endpoint.voiced(frame, rms, self._received_ms + 20)
         if self._private_until is not None:
             frame = self._private_cutoff(frame)
+            rms = _frame_rms(frame)
         # Renewed only once the privacy end is reached (#242 round 20): the controller counts a
         # chunk before pushing it, so the end can lie ahead, and the fresh diarizer must never
         # be fed a frame heard while private.
@@ -2070,12 +2203,11 @@ class LiveProcessor:
         self._push_diarizer(frame, private, uncertain)
         frame_start = self._received_ms
         self._received_ms += 20
-        rms = _frame_rms(frame)
-        if self._private_endpoint is None:
-            voiced = rms >= self.config.energy_threshold
-        else:
-            voiced = self._private_endpoint.voiced(rms, bool(self._utterance))
+        voiced = endpoint_voice if private else rms >= self.config.energy_threshold
         if voiced and not self._utterance:
+            if self._private_endpoint is not None:
+                self._quiet_before_onset = self._private_endpoint.quiet_period
+                self._onset_quiet_rms = self._private_endpoint.quiet_rms
             self._voice_start = frame_start
             self._utterance_start = frame_start - len(self._pre_roll) * 20
             self._utterance.extend(b"".join(self._pre_roll))
@@ -2199,11 +2331,15 @@ class LiveProcessor:
         self._continuation_until_ms = self._last_voice_ms + self.config.hangover_ms
         if not natural_end:
             return None
-        span = (
-            self._private_endpoint.voice_span(pcm)
-            if self._private_endpoint is not None
-            else (self._voice_start - offset, self._last_voice_ms - offset)
-        )
+        endpoint = self._private_endpoint if self._frame_private else None
+        span = (self._voice_start - offset, self._last_voice_ms - offset)
+        if endpoint is not None:
+            if self._quiet_before_onset is None:
+                return None
+            # The ending pause can lower the floor. A louder interval during the
+            # decode window cannot retroactively turn its own samples into noise.
+            self._onset_quiet_rms = min(self._onset_quiet_rms, endpoint.quiet_rms)
+            span = endpoint.voice_span(pcm, self._quiet_before_onset, self._onset_quiet_rms)
         if span is None:
             return None
         first, last = span
@@ -2213,6 +2349,9 @@ class LiveProcessor:
             return None
         self._continuation_until_ms = 0
         if offset + first == 0 or offset + first < continuation:
+            return None
+        if endpoint is not None and offset + first < self._quiet_before_onset.end_ms:
+            # A pause after the candidate cannot qualify its onset retroactively.
             return None
         return span
 
@@ -2252,8 +2391,8 @@ class LiveProcessor:
                 bool(timeline),
                 exit_voice_span=exit_span,
                 private_quiet_rms=(
-                    self._private_endpoint.quiet_rms
-                    if exit_span and self._private_endpoint is not None
+                    self._onset_quiet_rms
+                    if exit_span and self._frame_private and self._private_endpoint is not None
                     else None
                 ),
                 private_cleared_through=self._private_cleared_through,
@@ -2472,7 +2611,7 @@ class LiveProcessor:
             window, complete, provenance = packet.window, packet.complete, packet.provenance
             checked = _checked_units(packet.units, packet.duration_ms)
             unit_count = len(checked) if checked is not None else 0
-            whole = _complete_exit_units(checked, packet)
+            spoken_span = _complete_exit_span(checked, packet)
         if window is not None:
             skipped = window.rejected
             self._skipped_segments += skipped
@@ -2485,10 +2624,16 @@ class LiveProcessor:
                 self._skipped_utterances += 1
             skipped = self.skipped_segments - packet.before[0]
             suppressed = self.skipped_utterances > packet.before[1]
-        if skipped or suppressed or not whole or (window is not None and window.timing_incomplete):
+        if (
+            skipped
+            or suppressed
+            or not spoken_span
+            or (window is not None and window.timing_incomplete)
+        ):
             # The valid pieces can still be published. No part of this window, or
             # split exit spanning it, can prove what the owner said at the end.
             self._recognition_loss_end_ms = offset + packet.duration_ms
+            spoken_span = None
         private = (skipped or suppressed) and (
             packet.private_loss or self._heard_private(offset, offset + packet.duration_ms)
         )
@@ -2557,6 +2702,7 @@ class LiveProcessor:
                 packet=packet,
                 loss_before=left in gaps,
                 loss_after=right in gaps,
+                spoken_span=spoken_span,
             )
         if self.closed or packet.discarded:
             return
@@ -2578,6 +2724,7 @@ class LiveProcessor:
         packet: _FinalizedWindow,
         loss_before: bool = False,
         loss_after: bool = False,
+        spoken_span: tuple[int, int] | None = None,
     ) -> None:
         """Attribute one uninterrupted run; neither edge inference nor merging crosses loss."""
         if self.closed or packet.discarded or not units:
@@ -2715,6 +2862,8 @@ class LiveProcessor:
                 # Privacy wins a continuation tie: discard the held public prefix without
                 # publishing it, while keeping only this private sentence's PCM for exit.
                 self._merger.discard()
+                if len(kept) == 1 and spoken_span is not None:
+                    group["start_ms"], group["end_ms"] = (offset + ms for ms in spoken_span)
                 start = (group["start_ms"] - offset) * BYTES_PER_MS
                 end = (group["end_ms"] - offset) * BYTES_PER_MS
                 self._emit(group, memoryview(pcm)[start:end])
