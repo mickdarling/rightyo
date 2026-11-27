@@ -118,7 +118,11 @@ class PrivateTurnAudio:
         self.clear()
         self.key = self._key(turn)
         expected = (turn.end_ms - turn.start_ms) * BYTES_PER_MS
-        if len(pcm) == expected and 0 < expected <= PRIVATE_TURN_MAX_BYTES:
+        if (
+            turn.recognition_complete
+            and len(pcm) == expected
+            and 0 < expected <= PRIVATE_TURN_MAX_BYTES
+        ):
             self.pcm.extend(memoryview(pcm))
 
     def for_turn(self, turn):

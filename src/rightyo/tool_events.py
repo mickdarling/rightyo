@@ -389,8 +389,8 @@ def _phrase_in(words, phrases):
     )
 
 
-def _named_exit(words, unfiltered, addressing):
-    """Match an exit from the end, then check the name immediately before it."""
+def _exit_kind(words, unfiltered, addressing):
+    """Match the same ending for a named exit and a split follow-up."""
     # Check the actual ending before filler removal can hide a word like "um".
     last_word = next(
         (word for word in reversed(unfiltered) if word not in PRIVACY_EXIT_TRAILING), None
@@ -400,42 +400,54 @@ def _named_exit(words, unfiltered, addressing):
         end -= 1
     for phrase in PRIVACY_EXIT:
         start = end - len(phrase)
-        if start < 1 or last_word != phrase[-1] or tuple(words[start:end]) != phrase:
+        if start < 0 or last_word != phrase[-1] or tuple(words[start:end]) != phrase:
             continue
-        for at in range(max(0, start - 3), start):
-            name = addressing.name_for(" ".join(words[at:start]))
-            if name is not None and not _negated(words, at):
-                return True
-    return False
+        if start == 0:
+            return "rest"
+        if addressing is not None:
+            for at in range(max(0, start - 3), start):
+                name = addressing.name_for(" ".join(words[at:start]))
+                if name is not None and not _negated(words, at):
+                    return "exit"
+    return None
 
 
-def privacy_phrase(text, addressing):
+def privacy_phrase(text, addressing, *, recognition_complete=True):
     """Which of privacy mode's local phrases `text` holds (hailing-station #735 S-1).
 
     A set of: "exit" (a configured name or variant of up to three words, then an exit
-    phrase ending the turn apart from `PRIVACY_EXIT_TRAILING` words), "rest" (the turn
-    starts with an exit phrase, for a split name), "name" (the turn is only a name),
+    phrase ending the turn apart from `PRIVACY_EXIT_TRAILING` words), "rest" (the same
+    ending as the whole normalized turn), "name" (the turn is only a name),
     "status" (named or not) and "entry". For all but the entry,
     case, punctuation and filler are ignored when matching the phrase itself;
     "don't" or "do not" in the three words before it (before the name, for the exit) means
-    no match. The entry counts only as the whole turn (`_standalone_entry`) and never as a
-    question. Nothing is kept: the words exist only inside this call.
+    no match. Questions and incomplete recognition cannot supply any part of an exit.
+    The entry counts only as the whole turn (`_standalone_entry`) and never as a question.
     """
     unfiltered = _privacy_words(text, ())
     words = _matched_words(unfiltered, addressing)
     kinds = set()
-    if addressing is not None:
-        if words and addressing.name_for(" ".join(words)) is not None:
+    question = text.rstrip().endswith("?")
+    if recognition_complete and not question:
+        if addressing is not None and words and addressing.name_for(" ".join(words)) is not None:
             kinds.add("name")
-        if _named_exit(words, unfiltered, addressing):
-            kinds.add("exit")
-    if _phrase_at(words, 0, PRIVACY_EXIT):
-        kinds.add("rest")
+        exit_kind = _exit_kind(words, unfiltered, addressing)
+        if exit_kind is not None:
+            kinds.add(exit_kind)
     if _phrase_in(words, PRIVACY_STATUS):
         kinds.add("status")
-    if not text.rstrip().endswith("?") and _standalone_entry(unfiltered, addressing):
+    if not question and _standalone_entry(unfiltered, addressing):
         kinds.add("entry")
     return frozenset(kinds)
+
+
+def _completes_split(turn, name_end):
+    """Both fragments must follow the last ASR loss, even if it emitted no turn."""
+    return (
+        name_end is not None
+        and name_end >= turn.recognition_loss_end_ms
+        and 0 <= turn.start_ms - name_end <= PRIVACY_SPLIT_NAME_MS
+    )
 
 
 def _entry_shaped(text):
@@ -1357,15 +1369,15 @@ class SpeechEvents:
                     and turn.utterance_id not in self._private_seen
                 ):
                     with contextlib.suppress(Exception):
-                        kinds = privacy_phrase(turn.text, self._addressing)
+                        kinds = privacy_phrase(
+                            turn.text,
+                            self._addressing,
+                            recognition_complete=turn.recognition_complete,
+                        )
                         if (
                             "name" in kinds
                             or "exit" in kinds
-                            or (
-                                "rest" in kinds
-                                and ticket.split is not None
-                                and 0 <= turn.start_ms - ticket.split <= PRIVACY_SPLIT_NAME_MS
-                            )
+                            or ("rest" in kinds and _completes_split(turn, ticket.split))
                         ):
                             binding = self._binding_exit_check(turn, inferred)
                 if binding is None:
@@ -2046,7 +2058,9 @@ class SpeechEvents:
         """
         self._private_counts["discarded"] += 1
         try:
-            kinds = privacy_phrase(turn.text, self._addressing)
+            kinds = privacy_phrase(
+                turn.text, self._addressing, recognition_complete=turn.recognition_complete
+            )
         except Exception:  # noqa: BLE001 - the words must never reach an error or a log
             kinds = frozenset()
             self._private_counts["failed"] += 1
@@ -2081,11 +2095,7 @@ class SpeechEvents:
                 self._private_counts["exit_name_refused"] += 1
                 self._count_exit_refused(reason)
             return
-        named = "exit" in kinds or (
-            "rest" in kinds
-            and split is not None
-            and 0 <= turn.start_ms - split <= PRIVACY_SPLIT_NAME_MS
-        )
+        named = "exit" in kinds or ("rest" in kinds and _completes_split(turn, split))
         if named:
             allowed, reason = outcome
             if allowed:

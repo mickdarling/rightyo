@@ -1731,8 +1731,8 @@ The only events a private turn can produce carry no words:
 - **`action: "exit"`**: the enrolled owner named the assistant and asked to come back:
   "<name>, I'm back" (or "I am back"), "<name>, start listening", "<name>, privacy off"
   (or "privacy mode off"). It needs a configured name or variant of up to three words,
-  directly followed by the phrase. rightyo does not leave privacy mode itself: the host
-  decides and sends the privacy-off control.
+  directly followed by the phrase. The phrase must end the turn, apart from the trailing
+  words "now", "please" and "again". The host decides whether to send the privacy-off control.
 - **`action: "status"`**: anyone asked "what mode am I in", "are you recording" or "are
   you listening", with or without the name. The host answers from its own state.
 
@@ -1828,16 +1828,23 @@ is discarded, words and all; otherwise it is released at once on its own. So not
 the end can be joined to a private turn, and the first public request after privacy is decided
 on its own instead of being dropped with the private turn it was joined to.
 
-The phrases match loosely: anywhere in the turn, ignoring case, punctuation and filler
-("um", "uh", "ok", "okay", "so", "hey", "well", "please" and similar). A filler word that
-is part of a configured name or variant ("Okay", "Hey Jarvis") is kept only where it is
-matched as part of that name; everywhere else it is still filler, so with a variant "Please
-Jarvis", "Jarvis, please, I'm back" still exits. "Don't" or "do not" in the three words
-before the phrase (before the name, for the exit) means no match.
+Status phrases can occur anywhere in the turn. For a single-turn exit, other words
+may precede the name. Matching ignores case, punctuation and fillers such as "um",
+"okay" and "please" within the address and phrase. A filler that belongs to a
+configured name or variant is kept where that name matches. "Don't" or "do not" in
+the three words before the name (before the phrase for status) blocks the match.
+
+For either kind of exit, only "now", "please" and "again" may follow the phrase, in
+any combination. "Jarvis, I'm back, please" qualifies. "Jarvis, I'm back, okay" and
+"Jarvis, start listening to the podcast" stay private. A turn ending in `?` cannot
+start or complete an exit. The same applies when recognition is incomplete, including
+missing, invalid or repaired unit timing, lost text, or a recognizer retry.
 
 A split exit is the enrolled owner's lone name fragment ("Jarvis,") heard while privacy
-is on, followed within 4 seconds by a turn that starts with an exit phrase. Both turns
-must authenticate: each may pass its own binding check or an isolated voice check on
+is on, followed within 4 seconds by a turn consisting of the exit phrase and any
+permitted trailing words after normalization. For example, "Jarvis," followed by
+"start listening" qualifies. A recognition loss between the fragments breaks the pair.
+Both turns must authenticate. Each may pass its own binding check or an isolated voice check on
 its own buffered audio alone. Private processor turns are unlabelled, so both fragments
 must pass their own isolated voice checks. A guest or a TV supplying the name never
 counts. Any other turn between them, private or not, and any change of

@@ -767,6 +767,9 @@ class WordAttribution:
     strict_speakers: frozenset[str] = frozenset()
 
 
+_INTERNAL_TURN_FIELDS = frozenset({"word_attribution", "recognition_loss_end_ms"})
+
+
 @dataclass(frozen=True)
 class Turn:
     session_id: str
@@ -783,6 +786,7 @@ class Turn:
     speaker_provenance: str = "unknown"
     # Internal evidence from the processor, outside the transcript/replay contract.
     word_attribution: WordAttribution | None = field(default=None, kw_only=True, compare=False)
+    recognition_loss_end_ms: int = field(default=0, kw_only=True, compare=False)
 
     def __post_init__(self) -> None:
         for name in ("session_id", "utterance_id", "recognizer_id", "speaker_provenance"):
@@ -792,6 +796,7 @@ class Turn:
         integer(self.revision, "revision", 1)
         integer(self.start_ms, "start_ms")
         integer(self.end_ms, "end_ms")
+        integer(self.recognition_loss_end_ms, "recognition_loss_end_ms")
         if self.end_ms < self.start_ms:
             raise ContractError("turn timestamps are reversed")
         if not isinstance(self.text, str) or len(self.text) > MAX_TEXT_CHARS:
@@ -819,11 +824,16 @@ class Turn:
             # unrelated voices, or match a configured role, through a bare label.
             raise ContractError("utterance-local speaker ids must be utterance-scoped")
 
+    @property
+    def recognition_complete(self) -> bool:
+        """Every part of this turn follows the last incompletely timed ASR window."""
+        return self.recognition_loss_end_ms <= self.start_ms < self.end_ms
+
     @classmethod
     def from_dict(cls, raw: Any) -> Turn:
         if not isinstance(raw, dict):
             raise ContractError("turn must be an object")
-        if "word_attribution" in raw:
+        if not _INTERNAL_TURN_FIELDS.isdisjoint(raw):
             raise ContractError("unrecognized turn field")
         try:
             return cls(**raw)
@@ -831,7 +841,11 @@ class Turn:
             raise ContractError("missing or unrecognized turn fields") from None
 
     def to_dict(self) -> dict[str, Any]:
-        return {f.name: getattr(self, f.name) for f in fields(self) if f.name != "word_attribution"}
+        return {
+            f.name: getattr(self, f.name)
+            for f in fields(self)
+            if f.name not in _INTERNAL_TURN_FIELDS
+        }
 
 
 @dataclass(frozen=True)

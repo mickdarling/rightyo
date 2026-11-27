@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 import test_duck_mode as duck
 from test_live_audio import SILENCE, VOICE, FakeDiarizer
 from test_live_speaker_id import Harness, ScriptedEmbedder, settings, tone, unit, wait_for
-from test_whisper_window_recovery import BAD, GOOD, doc
+from test_whisper_window_recovery import BAD, GOOD, doc, segment
 
 from rightyo.contracts import SpeakerPriority
 from rightyo.live_audio import LiveConfig, LiveProcessor, _FinalizedWindow, _recognizer_window
@@ -680,6 +680,86 @@ class PrivacyMinimumTests(unittest.TestCase):
                     self.assertTrue(p._recovery.done.wait(3))
                     p._drain_results()
         self.assertEqual(e.drain(), [])
+
+    def replay_private_windows(self, *documents, retry=None):
+        c, e, s, p, _, units = self.arrange()
+        c._enrolled_roles.exit_audio = c._private_sentence
+        s.exit_score = Mock(return_value=EntryScore(0.9, None, 0, "scored"))
+        pending = iter(documents)
+
+        def decode(pcm, register=None):
+            units._window = _recognizer_window(next(pending), len(pcm) // 32)
+            return units._window.units
+
+        def private_audio(turn, pcm):
+            c._private_turn_audio(c._generation, turn, pcm)
+            if not turn.recognition_complete:
+                self.assertFalse(c._private_sentence.pcm)
+
+        units.transcribe = decode
+        p.config = replace(
+            p.config, provenance="causal-replay", on_private_turn_audio=private_audio
+        )
+        c.duck(True)
+        e.drain()
+        with patch("rightyo.live_audio._transcribe", return_value=retry) as redecode:
+            for _ in documents:
+                self.feed(c, p, VOICE * 10 + SILENCE * 72, s)
+                p._drain_results(wait=True)
+            p.finish()
+        self.assertEqual(redecode.call_count, int(retry is not None))
+        self.assertFalse(c._private_sentence.pcm)
+        return [event["action"] for event in e.drain()], s.exit_score.call_count
+
+    def test_processor_podcast_tail_with_valid_missing_or_invalid_timestamps(self):
+        command = segment("Jarvis, start listening", 0, 100)
+        for start in (100, None, -1):
+            with self.subTest(tail_start=start):
+                window = doc(command, segment(" to the podcast", start, 200))
+                self.assertEqual(self.replay_private_windows(window), ([], 0))
+        self.assertEqual(self.replay_private_windows(doc(command)), (["exit"], 1))
+
+    def test_exit_refuses_an_untimed_word_inside_or_after_the_phrase(self):
+        for parts in (
+            (("Jarvis,", 0, 100), (" start", 100, 100), (" listening", 100, 200)),
+            (("Jarvis, start listening", 0, 100), (" please", 100, 100)),
+        ):
+            with self.subTest(parts=parts):
+                self.assertEqual(
+                    self.replay_private_windows(doc(*(segment(*part) for part in parts))),
+                    ([], 0),
+                )
+
+    def test_segment_fallback_cannot_hide_an_untimed_token(self):
+        # Whisper keeps the timed segment's full text when token timing fails.
+        phrase = segment("Jarvis, start listening", 0, 200)
+        phrase["tokens"] = [
+            segment("Jarvis,", 0, 50),
+            {"text": " start"},
+            segment(" listening", 100, 200),
+        ]
+        self.assertEqual(self.replay_private_windows(doc(phrase)), ([], 0))
+        phrase["tokens"][1] = segment(" start", 50, 100)
+        self.assertEqual(self.replay_private_windows(doc(phrase)), (["exit"], 1))
+
+    def test_split_exit_refuses_loss_on_either_fragment_or_between_them(self):
+        name = segment("Jarvis", 0, 100)
+        rest = segment("start listening", 0, 100)
+        for documents, retry, checks in (
+            ((doc(name, BAD), doc(rest)), None, 0),
+            ((doc(name), doc(rest, BAD)), None, 1),
+            ((doc(name), doc(BAD)), doc(rest), 1),
+            ((doc(name), doc(BAD), doc(rest)), doc(BAD), 1),
+            ((doc(name), doc(), doc(rest)), None, 1),
+        ):
+            with self.subTest(documents=documents, retry=retry):
+                self.assertEqual(self.replay_private_windows(*documents, retry=retry), ([], checks))
+
+        # A fresh pair entirely after a loss remains eligible.
+        self.assertEqual(
+            self.replay_private_windows(doc(BAD), doc(name), doc(rest), retry=doc(BAD)),
+            (["exit"], 2),
+        )
 
     def test_processor_split_exit_authenticates_both_unlabelled_fragments(self):
         for scores, allowed in (((0.9, 0.9), True), ((0.1,), False), ((0.9, 0.1), False)):

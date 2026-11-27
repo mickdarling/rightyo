@@ -1067,10 +1067,15 @@ class _RecognizerWindow:
     retry_segments: int = 0
     retried: bool = False
     elapsed_ms: int = 0
+    unreliable_token_timing: bool = False
 
     @property
     def rejected(self) -> int:
         return sum(self.reasons[:4])
+
+    @property
+    def timing_incomplete(self) -> bool:
+        return bool(self.gaps or self.retried or self.repaired or self.unreliable_token_timing)
 
 
 def _counted_units(document: dict[str, Any], duration_ms: int) -> tuple[list[dict[str, Any]], int]:
@@ -1132,13 +1137,11 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
         fallback = {"text": text, "start_ms": start, "end_ms": end}
         fallbacks.append(fallback)
         tokens = segment.get("tokens")
-        if (
-            start != original[0]
-            or end > original[1]
-            or start == end
-            or not isinstance(tokens, list)
-            or len(tokens) > 4000
-        ):
+        if start != original[0] or end > original[1] or start == end or tokens is None:
+            result.append(fallback)
+            continue
+        if not isinstance(tokens, list) or len(tokens) > 4000:
+            window.unreliable_token_timing = True
             result.append(fallback)
             continue
         words: list[dict[str, Any]] = []
@@ -1166,6 +1169,8 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
             ):
                 usable = False
                 break
+            if right > end or (left == right and any(c.isalnum() for c in value)):
+                window.unreliable_token_timing = True
             left, right = min(left, end), min(right, end)
             if not words or (value[:1].isspace() and value.strip()):
                 words.append({"text": value, "start_ms": left, "end_ms": right})
@@ -1184,6 +1189,8 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
         usable &= bool(words) and (
             words[0]["start_ms"] >= previous_start and words[0]["end_ms"] >= previous_end
         )
+        if not usable:
+            window.unreliable_token_timing = True
         result.extend(words if usable else [fallback])
     if any(
         a["start_ms"] > b["start_ms"] or a["end_ms"] > b["end_ms"]
@@ -1193,6 +1200,7 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
         # their boundary. Keep all segment text/times; sacrifice detail, never words.
         result[:] = fallbacks
         window.gaps = segment_gaps
+        window.unreliable_token_timing = True
     window.reasons = tuple(reasons)
     return window
 
@@ -1539,6 +1547,7 @@ class LiveProcessor:
         self._utterances = 0
         self._skipped_utterances = 0
         self._skipped_segments = 0
+        self._recognition_loss_end_ms = 0
         self._waiting: deque[_FinalizedWindow] = deque()
         self._recoveries: deque[_FinalizedWindow] = deque()
         self._recovery: _WindowRecovery | None = None
@@ -2323,6 +2332,7 @@ class LiveProcessor:
             window, complete, provenance = packet.window, packet.complete, packet.provenance
             checked = _checked_units(packet.units, packet.duration_ms)
             unit_count = len(checked) if checked is not None else 0
+            untimed = not checked or any(unit["start_ms"] == unit["end_ms"] for unit in checked)
         if window is not None:
             skipped = window.rejected
             self._skipped_segments += skipped
@@ -2335,6 +2345,10 @@ class LiveProcessor:
                 self._skipped_utterances += 1
             skipped = self.skipped_segments - packet.before[0]
             suppressed = self.skipped_utterances > packet.before[1]
+        if skipped or suppressed or untimed or (window is not None and window.timing_incomplete):
+            # The valid pieces can still be published. No part of this window, or
+            # split exit spanning it, can prove what the owner said at the end.
+            self._recognition_loss_end_ms = offset + packet.duration_ms
         private = (skipped or suppressed) and (
             packet.private_loss or self._heard_private(offset, offset + packet.duration_ms)
         )
@@ -2610,6 +2624,7 @@ class LiveProcessor:
             provenance=self.config.provenance,
             speaker_provenance=group["speaker_provenance"],
             word_attribution=attribution,
+            recognition_loss_end_ms=self._recognition_loss_end_ms,
         )
         if gap is not None and self.config.on_post_turn_gap is not None:
             self.config.on_post_turn_gap(turn.utterance_id, gap)
