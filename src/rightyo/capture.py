@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import math
 import os
 import queue
@@ -9,7 +10,9 @@ import select
 import signal
 import subprocess
 import tempfile
+import termios
 import threading
+from array import array
 from pathlib import Path
 
 PCM_SAMPLE_RATE = 16_000
@@ -32,18 +35,34 @@ class QueuedPcmCapture:
 
     def __init__(self, queue_chunks):
         self._queue: queue.Queue[tuple[bytes, object | None]] = queue.Queue(maxsize=queue_chunks)
-        self.voiceprint_epoch = None  # Optional lock-free publisher snapshot.
+        self.voiceprint_epoch = None  # Optional (public epoch, known stream position) snapshot.
         self.last_read_epoch = self._chunk_epoch = self._read_epoch = None
+        self._backlog_bytes = 0
 
-    def _before_read(self, carry):
+    def _before_read(self, carry, stream):
         if self.voiceprint_epoch is not None:
-            self._read_epoch = self.voiceprint_epoch()
+            epoch, positioned = self.voiceprint_epoch()
+            if epoch is not None and epoch is not self._read_epoch and not positioned:
+                # A starved reader can find several private chunks already in the pipe.
+                # Cover at least one full chunk of new reads, beyond any partial carry.
+                unread = array("i", [0])
+                try:
+                    fcntl.ioctl(stream.fileno(), termios.FIONREAD, unread)
+                except (AttributeError, OSError, TypeError, ValueError):
+                    pass  # The stream cannot report how many bytes are ready.
+                self._backlog_bytes = max(
+                    self._backlog_bytes, len(carry) + max(PCM_CHUNK_BYTES, unread[0])
+                )
+            self._read_epoch = epoch
             if not carry:
                 self._chunk_epoch = self._read_epoch
 
     def _enqueue(self, pcm):
         # Every short read in a coalesced chunk must belong to the same public interval.
         epoch = self._read_epoch if self._read_epoch is self._chunk_epoch else None
+        if self._backlog_bytes:
+            epoch = None
+            self._backlog_bytes = max(0, self._backlog_bytes - len(pcm))
         self._queue.put_nowait((pcm, epoch))
         self._chunk_epoch = self._read_epoch
 
@@ -113,7 +132,7 @@ class MacMicrophoneCapture(QueuedPcmCapture):
         carry = b""
         try:
             while not self._stopped.is_set():
-                self._before_read(carry)
+                self._before_read(carry, process.stdout)
                 data = process.stdout.read(PCM_CHUNK_BYTES)
                 if self._stopped.is_set():
                     break
@@ -286,7 +305,7 @@ class StdinPcmCapture(QueuedPcmCapture):
         carry = b""
         try:
             while not self._stopped.is_set():
-                self._before_read(carry)
+                self._before_read(carry, self._stream)
                 data = read(PCM_CHUNK_BYTES)
                 if data is None or self._stopped.is_set():
                     break

@@ -908,11 +908,23 @@ wipes the PCM copy, window vectors and model scratch. It supplies no label, bind
 role or request authority. Only the local attention/request decision carries the
 measurement. Agent inputs and formed requests receive no voiceprint fields.
 
-Turns heard in privacy produce no attention decision. Input chunks also carry a
-diagnostic exclusion across capture backlog, including partial reads that straddle
-a privacy change. If such audio reaches a public decision after privacy-off, its
-voiceprint measurements are null with reason `private`. Privacy entry revokes pending
-measurements and interrupts any diagnostic already running on earlier public audio.
+Turns heard in privacy produce no attention decision. For the unlabelled voiceprint
+diagnostic, microphone and stdin chunks are also excluded if any contributing read
+started outside the public privacy epoch in which the chunk is fed. This covers
+in-flight reads, partial chunks and chunks waiting in the capture queue.
+
+After a microphone privacy-off, or a stdin privacy-off without `after_sample`, the
+first read in the new epoch starts an additional exclusion. It covers any partial
+chunk already held and the next 6,400 bytes (200 ms) of reads. If the input
+descriptor reports more than 6,400 bytes already waiting at that first read, the
+exclusion covers all of them. Every chunk touching those bytes is excluded,
+including a short final stdin chunk. A positioned stdin off keeps the existing
+sample boundary and adds no such guard.
+
+If a public turn overlaps any excluded chunk, its voiceprint measurements are null
+with reason `private` and its audio is never offered to the diagnostic worker.
+Privacy entry also revokes pending measurements and interrupts any diagnostic
+already running on earlier public audio.
 
 For a synthetic CPU measurement, run
 `PYTHONPATH=src python3 scripts/measure_unlabelled_voiceprint.py --model /path/to/model.onnx`

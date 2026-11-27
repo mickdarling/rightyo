@@ -3400,7 +3400,7 @@ class SpeechEvents:
         forms a request, and its evidence carries `decision_status: "unavailable"` and
         that `reason` beside the unchanged keys.
         """
-        with self._lock:
+        with self._lock, contextlib.ExitStack() as cleanup:
             if not self._active or not self._attention_enabled:
                 return
             if not isinstance(event, DecisionEvent) or event.turn.session_id != self._session:
@@ -3416,6 +3416,8 @@ class SpeechEvents:
                 return
             pending = self._pending.pop(key, None)
             voiceprint = self._pending_voiceprints.pop(key, None)
+            if voiceprint is not None:
+                cleanup.callback(voiceprint.cancel, "no_turn_embedding")
             guest_binding = self._pending_guest_bindings.pop(key, None)
             if pending is None:
                 return

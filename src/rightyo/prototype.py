@@ -696,6 +696,8 @@ class PrototypeController:
         self._stdin_used = False
         # Optional host-facing stream. The lab retains its browser lease and UI controls.
         self._events = event_publisher
+        # Stream start and positioned stdin exits have a known sample boundary.
+        self._positioned_capture_epoch = getattr(event_publisher, "capture_epoch", None)
         # #242 round 27: a publisher already private (as `--start-private` makes it) is refused
         # here with hosted speech, as the CLI and `duck(True)` refuse it: the audio heard while
         # private would still be sent to the hosted backend. Checked again at every start.
@@ -1072,6 +1074,7 @@ class PrototypeController:
                     ),
                 )
                 self._event_terminal = False
+                self._positioned_capture_epoch = getattr(self._events, "capture_epoch", None)
                 if self.owner_voice is not None and not voiceprint and self.report is not None:
                     with contextlib.suppress(Exception):
                         self.report("owner_voice off: speaker identification roles are not on")
@@ -1728,7 +1731,14 @@ class PrototypeController:
             and isinstance(events, SpeechEvents)
             and events.unlabelled_scorer is not None
         ):
-            capture.voiceprint_epoch = lambda: events.capture_epoch
+
+            def snapshot():
+                # Observe a positioned off and its epoch together, before the blocking read.
+                with self._lock:
+                    epoch = events.capture_epoch
+                    return epoch, epoch is self._positioned_capture_epoch
+
+            capture.voiceprint_epoch = snapshot
 
     def _feed(self, generation, processor, pcm, mode, shadow=None) -> bool:
         """Push audio up to the session budget; False once the session accepts no more."""
@@ -2167,7 +2177,10 @@ class PrototypeController:
 
     def _apply_positioned_off(self, sample: int) -> None:
         end_bytes = max(self._received_bytes, sample * 2)
+        ending = self._events.ducked is True
         self._apply_duck(False, (end_bytes + PCM_BYTES_PER_MS - 1) // PCM_BYTES_PER_MS)
+        if ending:
+            self._positioned_capture_epoch = getattr(self._events, "capture_epoch", None)
 
     def duck(self, on: bool) -> None:
         """Forward the host's duck mode (hailing-station #735) to the event publisher.

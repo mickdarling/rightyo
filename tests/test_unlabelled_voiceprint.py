@@ -6,14 +6,15 @@ import select
 import socket
 import threading
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 from test_conversation import decided
 from test_live_speaker_id import Harness, ScriptedEmbedder, settings, tone, turn, wait_for
 
-from rightyo.capture import PCM_CHUNK_BYTES, StdinPcmCapture
-from rightyo.contracts import SpeakerPriority
+from rightyo.capture import PCM_CHUNK_BYTES, MacMicrophoneCapture, StdinPcmCapture
+from rightyo.contracts import ContractError, SpeakerPriority
 from rightyo.live_speaker_id import EnrolledRoles, TurnVoiceprint
 from rightyo.prototype import PrototypeConfig, PrototypeController
 from rightyo.speaker_id import SpeakerEmbedder, SpeakerIdError, _diagnostic_requests
@@ -85,6 +86,7 @@ class UnlabelledVoiceprintTests(unittest.TestCase):
     def capture_controller(self, capture):
         config = PrototypeConfig(None, None, None, None, None)
         controller = PrototypeController(config, event_publisher=self.events)
+        self.addCleanup(controller._closed.set)
         controller._capture = capture
         controller._attach_capture_mask(capture)
         return controller
@@ -135,6 +137,85 @@ class UnlabelledVoiceprintTests(unittest.TestCase):
         self.submit(current)
         self.assertEqual(self.decision(current)["voiceprint_unavailable"], "private")
         self.offer.assert_not_called()
+
+    def check_sampleless_backlog(self, mode):
+        reader, writer = socket.socketpair()
+        with reader, writer, reader.makefile("rb", buffering=0) as stream:
+            reader.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * PCM_CHUNK_BYTES)
+            writer.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * PCM_CHUNK_BYTES)
+            writer.settimeout(2)
+            if mode == "stdin":
+                capture = StdinPcmCapture(stream)
+            else:
+                capture = MacMicrophoneCapture("unused")
+                capture._process = SimpleNamespace(stdout=stream)
+                capture._reader = threading.Thread(
+                    target=capture._receive, args=(capture._process,)
+                )
+            controller = self.capture_controller(capture)
+            controller._mode = mode
+            controller.duck(True)
+            writer.sendall(tone(0.4))
+            controller.duck(False)
+            # The reader was starved through both edges. Its first two reads start public.
+            if mode == "stdin":
+                capture.start()
+            else:
+                capture._reader.start()
+            try:
+                for start in (0, 200, 400):
+                    if start == 400:
+                        writer.sendall(tone(0.2))
+                    pcm = capture.read(timeout=2)
+                    self.assertEqual(len(pcm), PCM_CHUNK_BYTES)
+                    controller._feed(controller._generation, Mock(), pcm, mode, self.shadow)
+                    current = turn(start, start + 200, None)
+                    self.submit(current)
+                    if start < 400:
+                        evidence = self.decision(current)
+                        self.assertEqual(evidence["voiceprint_unavailable"], "private")
+                        self.assertIsNone(evidence["voiceprint_owner_score"])
+                        self.offer.assert_not_called()
+                self.offer.assert_called_once_with(400, 600, ("owner",))
+            finally:
+                capture._stopped.set()
+                writer.shutdown(socket.SHUT_WR)
+                capture._reader.join(2)
+                self.assertFalse(capture._reader.is_alive())
+
+    def test_sampleless_off_excludes_buffered_microphone_audio(self):
+        self.check_sampleless_backlog("microphone")
+
+    def test_sampleless_off_excludes_buffered_stdin_audio(self):
+        self.check_sampleless_backlog("stdin")
+
+    def test_sampleless_off_masks_a_full_chunk_beyond_partial_carry(self):
+        capture = StdinPcmCapture(io.BytesIO())
+        controller = self.capture_controller(capture)
+        sizes = iter([2, PCM_CHUNK_BYTES - 2, PCM_CHUNK_BYTES, PCM_CHUNK_BYTES, 0])
+
+        def read(_limit):
+            size = next(sizes)
+            if size == 2:
+                controller.duck(True)
+                controller.duck(False)
+            return bytes(size)
+
+        capture._receive(read)
+        for epoch in (None, None, self.events.capture_epoch):
+            self.assertEqual(len(capture.read()), PCM_CHUNK_BYTES)
+            self.assertIs(capture.last_read_epoch, epoch)
+
+    def test_positioned_off_keeps_the_first_public_stdin_chunk_eligible(self):
+        capture = StdinPcmCapture(io.BytesIO())
+        controller = self.capture_controller(capture)
+        controller._mode = "stdin"
+        controller.duck(True)
+        controller.duck_after_sample(0)
+        capture._receive(io.BytesIO(tone(0.2)).read)
+        controller._feed(controller._generation, Mock(), capture.read(), "stdin", self.shadow)
+        self.submit(turn(0, 200, None))
+        self.offer.assert_called_once_with(0, 200, ("owner",))
 
     def test_busy_labelled_worker_skips_without_queue_or_pcm_copy(self):
         gate = self.model.gate = threading.Event()
@@ -215,6 +296,26 @@ class UnlabelledVoiceprintTests(unittest.TestCase):
         self.shadow.turn(turn(1000, 2000), spans=[(1000, 2000)], wait=True)
         self.assertTrue(self.shadow.active)
         self.assertEqual(self.shadow.scored, 1)
+
+    def test_decision_stops_ticket_on_mismatch_or_evidence_failure(self):
+        for start, mismatch in ((0, True), (1000, False)):
+            with self.subTest(mismatch=mismatch):
+                current = turn(start, start + 1000, None)
+                ticket = TurnVoiceprint()
+                self.events.unlabelled_scorer = Mock(return_value=ticket)
+                self.assertIs(self.submit(current), ticket)
+                with ticket.cancellation_fd() as fd:
+                    if mismatch:
+                        with self.assertRaisesRegex(ContractError, "committed transcript"):
+                            self.decision(replace(current, text="different words"))
+                    else:
+                        with (
+                            patch.object(self.events, "_standing_evidence", side_effect=ValueError),
+                            self.assertRaises(ValueError),
+                        ):
+                            self.decision(current)
+                    self.assertNotIn(current.utterance_id, self.events._pending_voiceprints)
+                    self.assertEqual(select.select([fd], [], [], 0)[0], [fd])
 
     def test_privacy_entry_revokes_an_inflight_public_turn(self):
         entered, revoked = threading.Event(), threading.Event()
