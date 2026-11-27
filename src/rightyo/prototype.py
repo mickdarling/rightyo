@@ -1506,7 +1506,9 @@ class PrototypeController:
     def _audio(self, generation, stop, session, work, memory, mode):
         capture = processor = end_of_turn = shadow = vad = None
         try:
-            vad = self._silero_vad(stop)
+            # Voice exits require enrolled roles. Always diagnose an explicitly configured VAD.
+            if self.config.silero_vad is not None or self.config.voiceprint_roles:
+                vad = self._silero_vad(stop)
             end_of_turn = self._end_of_turn_model(stop)
             shadow = self._shadow_speaker_id()
             with self._lock:

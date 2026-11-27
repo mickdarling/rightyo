@@ -228,9 +228,10 @@ verifies the SHA-256 again and passes those same bytes to the CPU inference sess
 ```
 
 An absent configuration, missing or unreadable model, checksum mismatch, or worker
-failure disables voice exits for the session. The diagnostic on stderr gives the
-reason without paths, audio or transcript content. Host privacy controls and the
-status question remain available.
+failure disables voice exits for the session. Sessions with enrolled roles report
+a missing configuration on stderr. An explicitly configured worker reports startup
+or runtime failures regardless of roles. These diagnostics include only a fixed
+reason. Host privacy controls and the status question remain available.
 
 ### Reproduce the Silero test worker on Apple Silicon
 

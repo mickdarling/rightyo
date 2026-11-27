@@ -510,7 +510,7 @@ class SessionTests(unittest.TestCase):
                 number=1,
                 timeline_present=False,
                 complete=True,
-                packet=SimpleNamespace(discarded=False),
+                packet=SimpleNamespace(discarded=False, exit_voice_span=None),
             )
             (current,) = accepted
             self.assertEqual((current.start_ms, current.end_ms), (100, 200))

@@ -67,6 +67,38 @@ class Replay:
 
 
 class FailureTests(Replay, unittest.TestCase):
+    def test_unconfigured_vad_diagnostic_at_session_start(self):
+        for roles in (False, True):
+            with self.subTest(roles=roles):
+                processor = Mock()
+                controller = self.controller(
+                    constructor={
+                        "audio_input": io.BytesIO(),
+                        "audio_provenance": "synthetic",
+                        "processor_factory": processor,
+                        "speaker_id_factory": Mock(),
+                    },
+                    speakers={"owner": ["owner"]},
+                    speaker_id={
+                        "python": sys.executable,
+                        "model": sys.executable,
+                        "live": True,
+                        "roles": roles,
+                    },
+                )
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    controller.start({"mode": "stdin"})
+                    controller._audio_thread.join(3)
+                self.assertFalse(controller._audio_thread.is_alive())
+                processor.assert_called_once()
+                self.assertIsNone(processor.call_args.args[0].silero_vad)
+                missing = (
+                    "rightyo: Silero VAD model and worker not configured; "
+                    "voice privacy exit disabled\n"
+                )
+                self.assertEqual(stderr.getvalue(), missing if roles else "")
+
     def test_startup_failures_keep_privacy_on_and_report_fixed_reasons(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -226,12 +258,16 @@ class AdversarialReplay(Replay):
         command = tones(fan, (200, 3000), (400, 1000))
         amp = 1000 * math.sqrt((1.465**2 - 1) / (1 + 0.2**2 + 0.1**2))
         tail = tones(fan, (80, amp), (160, 0.2 * amp), (240, 0.1 * amp))
-        prefix = tones(fan) * 2 + command * 10
         with self.subTest(case="clean command over the same fan"):
+            # Silero labels whole 32 ms blocks. A 200 ms lead-in can count as only
+            # 192 ms of absence when the block straddling onset is labelled speech.
             self.exercise(
-                prefix + tones(fan) * 16, [(200, 1200)], (200, 1200), expected=(["exit"], 1)
+                tones(fan) * 4 + command * 10 + tones(fan) * 16,
+                [(400, 1400)],
+                (400, 1400),
+                expected=(["exit"], 1),
             )
-        audio = prefix + tail * 20 + tones(fan) * 16
+        audio = tones(fan) * 2 + command * 10 + tail * 20 + tones(fan) * 16
         labels, calls = self.exercise(audio, [(200, 3200)], (200, 1200), expected=([], 0))
         self.assertTrue(
             any(labels[1200 // CHUNK_MS : 3200 // CHUNK_MS]), "VAD missed the voiced tail"
