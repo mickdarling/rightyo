@@ -24,7 +24,35 @@ class CaptureError(ValueError):
     """Safe fixed-message failure; native output and paths are never surfaced."""
 
 
-class MacMicrophoneCapture:
+class QueuedPcmCapture:
+    """Carry the public privacy epoch alongside PCM until the controller accepts it.
+
+    read() still returns the original bytes. Only the diagnostic uses last_read_epoch.
+    """
+
+    def __init__(self, queue_chunks):
+        self._queue: queue.Queue[tuple[bytes, object | None]] = queue.Queue(maxsize=queue_chunks)
+        self.voiceprint_epoch = None  # Optional lock-free publisher snapshot.
+        self.last_read_epoch = self._chunk_epoch = self._read_epoch = None
+
+    def _before_read(self, carry):
+        if self.voiceprint_epoch is not None:
+            self._read_epoch = self.voiceprint_epoch()
+            if not carry:
+                self._chunk_epoch = self._read_epoch
+
+    def _enqueue(self, pcm):
+        # Every short read in a coalesced chunk must belong to the same public interval.
+        epoch = self._read_epoch if self._read_epoch is self._chunk_epoch else None
+        self._queue.put_nowait((pcm, epoch))
+        self._chunk_epoch = self._read_epoch
+
+    def _dequeue(self, timeout):
+        pcm, self.last_read_epoch = self._queue.get(timeout=timeout)
+        return pcm
+
+
+class MacMicrophoneCapture(QueuedPcmCapture):
     """Start only on explicit user action; read PCM chunks, stop to discard them.
 
     The helper itself requests microphone permission. This wrapper does not infer
@@ -39,7 +67,7 @@ class MacMicrophoneCapture:
         if type(queue_chunks) is not int or not 1 <= queue_chunks <= 256:
             raise CaptureError("Invalid microphone queue bound")
         self.helper = Path(helper)
-        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=queue_chunks)
+        super().__init__(queue_chunks)
         self._process: subprocess.Popen[bytes] | None = None
         self._reader: threading.Thread | None = None
         self._stopped = threading.Event()
@@ -85,6 +113,7 @@ class MacMicrophoneCapture:
         carry = b""
         try:
             while not self._stopped.is_set():
+                self._before_read(carry)
                 data = process.stdout.read(PCM_CHUNK_BYTES)
                 if self._stopped.is_set():
                     break
@@ -100,7 +129,7 @@ class MacMicrophoneCapture:
                     break
                 data = carry + data
                 while len(data) >= PCM_CHUNK_BYTES:
-                    self._queue.put_nowait(data[:PCM_CHUNK_BYTES])
+                    self._enqueue(data[:PCM_CHUNK_BYTES])
                     data = data[PCM_CHUNK_BYTES:]
                 carry = data
         except queue.Full:
@@ -128,7 +157,7 @@ class MacMicrophoneCapture:
         if self._process is None or self._stopped.is_set():
             raise CaptureError("Microphone capture is not running")
         try:
-            chunk = self._queue.get(timeout=timeout)
+            chunk = self._dequeue(timeout)
         except queue.Empty:
             if self._failure is not None:
                 raise CaptureError(self._failure) from None
@@ -177,7 +206,7 @@ class MacMicrophoneCapture:
                     break
 
 
-class StdinPcmCapture:
+class StdinPcmCapture(QueuedPcmCapture):
     """Raw PCM from a host-supplied binary stream (normally stdin), same format as the helper.
 
     Format: mono, 16,000 Hz, signed 16-bit little-endian, headerless, no other
@@ -204,7 +233,7 @@ class StdinPcmCapture:
             raise CaptureError("Invalid stdin queue bound")
         self._stream = stream
         self._report = report
-        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=queue_chunks)
+        super().__init__(queue_chunks)
         self._reader: threading.Thread | None = None
         self._stopped = threading.Event()
         self._eof = threading.Event()
@@ -244,7 +273,7 @@ class StdinPcmCapture:
     def _offer(self, data: bytes) -> bool:
         """Queue one chunk without blocking; on a full queue drop ``data`` and overrun."""
         try:
-            self._queue.put_nowait(data[:PCM_CHUNK_BYTES])
+            self._enqueue(data[:PCM_CHUNK_BYTES])
             return True
         except queue.Full:
             self.dropped_bytes = len(data)
@@ -257,6 +286,7 @@ class StdinPcmCapture:
         carry = b""
         try:
             while not self._stopped.is_set():
+                self._before_read(carry)
                 data = read(PCM_CHUNK_BYTES)
                 if data is None or self._stopped.is_set():
                     break
@@ -284,7 +314,7 @@ class StdinPcmCapture:
         if self._stopped.is_set():
             raise CaptureError("Stdin capture is not running")
         try:
-            return self._queue.get(timeout=timeout)
+            return self._dequeue(timeout)
         except queue.Empty:
             if self._eof.is_set() and self._queue.empty():
                 if self._failure is not None:

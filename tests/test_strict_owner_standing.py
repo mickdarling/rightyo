@@ -6,8 +6,10 @@ from unittest.mock import patch
 
 from test_conversation import SESSION, decided
 from test_edge_attribution import SPEECH, Timeline, Units
+from test_live_speaker_id import Harness, settings, tone, wait_for
 from test_request_outcomes import outcome
 from test_turn_merge import BoundShadow
+from test_unlabelled_voiceprint import DiagnosticEmbedder
 
 from rightyo.contracts import Addressing, Conversation, SpeakerPriority
 from rightyo.live_audio import FRAME_BYTES, LiveConfig, LiveProcessor
@@ -78,10 +80,12 @@ class StrictOwnerStandingTests(unittest.TestCase):
         processor.finish()
         return [(t, t.utterance_id in inferred, heads[t.utterance_id]) for t in turns]
 
-    def submit(self, replayed, *, label="attend", score=0.98):
+    def submit(self, replayed, *, label="attend", score=0.98, after_transcript=None):
         turn, inferred, head = replayed
         self.assertFalse(turn.overlap)
         self.events.transcript(turn, turn.end_ms, inferred=inferred, diarized_head=head)
+        if after_transcript is not None:
+            after_transcript()
         event = decided(turn, label, attend=score, confidence=score)
         if label == "uncertain":
             # A raw attend plurality below the ordinary request floor.
@@ -371,6 +375,91 @@ class StrictOwnerStandingTests(unittest.TestCase):
                     if not diagnostics:
                         self.assertTrue(DIAGNOSTIC_KEYS.isdisjoint(decision))
                     e["decision"] = {k: v for k, v in decision.items() if k not in DIAGNOSTIC_KEYS}
+            return stream
+
+        for keys_on in (False, True):
+            with self.subTest(keys_on=keys_on):
+                self.assertEqual(scene(keys_on, True), scene(keys_on, False))
+
+    def test_unlabelled_scoring_preserves_decisions_with_policy_keys_off_and_on(self):
+        opening, follow, other, one, private, two, three = self.replay(
+            (BODY_TAIL, ((0, 1000, 1),)),
+            (((" Repeat your last", 40, 480), (" answer.", 700, 920)), ((3000, 3500, 1),)),
+            (BODY_TAIL, ((6000, 7000, 2),)),
+            *((BODY_TAIL, ()) for _ in range(4)),
+        )
+        self.assertTrue(follow[1])
+        for unlabelled in (one, private, two, three):
+            self.assertIsNone(unlabelled[0].speaker_id)
+
+        def scene(keys_on, scoring):
+            model = DiagnosticEmbedder()
+            shadow = Harness(
+                model, config=settings(roles=True, bind_min_seconds=0.5, min_turn_seconds=0.5)
+            ).shadow
+            self.addCleanup(shadow.close)
+            shadow.start()
+            shadow.audio(tone(1) * 21)
+            model.vectors = [[1, 0, 0], [0, 1, 0]]
+            for labelled in (opening[0], other[0]):
+                shadow.turn(labelled, spans=[(labelled.start_ms, labelled.end_ms)], wait=True)
+            roles = EnrolledRoles(SpeakerPriority(owners=("owner",)))
+            roles.source = shadow
+            self.start(
+                replace(
+                    MODE,
+                    require_guest_address=keys_on,
+                    answer_follow_up_min_probability=0.4 if keys_on else None,
+                    answer_follow_up_window_ms=5000,
+                ),
+                roles=roles,
+                duck=True,
+            )
+            self.events._score_unlabelled = scoring
+            self.events.unlabelled_scorer = shadow.try_unlabelled_score
+            stream = self.submit(opening)
+            for state, at in (("accepted", 1100), ("reply_started", 1400), ("reply_ended", 1900)):
+                self.assertTrue(
+                    self.events.request_outcome(outcome(opening[0].utterance_id, state), at)
+                )
+            stream.extend(self.submit(follow, label="uncertain", score=0.44))
+            stream.extend(self.submit(other))
+
+            def emit_unlabelled(replayed):
+                events = self.submit(
+                    replayed, after_transcript=lambda: wait_for(lambda: shadow._diagnostic is None)
+                )
+                evidence = next(e["decision"] for e in events if e["type"] == "attention")
+                self.assertEqual(isinstance(evidence["voiceprint_owner_score"], float), scoring)
+                stream.extend(events)
+
+            emit_unlabelled(one)
+            self.events.duck(True, now_ms=private[0].start_ms, ack=True)
+            stream.extend(self.events.drain())
+            self.assertEqual(self.submit(private), [])
+            self.events.duck(False, now_ms=private[0].end_ms)
+            emit_unlabelled(two)
+            emit_unlabelled(three)
+            self.events.end("stopped", three[0].end_ms)
+            stream.extend(self.events.drain())
+            evidence = [e["decision"] for e in stream if e["type"] == "attention"]
+            self.assertEqual(len(evidence), 6)
+            self.assertEqual(evidence[0]["standing_reason"], "strict_owner")
+            self.assertEqual(evidence[1].get("follow_up", False), keys_on)
+            self.assertEqual(evidence[2].get("guest_unaddressed", False), keys_on)
+            self.assertEqual(len(model.windows), 3 if scoring else 0)
+            for e in stream:
+                if "decision" in e:
+                    e["decision"] = {
+                        k: v
+                        for k, v in e["decision"].items()
+                        if k
+                        not in {
+                            "voiceprint_owner_score",
+                            "voiceprint_speech_ms",
+                            "voiceprint_unavailable",
+                        }
+                    }
             return stream
 
         for keys_on in (False, True):

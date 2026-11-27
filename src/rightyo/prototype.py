@@ -27,7 +27,12 @@ from rightyo.addressedness import (
     scene_text,
     unfinished_shaped,
 )
-from rightyo.capture import CaptureError, MacMicrophoneCapture, StdinPcmCapture
+from rightyo.capture import (
+    CaptureError,
+    MacMicrophoneCapture,
+    QueuedPcmCapture,
+    StdinPcmCapture,
+)
 from rightyo.contracts import (
     PROVENANCE,
     Acknowledgement,
@@ -90,7 +95,7 @@ from rightyo.speech_backends import (
     utterance_local_labels,
 )
 from rightyo.state_log import DecisionStateLog
-from rightyo.tool_events import privacy_phrase
+from rightyo.tool_events import SpeechEvents, privacy_phrase
 from rightyo.turn_merge import (
     DEFAULT_TURN_MERGE_GAP_MS,
     complete_hold,
@@ -1480,6 +1485,10 @@ class PrototypeController:
             with self._lock:
                 if generation == self._generation:
                     self._shadow = shadow
+                    if isinstance(self._events, SpeechEvents):
+                        self._events.unlabelled_scorer = getattr(
+                            shadow, "try_unlabelled_score", None
+                        )
             settings = self.config.end_of_turn
             wake_word, owner = self._wake_join()
             if owner is None and self.config.turn_owner_pause_ms:
@@ -1566,6 +1575,7 @@ class PrototypeController:
                     if generation != self._generation or stop.is_set():
                         return
                     self._capture = capture
+                    self._attach_capture_mask(capture)
                     capture.start()
                 while not stop.is_set():
                     pcm = capture.read(timeout=0.25)
@@ -1579,6 +1589,7 @@ class PrototypeController:
                     if generation != self._generation or stop.is_set():
                         return
                     self._capture = self._stdin_capture = capture
+                    self._attach_capture_mask(capture)
                     capture.start()
                 accepted = True
                 while accepted and not stop.is_set():
@@ -1703,10 +1714,21 @@ class PrototypeController:
             with self._lock:
                 if self._shadow is shadow:
                     self._shadow = None
+                    if isinstance(self._events, SpeechEvents):
+                        self._events.unlabelled_scorer = None
                 if generation == self._generation:
                     self._capture = self._processor = None
                 elif generation + 1 == self._generation and self._phase == "stopping":
                     self._phase = "idle"
+
+    def _attach_capture_mask(self, capture):
+        events = self._events
+        if (
+            isinstance(capture, QueuedPcmCapture)
+            and isinstance(events, SpeechEvents)
+            and events.unlabelled_scorer is not None
+        ):
+            capture.voiceprint_epoch = lambda: events.capture_epoch
 
     def _feed(self, generation, processor, pcm, mode, shadow=None) -> bool:
         """Push audio up to the session budget; False once the session accepts no more."""
@@ -1732,6 +1754,20 @@ class PrototypeController:
             # Read with the clock under the lock, so a change stamped after this chunk
             # never leaves a chunk heard in privacy in the speaker ring.
             private = self._private_audio()
+            if (
+                isinstance(self._events, SpeechEvents)
+                and self._events.unlabelled_scorer is not None
+            ):
+                # A chunk may have been read or queued during an earlier privacy epoch.
+                # Demo files go directly to _feed. Unstamped live input fails closed.
+                queued_private = mode != "demo" and (
+                    getattr(self._capture, "last_read_epoch", None)
+                    is not self._events.capture_epoch
+                )
+                if private or queued_private:
+                    self._events.exclude_voiceprint_audio(
+                        self._received_bytes - len(pcm), self._received_bytes
+                    )
             if private and self.config.hosted_speech:
                 # #242 round 27, the one choke point every audio consumer is fed through: in
                 # privacy, a hosted consumer (`hosted_audio_consumers`) receives nothing, by
