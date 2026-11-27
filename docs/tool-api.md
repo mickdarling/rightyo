@@ -1728,11 +1728,16 @@ The only events a private turn can produce carry no words:
 {"schema_version": 1, "type": "privacy", "session_id": "…", "sequence": 8, "emitted_at_ms": 53900, "action": "status"}
 ```
 
-- **`action: "exit"`**: the enrolled owner named the assistant and asked to come back:
-  "<name>, I'm back" (or "I am back"), "<name>, start listening", "<name>, privacy off"
-  (or "privacy mode off"). It needs a configured name or variant of up to three words,
-  directly followed by the phrase. The phrase must end the turn, apart from the trailing
-  words "now", "please" and "again". The host decides whether to send the privacy-off control.
+- **`action: "exit"`**: **A privacy exit must be a statement.** As the enrolled owner,
+  say the assistant's configured name or variant (up to three words) followed directly
+  by the exit phrase. For example, say "Jarvis, privacy off.", "Jarvis, I'm back." or
+  "Jarvis, start listening." The phrases "privacy mode off" and "I am back" also work.
+  The host decides whether to send the privacy-off control.
+
+  Privacy stays on if you ask "Jarvis, can you turn privacy off?", add extra words
+  after the phrase (apart from "now", "please" or "again"), or RightyO recognises
+  only part of the turn. A refused exit is silent today. Say the phrase again as a
+  statement. Visible feedback is tracked in [rightyo#353](https://github.com/mickdarling/rightyo/issues/353).
 - **`action: "status"`**: anyone asked "what mode am I in", "are you recording" or "are
   you listening", with or without the name. The host answers from its own state.
 
