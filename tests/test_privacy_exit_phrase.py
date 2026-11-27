@@ -5,16 +5,19 @@ from dataclasses import replace
 
 import test_duck_mode as duck
 
-from rightyo.contracts import ContractError, Turn
-from rightyo.tool_events import SpeechEvents
+from rightyo.contracts import Addressing, ContractError, Turn
+from rightyo.tool_events import SpeechEvents, privacy_phrase
 
 
 class NamedPrivacyExitTests(unittest.TestCase):
     def setUp(self):
+        self.start(duck.OURS)
+
+    def start(self, addressing):
         self.events = SpeechEvents()
         self.events.duck(True, now_ms=0)
         self.events.start(
-            duck.SESSION, now_ms=0, addressing=duck.OURS, priority=duck.enrolled(), duck=True
+            duck.SESSION, now_ms=0, addressing=addressing, priority=duck.enrolled(), duck=True
         )
         self.events.drain()
 
@@ -79,13 +82,67 @@ class NamedPrivacyExitTests(unittest.TestCase):
                 "Did you hear Jarvis start listening",
                 "Well, could you hear Jarvis start listening",
                 "Yesterday did you hear Jarvis start listening",
+                "After lunch did anyone hear Jarvis start listening",
+                "After lunch did anyone hear that. Jarvis, start listening",
                 "She asked did Jarvis start listening",
             )
         ):
             with self.subTest(text=text):
                 self.assertEqual(self.hear(text, index * 1000), [])
-        (event,) = self.hear("Yesterday I heard Jarvis start listening.", 10000)
-        self.assertEqual(event["action"], "exit")
+
+    def test_address_starts_a_sentence(self):
+        for index, sep in enumerate((".", "!", ";", "\n")):
+            with self.subTest(sep=sep):
+                (event,) = self.hear(
+                    f"That's enough of that{sep} Well, Jarvis, I'm back", index * 1000
+                )
+                self.assertEqual(event["action"], "exit")
+        for sep in (" ", ", ", ": ", " — "):
+            with self.subTest(sep=sep):
+                self.assertFalse(
+                    privacy_phrase(f"That's enough of that{sep}Jarvis I'm back", duck.OURS)
+                )
+        for text in (
+            "Yesterday I heard Jarvis start listening.",
+            "When I give the signal, Jarvis, start listening.",
+            "Jarvis сказал «start listening».",
+            "Jarvis, privacy off 谢谢",
+            "Jarvis, privacy off, क्",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(privacy_phrase(text, duck.OURS))
+
+    def test_only_the_eight_fillers_can_surround_the_address(self):
+        for word in ("um", "uh", "ok", "okay", "hey", "so", "please", "well"):
+            self.assertEqual(privacy_phrase(f"{word} Jarvis {word} I'm back", duck.OURS), {"exit"})
+        for word in ("umm", "uhm", "er", "erm", "ah", "hmm", "mm", "oh", "now", "again"):
+            for text in (f"{word} Jarvis, privacy off", f"Jarvis {word} privacy off"):
+                with self.subTest(text=text):
+                    self.assertFalse(privacy_phrase(text, duck.OURS))
+
+    def test_unknown_words_cannot_arm_or_complete_a_split(self):
+        for index, word in enumerate(("谢谢", "сказал", "قال", "क्", "7", "\u0301")):
+            with self.subTest(word=word):
+                at = index * 4000
+                self.assertEqual(self.hear(f"Jarvis {word}", at), [])
+                self.assertEqual(self.hear("I'm back", at + 1000), [])
+                self.assertEqual(self.hear("Jarvis", at + 2000), [])
+                self.assertEqual(self.hear(f"I'm back {word}", at + 3000), [])
+
+    def test_question_word_as_name_or_variant(self):
+        for naming in (
+            Addressing(("Will", "May")),
+            Addressing(("Jarvis",), (("Jarvis", ("Will", "May")),)),
+        ):
+            with self.subTest(naming=naming):
+                self.start(naming)
+                (event,) = self.hear("Will, start listening.", 0)
+                self.assertEqual(event["action"], "exit")
+                self.assertEqual(self.hear("May,", 1000), [])
+                (event,) = self.hear("I'm back.", 2000)
+                self.assertEqual(event["action"], "exit")
+                self.assertEqual(self.hear("Will, start listening?", 3000), [])
+                self.assertEqual(self.hear("May I ask. Will, start listening.", 4000), [])
 
     def test_marked_questions_disarm_each_split_fragment(self):
         for index, (name, rest) in enumerate(

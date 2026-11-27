@@ -174,10 +174,13 @@ _AUXILIARIES = frozenset(
 _QUESTION_OPENERS = _AUXILIARIES | frozenset(
     "what what's whats when where where's which who who's whom whose why how how's".split()
 )
+_QUESTION_SUBJECTS = frozenset(
+    "i you he she it we they there anyone anybody someone somebody everyone everybody".split()
+)
 _OPENERS = _IMPERATIVES | _QUESTION_OPENERS | {"please"}
 
 
-def question_shaped(text: str) -> bool:
+def question_shaped(text: str, *, address: tuple[int, int] | None = None) -> bool:
     """Question punctuation anywhere, or an English interrogative clause in ASR text."""
     for char in text:
         if char == "?":
@@ -186,13 +189,17 @@ def question_shaped(text: str) -> bool:
             name = unicodedata.name(char, "")
             if "QUESTION" in name or "INTERROBANG" in name:
                 return True
+    if address is not None:
+        # Only the matched vocative is exempt. Question marks anywhere still veto it.
+        start, end = address
+        text = text[:start] + " listener " + text[end:]
     for clause in re.split(r"[^\w\s']+", text.lower().replace("’", "'")):
         at_head, after_auxiliary = True, False
         for token in _WORDS.findall(clause):
             word = token.strip("'")
             if not word or (at_head and (word in _FILLERS or word == "please")):
                 continue
-            if after_auxiliary and word in {"i", "you", "he", "she", "it", "we", "they", "there"}:
+            if after_auxiliary and word in _QUESTION_SUBJECTS:
                 return True  # "Yesterday did you hear ..." without ASR punctuation.
             base = word.removesuffix("n't").partition("'")[0]
             after_auxiliary = (

@@ -1035,11 +1035,18 @@ class PrivateExitTests(unittest.TestCase):
             controller._private_turn_audio(generation, current, pcm)
             retained.append(controller._private_sentence.pcm)
 
+        recognizer = Units()
+        recognizer.transcribe = Mock(
+            side_effect=[
+                Units(("synthetic token", 20, 420)).units,
+                Units((EXIT, 0, 1000)).units,
+            ]
+        )
         processor = LiveProcessor(
             LiveConfig(
                 "shadow-test",
-                transcriber=Units(("synthetic token", 0, 400), (EXIT, 500, 1500)),
-                diarizer=Timeline((0, 400, 1), (500, 1500, 2)),
+                transcriber=recognizer,
+                diarizer=Timeline((20, 420, 1), (1860, 2860, 2)),
                 private=controller._heard_private_span,
                 on_private_turn_audio=audio,
                 turn_merge_gap_ms=2000,
@@ -1048,7 +1055,8 @@ class PrivateExitTests(unittest.TestCase):
             lambda current: controller._turn(generation, work, memory, harness.shadow, current),
         )
         self.addCleanup(processor.close)
-        pcm = tone(1.5, OWNER_F0) + bytes(32000 * 2)
+        pause = bytes(1440 * 32)
+        pcm = bytes(20 * 32) + tone(0.4, OWNER_F0) + pause + tone(1, OWNER_F0) + pause
         for at in range(0, len(pcm), 6400):
             controller._feed(generation, processor, pcm[at : at + 6400], "stdin", harness.shadow)
         processor.finish()
@@ -1059,7 +1067,7 @@ class PrivateExitTests(unittest.TestCase):
         self.assertEqual(harness.shadow._labels, {})
         self.assertEqual(memory.snapshot(4000)["turns"], [])
         self.assertEqual(work.qsize(), 0)
-        self.assertFalse(any(harness.shadow._ring.span(0, 3500)[0]))
+        self.assertFalse(any(harness.shadow._ring.span(0, len(pcm) // 32)[0]))
 
 
 class PrivateListenTests(unittest.TestCase):
@@ -1110,8 +1118,8 @@ class PrivateListenTests(unittest.TestCase):
                     return LiveProcessor(
                         replace(
                             loaded,
-                            transcriber=Units((EXIT, 0, 1000)),
-                            diarizer=Timeline((0, 1000, 1)),
+                            transcriber=Units((EXIT, 20, 1020)),
+                            diarizer=Timeline((20, 1020, 1)),
                             on_private_turn_audio=audio,
                         ),
                         on_turn,
@@ -1148,7 +1156,7 @@ class PrivateListenTests(unittest.TestCase):
                         args,
                         output=output,
                         controller_factory=factory,
-                        audio_input=io.BytesIO(tone(1, f0) + bytes(32000 * 2)),
+                        audio_input=io.BytesIO(bytes(20 * 32) + tone(1, f0) + bytes(32000 * 2)),
                     )
                 self.assertEqual(result, 0)
                 self.assertEqual(set(root.rglob("*")), expected)

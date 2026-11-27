@@ -74,6 +74,7 @@ PRIVACY_EXIT = (
     ("privacy", "off"),
     ("privacy", "mode", "off"),
 )
+PRIVACY_EXIT_FILLER = frozenset({"um", "uh", "ok", "okay", "hey", "so", "please", "well"})
 PRIVACY_EXIT_TRAILING = frozenset({"now", "please", "again"})
 PRIVACY_STATUS = (
     ("what", "mode", "am", "i", "in"),
@@ -103,7 +104,7 @@ PRIVACY_ENTRY_WORDS = frozenset({"privacy", "private"})
 PRIVACY_STOPPED = frozenset({"recording", "recordings", "listening"})
 # Words that may open an address before the name ("hey Jarvis, privacy mode").
 PRIVACY_ADDRESS = frozenset({"hey"})
-# Words dropped anywhere before matching, so "um, ok Jarvis, so I'm back" still matches.
+# The older, wider filler set for status matching.
 PRIVACY_FILLER = frozenset(
     {
         "um",
@@ -390,50 +391,71 @@ def _phrase_in(words, phrases):
     )
 
 
-def _exit_kind(words, unfiltered, addressing):
-    """Match the same ending for a named exit and a split follow-up."""
-    # Check the actual ending before filler removal can hide a word like "um".
-    last_word = next(
-        (word for word in reversed(unfiltered) if word not in PRIVACY_EXIT_TRAILING), None
+def _exit_kinds(text, addressing):
+    """Parse the exit and both split fragments without discarding unknown words."""
+    # Keep original offsets for sentence breaks and the vocative's question exemption.
+    # Only whitespace and punctuation separate words. Marks, format characters and
+    # unfamiliar symbols survive as literal input that must match the grammar.
+    cleaned = "".join(
+        " " if c != "'" and unicodedata.category(c).startswith("P") else c
+        for c in text.replace("’", "'")
     )
+    tokens = list(re.finditer(r"\S+", cleaned))
+    words = [token.group().lower() for token in tokens]
+    name_keys = {
+        "".join(c.lower() for c in spelling if c.isalnum())
+        for name in (addressing.names if addressing else ())
+        for spelling in (name, *addressing.spellings(name))
+    }
+
+    def addressed(end, *, whole_turn):
+        # A name of at most three words must consume the last non-filler before
+        # the phrase. Try filler words as names too (including configured variants).
+        last = max((i for i in range(end) if words[i] not in PRIVACY_EXIT_FILLER), default=-1)
+        head = True
+        for at in range(end):
+            if at and not whole_turn:
+                between = text[tokens[at - 1].end() : tokens[at].start()]
+                head = head or any(c in ".!?;\r\n" for c in between)
+            if head and at + 3 > last:
+                for stop in range(max(at + 1, last + 1), min(end, at + 3) + 1):
+                    key = "".join(words[at:stop]).replace("'", "")
+                    if key not in name_keys:
+                        continue
+                    before = text[: tokens[at].start()]
+                    prior = _matched_words(_privacy_words(before, ()), addressing)
+                    return not _negated(prior, len(prior)) and not question_shaped(
+                        text, address=(tokens[at].start(), tokens[stop - 1].end())
+                    )
+            head = head and words[at] in PRIVACY_EXIT_FILLER
+        return False
+
+    kinds = set()
+    if addressed(len(words), whole_turn=True):
+        kinds.add("name")
     end = len(words)
     while end and words[end - 1] in PRIVACY_EXIT_TRAILING:
         end -= 1
     for phrase in PRIVACY_EXIT:
         start = end - len(phrase)
-        if start < 0 or last_word != phrase[-1] or tuple(words[start:end]) != phrase:
+        if start < 0 or tuple(words[start:end]) != phrase:
             continue
-        if start == 0:
-            return "rest"
-        if addressing is not None:
-            for at in range(max(0, start - 3), start):
-                name = addressing.name_for(" ".join(words[at:start]))
-                if name is not None and not _negated(words, at):
-                    return "exit"
-    return None
+        if addressed(start, whole_turn=False):
+            kinds.add("exit")
+        elif all(w in PRIVACY_EXIT_FILLER for w in words[:start]) and not question_shaped(text):
+            kinds.add("rest")
+        break
+    return kinds
 
 
 def privacy_phrase(text, addressing, *, recognition_complete=True):
-    """Which of privacy mode's local phrases `text` holds (hailing-station #735 S-1).
-
-    A set of: "exit" (a configured name or variant of up to three words, then an exit
-    phrase ending the turn apart from `PRIVACY_EXIT_TRAILING` words), "rest" (the same
-    ending as the whole normalized turn), "name" (the turn is only a name),
-    "status" (named or not) and "entry". For all but the entry,
-    case, punctuation and filler are ignored when matching the phrase itself;
-    "don't" or "do not" in the three words before it (before the name, for the exit) means
-    no match. Questions and incomplete recognition cannot supply any part of an exit.
-    The entry counts only as the whole turn (`_standalone_entry`) and never as a question.
+    """Classify local privacy phrases. Exit evidence requires complete recognition,
+    a statement and a sentence-initial address (or two whole split fragments).
+    Status and standalone entry retain their own grammars.
     """
     unfiltered = _privacy_words(text, ())
     words = _matched_words(unfiltered, addressing)
-    kinds = set()
-    if recognition_complete and not question_shaped(text):
-        if addressing is not None and words and addressing.name_for(" ".join(words)) is not None:
-            kinds.add("name")
-        exit_kind = _exit_kind(words, unfiltered, addressing)
-        if exit_kind is not None:
-            kinds.add(exit_kind)
+    kinds = _exit_kinds(text, addressing) if recognition_complete else set()
     if _phrase_in(words, PRIVACY_STATUS):
         kinds.add("status")
     if not text.rstrip().endswith("?") and _standalone_entry(unfiltered, addressing):

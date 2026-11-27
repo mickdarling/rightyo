@@ -1729,9 +1729,11 @@ The only events a private turn can produce carry no words:
 ```
 
 - **`action: "exit"`**: **A privacy exit must be a statement.** As the enrolled owner,
-  say the assistant's configured name or variant (up to three words) followed directly
-  by the exit phrase. For example, say "Jarvis, privacy off.", "Jarvis, I'm back." or
-  "Jarvis, start listening." The phrases "privacy mode off" and "I am back" also work.
+  pause before the assistant's configured name or variant (up to three words), or
+  start a new sentence with it. Say "Jarvis, privacy off.", "Hey Jarvis, please
+  start listening." or "That's enough of that. Jarvis, I'm back." The phrases
+  "privacy mode off" and "I am back" also work. If the recognizer writes
+  "that's enough of that Jarvis I'm back" as one sentence, privacy stays on.
   The host decides whether to send the privacy-off control.
 
   Privacy stays on if you ask "Jarvis, can you turn privacy off?", add extra words
@@ -1833,26 +1835,37 @@ is discarded, words and all; otherwise it is released at once on its own. So not
 the end can be joined to a private turn, and the first public request after privacy is decided
 on its own instead of being dropped with the private turn it was joined to.
 
-Status phrases can occur anywhere in the turn. For a single-turn exit, other words
-may precede the name. Matching ignores case, punctuation and fillers such as "um",
-"okay" and "please" within the address and phrase. A filler that belongs to a
-configured name or variant is kept where that name matches. "Don't" or "do not" in
-the three words before the name (before the phrase for status) blocks the match.
+Status phrases can occur anywhere in the turn. "Don't" or "do not" in the three
+words before a status phrase blocks it.
 
-For either kind of exit, only "now", "please" and "again" may follow the phrase, in
-any combination. "Jarvis, I'm back, please" qualifies. "Jarvis, I'm back, okay" and
-"Jarvis, start listening to the podcast" stay private. Question punctuation anywhere
-in the turn, or a question opener such as "did you hear", blocks a named exit and
-either fragment of a split exit. Each must contain the whole recognised utterance
-and end at an observed speech pause. A speaker boundary that divides the text, a
-forced ASR cut or its continuation, and an end-of-input flush all make a fragment
-ineligible. So do lost text, a recognizer retry, textless timed units, and missing,
-repaired or overlapping word or token timing.
+For an exit, the name must open the turn or a new sentence. A period, exclamation
+mark, question mark, semicolon or newline marks a sentence break. The question
+guard still applies to the whole turn. Only "um", "uh", "ok", "okay", "hey",
+"so", "please" and "well" may come before the name in its sentence or between
+the name and the phrase. "Um, ok Jarvis, so, I'm back" qualifies. "I heard
+Jarvis start listening" stays private. A nearby negation before the name also
+blocks the exit.
 
-A split exit is the enrolled owner's lone name fragment ("Jarvis,") heard while privacy
-is on, followed within 4 seconds by a turn consisting of the exit phrase and any
-permitted trailing words after normalization. For example, "Jarvis," followed by
-"start listening" qualifies. A recognition loss between the fragments breaks the pair.
+Only "now", "please" and "again" may follow the phrase, in any combination.
+"Jarvis, I'm back, please" qualifies. "Jarvis, I'm back, okay" and "Jarvis,
+start listening to the podcast" stay private. Words in any script count.
+Question punctuation anywhere in the turn, or a question form such as "did
+anyone hear", blocks a named exit and either split fragment. A configured
+name such as "Will" or "May" can open an exit statement.
+
+Each fragment needs a complete utterance with an observed onset and a speech
+pause. Private endpointing measures speech relative to the surrounding noise
+level. Speech already active when the stream starts, or voice in a gap between
+recognised words or beyond the final word, keeps privacy on. A speaker boundary
+that divides the text, a forced ASR cut or its continuation, and an end-of-input
+flush also disqualify the fragment. So do lost text, a recognizer retry, textless timed
+units, and missing, repaired or overlapping word or token timing.
+
+A split exit is the enrolled owner's lone name fragment ("Jarvis,") heard while
+privacy is on, followed within 4 seconds by the exit phrase. The same fillers
+may surround the name or precede the phrase, and the same trailing words may
+follow it. For example, "May," followed by "I'm back." qualifies when "May"
+is configured. A recognition loss between the fragments breaks the pair.
 Both turns must authenticate. Each may pass its own binding check or an isolated voice check on
 its own buffered audio alone. Private processor turns are unlabelled, so both fragments
 must pass their own isolated voice checks. A guest or a TV supplying the name never

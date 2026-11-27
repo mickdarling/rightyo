@@ -361,6 +361,63 @@ def _pcm_samples(pcm: bytes) -> array.array:
     return values
 
 
+def _frame_rms(frame: bytes) -> float:
+    values = _pcm_samples(frame)
+    return math.sqrt(sum(value * value for value in values) / len(values)) / 32768
+
+
+class _PrivateEndpoint:
+    """Measure 20 ms frames against the quiet level around this private utterance."""
+
+    # RMS ratio (~3.5 dB), independent of microphone gain.
+    MARGIN = 1.5
+
+    def __init__(self):
+        self.floor: float | None = None
+        self.unresolved = True
+
+    def voiced(self, rms: float, active: bool) -> bool:
+        if self.floor is None:
+            self.floor = rms
+        if self.unresolved:
+            # With no prior quiet, capture possible speech from the very first frame.
+            # A steady initial level alone proves neither an onset nor a pause.
+            if rms and self.floor / self.MARGIN <= rms <= self.floor * self.MARGIN:
+                return True
+            self.unresolved = False
+        if rms > self.floor * self.MARGIN:
+            return True
+        # Follow the local background between turns. During a turn a quieter frame
+        # can lower the estimate, but continuing speech must never raise it.
+        self.floor = min(self.floor, rms) if active else rms
+        return False
+
+    @property
+    def quiet_rms(self) -> float:
+        # Read only after this endpoint has received frames.
+        assert self.floor is not None
+        return self.floor * self.MARGIN
+
+    def voice_span(self, pcm: bytearray) -> tuple[int, int] | None:
+        # Re-evaluate both edges against the final floor. For example, the stream
+        # might have opened on a steady fan, or in the middle of continuous speech.
+        if self.unresolved or self.floor is None:
+            return None
+        threshold = self.quiet_rms
+        frames = range(0, len(pcm), FRAME_BYTES)
+
+        def first_voiced(offsets):
+            return next(
+                (i for i in offsets if _frame_rms(pcm[i : i + FRAME_BYTES]) > threshold), None
+            )
+
+        first = first_voiced(frames)
+        if first is None:
+            return None
+        last = first_voiced(reversed(frames))
+        return first // BYTES_PER_MS, (last + FRAME_BYTES) // BYTES_PER_MS
+
+
 class _ModelConfig(ctypes.Structure):
     _fields_ = [
         ("size", ctypes.c_size_t),
@@ -1178,7 +1235,7 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
             if (
                 right > end
                 or (left == right and any(c.isalnum() for c in value))
-                or (left < right and not value.strip())
+                or (left < right and not any(c.isalnum() for c in value))
                 or (words and left < words[-1]["end_ms"])
             ):
                 # Check each token before coalescing subwords can hide a reversal.
@@ -1272,7 +1329,8 @@ class _FinalizedWindow:
     discarded: bool = False
     private_cleared_through: int = 0
     # Exit evidence only. A natural end and an unclipped onset are both required.
-    whole_utterance: bool = False
+    exit_voice_span: tuple[int, int] | None = None  # window-relative milliseconds
+    private_quiet_rms: float | None = None
 
     def release(self) -> None:
         """Discard owned PCM/text evidence; safe to repeat during shutdown."""
@@ -1286,6 +1344,8 @@ class _FinalizedWindow:
         self.units = []
         self.window = None
         self.timeline = []
+        self.exit_voice_span = None
+        self.private_quiet_rms = None
         # A released barrier has no recognizer metadata left to coalesce into.
         self.overflow = False
 
@@ -1455,15 +1515,28 @@ def _checked_units(units: Any, duration_ms: int) -> list[dict[str, Any]] | None:
     return units
 
 
-def _complete_exit_units(units: list[dict[str, Any]] | None) -> bool:
-    """Every retained unit must supply text on its own positive-duration interval."""
-    if not units:
+def _complete_exit_units(units: list[dict[str, Any]] | None, packet: _FinalizedWindow) -> bool:
+    """Check spoken unit timings against this window's observed voice."""
+    if not units or packet.exit_voice_span is None:
+        return False
+    first, last = packet.exit_voice_span
+    if units[0]["start_ms"] > first or units[-1]["end_ms"] < last:
         return False
     previous_end = 0
     for unit in units:
-        if not unit["text"].strip() or not previous_end <= unit["start_ms"] < unit["end_ms"]:
+        if not any(c.isalnum() for c in unit["text"]):
             return False
-        previous_end = unit["end_ms"]
+        start, end = unit["start_ms"], unit["end_ms"]
+        if not previous_end <= start < end:
+            return False
+        if previous_end and previous_end < start and packet.private_quiet_rms is not None:
+            # A later allowed word must not cover an omitted spoken tail. Only a
+            # quiet gap can separate two units in a complete private utterance.
+            for ms in range(previous_end // 20 * 20, start, 20):
+                at = ms * BYTES_PER_MS
+                if _frame_rms(packet.pcm[at : at + FRAME_BYTES]) > packet.private_quiet_rms:
+                    return False
+        previous_end = end
     return True
 
 
@@ -1549,6 +1622,7 @@ class LiveProcessor:
         self._private_ranges: list[tuple[int, int]] = []
         self._private_cleared_through = 0  # audio-owner watermark, snapshotted per window
         self._private_lock = threading.Lock()
+        self._private_endpoint: _PrivateEndpoint | None = None
         self._frame_private = False
         self._diarizer_private_frames = 0
         self._privacy_uncertain = False
@@ -1974,6 +2048,7 @@ class LiveProcessor:
                 # No frame between toggles means no private audio and no new text.
                 self._queue_merger_barrier("privacy")
                 self._frame_private = private
+                self._private_endpoint = _PrivateEndpoint() if private else None
         if self._private_until is not None:
             frame = self._private_cutoff(frame)
         # Renewed only once the privacy end is reached (#242 round 20): the controller counts a
@@ -1995,9 +2070,11 @@ class LiveProcessor:
         self._push_diarizer(frame, private, uncertain)
         frame_start = self._received_ms
         self._received_ms += 20
-        values = _pcm_samples(frame)
-        rms = math.sqrt(sum(value * value for value in values) / len(values)) / 32768
-        voiced = rms >= self.config.energy_threshold
+        rms = _frame_rms(frame)
+        if self._private_endpoint is None:
+            voiced = rms >= self.config.energy_threshold
+        else:
+            voiced = self._private_endpoint.voiced(rms, bool(self._utterance))
         if voiced and not self._utterance:
             self._voice_start = frame_start
             self._utterance_start = frame_start - len(self._pre_roll) * 20
@@ -2115,6 +2192,30 @@ class LiveProcessor:
         except Exception:  # noqa: BLE001 - fail closed: withhold the diagnostic
             return True
 
+    def _exit_voice_span(self, pcm: bytearray, natural_end: bool) -> tuple[int, int] | None:
+        """Record the next continuation barrier and qualify this window's acoustic edges."""
+        offset = self._utterance_start
+        continuation = self._continuation_until_ms
+        self._continuation_until_ms = self._last_voice_ms + self.config.hangover_ms
+        if not natural_end:
+            return None
+        span = (
+            self._private_endpoint.voice_span(pcm)
+            if self._private_endpoint is not None
+            else (self._voice_start - offset, self._last_voice_ms - offset)
+        )
+        if span is None:
+            return None
+        first, last = span
+        if offset + last > self._last_voice_ms:
+            # A lower final floor revealed voice during the presumed ending pause.
+            self._continuation_until_ms = offset + last + self.config.hangover_ms
+            return None
+        self._continuation_until_ms = 0
+        if offset + first == 0 or offset + first < continuation:
+            return None
+        return span
+
     def _finalize(
         self, timeline: list[dict[str, Any]], complete: bool = False, *, natural_end: bool = False
     ) -> None:
@@ -2125,12 +2226,11 @@ class LiveProcessor:
         offset = self._utterance_start
         before = (self.skipped_segments, self.skipped_utterances)
         self._utterances += 1
-        whole_utterance = natural_end and self._voice_start >= self._continuation_until_ms
-        self._continuation_until_ms = (
-            0 if natural_end else self._last_voice_ms + self.config.hangover_ms
-        )
         with self._recovery_lock:
+            if self.closed:
+                return
             pcm = bytearray(self._utterance)
+            exit_span = self._exit_voice_span(pcm, natural_end)
             packet = _FinalizedWindow(
                 pcm,
                 offset,
@@ -2150,7 +2250,12 @@ class LiveProcessor:
                 before,
                 len(pcm) // BYTES_PER_MS,
                 bool(timeline),
-                whole_utterance=whole_utterance,
+                exit_voice_span=exit_span,
+                private_quiet_rms=(
+                    self._private_endpoint.quiet_rms
+                    if exit_span and self._private_endpoint is not None
+                    else None
+                ),
                 private_cleared_through=self._private_cleared_through,
             )
             self._finalizing = packet
@@ -2367,7 +2472,7 @@ class LiveProcessor:
             window, complete, provenance = packet.window, packet.complete, packet.provenance
             checked = _checked_units(packet.units, packet.duration_ms)
             unit_count = len(checked) if checked is not None else 0
-            whole = packet.whole_utterance and _complete_exit_units(checked)
+            whole = _complete_exit_units(checked, packet)
         if window is not None:
             skipped = window.rejected
             self._skipped_segments += skipped
