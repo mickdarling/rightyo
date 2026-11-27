@@ -153,10 +153,30 @@ class Units:
         return [{"start_ms": 0, "end_ms": 200, "text": "Authored sentence."}]
 
 
+class FixtureVad:
+    """A stand-in worker. Match authored quiet blocks by identity, including subframe edges."""
+
+    chunk_ms = 1
+    available = True
+
+    def __init__(self, *quiet_frames):
+        self.quiet = {
+            frame[i : i + 32]
+            for frame in (SILENCE, *quiet_frames)
+            for i in range(0, len(frame), 32)
+        }
+
+    def is_speech(self, pcm):
+        return pcm not in self.quiet
+
+    def close(self):
+        pass
+
+
 class PrivacyMinimumTests(unittest.TestCase):
     controller = duck.DuckControllerTests.controller
 
-    def arrange(self, *, vector=None, end_of_turn=None, pre_roll_ms=240):
+    def arrange(self, *, vector=None, end_of_turn=None, pre_roll_ms=240, vad=FixtureVad()):
         controller = self.controller()
         notes = []
         controller.report = notes.append
@@ -188,6 +208,7 @@ class PrivacyMinimumTests(unittest.TestCase):
             end_of_turn=end_of_turn,
             pre_roll_ms=pre_roll_ms,
             private=controller._heard_private_span,
+            silero_vad=vad,
         )
         processor = LiveProcessor(
             config, lambda t: controller._turn(controller._generation, work, memory, shadow, t)
@@ -692,10 +713,13 @@ class PrivacyMinimumTests(unittest.TestCase):
         audio=None,
         end_of_turn=None,
         pre_roll_ms=20,
+        vad=FixtureVad(),
         **window_settings,
     ):
         """Replay authored Whisper documents or a replaceable adapter's unit lists."""
-        c, e, s, p, _, units = self.arrange(end_of_turn=end_of_turn, pre_roll_ms=pre_roll_ms)
+        c, e, s, p, _, units = self.arrange(
+            end_of_turn=end_of_turn, pre_roll_ms=pre_roll_ms, vad=vad
+        )
         c._enrolled_roles.exit_audio = c._private_sentence
         s.exit_score = Mock(return_value=EntryScore(0.9, None, 0, "scored"))
         pending = iter(windows)
@@ -910,11 +934,17 @@ class PrivacyMinimumTests(unittest.TestCase):
                 with self.subTest(gain=gain, extra=extra):
                     audio = [quiet * 10 + voiced * (50 + extra) + quiet * 72]
                     self.assertEqual(
-                        self.replay_private_windows(phrase, audio=audio, pre_roll_ms=240), expected
+                        self.replay_private_windows(
+                            phrase, vad=FixtureVad(quiet), audio=audio, pre_roll_ms=240
+                        ),
+                        expected,
                     )
             clipped = doc(segment("Jarvis, privacy off.", 0, 1000))
             self.assertEqual(
-                self.replay_private_windows(clipped, audio=[voiced * 50 + quiet * 72]), ([], 0)
+                self.replay_private_windows(
+                    clipped, vad=FixtureVad(quiet), audio=[voiced * 50 + quiet * 72]
+                ),
+                ([], 0),
             )
 
     def test_digital_silence_before_a_command_does_not_zero_the_ending_floor(self):
@@ -923,7 +953,10 @@ class PrivacyMinimumTests(unittest.TestCase):
         for lead in (SILENCE * 10, SILENCE * 10 + fan):
             with self.subTest(fan_lead=lead.endswith(fan)):
                 audio = [lead + voice * 50 + fan * 72]
-                self.assertEqual(self.replay_private_windows(phrase, audio=audio), (["exit"], 1))
+                self.assertEqual(
+                    self.replay_private_windows(phrase, vad=FixtureVad(fan), audio=audio),
+                    (["exit"], 1),
+                )
 
     def test_subframe_edges_over_50_and_100_hz_background_peaks(self):
         def frame(voice):
@@ -951,13 +984,18 @@ class PrivacyMinimumTests(unittest.TestCase):
                 ]
                 phrase = doc(segment("Jarvis, privacy off.", 200 + shift, 1200 + shift))
                 self.assertEqual(
-                    self.replay_private_windows(phrase, audio=audio, pre_roll_ms=240),
+                    self.replay_private_windows(
+                        phrase, vad=FixtureVad(fan), audio=audio, pre_roll_ms=240
+                    ),
                     (["exit"], 1),
                 )
                 if shift:
                     early = doc(segment("Jarvis, privacy off.", 200 + shift, 1199 + shift))
                     self.assertEqual(
-                        self.replay_private_windows(early, audio=audio, pre_roll_ms=240), ([], 0)
+                        self.replay_private_windows(
+                            early, vad=FixtureVad(fan), audio=audio, pre_roll_ms=240
+                        ),
+                        ([], 0),
                     )
 
     def test_whisper_period_in_verified_ending_silence_is_neither_repair_nor_voice(self):
@@ -1008,11 +1046,15 @@ class PrivacyMinimumTests(unittest.TestCase):
         for gain in (100, 1000):
             with self.subTest(gain=gain):
                 fan, voice = self.fan_frame(gain), self.fan_frame(gain, math.sqrt(10))
-                self.assertEqual(self.replay_private_windows(audio=[fan * 1200]), ([], 0))
+                self.assertEqual(
+                    self.replay_private_windows(vad=FixtureVad(fan), audio=[fan * 1200]), ([], 0)
+                )
                 audio = [SILENCE + fan * 10 + voice * 50 + fan * 72]
                 phrase = doc(segment("Jarvis, privacy off.", 220, 1220))
                 self.assertEqual(
-                    self.replay_private_windows(phrase, audio=audio, pre_roll_ms=240),
+                    self.replay_private_windows(
+                        phrase, vad=FixtureVad(fan), audio=audio, pre_roll_ms=240
+                    ),
                     (["exit"], 1),
                 )
 
@@ -1081,7 +1123,10 @@ class PrivacyMinimumTests(unittest.TestCase):
         word = onset + voice * 19 + offset
         audio = [fan * 10 + word + fan * 9 + word + fan * 72]
         doc_with_gap = doc(segment("Jarvis,", 30, 430), segment(" privacy off.", 630, 1030))
-        self.assertEqual(self.replay_private_windows(doc_with_gap, audio=audio), (["exit"], 1))
+        self.assertEqual(
+            self.replay_private_windows(doc_with_gap, vad=FixtureVad(fan), audio=audio),
+            (["exit"], 1),
+        )
 
     def test_partial_speaker_coverage_cannot_separate_an_exit_from_its_window(self):
         phrase = segment("Jarvis, start listening", 0, 100)

@@ -178,7 +178,7 @@ an error that names the rule; nothing is clamped. Both buffers stay in memory an
 never written. The values are read when RightyO starts, so a change takes effect at the
 next restart. Each `listen` session logs them once on stderr, in seconds only:
 `audio_retention speaker_ring_s=120 timeline_window_s=90`. The lab has no report channel
-and logs nothing.
+for these retention settings.
 
 An optional `"decision": {"provider": "jev", "allow_hosted": true}` is the file form of
 `listen --use-jev --allow-hosted`, for hosts that start `listen` with a fixed argument list.
@@ -197,6 +197,55 @@ a separate physical test.
 ```sh
 .venv/bin/rightyo prototype --config local/prototype.json --port 8766
 ```
+
+## Silero VAD for leaving Privacy by voice
+
+A voice exit needs speech and silence observations from a local Silero VAD worker.
+Provision the official `snakers4/silero-vad` ONNX file from tag `v5.1.2`. From the
+checkout root, fetch and verify the file in the ignored cache.
+
+```sh
+mkdir -p .cache
+curl -q --fail --show-error --proto '=https' \
+  --output .cache/silero_vad-v5.1.2.onnx \
+  https://raw.githubusercontent.com/snakers4/silero-vad/v5.1.2/src/silero_vad/data/silero_vad.onnx
+printf '%s  %s\n' \
+  2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f \
+  .cache/silero_vad-v5.1.2.onnx | shasum -a 256 -c -
+```
+
+Add this section to the local configuration, substituting absolute paths. The worker
+interpreter needs NumPy and ONNX Runtime. RightyO launches it in isolated mode,
+verifies the SHA-256 again and passes those same bytes to the CPU inference session.
+
+```json
+{
+  "silero_vad": {
+    "python": "/absolute/path/to/worker/bin/python",
+    "model": "/absolute/path/to/rightyo/.cache/silero_vad-v5.1.2.onnx"
+  }
+}
+```
+
+An absent configuration, missing or unreadable model, checksum mismatch, or worker
+failure disables voice exits for the session. The diagnostic on stderr gives the
+reason without paths, audio or transcript content. Host privacy controls and the
+status question remain available.
+
+The adversarial tests use generated tones and authored recognition. To run the four
+real-model cases against a provisioned interpreter, use the following command from
+the checkout. The tests default to the current interpreter and the cache path above.
+Set `RIGHTYO_SILERO_MODEL` to test a different local copy of the pinned file.
+
+```sh
+cd tests
+RIGHTYO_SILERO_PYTHON=/absolute/path/to/worker/bin/python PYTHONPATH=../src \
+  python3 -m unittest -v test_silero_vad.RealModelDecisions
+```
+
+The cases skip when the model or runtime is absent. A failed inference or an
+unexpected adversarial decision fails the test. The fake worker covers the same
+decision path in CI. Its results provide no measure of Silero's accuracy.
 
 ## Speech backends
 

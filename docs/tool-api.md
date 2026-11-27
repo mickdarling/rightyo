@@ -1858,16 +1858,17 @@ as "Will" or "May" can open an exit statement.
 
 Each fragment needs a complete utterance with an observed onset and a speech
 pause. Before the onset, the stream must have had at least 200 consecutive
-milliseconds judged speech-absent and well below the candidate's speech level.
-Steady background noise can qualify. The local experimental endpointer uses
-frame energy and periodicity and estimates a noise floor from nonzero background
-frames. A quiet period qualifies only the onset immediately following it.
-The supplied intervals for the name and each exit word must overlap observed
-speech. If the adapter supplies one interval for several words, that interval is
-the available timing evidence. Voice in a gap between original spoken tokens
-or beyond the final spoken token keeps privacy on.
-Coverage checks use the actual samples up to each timestamp, including partial
-20 ms frames. Punctuation supplies no speech timing. A speaker boundary
+milliseconds judged speech-absent by the pinned local Silero VAD. The worker scores
+consecutive 512-sample (32 ms) blocks at 16 kHz. A speech probability of at least
+0.5 marks the whole block as speech. Only observed blocks count toward either
+pause. A quiet period qualifies only the onset immediately following it.
+
+Each word's supplied timing must contain a complete speech block. A shared
+interval for several words supplies their common timing evidence. Voice in a gap
+between original spoken tokens or beyond the final spoken token keeps Privacy on,
+even when the gap intersects only part of a speech block. A missing or failed VAD
+disables voice exits. See [local setup and model pin](prototype.md#silero-vad-for-leaving-privacy-by-voice).
+Punctuation supplies no speech timing. A speaker boundary
 that divides the text, a forced ASR cut or its continuation, and an end-of-input
 flush also disqualify the fragment. So do lost text, a recognizer retry, textless timed
 units, and missing, repaired or overlapping word or token timing.

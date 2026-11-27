@@ -9,6 +9,7 @@ import json
 import math
 import queue
 import secrets
+import sys
 import threading
 import time
 import uuid
@@ -80,6 +81,7 @@ from rightyo.providers import (
     unavailable_decision,
 )
 from rightyo.self_voice import SelfVoiceConfig
+from rightyo.silero_vad import SileroVad, VadConfig, VadError
 from rightyo.smart_turn import EndOfTurn, SmartTurn, SmartTurnError
 from rightyo.speaker_id import SpeakerIdConfig
 from rightyo.speech_backends import (
@@ -375,6 +377,7 @@ class PrototypeConfig:
     speaker_ring_ms: int = RING_MS
     timeline_window_ms: int = TIMELINE_WINDOW_MS
     self_voice: SelfVoiceConfig = SelfVoiceConfig()
+    silero_vad: VadConfig | None = None
 
     @property
     def voiceprint_roles(self) -> bool:
@@ -418,6 +421,7 @@ class PrototypeConfig:
             synthetic = is_synthetic(transcriber) or is_synthetic(diarizer)
             if synthetic and (
                 not (is_synthetic(transcriber) and is_synthetic(diarizer))
+                or "silero_vad" in raw
                 or "end_of_turn" in raw
                 or "speaker_id" in raw
             ):
@@ -452,6 +456,7 @@ class PrototypeConfig:
                 "turns",
                 "dismissal",
                 "end_of_turn",
+                "silero_vad",
                 "conversation",
                 "acknowledgement",
                 "meeting",
@@ -493,6 +498,7 @@ class PrototypeConfig:
             ask_anywhere = meeting.get("ask_anywhere", True)
             if type(ask_anywhere) is not bool:
                 raise ValueError
+            silero_vad = VadConfig.from_dict(raw.pop("silero_vad")) if "silero_vad" in raw else None
             end_of_turn = raw.pop("end_of_turn", None)
             if end_of_turn is not None:
                 end_of_turn = EndOfTurn.from_dict(end_of_turn)
@@ -576,6 +582,7 @@ class PrototypeConfig:
                 word_label_coverage=coverage,
                 dismissal=dismissal,
                 end_of_turn=end_of_turn,
+                silero_vad=silero_vad,
                 conversation=conversation,
                 acknowledgement=acknowledgement,
                 meeting_ask_anywhere=ask_anywhere,
@@ -852,6 +859,7 @@ class PrototypeController:
             or self.audio_provenance != "synthetic"
             or hosted
             or self.config.hosted_decisions
+            or self.config.silero_vad is not None
             or self.config.end_of_turn is not None
             or self.config.speaker_id is not None
         ):
@@ -1294,6 +1302,21 @@ class PrototypeController:
             # Called just before the same turn is accepted, so this holds at most one id.
             self._turn_spans[utterance_id] = spans
 
+    def _silero_vad(self, stop):
+        settings = self.config.silero_vad
+        reason = "model and worker not configured"
+        if settings is not None:
+            try:
+                return SileroVad(settings, cancelled=stop.is_set)
+            except VadError as error:
+                reason = str(error)  # SileroVad maps wire errors to fixed reasons
+        print(
+            f"rightyo: Silero VAD {reason}; voice privacy exit disabled",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
     def _end_of_turn_model(self, stop):
         """Start the configured end-of-turn model, or None; never fails the session (#117)."""
         settings = self.config.end_of_turn
@@ -1481,8 +1504,9 @@ class PrototypeController:
             self._private_sentence.replace(turn, pcm)
 
     def _audio(self, generation, stop, session, work, memory, mode):
-        capture = processor = end_of_turn = shadow = None
+        capture = processor = end_of_turn = shadow = vad = None
         try:
+            vad = self._silero_vad(stop)
             end_of_turn = self._end_of_turn_model(stop)
             shadow = self._shadow_speaker_id()
             with self._lock:
@@ -1514,6 +1538,7 @@ class PrototypeController:
                     cancelled=stop.is_set,
                     report=self.report,
                     private=self._heard_private_span,
+                    silero_vad=vad,
                     on_private_turn_audio=lambda turn, pcm: self._private_turn_audio(
                         generation, turn, pcm
                     ),
@@ -1696,6 +1721,8 @@ class PrototypeController:
                 capture.stop()
             if processor is not None:
                 processor.close()
+            if vad is not None:
+                vad.close()
             if end_of_turn is not None:
                 end_of_turn.close()
             if shadow is not None:

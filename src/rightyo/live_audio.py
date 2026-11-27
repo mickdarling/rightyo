@@ -38,6 +38,7 @@ from typing import Any, Callable
 from .addressedness import reply_wait
 from .contracts import PROVENANCE, Turn, WordAttribution, identifier, utterance_scoped_speaker
 from .providers import Diarizer, Transcriber
+from .silero_vad import SpeechVad
 from .turn_merge import TurnMerger, complete_hold, merge_gap, owner_pause, tail_join
 
 SAMPLE_RATE = 16000
@@ -251,6 +252,8 @@ class LiveConfig:
     # turns bypass continuation holds so only the current sentence needs retaining.
     on_private_turn_audio: Callable[[Turn, memoryview], None] | None = None
 
+    silero_vad: SpeechVad | None = None
+
     def __post_init__(self) -> None:
         identifier(self.session_id, "session_id")
         timeline_window(self.timeline_window_ms)
@@ -300,6 +303,10 @@ class LiveConfig:
             or not 0 <= self.word_label_coverage <= 1
         ):
             raise LiveAudioError("Invalid word label coverage")
+        if self.silero_vad is not None and (
+            type(self.silero_vad.chunk_ms) is not int or not 1 <= self.silero_vad.chunk_ms <= 32
+        ):
+            raise LiveAudioError("Invalid VAD block size")
         if self.end_of_turn is not None and not callable(self.end_of_turn):
             raise LiveAudioError("Invalid end-of-turn model")
         if (
@@ -366,132 +373,6 @@ def _pcm_samples(pcm: bytes) -> array.array:
 def _frame_rms(frame: bytes) -> float:
     values = _pcm_samples(frame)
     return math.sqrt(sum(value * value for value in values) / len(values)) / 32768
-
-
-@dataclass(frozen=True)
-class _NoiseProfile:
-    # A Goertzel coefficient and power, when a low-frequency hum dominates.
-    hum: tuple[float, float] | None = None
-
-
-_NO_HUM = _NoiseProfile()
-# The three lowest non-DC bins of a 320-sample frame (50, 100 and 150 Hz).
-_HUM_COEFFICIENTS = tuple(2 * math.cos(2 * math.pi * k / 320) for k in (1, 2, 3))
-
-
-def _tone_power(samples: array.array, coefficient: float) -> float:
-    """Goertzel power in one frequency bin of a 20 ms frame."""
-    previous = older = 0.0
-    for sample in samples:
-        current = sample + coefficient * previous - older
-        older, previous = previous, current
-    return previous**2 + older**2 - coefficient * previous * older
-
-
-@dataclass(frozen=True)
-class _QuietPeriod:
-    peak_rms: float
-    end_ms: int
-    noise: _NoiseProfile
-
-
-class _PrivateEndpoint:
-    """Causal, local speech-absence evidence for a private recognition window."""
-
-    # RMS ratio (~3.5 dB), independent of microphone gain.
-    MARGIN = 1.5
-
-    def __init__(self):
-        self.background: deque[tuple[float, int]] = deque(maxlen=100)
-        self.quiet_rms = 0.0
-        self.quiet_peak = 0
-        self.quiet_run: deque[tuple[float, _NoiseProfile]] = deque(maxlen=10)
-        self.quiet_period: _QuietPeriod | None = None
-
-    @staticmethod
-    def noise_profile(frame: bytes) -> _NoiseProfile | None:
-        """Recognize rumble or aperiodic noise. Other frames may contain speech."""
-        samples = _pcm_samples(frame)
-        # A transition within the frame is not a steady background observation.
-        quarters = [sum(x * x for x in samples[i : i + 80]) for i in range(0, len(samples), 80)]
-        if min(quarters) < 0.05 * max(quarters):
-            return None
-        # Average to 4 kHz for the pitch check. A large DC component, including
-        # a constant-amplitude replay signal, supplies no noise evidence.
-        band = [sum(samples[i : i + 4]) for i in range(0, len(samples), 4)]
-        power = sum(v * v for v in band)
-        if not power or sum(band) ** 2 > 0.2 * len(band) * power:
-            return None
-        # A smooth low-frequency hum can be present throughout the stream.
-        # First-difference energy bounds its RMS frequency at about 120 Hz.
-        delta = sum((a - b) ** 2 for a, b in zip(band, band[1:]))
-        if delta < 0.036 * power:
-            hum = max(
-                ((c, _tone_power(samples, c)) for c in _HUM_COEFFICIENTS),
-                key=lambda item: item[1],
-            )
-            return _NoiseProfile(hum)
-        # Normalized autocorrelation over voice pitch periods (2 to 12 ms).
-        # A periodic frame cannot establish its own noise floor, at any gain.
-        for lag in range(8, 49):
-            left, right = band[:-lag], band[lag:]
-            dot = sum(a * b for a, b in zip(left, right))
-            if dot > 0 and dot * dot > 0.5 * sum(a * a for a in left) * sum(b * b for b in right):
-                return None
-        return _NO_HUM
-
-    def voiced(self, frame: bytes, rms: float, end_ms: int) -> bool:
-        noise = self.noise_profile(frame) if rms else _NO_HUM
-        if rms and noise is not None:
-            # A single low reading cannot lock out subsequent background frames.
-            # The spectral check admits floor observations independently of gain.
-            self.background.append((rms, max(map(abs, _pcm_samples(frame)))))
-            levels = sorted(self.background)
-            floor_rms, self.quiet_peak = levels[len(levels) // 10]
-            self.quiet_rms = floor_rms * self.MARGIN
-        voiced = noise is None or (len(self.background) >= 10 and rms > self.quiet_rms)
-        if voiced:
-            self.quiet_run.clear()
-            self.quiet_period = None
-        else:
-            self.quiet_run.append((rms, noise))
-            if len(self.quiet_run) == self.quiet_run.maxlen:
-                peak, profile = max(self.quiet_run, key=lambda item: item[0])
-                self.quiet_period = _QuietPeriod(peak, end_ms, profile)
-        return voiced
-
-    def voice_span(
-        self, pcm: bytearray, prior: _QuietPeriod, quiet_rms: float
-    ) -> tuple[int, int] | None:
-        # Re-evaluate the retained audio against the final floor. A rise in the
-        # level of background noise alone supplies no positive speech evidence.
-        first = last = None
-        peak_rms = max(quiet_rms, prior.peak_rms * self.MARGIN)
-        peak_at = None
-        for i in range(0, len(pcm), FRAME_BYTES):
-            frame = pcm[i : i + FRAME_BYTES]
-            rms = _frame_rms(frame)
-            if not rms:
-                continue
-            noise = self.noise_profile(frame)
-            if noise is not None and rms <= quiet_rms:
-                continue
-            if first is None:
-                first = i // BYTES_PER_MS
-            last = (i + len(frame)) // BYTES_PER_MS
-            if noise is None and rms > peak_rms:
-                peak_rms, peak_at = rms, i
-        if peak_at is None:
-            return None
-        if prior.noise.hum:
-            # A low pitched voice can resemble machinery. Require the putative
-            # hum to persist under the speech at its former level (within 3 dB).
-            # A tone that simply got louder or changed pitch is ambiguous.
-            coefficient, baseline = prior.noise.hum
-            peak = _pcm_samples(pcm[peak_at : peak_at + FRAME_BYTES])
-            if not baseline / 2 <= _tone_power(peak, coefficient) <= baseline * 2:
-                return None
-        return first, last
 
 
 class _ModelConfig(ctypes.Structure):
@@ -1446,8 +1327,8 @@ class _FinalizedWindow:
     private_cleared_through: int = 0
     # Exit evidence only. A natural end and an unclipped onset are both required.
     exit_voice_span: tuple[int, int] | None = None  # window-relative milliseconds
-    private_quiet_rms: float | None = None
-    private_quiet_peak: int = 0
+    vad_mask: bytes | None = None  # one label per ms, at the worker's native resolution
+    vad_block_ms: int = 0
 
     def release(self) -> None:
         """Discard owned PCM/text evidence; safe to repeat during shutdown."""
@@ -1464,8 +1345,7 @@ class _FinalizedWindow:
         self.window = None
         self.timeline = []
         self.exit_voice_span = None
-        self.private_quiet_rms = None
-        self.private_quiet_peak = 0
+        self.vad_mask = None
         # A released barrier has no recognizer metadata left to coalesce into.
         self.overflow = False
 
@@ -1477,6 +1357,7 @@ class _FinalizedWindow:
         return (
             1024
             + len(self.pcm)
+            + (len(self.vad_mask) if self.vad_mask is not None else 0)
             + 512 * len(self.timeline)
             + sum(512 + 4 * len(unit["text"]) for unit in self.units)
             + (512 * len(self.window.gaps) if self.window is not None else 0)
@@ -1667,32 +1548,16 @@ def _complete_exit_span(
         return None
     first, last = packet.exit_voice_span
     span = (intervals[0][0], intervals[-1][1])
-    if packet.private_quiet_rms is None:
+    if packet.vad_mask is None:
         return span if span[0] <= first and span[-1] >= last else None
 
-    def voiced_frame(frame: bytes) -> bool:
-        rms = _frame_rms(frame)
-        return rms > packet.private_quiet_rms or bool(
-            rms and _PrivateEndpoint.noise_profile(frame) is None
-        )
-
-    def has_voice(start: int, end: int, *, require_observed_frame: bool = False) -> bool:
-        while start < end:
-            frame_start = start // 20 * 20
-            stop = min(end, frame_start + 20)
-            frame = packet.pcm[start * BYTES_PER_MS : stop * BYTES_PER_MS]
-            if len(frame) == FRAME_BYTES:
-                if voiced_frame(frame):
-                    return True
-            # A short slice can consist entirely of background peaks. Compare
-            # its sample peak to the observed background peak in the same units.
-            elif max(map(abs, _pcm_samples(frame))) > packet.private_quiet_peak:
-                if not require_observed_frame or voiced_frame(
-                    packet.pcm[frame_start * BYTES_PER_MS : (frame_start + 20) * BYTES_PER_MS]
-                ):
-                    return True
-            start = stop
-        return False
+    def has_voice(start: int, end: int, *, whole_block: bool = False) -> bool:
+        if whole_block:
+            # A speech block straddling a word edge cannot establish speech on
+            # that word's side. For gaps, even part of a speech block vetoes exit.
+            start += -(packet.offset + start) % packet.vad_block_ms
+            end -= (packet.offset + end) % packet.vad_block_ms
+        return packet.vad_mask.find(b"\x01", start, end) >= 0
 
     previous = first
     covered_word = -1
@@ -1700,7 +1565,7 @@ def _complete_exit_span(
         if first_word > covered_word + 1 or has_voice(previous, min(start, last)):
             return None
         if last_word > covered_word and has_voice(
-            max(first, start), min(last, end), require_observed_frame=True
+            max(first, start), min(last, end), whole_block=True
         ):
             covered_word = last_word
         previous = max(previous, end)
@@ -1789,10 +1654,10 @@ class LiveProcessor:
         self._private_ranges: list[tuple[int, int]] = []
         self._private_cleared_through = 0  # audio-owner watermark, snapshotted per window
         self._private_lock = threading.Lock()
-        self._private_endpoint = _PrivateEndpoint() if config.private is not None else None
-        self._quiet_before_onset: _QuietPeriod | None = None
-        self._onset_quiet_rms = 0.0
-        self._onset_quiet_peak = 0
+        self._vad = config.silero_vad
+        self._vad_pending = bytearray()  # scored milliseconds at the head of _partial
+        self._vad_quiet_ms = 0
+        self._utterance_vad: bytearray | None = None
         self._frame_private = False
         self._diarizer_private_frames = 0
         self._privacy_uncertain = False
@@ -1911,14 +1776,53 @@ class LiveProcessor:
             ):
                 raise LiveAudioError("Audio session exceeded duration limit")
             self._partial.extend(pcm)
-            while len(self._partial) >= FRAME_BYTES:
-                frame = bytes(self._partial[:FRAME_BYTES])
-                del self._partial[:FRAME_BYTES]
-                self._frame(frame)
+            self._drain_frames()
         except Exception:
             self.failed = True
             self.close()
             raise
+
+    def _disable_vad(self) -> None:
+        self._vad = None
+        self._vad_pending.clear()
+        self._utterance_vad = None
+        print(
+            "rightyo: Silero VAD worker failed; voice privacy exit disabled",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    def _drain_frames(self, *, final: bool = False) -> None:
+        # Attribute each native VAD block to its own audio. A 20 ms ASR frame can
+        # straddle two 32 ms blocks. Wait for both before interpreting silence.
+        while len(self._partial) >= FRAME_BYTES:
+            mask = None
+            while self._vad is not None and len(self._vad_pending) < 20:
+                block = self._vad.chunk_ms
+                start = len(self._vad_pending) * BYTES_PER_MS
+                stop = start + block * BYTES_PER_MS
+                if stop > len(self._partial):
+                    if not final:
+                        return
+                    break  # an incomplete model block is never zero-padded
+                try:
+                    voice = self._vad.is_speech(bytes(self._partial[start:stop]))
+                    if type(voice) is not bool:
+                        raise ValueError
+                except Exception:  # never expose worker output or private content
+                    self._disable_vad()
+                    break
+                if self.closed:  # Stop may have released the input while the worker scored it.
+                    return
+                self._vad_pending.extend(bytes([voice]) * block)
+            if self.closed:
+                return
+            if len(self._vad_pending) >= 20:
+                mask = bytes(self._vad_pending[:20])
+            del self._vad_pending[:20]
+            frame = bytes(self._partial[:FRAME_BYTES])
+            del self._partial[:FRAME_BYTES]
+            self._frame(frame, mask)
 
     def reset_speakers(self, private_until_bytes: int | None = None, *, renew: bool = True) -> None:
         """Start a fresh diarizer once nothing is open (hailing-station #735 S-1): called when
@@ -2210,7 +2114,7 @@ class LiveProcessor:
             self._diarizer_pending -= 1
             self._diarizer_audited_bytes += len(pcm)
 
-    def _frame(self, frame: bytes) -> None:
+    def _frame(self, frame: bytes, mask: bytes | None) -> None:
         private, uncertain = self._diarizer_privacy(20)
         if self.config.private is not None:
             if private != self._frame_private:
@@ -2218,16 +2122,16 @@ class LiveProcessor:
                 # No frame between toggles means no private audio and no new text.
                 self._queue_merger_barrier("privacy")
                 self._frame_private = private
-        # Qualify absence on the continuous input clock, before a privacy cutoff
-        # can substitute zeros. Public ASR keeps its configured energy gate.
-        rms = _frame_rms(frame)
-        endpoint_voice = False
-        if self._private_endpoint is not None:
-            prior = self._private_endpoint.quiet_period
-            endpoint_voice = self._private_endpoint.voiced(frame, rms, self._received_ms + 20)
+        # The mask always describes original samples, before any privacy cutoff.
+        prior_quiet = self._vad_quiet_ms
+        if mask is None:
+            self._vad_quiet_ms = 0
+        elif b"\x01" in mask:
+            self._vad_quiet_ms = len(mask) - mask.rindex(1) - 1
+        else:
+            self._vad_quiet_ms += 20
         if self._private_until is not None:
             frame = self._private_cutoff(frame)
-            rms = _frame_rms(frame)
         # Renewed only once the privacy end is reached (#242 round 20): the controller counts a
         # chunk before pushing it, so the end can lie ahead, and the fresh diarizer must never
         # be fed a frame heard while private.
@@ -2247,12 +2151,23 @@ class LiveProcessor:
         self._push_diarizer(frame, private, uncertain)
         frame_start = self._received_ms
         self._received_ms += 20
-        voiced = endpoint_voice if private else rms >= self.config.energy_threshold
+        # Ordinary ASR can still recognize status when VAD is unavailable. Only
+        # a VAD-qualified private window ever receives private exit evidence.
+        voiced = (
+            any(mask)
+            if private and mask is not None
+            else (_frame_rms(frame) >= self.config.energy_threshold)
+        )
         if voiced and not self._utterance:
-            if self._private_endpoint is not None:
-                self._quiet_before_onset = prior
-                self._onset_quiet_rms = self._private_endpoint.quiet_rms
-                self._onset_quiet_peak = self._private_endpoint.quiet_peak
+            pre_roll_ms = len(self._pre_roll) * 20
+            if (
+                private
+                and mask is not None
+                and not uncertain
+                and prior_quiet >= pre_roll_ms
+                and prior_quiet + mask.index(1) >= 200
+            ):
+                self._utterance_vad = bytearray(pre_roll_ms)
             self._voice_start = frame_start
             self._utterance_start = frame_start - len(self._pre_roll) * 20
             self._utterance.extend(b"".join(self._pre_roll))
@@ -2261,6 +2176,10 @@ class LiveProcessor:
                 # Followed by detected speech, whether or not it yields text (#96).
                 self._merger.heard(frame_start)
         if self._utterance or voiced:
+            if mask is None or not private or uncertain:
+                self._utterance_vad = None
+            elif self._utterance_vad is not None:
+                self._utterance_vad.extend(mask)
             self._utterance.extend(frame)
             if voiced:
                 self._last_voice_ms = self._received_ms
@@ -2370,37 +2289,22 @@ class LiveProcessor:
         except Exception:  # noqa: BLE001 - fail closed: withhold the diagnostic
             return True
 
-    def _exit_voice_span(self, pcm: bytearray, natural_end: bool) -> tuple[int, int] | None:
+    def _exit_voice_span(self, natural_end: bool) -> tuple[int, int] | None:
         """Record the next continuation barrier and qualify this window's acoustic edges."""
         offset = self._utterance_start
         continuation = self._continuation_until_ms
         if not natural_end:
             self._continuation_until_ms = self._last_voice_ms + self.config.hangover_ms
             return None
-        endpoint = self._private_endpoint if self._frame_private else None
-        span = (self._voice_start - offset, self._last_voice_ms - offset)
-        if endpoint is not None:
-            if self._quiet_before_onset is None:
+        if self._frame_private:
+            mask = self._utterance_vad
+            if mask is None:
                 return None
-            # The ending pause can lower the floor. A louder interval during the
-            # decode window cannot retroactively turn its own samples into noise.
-            if not self._onset_quiet_rms or 0 < endpoint.quiet_rms < self._onset_quiet_rms:
-                self._onset_quiet_rms = endpoint.quiet_rms
-                self._onset_quiet_peak = endpoint.quiet_peak
-            span = endpoint.voice_span(pcm, self._quiet_before_onset, self._onset_quiet_rms)
-        if span is None:
-            self._continuation_until_ms = self._last_voice_ms + self.config.hangover_ms
-            return None
-        first, last = span
-        if offset + last > self._last_voice_ms:
-            # A lower final floor revealed voice during the presumed ending pause.
-            self._continuation_until_ms = offset + last + self.config.hangover_ms
-            return None
+            span = (mask.index(1), mask.rindex(1) + 1)
+        else:
+            span = (self._voice_start - offset, self._last_voice_ms - offset)
         self._continuation_until_ms = 0
-        if offset + first == 0 or offset + first < continuation:
-            return None
-        if endpoint is not None and offset + first < self._quiet_before_onset.end_ms:
-            # A pause after the candidate cannot qualify its onset retroactively.
+        if offset + span[0] == 0 or offset + span[0] < continuation:
             return None
         return span
 
@@ -2418,7 +2322,7 @@ class LiveProcessor:
             if self.closed:
                 return
             pcm = bytearray(self._utterance)
-            exit_span = self._exit_voice_span(pcm, natural_end)
+            exit_span = self._exit_voice_span(natural_end)
             packet = _FinalizedWindow(
                 pcm,
                 offset,
@@ -2439,12 +2343,8 @@ class LiveProcessor:
                 len(pcm) // BYTES_PER_MS,
                 bool(timeline),
                 exit_voice_span=exit_span,
-                private_quiet_rms=(
-                    self._onset_quiet_rms
-                    if exit_span and self._frame_private and self._private_endpoint is not None
-                    else None
-                ),
-                private_quiet_peak=self._onset_quiet_peak,
+                vad_mask=bytes(self._utterance_vad) if exit_span and self._utterance_vad else None,
+                vad_block_ms=self._vad.chunk_ms if self._vad is not None else 0,
                 private_cleared_through=self._private_cleared_through,
             )
             self._finalizing = packet
@@ -2475,6 +2375,7 @@ class LiveProcessor:
         finally:
             self._asr_process = None
         self._utterance.clear()
+        self._utterance_vad = None
         self._pre_roll.clear()
         self._drain_results()
         try:
@@ -2832,7 +2733,7 @@ class LiveProcessor:
             inferred = _attribute_edges(
                 attributed, evidence, self.config.edge_attribution_ms, blockers=edges
             )
-        if spoken_span is not None and packet.private_quiet_rms is not None:
+        if spoken_span is not None and packet.vad_mask is not None:
             # A punctuation point can lack a timeline label. Keep its text and
             # original privacy bounds with the private speech it punctuates.
             # An actual speaker division still disqualifies the entire window.
@@ -2928,6 +2829,12 @@ class LiveProcessor:
                 # Privacy wins a continuation tie: discard the held public prefix without
                 # publishing it, while keeping only this private sentence's PCM for exit.
                 self._merger.discard()
+                # ASR can outlive the worker that scored this window.
+                if self._vad is not None and not self._vad.available:
+                    self._disable_vad()
+                if self._vad is None or packet.vad_mask is None:
+                    self._recognition_loss_end_ms = offset + packet.duration_ms
+                    spoken_span = None
                 if len(kept) == 1 and spoken_span is not None:
                     group["start_ms"], group["end_ms"] = (offset + ms for ms in spoken_span)
                     group["acoustic_span_ms"] = tuple(offset + ms for ms in acoustic_span)
@@ -3003,6 +2910,7 @@ class LiveProcessor:
         if self.closed:
             return
         try:
+            self._drain_frames(final=True)
             # Any privacy end not reached yet is applied here, to the tail and what is buffered.
             pcm = self._private_cutoff(bytes(self._partial), final=True)
             self._partial.clear()
@@ -3068,6 +2976,8 @@ class LiveProcessor:
             if first:
                 self._merger.discard()
                 self._partial.clear()
+                self._vad_pending.clear()
+                self._utterance_vad = None
                 self._pre_roll.clear()
                 self._utterance.clear()
                 self._diarizer.close()

@@ -28,6 +28,7 @@ from test_live_speaker_id import (
     unit,
     wait_for,
 )
+from test_privacy_minimum import FixtureVad
 
 from rightyo import speaker_id
 from rightyo.contracts import Addressing, SpeakerPriority
@@ -845,6 +846,7 @@ class PrivateExitTests(unittest.TestCase):
                 transcriber=ScriptedTranscriber(("Synthetic public prefix", "synthetic tail")),
                 diarizer=ScriptedDiarizer(),
                 private=controller._heard_private_span,
+                silero_vad=FixtureVad(),
                 on_private_turn_audio=private_audio,
                 turn_merge_gap_ms=2000,
             ),
@@ -1048,6 +1050,7 @@ class PrivateExitTests(unittest.TestCase):
                 transcriber=recognizer,
                 diarizer=Timeline((200, 600, 1), (2040, 3040, 2)),
                 private=controller._heard_private_span,
+                silero_vad=FixtureVad(),
                 on_private_turn_audio=audio,
                 turn_merge_gap_ms=2000,
                 reply_wait_ms=2000,
@@ -1090,6 +1093,7 @@ class PrivateListenTests(unittest.TestCase):
                             **{key: str(asset) for key in local},
                             "addressing": {"names": ["Unit"]},
                             "speakers": {"owner": ["owner"]},
+                            "silero_vad": {"python": str(asset), "model": str(asset)},
                             "speaker_id": {
                                 "python": str(asset),
                                 "model": str(asset),
@@ -1151,6 +1155,7 @@ class PrivateListenTests(unittest.TestCase):
                     patch.dict(os.environ, {"HOME": directory}),
                     contextlib.chdir(root),
                     patch("sys.stderr", errors),
+                    patch("rightyo.prototype.SileroVad", return_value=FixtureVad()) as start_vad,
                 ):
                     result = listen(
                         args,
@@ -1159,6 +1164,7 @@ class PrivateListenTests(unittest.TestCase):
                         audio_input=io.BytesIO(bytes(200 * 32) + tone(1, f0) + bytes(32000 * 2)),
                     )
                 self.assertEqual(result, 0)
+                start_vad.assert_called_once()
                 self.assertEqual(set(root.rglob("*")), expected)
                 events = [json.loads(line) for line in output.getvalue().splitlines()]
                 self.assertEqual(events[0]["duck"], {"version": 3, "private": True})

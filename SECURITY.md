@@ -26,6 +26,11 @@ sample, feature and model output arrays. Each worker releases its request and se
 reply before reading again. Python cannot guarantee overwriting freed immutable data
 or temporary allocations inside NumPy and ONNX Runtime.
 
+The local Silero VAD worker checks the pinned model bytes before creating its ONNX
+session. Across consecutive blocks it keeps the 64 context samples and recurrent
+state required by the model. The controller receives speech labels only. A model or
+worker failure disables voice privacy exits for the session.
+
 Attention and transcript events are untrusted input, never authorization to execute privileged commands. Playback/echo must not fabricate user authority. Validate all event fields, lengths, timestamps, IDs, and bounds. Fail closed on malformed input.
 
 Do not post secrets or private conversations to issues. Until a dedicated reporting channel is chosen, contact the repository owner privately for sensitive reports. Use sanitized public-safe summaries for tracking.
