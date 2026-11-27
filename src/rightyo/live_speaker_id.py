@@ -1311,8 +1311,10 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         self._spans = None
         self.exit_audio: PrivateTurnAudio | None = None
 
-    def clear_exit_audio(self) -> None:
-        if self.exit_audio is not None:
+    def clear_exit_audio(self, turn=None) -> None:
+        if self.exit_audio is not None and (
+            turn is None or self.exit_audio.for_turn(turn) is not None
+        ):
             self.exit_audio.clear()
 
     def exit_voice(self, turn) -> str | None:

@@ -1337,6 +1337,10 @@ class SpeechEvents:
                             )
                         ):
                             binding = self._binding_exit_check(turn, inferred)
+                if binding is None:
+                    # No owner check will consume this turn. Silence may follow it
+                    # indefinitely, so wipe at classification, before publication.
+                    self._clear_exit_audio(turn)
             elif (
                 inferred
                 and self._role_sources
@@ -2066,11 +2070,14 @@ class SpeechEvents:
         self._private_counts["exit_refused"] += 1
         self._private_counts[f"exit_refused_{reason}"] += 1
 
-    def _clear_exit_audio(self):
+    def _clear_exit_audio(self, turn=None):
         clear = getattr(self._priority, "clear_exit_audio", None)
         if callable(clear):
             with contextlib.suppress(Exception):
-                clear()
+                if turn is None:
+                    clear()
+                else:
+                    clear(turn)
 
     def _exit_check(self, turn, inferred, *, binding=None):
         return self._exit_approval(turn, inferred, binding=binding)[0]

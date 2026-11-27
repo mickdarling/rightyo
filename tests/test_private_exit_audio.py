@@ -13,7 +13,7 @@ import unittest
 from argparse import Namespace
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from test_edge_attribution import Timeline, Units
 from test_live_speaker_id import (
@@ -29,6 +29,7 @@ from test_live_speaker_id import (
     wait_for,
 )
 
+from rightyo import speaker_id
 from rightyo.contracts import Addressing, SpeakerPriority
 from rightyo.live_audio import LiveConfig, LiveProcessor
 from rightyo.live_speaker_id import (
@@ -641,16 +642,18 @@ class PrivateExitTests(unittest.TestCase):
 
     def test_non_exit_status_and_unnamed_remainders_are_never_scored(self):
         harness = self.harness()
-        controller, _events, _roles = self.controller(harness)
+        controller, events, _roles = self.controller(harness)
         with patch.object(harness.shadow, "exit_score", wraps=harness.shadow.exit_score) as score:
-            previous = None
-            for index, text in enumerate(("synthetic token", "status", "privacy off")):
+            turns = ("synthetic token", "status", "are you recording?", "privacy off")
+            for index, text in enumerate(turns):
                 old = self.hear(controller, text, start=index * 1000)
-                self.assertTrue(any(old))
-                if previous is not None:
-                    self.assertFalse(any(previous))
-                previous = old
+                # The matcher has ruled out an exit. Waiting for another turn to wipe
+                # this one would keep unrelated private speech indefinitely in silence.
+                self.assertEqual(len(old), 32000)
+                self.assertFalse(any(old))
+                self.assertFalse(controller._private_sentence.pcm)
             score.assert_not_called()
+        self.assertEqual([event.get("action") for event in events.drain()], ["status"])
         self.assertEqual(harness.embedder.calls, 0)
         self.assertEqual(harness.shadow._labels, {})
 
@@ -668,6 +671,27 @@ class PrivateExitTests(unittest.TestCase):
         self.assertEqual(harness.shadow._bound_ids, {"guest"})
         self.assertEqual(harness.shadow.scored_seconds, 3)
         self.assertEqual(harness.shadow.offered, 0)
+
+    def test_classifying_another_turn_does_not_wipe_the_candidate_being_verified(self):
+        harness = self.harness()
+        controller, events, _roles = self.controller(harness)
+        candidate = replace(turn(1000, 2000), text=EXIT)
+        controller._private_turn_audio(
+            controller._generation, candidate, memoryview(tone(1, OWNER_F0))
+        )
+        old = controller._private_sentence.pcm
+        score = harness.shadow.exit_score
+
+        def score_after_non_exit(pcm, owners):
+            events.prepare_transcript(replace(turn(0, 1000), text="synthetic token"))
+            return score(pcm, owners)
+
+        with patch.object(harness.shadow, "exit_score", side_effect=score_after_non_exit):
+            checks = events.prepare_transcript(candidate)
+        self.assertFalse(any(old))
+        self.assertFalse(controller._private_sentence.pcm)
+        events.transcript(candidate, now_ms=2000, voice_checks=checks)
+        self.assertEqual([event.get("action") for event in events.drain()], ["exit"])
 
     def test_wipes_on_unavailable_short_and_embedder_exception(self):
         for embedder, seconds in ((ScriptedEmbedder(fail_on=1), 1), (ToneEmbedder(), 0.2)):
@@ -761,7 +785,12 @@ class PrivateExitTests(unittest.TestCase):
             with self.subTest(action=action):
                 harness = self.harness()
                 controller, events, _roles = self.controller(harness)
-                old = self.hear(controller, "synthetic token")
+                # Interrupt a pending exit before the matcher or scorer wipes its audio.
+                candidate = replace(turn(0, 1000), text=EXIT)
+                controller._private_turn_audio(
+                    controller._generation, candidate, memoryview(tone(1))
+                )
+                old = controller._private_sentence.pcm
                 self.assertTrue(any(old))
                 if action == "off":
                     controller.duck(False)
@@ -1143,6 +1172,30 @@ class PrivateListenTests(unittest.TestCase):
 
 
 class PrivatePipeTests(unittest.TestCase):
+    def test_private_worker_wipes_pcm_features_and_both_embedding_arrays(self):
+        header = b'{"command":"embed_private","size":2}\n'
+        source = io.BytesIO(header + b"\x01\x02")
+        request = json.loads(header)
+        protocol, np, session = io.StringIO(), Mock(), Mock()
+        samples, features, output, vector = MagicMock(), MagicMock(), Mock(), Mock()
+        np.frombuffer.return_value.astype.return_value = samples
+        samples.__itruediv__.return_value = samples
+        session.run.return_value = [output]
+        np.asarray.return_value.reshape.return_value = vector
+        vector.tolist.return_value = [0.25, -0.75]
+
+        with (
+            patch.object(speaker_id.json, "loads", return_value=request),
+            patch.object(speaker_id, "_kaldi_fbank", return_value=features),
+        ):
+            self.assertTrue(speaker_id._embed_request(source, protocol, np, session, "input"))
+        self.assertEqual(request, {})
+        self.assertEqual(np.frombuffer.call_args.args[0], bytearray(2))
+        for scratch in (samples, features, output, vector):
+            scratch.fill.assert_called_once_with(0)
+        self.assertEqual(vector.tolist.return_value, [])
+        self.assertEqual(json.loads(protocol.getvalue()), {"ok": True, "embedding": [0.25, -0.75]})
+
     def test_worker_reads_mutable_pcm_and_wipes_partial_reads_on_failure(self):
         payload = tone(0.5)
         pcm = _read_private_pcm(io.BytesIO(payload), len(payload))

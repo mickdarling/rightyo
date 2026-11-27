@@ -1813,8 +1813,8 @@ the matcher.
 The live speaker-identification ring (`audio_retention.speaker_ring_seconds`) receives
 silence of the same length for every chunk received while privacy is on, so none of that
 audio enters that ring and its stream offsets stay aligned. Public ring feeding and scoring
-are unchanged. A separate **single-sentence RAM buffer** holds only the most recent
-finalized private turn's exact PCM span, for the exit check alone
+are unchanged. A separate **single-sentence RAM buffer** holds the finalized private
+turn's exact PCM span during exit matching and, for a candidate, owner verification
 ([hailing-station #946](https://github.com/mickdarling/hailing-station/issues/946), step 1;
 the refined #735 option (a), 2026-10-27). It is a mutable `bytearray`, capped at
 **320,000 bytes: 10 s of mono 16 kHz s16le**. A longer or incompletely available turn
@@ -1827,7 +1827,8 @@ utterance/pre-roll audio; there is no additional streaming private ring or archi
 
 Only a complete named exit phrase or a name-only fragment matched by the existing local
 matcher (`exit`, `name`, or `rest` completing an accepted split-name fragment) can invoke
-the scorer. Other non-exit turns, unnamed remainders and status questions are never scored.
+the scorer. When the matcher rules out an exit, it immediately wipes and releases
+the sentence, including for an unnamed remainder or a status question alone.
 Every exit check, including a name fragment's check,
 wipes and releases the sentence immediately after the check, whether a binding already
 passed, the voice passed, a precheck refused, or
@@ -1843,13 +1844,11 @@ accumulation, written to disk, logged, or sent to hosted speech. The retained se
 buffer and some owned scratch copies are explicitly wiped; this is not a claim to erase
 OS/runtime/model internal allocations.
 
-Retained while private: the single rolling buffer holding the most recent finalized
-private turn, in RAM, zeroed on overwrite, after any exit check and at privacy-off or
-stop. Some owned scratch copies (the scorer input, returned samples, worker PCM and
-features) are zeroed; transient library copies (speech filtering, NumPy feature
-extraction, ONNX Runtime internals) are freed, not zeroed, when the check returns.
-These transient copies exist only for the check's duration. They never reach disk, logs
-or the network. Python cannot guarantee that freed memory is overwritten.
+Before the local Smart Turn or owner-verification worker reads its next request, it
+zeros the mutable private PCM, samples, features and model output, including the
+owner-verification embedding. The request and serialized reply go out of scope with
+that exchange. Python cannot guarantee overwriting freed immutable data or temporary
+allocations inside NumPy and ONNX Runtime.
 
 The local recognizer, diarizer and end-of-turn model still hear the audio in memory, in
 order to run (the open utterance's PCM). Nothing is written to disk, even briefly: the
