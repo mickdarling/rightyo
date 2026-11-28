@@ -8,8 +8,8 @@ Remote audio must use authenticated encrypted transport and an authorized source
 
 In privacy mode, the local tool retains at most one finalized sentence's PCM in a
 mutable RAM buffer (10 s / 320,000 bytes at mono 16 kHz s16le), exclusively to check a
-named exit phrase or either fragment of a split exit. Each fragment must independently
-pass the owner check; unlabelled private processor turns use only their isolated voice.
+named exit phrase or either fragment of a split exit. The name and phrase each require their own
+owner verification, including when recognized together; unlabelled private processor turns use only their isolated voice.
 Oversized or incomplete sentences refuse the voice check.
 The matcher immediately zeros and releases the buffer when the turn is ineligible for
 an exit check. For a candidate, verification wipes the buffer on every outcome.
@@ -25,6 +25,11 @@ The local Smart Turn and owner-verification workers zero their mutable private P
 sample, feature and model output arrays. Each worker releases its request and serialized
 reply before reading again. Python cannot guarantee overwriting freed immutable data
 or temporary allocations inside NumPy and ONNX Runtime.
+
+The local Silero VAD worker checks the pinned model bytes before creating its ONNX
+session. Across consecutive blocks it keeps the 64 context samples and recurrent
+state required by the model. The controller receives speech labels only. A model or
+worker failure disables voice privacy exits for the session.
 
 Attention and transcript events are untrusted input, never authorization to execute privileged commands. Playback/echo must not fabricate user authority. Validate all event fields, lengths, timestamps, IDs, and bounds. Fail closed on malformed input.
 

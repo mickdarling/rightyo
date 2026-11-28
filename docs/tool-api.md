@@ -1728,11 +1728,18 @@ The only events a private turn can produce carry no words:
 {"schema_version": 1, "type": "privacy", "session_id": "…", "sequence": 8, "emitted_at_ms": 53900, "action": "status"}
 ```
 
-- **`action: "exit"`**: the enrolled owner named the assistant and asked to come back:
-  "<name>, I'm back" (or "I am back"), "<name>, start listening", "<name>, privacy off"
-  (or "privacy mode off"). It needs a configured name or variant of up to three words,
-  directly followed by the phrase. rightyo does not leave privacy mode itself: the host
-  decides and sends the privacy-off control.
+- **`action: "exit"`**: **A privacy exit must be a statement.** As the enrolled owner,
+  pause before the assistant's configured name or variant (up to three words), or
+  start a new sentence with it. Say "Jarvis, privacy off.", "Hey Jarvis, please
+  start listening." or "That's enough of that. Jarvis, I'm back." The phrases
+  "privacy mode off" and "I am back" also work. If the recognizer writes
+  "that's enough of that Jarvis I'm back" as one sentence, privacy stays on.
+  The host decides whether to send the privacy-off control.
+
+  Privacy stays on if you ask "Jarvis, can you turn privacy off?", add extra words
+  after the phrase (apart from "now", "please" or "again"), or RightyO recognises
+  only part of the turn. A refused exit is silent today. Say the phrase again as a
+  statement. Visible feedback is tracked in [rightyo#353](https://github.com/mickdarling/rightyo/issues/353).
 - **`action: "status"`**: anyone asked "what mode am I in", "are you recording" or "are
   you listening", with or without the name. The host answers from its own state.
 
@@ -1828,19 +1835,108 @@ is discarded, words and all; otherwise it is released at once on its own. So not
 the end can be joined to a private turn, and the first public request after privacy is decided
 on its own instead of being dropped with the private turn it was joined to.
 
-The phrases match loosely: anywhere in the turn, ignoring case, punctuation and filler
-("um", "uh", "ok", "okay", "so", "hey", "well", "please" and similar). A filler word that
-is part of a configured name or variant ("Okay", "Hey Jarvis") is kept only where it is
-matched as part of that name; everywhere else it is still filler, so with a variant "Please
-Jarvis", "Jarvis, please, I'm back" still exits. "Don't" or "do not" in the three words
-before the phrase (before the name, for the exit) means no match.
+Status phrases can occur anywhere in the turn. "Don't" or "do not" in the three
+words before a status phrase blocks it.
 
-A split exit is the enrolled owner's lone name fragment ("Jarvis,") heard while privacy
-is on, followed within 4 seconds by a turn that starts with an exit phrase. Both turns
-must authenticate: each may pass its own binding check or an isolated voice check on
+For an exit, the name must open the turn or a new sentence. A period, exclamation
+mark, question mark, semicolon or newline marks a sentence break. Only "um",
+"uh", "ok", "okay", "hey", "so", "please" and "well" may come before the name
+in its sentence or between
+the name and the phrase. "Um, ok Jarvis, so, I'm back" qualifies. "I heard
+Jarvis start listening" stays private. A nearby negation before the name also
+blocks the exit.
+
+In a single-turn exit, the configured name and all words of the exit phrase
+must belong to one sentence. Both "Jarvis; privacy off." and "Jarvis, start;
+listening." keep privacy on. Unicode line breaks also end a sentence. A three-dot
+pause before the phrase is allowed in "Jarvis... privacy off." Only "now",
+"please" and "again" may follow the phrase, in any combination.
+"Jarvis, I'm back, please" qualifies. "Jarvis, I'm back, okay" and "Jarvis,
+start listening to the podcast" stay private. Words in any script count.
+Question punctuation in the exit sentence or a question opener after the
+name blocks the exit. "Really? Jarvis, start listening." qualifies.
+"Jarvis, start listening?" stays private. A configured name or variant such
+as "Will" or "May" can open an exit statement.
+
+Each fragment needs a complete utterance with an observed onset and a speech
+pause. Before the onset, the stream must have had at least 200 consecutive
+milliseconds judged speech-absent by the pinned local Silero VAD. The worker scores
+consecutive 512-sample (32 ms) blocks at 16 kHz. A speech probability of at least
+0.5 marks the whole block as speech. Only observed blocks count toward either
+pause. A quiet period qualifies only the onset immediately following it.
+
+The fixed **1,728 ms (54 native blocks)** confirmation window starts at the latest
+of the recognized final-word end, the end of its last associated Silero speech block,
+and any acoustically continuous final-word audio observed in the recognition window.
+The processor counts observed audio from that end, independent of ASR close.
+It waits for the complete native block covering the deadline before checking the
+owner for a complete exit or either split fragment. Resumed speech cancels the
+candidate even on that last block. An independently matched status question in
+the same private turn still emits its status event after a cancellation, including
+after speakers are forgotten. Its timestamp follows the session clock at
+publication. A partial block at end of input cannot complete the window.
+
+The 2026-11-27 operator ruling uses the maximum lag among grid cells that Silero
+detects within 2 s, plus 2 blocks. The round-18 synthetic replay maximum in that
+interval was 1,652 ms at 200 counts RMS with a 420 ms lead-in. Adding 64 ms
+and rounding up to a whole block gives 1,728 ms. At publication the processor
+rechecks the current privacy session, owner approval, speaker and playback
+evidence, and requires a fresh round-trip to the VAD worker.
+[Full detection-lag grid and clean control](prototype.md#post-end-confirmation-window-basis)
+
+The pinned VAD can judge a very quiet speech-like onset at stream start as
+absent. An exit in that case also requires ASR to omit the opening words.
+If ASR retains them ahead of the configured name in the same sentence, the
+sentence-initial name rule (R1) refuses the exit. The residual tail limit is a
+speech-like continuation that the pinned VAD first detects later than the window
+after the command's acoustic end. If the other gates pass, the exit can commit
+before detection. The three starred grid cells illustrate this limit with
+generated signals and authored recognition. The owner-clip install gate below
+supplies the required real-speech evidence.
+
+R4 and R4b cover continuing speech as judged by the pinned VAD. Continuing
+non-speech sound such as a tone, hum or music does not block an exit after a
+genuine exit phrase. Before any install, the owner-clip speech-continues negative
+must prove that real speech continuing beyond the recognized phrase keeps privacy
+on, with zero owner checks and zero exits. [Owner-clip replay](prototype.md#owner-clip-replay-for-350)
+
+Each word's supplied timing must contain a complete speech block. Consecutive
+subword timings of the same word can cover that block together when they touch. A shared
+interval for several words supplies their common timing evidence. A native block may
+straddle the first word's start or the final word's end. A whole speech block outside
+those bounds keeps privacy on. Any detected speech in a gap between original spoken
+tokens also keeps privacy on. Initial positive blocks can supply local recognition
+for a status question. Exit eligibility still requires the preceding observed absence.
+The worker must answer a fresh, bounded probe after owner verification to authorize
+publication. A missing or unresponsive VAD disables voice exits. See [local setup and model pin](prototype.md#silero-vad-for-leaving-privacy-by-voice).
+Punctuation supplies no speech timing. A speaker boundary
+that divides the text, a forced ASR cut or its continuation, and an end-of-input
+flush also disqualify the fragment. So do lost text, a recognizer retry, textless timed
+units, and missing, repaired or overlapping word or token timing.
+
+A split exit accepts the name at the beginning of its sentence under the same
+rule. The processor measures the 4 seconds from the observed acoustic end of
+the name utterance to the onset of the next utterance. "We're done. Jarvis,"
+followed within that window by "Privacy off." qualifies
+when both turns are heard in privacy and authenticate as the owner. The same fillers
+may surround the name or precede the phrase, and the same trailing words may
+follow it. For example, "May," followed by "I'm back." qualifies when "May"
+is configured. A recognition loss between the fragments breaks the pair.
+Both turns must authenticate. Each may pass its own binding check or an isolated voice check on
 its own buffered audio alone. Private processor turns are unlabelled, so both fragments
-must pass their own isolated voice checks. A guest or a TV supplying the name never
-counts. Any other turn between them, private or not, and any change of
+must pass their own isolated voice checks. In a single recognition the verifier
+checks the configured name's timed audio and the exit phrase's timed audio
+separately. A split fragment supplies only its own matched tokens. Earlier
+sentences, fillers and intervening audio are excluded. Missing or shared times
+that prevent isolation, or insufficient speech after trimming either part, keep
+privacy on.
+The three-dot vocative pause may fall on either side of the split. Other sentence
+boundaries at the join break the pair. Forgetting speakers or changing the verification
+generation also revokes the name. The remainder rechecks the original speaker's
+binding revision and playback exclusion over the name's span, including the
+300 ms margin, before it can emit an exit. A confirming candidate retains an
+applicable playback veto even after that report leaves the recent playback history.
+A guest or a TV supplying the name never counts. Any other turn between them, private or not, and any change of
 the mode, ends it, and a name piece released after the off (heard across it) never
 starts one. Private finalized pieces bypass continuation holds and wake joining: each
 piece replaces the retained sentence, and each half of a split exit authenticates its
@@ -1867,13 +1963,16 @@ retains no audio and cannot pass the new voice check: scoring a clipped fragment
 omit another voice's words. The previous sentence is overwritten with zeros in place
 before replacement and release, so references to the old object see zeros. The new
 buffer contains no public prefix if privacy began mid-turn; that crossing turn refuses.
-Between finalized turns, only the existing bounded local ASR assembly holds current
-utterance/pre-roll audio; there is no additional streaming private ring or archive.
+Between finalized turns, the bounded local ASR assembly holds the current utterance
+and pre-roll. The Silero worker keeps the last 64 samples of audio context until
+its next block or shutdown, along with the recurrent state required by the model.
 
 Only a complete named exit phrase or a name-only fragment matched by the existing local
 matcher (`exit`, `name`, or `rest` completing an accepted split-name fragment) can invoke
 the scorer. When the matcher rules out an exit, it immediately wipes and releases
 the sentence, including for an unnamed remainder or a status question alone.
+During confirmation the buffer retains only the matched token audio, with a
+separate range for each part that requires verification. Cancellation and end of input wipe it.
 Every exit check, including a name fragment's check,
 wipes and releases the sentence immediately after the check, whether a binding already
 passed, the voice passed, a precheck refused, or

@@ -109,25 +109,85 @@ class PrivateTurnAudio:
     def __init__(self):
         self.pcm = bytearray()
         self.key = None
+        self._part_ends = ()
+        self._lock = threading.RLock()
 
     @staticmethod
     def _key(turn):
         return (turn.session_id, turn.utterance_id, turn.start_ms, turn.end_ms)
 
     def replace(self, turn, pcm) -> None:
-        self.clear()
-        self.key = self._key(turn)
-        expected = (turn.end_ms - turn.start_ms) * BYTES_PER_MS
-        if len(pcm) == expected and 0 < expected <= PRIVATE_TURN_MAX_BYTES:
-            self.pcm.extend(memoryview(pcm))
+        with self._lock:
+            self.clear()
+            self.key = self._key(turn)
+            expected = (turn.end_ms - turn.start_ms) * BYTES_PER_MS
+            if (
+                turn.recognition_complete
+                and len(pcm) == expected
+                and 0 < expected <= PRIVATE_TURN_MAX_BYTES
+            ):
+                self.pcm.extend(memoryview(pcm))
 
     def for_turn(self, turn):
-        return self.pcm if self.key == self._key(turn) else None
+        with self._lock:
+            return self.pcm if self.key == self._key(turn) else None
 
-    def clear(self) -> None:
-        wipe(self.pcm)
-        self.pcm = bytearray()
-        self.key = None
+    def selected_parts(self, turn):
+        with self._lock:
+            pcm = self.for_turn(turn)
+            if not pcm or not self._part_ends:
+                return ()
+            if len(self._part_ends) == 1:
+                return (pcm,)
+            view = memoryview(pcm)
+            return tuple(view[a:b] for a, b in zip((0, *self._part_ends), self._part_ends))
+
+    def select(self, turn, spans) -> bool:
+        """Isolate each matched part. A shared timestamp cannot identify a speaker handoff."""
+        with self._lock:
+            pcm = self.for_turn(turn)
+            if not pcm or not spans or self._part_ends:
+                return False
+            if not turn.exit_timings and len(spans) == 1 and turn.acoustic_span_ms is None:
+                left, right = spans[0]
+                if not any(ch.isalnum() for ch in turn.text[:left] + turn.text[right:]):
+                    # A whole authored split fragment already has its own isolated audio.
+                    self._part_ends = (len(pcm),)
+                    return True
+            pieces, ends = [], []
+            size = 0
+            previous_end = turn.start_ms
+            for left, right in spans:
+                cursor = left
+                for first, last, start, end in turn.exit_timings:
+                    if first < right and left < last:
+                        if (
+                            not cursor <= first < last <= right
+                            or not previous_end <= start < end <= turn.end_ms
+                            or any(ch.isalnum() for ch in turn.text[cursor:first])
+                        ):
+                            return False
+                        first_byte = (start - turn.start_ms) * BYTES_PER_MS
+                        past_byte = (end - turn.start_ms) * BYTES_PER_MS
+                        pieces.append(memoryview(pcm)[first_byte:past_byte])
+                        size += past_byte - first_byte
+                        cursor, previous_end = last, end
+                if cursor == left or any(ch.isalnum() for ch in turn.text[cursor:right]):
+                    return False
+                ends.append(size)
+            if size != len(pcm):
+                self.pcm = bytearray().join(pieces)
+                wipe(pcm)
+            self._part_ends = tuple(ends)
+            return True
+
+    def clear(self, turn=None) -> None:
+        with self._lock:
+            if turn is None or self.key == self._key(turn):
+                wipe(self.pcm)
+                self.pcm = bytearray()
+                self.key = None
+                self._part_ends = ()
 
 
 class _ExitCheck:
@@ -1263,7 +1323,7 @@ class ShadowSpeakerId:
         except Exception:  # noqa: BLE001 - a check that fails refuses, never raises
             return EntryScore(None, None, 0, "unavailable")
 
-    def exit_score(self, pcm: bytearray, owners) -> EntryScore:
+    def exit_score(self, pcm: bytearray | memoryview, owners) -> EntryScore:
         """Score only an exit candidate, without binding, accumulation or immutable PCM.
 
         Always wipes the borrowed buffer, including unavailable/busy/timeout/error.
@@ -1497,12 +1557,13 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         self.exit_audio: PrivateTurnAudio | None = None
 
     def clear_exit_audio(self, turn=None) -> None:
-        if self.exit_audio is not None and (
-            turn is None or self.exit_audio.for_turn(turn) is not None
-        ):
-            self.exit_audio.clear()
+        if self.exit_audio is not None:
+            self.exit_audio.clear(turn)
 
-    def exit_voice(self, turn) -> str | None:
+    def select_exit_audio(self, turn, match):
+        return self.exit_audio is not None and self.exit_audio.select(turn, match)
+
+    def exit_voice(self, turn, match) -> str | None:
         """Fixed outcome for this turn's isolated exit check; None for legacy callers.
 
         Uses entry_threshold and entry_min_seconds, never a label or accumulated voice.
@@ -1511,22 +1572,33 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         if self.exit_audio is None:
             return None
         try:
-            pcm = self.exit_audio.for_turn(turn)
+            if match is not None and not self.select_exit_audio(turn, match):
+                return "voice_unavailable"
+            parts = self.exit_audio.selected_parts(turn)
             source = self.source
             check = getattr(source, "exit_score", None)
-            if not callable(check) or not pcm or turn.overlap:
+            if not callable(check) or not parts or turn.overlap:
                 return "voice_unavailable"
-            result = check(pcm, self.priority.owners)
-            score = result.labelled
-            if result.outcome != "scored" or type(score) is not float or not math.isfinite(score):
-                return "voice_unavailable"
-            passed = score >= source.settings.entry_threshold
-            source._report(f"speaker_id exit_check score={score:.3f}")
-            return "pass" if passed else "voice_below_threshold"
+            for index, pcm in enumerate(parts):
+                if index and turn.exit_available is not None and not turn.exit_available():
+                    return "voice_unavailable"
+                result = check(pcm, self.priority.owners)
+                score = result.labelled
+                if (
+                    result.outcome != "scored"
+                    or type(score) is not float
+                    or not math.isfinite(score)
+                ):
+                    return "voice_unavailable"
+                source._report(f"speaker_id exit_check score={score:.3f}")
+                passed = score >= source.settings.entry_threshold
+                if not passed:
+                    return "voice_below_threshold"
+            return "pass"
         except Exception:  # noqa: BLE001 - private failures never reach logs
             return "voice_unavailable"
         finally:
-            self.clear_exit_audio()
+            self.clear_exit_audio(turn)
 
     def role_for(self, turn) -> str:
         self._resolved = None

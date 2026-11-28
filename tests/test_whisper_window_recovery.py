@@ -755,6 +755,50 @@ class WhisperWindowRecoveryTests(unittest.TestCase):
         self.assertEqual(processor.skipped_utterances, 1)
         self.assertTrue(all("PUBLIC_AFTER_REJECTION" not in report for report in reports))
 
+    def test_overflow_barrier_drops_thousand_token_timings_and_vad_mask(self):
+        processor, _, _, entered, release, _, _, decode = self.blocked_retry()
+        tokens = [segment(" a", i, i + 1) for i in range(1000)]
+        result = _recognizer_window(doc({**segment(" a" * 1000, 0, 1000), "tokens": tokens}), 2000)
+        self.assertEqual(len(result.spoken_intervals), 1000)
+        packet = _FinalizedWindow(
+            bytearray(2000 * BYTES_PER_MS),
+            2000,
+            4000,
+            2000,
+            2,
+            [],
+            "causal-replay",
+            True,
+            result.units,
+            result,
+            (0, 0),
+            2000,
+            False,
+            exit_voice_span=(0, 1000),
+            vad_mask=bytes(2000),
+            vad_block_ms=32,
+        )
+        price = packet.held_bytes(compacted=True)
+        with (
+            patch("rightyo.live_audio._transcribe", side_effect=decode),
+            patch("rightyo.live_audio.ASR_HELD_BYTES", price),
+        ):
+            try:
+                self.feed(processor)
+                self.assertTrue(entered.wait(2))
+                processor._queue_window(packet)
+                self.assertIs(processor._waiting[-1], packet)
+                self.assertTrue(packet.overflow)
+                self.assertEqual(packet.held_bytes(), price)
+                self.assertIsNone(packet.window.spoken_intervals)
+                self.assertIsNone(packet.vad_mask)
+                self.assertLessEqual(
+                    sum(p.held_bytes() for p in processor._waiting if not p.retry_pending), price
+                )
+            finally:
+                release.set()
+            processor.finish()
+
     def test_public_rejection_keeps_pcm_when_callback_frees_retry_slot(self):
         processor, turns, reports = self.processor()
         entered, release = threading.Event(), threading.Event()

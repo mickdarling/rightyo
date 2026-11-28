@@ -14,6 +14,13 @@ The [official Whisper README](https://github.com/openai/whisper#license) states 
 
 Audit each actual base model revision and checksum, fork/runtime, dependency, teacher model, dataset, and generated training corpus. Do not assume all Whisper-named models have OpenAI Whisper's license. Reject incompatible or noncommercial dependencies for the intended open release, or record a different explicit disposition before reuse.
 
+## Silero voice activity detector
+
+Voice privacy exit uses the unmodified ONNX model from the official
+`snakers4/silero-vad` tag `v5.1.2`. Operators provision it separately. The setup
+guide records the exact artifact and SHA-256. [Model setup](prototype.md#silero-vad-for-leaving-privacy-by-voice)
+and [tagged upstream license](https://github.com/snakers4/silero-vad/blob/v5.1.2/LICENSE).
+
 ## Speaker embedding model
 
 `rightyo enroll` ([speaker enrollment](speaker-enrollment.md)) uses a separately provisioned

@@ -25,6 +25,7 @@ assistant is the decision model's judgement (or the exact configured stop phrase
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 from .contracts import Addressing, ContractError, normalize_phrase
@@ -157,6 +158,8 @@ def _utterance_scope(speaker: str) -> str:
 
 
 _WORDS = re.compile(r"[a-z']+")
+# Unicode line boundaries recognized by str.splitlines().
+LINE_BREAKS = "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
 _FILLERS = frozenset(
     "hey ok okay so and um uh oh well now then also actually alright right yeah yes".split()
 )
@@ -167,13 +170,35 @@ _IMPERATIVES = frozenset(
     help schedule cancel email text message note book order explain summarize translate
     """.split()
 )
-_OPENERS = _IMPERATIVES | frozenset(
-    """
-    can could would will should shall may might please
-    what what's whats when where where's which who who's whom whose why how how's
-    is are am was were do does did have has
-    """.split()
+_AUXILIARIES = frozenset(
+    "can could would will should shall may might is are am was were do does did have has".split()
 )
+_QUESTION_OPENERS = _AUXILIARIES | frozenset(
+    "what what's whats when where where's which who who's whom whose why how how's".split()
+)
+_OPENERS = _IMPERATIVES | _QUESTION_OPENERS | {"please"}
+
+
+def question_shaped(text: str, *, address_end: int = 0) -> bool:
+    """Check the exit sentence's punctuation and its first words after the vocative."""
+    for char in text:
+        if char == "?":
+            return True
+        if not char.isascii():
+            name = unicodedata.name(char, "")
+            if "QUESTION" in name or "INTERROBANG" in name:
+                return True
+    for token in _WORDS.findall(text[address_end:].lower().replace("’", "'")):
+        word = token.strip("'")
+        if word and word not in _FILLERS and word != "please":
+            base = word.removesuffix("n't").partition("'")[0]
+            return base in _QUESTION_OPENERS | {"must", "had"} or word in {
+                "can't",
+                "won't",
+                "shan't",
+                "ain't",
+            }
+    return False
 
 
 def request_shaped(text: str) -> bool:

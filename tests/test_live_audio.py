@@ -799,7 +799,14 @@ class ConservativeAlignmentTests(unittest.TestCase):
         blank = document(0, 300, " First")
         blank["transcription"].append({"text": " ", "offsets": {"from": 300, "to": 300}})
         self.assertEqual(
-            _counted_units(blank, 1000), ([{"text": " First", "start_ms": 0, "end_ms": 300}], 0)
+            _counted_units(blank, 1000),
+            (
+                [
+                    {"text": " First", "start_ms": 0, "end_ms": 300},
+                    {"text": " ", "start_ms": 300, "end_ms": 300},
+                ],
+                0,
+            ),
         )
 
     def test_out_of_order_word_timing_falls_back_to_the_whole_segment(self):

@@ -213,6 +213,7 @@ class SyntheticPrototypeTests(unittest.TestCase):
             ("diarizer", {"kind": "nemotron.cpp"}),
             ("transcriber", {"kind": "whisper.cpp"}),
             ("end_of_turn", {"enabled": False}),
+            ("silero_vad", {"python": "/worker", "model": "/model"}),
             ("speaker_id", {"enabled": False}),
             ("decision", {"provider": "jev", "allow_hosted": True}),
         ):
@@ -253,7 +254,7 @@ class SyntheticPrototypeTests(unittest.TestCase):
                 controller.close()
 
     def test_direct_config_native_optional_components_cannot_bypass_guard(self):
-        for key in ("end_of_turn", "speaker_id"):
+        for key in ("end_of_turn", "silero_vad", "speaker_id"):
             config = replace(self.load(), **{key: object()})
             controller = PrototypeController(
                 config, audio_input=io.BytesIO(), audio_provenance="synthetic"

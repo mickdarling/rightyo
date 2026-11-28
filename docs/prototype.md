@@ -178,7 +178,7 @@ an error that names the rule; nothing is clamped. Both buffers stay in memory an
 never written. The values are read when RightyO starts, so a change takes effect at the
 next restart. Each `listen` session logs them once on stderr, in seconds only:
 `audio_retention speaker_ring_s=120 timeline_window_s=90`. The lab has no report channel
-and logs nothing.
+for these retention settings.
 
 An optional `"decision": {"provider": "jev", "allow_hosted": true}` is the file form of
 `listen --use-jev --allow-hosted`, for hosts that start `listen` with a fixed argument list.
@@ -197,6 +197,228 @@ a separate physical test.
 ```sh
 .venv/bin/rightyo prototype --config local/prototype.json --port 8766
 ```
+
+## Silero VAD for leaving Privacy by voice
+
+A voice exit needs speech and silence observations from a local Silero VAD worker.
+Provision the official `snakers4/silero-vad` ONNX file from tag `v5.1.2`. From the
+checkout root, fetch and verify the file in the ignored cache.
+
+```sh
+mkdir -p .cache
+curl -q --fail --show-error --proto '=https' \
+  --output .cache/silero_vad-v5.1.2.onnx \
+  https://raw.githubusercontent.com/snakers4/silero-vad/v5.1.2/src/silero_vad/data/silero_vad.onnx
+printf '%s  %s\n' \
+  2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f \
+  .cache/silero_vad-v5.1.2.onnx | shasum -a 256 -c -
+```
+
+Add this section to the local configuration, substituting absolute paths. The worker
+interpreter needs NumPy and ONNX Runtime. RightyO launches it in isolated mode,
+verifies the SHA-256 again and passes those same bytes to the CPU inference session.
+
+```json
+{
+  "silero_vad": {
+    "python": "/absolute/path/to/worker/bin/python",
+    "model": "/absolute/path/to/rightyo/.cache/silero_vad-v5.1.2.onnx"
+  }
+}
+```
+
+An absent configuration, missing or unreadable model, checksum mismatch, or worker
+failure disables voice exits for the session. Sessions with enrolled roles report
+a missing configuration on stderr. An explicitly configured worker reports startup
+or runtime failures regardless of roles. These diagnostics include only a fixed
+reason. Host privacy controls remain available. Private status questions remain available
+without a configured VAD and after a runtime worker failure. With an active worker,
+its observed speech can open a recognition window at stream start for status.
+The preceding absence rule still applies to every exit candidate.
+
+The post-end confirmation window is fixed at **1,728 ms (54 native blocks)**.
+It starts at the latest observed evidence of the command's acoustic end, using
+the recognized final-word end, its last associated positive Silero block, and
+acoustically continuous final-word audio in the recognition window. The processor
+waits for the entire block covering the deadline before checking the owner.
+Resumed speech on any of those blocks cancels the exit. All exit preconditions,
+including a fresh worker liveness round-trip, must still pass at publication.
+
+### Post-end confirmation window basis
+
+The operator fixed the window on 2026-11-27 using the maximum lag among grid
+cells that Silero detects within 2 s, plus 2 blocks. In the round-18 generated
+replay, that maximum was **1,652 ms** at 200 counts RMS with a 420 ms lead-in.
+Adding 64 ms gives 1,716 ms, which rounds up to 54 whole 32 ms blocks.
+
+The table gives the lag in milliseconds from the acoustic end of the one-second
+command to the **start** of the first continuation block labelled speech by
+pinned Silero v5.1.2. Each row sets the RMS of the generated speech-like
+continuation mixed with the 50 Hz background. Each column sets the duration
+of the background before the command.
+
+| Continuation RMS (counts) | 200 ms lead-in | 420 ms lead-in | 1,000 ms lead-in |
+|---:|---:|---:|---:|
+| 160 | 3,568\* | 3,220\* | 1,360 |
+| 180 | 1,360 | 3,188\* | 1,328 |
+| 200 | 1,328 | 1,652 | 976 |
+| 250 | 944 | 1,332 | 944 |
+| 300 | 944 | 1,012 | 944 |
+| 400 | 720 | 980 | 720 |
+
+\* No detection occurred within the two-second continuation. The marked lags
+come from six-second continuations whose first two seconds were byte-identical
+to the original replays.
+
+The residual limit is a speech-like continuation that the pinned VAD first
+detects later than the window after the command's acoustic end. The three
+starred cells illustrate this limit. When all other gates pass, the exit can
+commit before detection. In the 200 ms lead-in replay the first speech-positive
+command block starts at 192 ms, so the separate 200 ms onset gate refuses it.
+
+In the clean 400 ms lead-in control, the command ends at 1,400 ms and the
+window ends at 3,128 ms. Normal ASR closes at 2,120 ms. The fast “complete”
+endpointer can close at 700 ms and truncate the command. Its earliest close
+retaining every word is 1,400 ms. Both qualifying endpointers reach the owner
+checks at 3,136 ms, when the last native block is complete.
+
+The pinned VAD can also miss a very quiet speech-like onset at stream start.
+The onset replay requires the recognizer to omit those quiet words. These
+measurements use generated audio and authored recognition. The owner-clip
+replay below remains the real-speech install gate.
+
+R4 and R4b cover continuing speech as judged by the pinned VAD. Continuing
+non-speech sound such as a tone, hum or music does not block an exit after a
+genuine exit phrase.
+
+### Reproduce the Silero test worker on Apple Silicon
+
+The #350 round-8 replay used an existing CPython 3.11.14 on macOS 15.8.3 arm64,
+NumPy 2.2.6 and ONNX Runtime 1.24.4 with the CPU provider. ONNX Runtime also
+requires flatbuffers, packaging, protobuf and SymPy. SymPy requires mpmath.
+The requirements file pins all seven versions and records the PyPI SHA-256 of
+each wheel alongside the model SHA-256. [Test requirements](silero-test-macos-arm64.txt)
+
+From the checkout root, start with a fresh `.cache/vad-venv`. The existing
+interpreter's pip (25.3 in this run) installs the wheels into the test venv.
+
+```sh
+(
+  set -e
+  test "$(python3.11 -I -B --version)" = "Python 3.11.14"
+  mkdir -p .cache/test-home .cache/tmp
+  python3.11 -I -B -m venv --without-pip .cache/vad-venv
+  env -i PATH="$PATH" HOME="$PWD/.cache/test-home" TMPDIR="$PWD/.cache/tmp" \
+    PIP_CONFIG_FILE=/dev/null python3.11 -I -B -m pip \
+    --disable-pip-version-check --no-cache-dir --python .cache/vad-venv/bin/python \
+    install --index-url https://pypi.org/simple --only-binary=:all: --require-hashes \
+    -r docs/silero-test-macos-arm64.txt
+)
+```
+
+Run the generated-tone fixtures with authored recognition and a stand-in owner.
+The tests use the cache model above by default. Set `RIGHTYO_SILERO_MODEL` to
+test a different local copy of the pinned file.
+
+```sh
+cd tests
+HOME="$PWD/../.cache/test-home" TMPDIR="$PWD/../.cache/tmp" \
+  RIGHTYO_SILERO_PYTHON="$PWD/../.cache/vad-venv/bin/python" PYTHONPATH=../src \
+  taskpolicy -b python3 -m unittest -v test_silero_vad.RealModelDecisions
+```
+
+The cases skip when the model or runtime is absent. With the pinned worker, the
+100 and 200 Hz machinery replays, the omitted low-pitched tail with a 200 ms
+lead-in and the persistent fundamental with a louder third harmonic must all
+keep privacy on, make zero owner checks and emit no transcript or exit.
+Two boundary replays use a persistent 100 Hz tone with raised second and fourth
+harmonics and a synthetic tail at 1.465× fan RMS after a 400 ms lead-in.
+Silero labels the continuing tone in each as non-speech. Both expect two
+stand-in owner checks and one exit, as does the 50 Hz clean control with a
+400 ms lead-in. The fake worker supplies known speech intervals and
+exercises the positive machinery, onset, omitted-tail and early-close decisions in CI.
+
+### Owner-clip replay for #350
+
+The optional file tests read six consented owner recordings from
+`~/.local/share/rightyo-fixtures/350/` or the directory named by
+`RIGHTYO_350_FIXTURES`. Use uncompressed mono 16 kHz signed 16-bit PCM WAV.
+Trim leading and trailing quiet to the spoken boundaries. The replay supplies
+the lead-in, background, exact inter-clip gaps and trailing quiet in memory.
+Keep the clips and the separate existing enrollment outside Git.
+
+| Filename | Spoken words | Approximate spoken duration |
+| --- | --- | --- |
+| `privacy-off.wav` | Jarvis, privacy off. | 1.2–1.6 s |
+| `podcast.wav` | Jarvis, start listening to the podcast. | 2.5–3.5 s, one uninterrupted sentence |
+| `jarvis.wav` | Jarvis. | 0.7–1.0 s |
+| `start-listening.wav` | Start listening. | 0.8–1.2 s |
+| `stop-recording.wav` | Jarvis, stop recording. | 1.2–1.8 s |
+| `go-private.wav` | Go private. | 0.8–1.2 s |
+
+Each split fragment needs at least 0.5 s of speech after the verifier's silence
+trim. Set these variables to existing local files before running the tests.
+
+| Variable | File |
+| --- | --- |
+| `RIGHTYO_SILERO_PYTHON` | Worker interpreter for Silero and WeSpeaker, with NumPy and ONNX Runtime |
+| `RIGHTYO_SILERO_MODEL` | Optional override for the pinned Silero model in the checkout cache |
+| `RIGHTYO_350_WHISPER_CLI` | Local whisper.cpp CLI with the stdin WAV and stdout full-JSON support used by the prototype |
+| `RIGHTYO_350_WHISPER_MODEL` | Whisper model for that CLI |
+| `RIGHTYO_350_SPEAKER_MODEL` | Pinned WeSpeaker ResNet34-LM ONNX model used for the enrollment |
+| `RIGHTYO_350_OWNER_PRINT` | Existing RightyO `<id>.json` enrollment from independent owner speech, read individually |
+
+With those variables exported, run the suite from the checkout root.
+
+```sh
+PYTHONPATH=src:tests python3 -m unittest -v test_privacy_owner_clips
+```
+
+The clean single exit and its 50, 100 and 200 Hz tone variants must each pass
+separate name and phrase checks and emit one content-free exit. At 100 and 200 Hz, 24 seconds of machinery alone
+must open zero recognition windows. The synthetic 200 Hz onset has triggered
+Silero before (see below). This same background check is part of owner qualification.
+
+The full podcast sentence and its final words alone must stay private. A second
+pass drops Whisper's words and timings after “listening” while Silero hears the
+whole recording. Before any install, this owner-clip speech-continues negative
+(`test_omitted_continuing_speech_stays_private`) must prove that Silero detects
+real continuing speech, the ASR window stays open through the clip, and the
+processor makes zero owner checks and emits zero exits. Whisper's timing for “to” also locates
+the excerpt used for the side-talk replay.
+
+With a 2 s gap, the name must authenticate silently and the remainder must
+authenticate independently and emit one exit. With a 4.2 s gap, only the name
+is checked. The remainder alone stays private. Each public entry must publish
+its own transcript before the merge hold expires. Replayed in privacy, it must
+produce zero checks or events.
+
+These replays use a single-speaker diarization stand-in. Silero, local ASR and
+isolated owner scoring use their production adapters. A missing clip, model,
+interpreter or enrollment skips the affected tests with a reason. A supplied
+fixture that misses an expected result fails qualification.
+
+### Round-8 synthetic replay results (2026-11-27)
+
+All four real-model tests failed on the five replays below. Privacy stayed on and
+the owner verifier received zero calls in every replay. The test threshold was
+0.5. In a separate run of the same fixtures, a test-only observer sampled the ONNX
+speech probability inside the worker. Thresholding each score reproduced every
+32 ms label on the worker socket. Counts below include blocks wholly inside each
+stated interval. Times are relative to the start of generated audio.
+
+| Synthetic input | Peak speech probability and timing | Observed decision |
+| --- | --- | --- |
+| Persistent 100 Hz fundamental, louder third harmonic | Peak 0.1661 in the first 400 ms, 0.4890 in the louder section (400–1400 ms). | All 100 blocks over 3200 ms scored absent, certifying a false onset gap. No exit. |
+| Low-pitched voiced tail at 1.47× fan RMS | Command peaked at 0.9896. Tail peaked at 0.4159 with 0/62 full blocks labelled speech from 1200–3200 ms. | No exit. The recognition window ended at 2220 ms, 980 ms before the authored tail ended. |
+| Steady 200 Hz machinery, then command | First machine block (0–32 ms) scored 0.5733, the only positive in 24 s. Command peaked at 0.1656 with 0/50 speech blocks from 24000–25600 ms. | Machinery alone opened a 0–1480 ms recognition window. The expected exit never occurred by 27200 ms. |
+| Clean command over the same 50 Hz fan (tail control) | Command peaked at 0.9896 at 224–256 ms. The last speech block ended at 768 ms. The command continued to 1200 ms. | The expected exit never occurred by 2800 ms. |
+| Command sharing the fan's 100 Hz fundamental | Fan peaked at 0.0477 in 24 s. Command peaked at 0.2619 with 0/50 speech blocks from 24000–25600 ms. | No recognition window or exit by 27200 ms. |
+
+With the uninstrumented worker, unittest took 9.964 s for all four methods.
+Wall times including worker startup were 1.104 s for the persistent fundamental,
+3.014 s for the tail and its control together, 3.443 s for 200 Hz machinery and
+2.401 s for the shared 100 Hz fundamental.
 
 ## Speech backends
 

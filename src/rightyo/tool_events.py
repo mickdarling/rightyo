@@ -9,15 +9,18 @@ import json
 import re
 import unicodedata
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from threading import RLock
 
 from rightyo.addressedness import (
+    LINE_BREAKS,
     answer_shaped,
     follow_up_cued,
     guest_address_tail,
     mentions_name,
     possible_aside,
+    question_shaped,
     spoken_reply_cue,
 )
 from rightyo.contracts import (
@@ -34,6 +37,7 @@ from rightyo.contracts import (
     formed_request_text,
     identifier,
     integer,
+    name_key,
     speaker_role,
 )
 from rightyo.live_speaker_id import BYTES_PER_MS
@@ -73,6 +77,8 @@ PRIVACY_EXIT = (
     ("privacy", "off"),
     ("privacy", "mode", "off"),
 )
+PRIVACY_EXIT_FILLER = frozenset({"um", "uh", "ok", "okay", "hey", "so", "please", "well"})
+PRIVACY_EXIT_TRAILING = frozenset({"now", "please", "again"})
 PRIVACY_STATUS = (
     ("what", "mode", "am", "i", "in"),
     ("are", "you", "recording"),
@@ -101,7 +107,7 @@ PRIVACY_ENTRY_WORDS = frozenset({"privacy", "private"})
 PRIVACY_STOPPED = frozenset({"recording", "recordings", "listening"})
 # Words that may open an address before the name ("hey Jarvis, privacy mode").
 PRIVACY_ADDRESS = frozenset({"hey"})
-# Words dropped anywhere before matching, so "um, ok Jarvis, so I'm back" still matches.
+# The older, wider filler set for status matching.
 PRIVACY_FILLER = frozenset(
     {
         "um",
@@ -352,12 +358,12 @@ def _filler_for(addressing):
     return PRIVACY_FILLER - named
 
 
-def _matched_words(text, addressing):
-    """`text` as privacy words with filler dropped, except where a filler word is part of a
+def _matched_words(words, addressing):
+    """Privacy words with filler dropped, except where a filler word is part of a
     configured name or variant matched at that place (round 18): "please" stays in "Please
     Jarvis, I'm back", but is still filler in "Jarvis, please, I'm back"."""
     filler = _filler_for(addressing)
-    words = _privacy_words(text, filler)
+    words = [word for word in words if word not in filler]
     if filler == PRIVACY_FILLER:
         return words
     named = set()
@@ -388,38 +394,155 @@ def _phrase_in(words, phrases):
     )
 
 
-def privacy_phrase(text, addressing):
-    """Which of privacy mode's local phrases `text` holds (hailing-station #735 S-1).
+def _exit_matches(text, addressing, *, open_name, split_join=""):
+    """Parse the exit and both split fragments without discarding unknown words."""
+    # Apply the same grammar to both ellipsis spellings, then map the matched spans
+    # back to the transcript offsets used for audio selection.
+    offsets = None
+    if "…" in text:
+        offsets = []
+        for index, char in enumerate(text):
+            offsets.extend([index] * (3 if char == "…" else 1))
+        offsets.append(len(text))
+        text = text.replace("…", "...")
 
-    A set of: "exit" (a configured name or variant of up to three words, then an exit
-    phrase), "rest" (the turn starts with an exit phrase, for a split name), "name" (the
-    turn is only a name), "status" (named or not) and "entry". For all but the entry,
-    case, punctuation and filler are ignored, and the phrase may come anywhere in the turn;
-    "don't" or "do not" in the three words before it (before the name, for the exit) means
-    no match. The entry counts only as the whole turn (`_standalone_entry`) and never as a
-    question. Nothing is kept: the words exist only inside this call.
+    # Keep character offsets for sentence breaks and the vocative's question exemption.
+    # Only whitespace and punctuation separate words. Marks, format characters and
+    # unfamiliar symbols survive as literal input that must match the grammar.
+    spellings = {
+        spelling
+        for name in (addressing.names if addressing else ())
+        for spelling in (name, *addressing.spellings(name))
+    }
+    source = text.replace("’", "'")
+    dotted = sorted((s for s in spellings if "." in s), key=len, reverse=True)
+    if dotted:
+        # Keep literal intra-name periods inside the address token. An apostrophe
+        # preserves its source offset and is already ignored in the name key.
+        pattern = "|".join(map(re.escape, dotted))
+        source = re.sub(
+            rf"(?<!\w)(?:{pattern})(?!\w)", lambda m: m[0].replace(".", "'"), source, flags=re.I
+        )
+    cleaned = "".join(
+        " " if c != "'" and unicodedata.category(c).startswith("P") else c for c in source
+    )
+    tokens = list(re.finditer(r"\S+", cleaned))
+    words = [token.group().lower() for token in tokens]
+    name_keys = {name_key(spelling) for spelling in spellings}
+    # Retain the source sentence of each word through phrase and name matching.
+    boundaries = ".!?;" + LINE_BREAKS
+    sentences = []
+    sentence = 0
+    for at, token in enumerate(tokens):
+        if at:
+            for i in range(tokens[at - 1].end(), token.start()):
+                if source[i] in boundaries:
+                    sentence = i + 1
+        sentences.append(sentence)
+
+    def addressed(end, sentence_end, phrase_sentence=None):
+        # A name of at most three words must consume the last non-filler before
+        # the phrase. Try filler words as names too (including configured variants).
+        last = max((i for i in range(end) if words[i] not in PRIVACY_EXIT_FILLER), default=-1)
+        head = True
+        for at in range(end):
+            sentence = sentences[at]
+            if at and sentence != sentences[at - 1]:
+                head = True
+            if head and at + 3 > last and (phrase_sentence is None or sentence == phrase_sentence):
+                for stop in range(max(at + 1, last + 1), min(end, at + 3) + 1):
+                    key = "".join(words[at:stop]).casefold().replace("'", "")
+                    if key not in name_keys or sentences[stop - 1] != sentence:
+                        continue
+                    # At a sentence head only the approved fillers can precede
+                    # the address, which also excludes any in-sentence negation.
+                    if not question_shaped(
+                        text[sentence:sentence_end], address_end=tokens[stop - 1].end() - sentence
+                    ):
+                        return tokens[at].start(), tokens[stop - 1].end()
+            head = head and words[at] in PRIVACY_EXIT_FILLER
+        return None
+
+    matches = {}
+    name = addressed(len(words), len(text), sentences[-1]) if words else None
+    if name is not None:
+        # A terminal period can classify a standalone name for other callers.
+        # Arming a split requires the sentence to remain open at the join.
+        after = source[name[1] : len(source) if open_name else tokens[-1].end()]
+        if not any(ch in boundaries for ch in after) or (
+            source[tokens[-1].end() :].strip(" \t") == "..."
+            and not any(ch in boundaries for ch in source[name[1] : tokens[-1].end()])
+        ):
+            matches["name"] = (name,)
+    end = len(words)
+    while end and words[end - 1] in PRIVACY_EXIT_TRAILING:
+        end -= 1
+    for phrase in PRIVACY_EXIT:
+        start = end - len(phrase)
+        if start < 0 or tuple(words[start:end]) != phrase or sentences[start] != sentences[end - 1]:
+            continue
+        sentence_end = next((s for s in sentences[end:] if s != sentences[end - 1]), len(text))
+        phrase_sentence = sentences[start]
+        if start and text[tokens[start - 1].end() : tokens[start].start()].strip(" \t") == "...":
+            # The existing vocative grammar allows a three-dot hesitation before
+            # the phrase. Internal name/phrase breaks above retain their meaning.
+            phrase_sentence = sentences[start - 1]
+        address = addressed(start, sentence_end, phrase_sentence)
+        prefix = source[: tokens[start].start()]
+        if split_join in ("...", "…"):
+            joins = not prefix.strip(" \t")
+        else:
+            filler_end = tokens[start - 1].end() if start else 0
+            joins = not any(ch in boundaries for ch in prefix) or (
+                (not split_join or start > 0)
+                and prefix[filler_end:].strip(" \t") == "..."
+                and not any(ch in boundaries for ch in prefix[:filler_end])
+            )
+        phrase_span = (tokens[start].start(), tokens[end - 1].end())
+        if address is not None:
+            matches["exit"] = (address, phrase_span)
+        elif (
+            joins
+            and all(w in PRIVACY_EXIT_FILLER for w in words[:start])
+            and not question_shaped(text[:sentence_end])
+        ):
+            matches["rest"] = (phrase_span,)
+        break
+    if offsets is not None:
+        return {
+            kind: tuple((offsets[left], offsets[right]) for left, right in spans)
+            for kind, spans in matches.items()
+        }
+    return matches
+
+
+def privacy_phrase(text, addressing, *, recognition_complete=True, open_name=False, split_join=""):
+    """Classify local privacy phrases. Exit evidence requires complete recognition,
+    a statement and a sentence-initial address (or two whole split fragments).
+    Status and standalone entry retain their own grammars.
     """
-    words = _matched_words(text, addressing)
-    kinds = set()
-    if addressing is not None:
-        if words and addressing.name_for(" ".join(words)) is not None:
-            kinds.add("name")
-        for at in range(len(words)):
-            for width in range(1, 4):
-                if (
-                    at + width < len(words)
-                    and addressing.name_for(" ".join(words[at : at + width])) is not None
-                    and _phrase_at(words, at + width, PRIVACY_EXIT)
-                    and not _negated(words, at)
-                ):
-                    kinds.add("exit")
-    if _phrase_at(words, 0, PRIVACY_EXIT):
-        kinds.add("rest")
+    unfiltered = _privacy_words(text, ())
+    words = _matched_words(unfiltered, addressing)
+    kinds = (
+        set(_exit_matches(text, addressing, open_name=open_name, split_join=split_join))
+        if recognition_complete
+        else set()
+    )
     if _phrase_in(words, PRIVACY_STATUS):
         kinds.add("status")
-    if not text.rstrip().endswith("?") and _standalone_entry(_privacy_words(text, ()), addressing):
+    if not text.rstrip().endswith("?") and _standalone_entry(unfiltered, addressing):
         kinds.add("entry")
     return frozenset(kinds)
+
+
+def _completes_split(turn, name_end):
+    """Both fragments must follow the last ASR loss, even if it emitted no turn."""
+    onset = turn.acoustic_span_ms[0] if turn.acoustic_span_ms else turn.start_ms
+    return (
+        name_end is not None
+        and name_end >= turn.recognition_loss_end_ms
+        and 0 <= onset - name_end <= PRIVACY_SPLIT_NAME_MS
+    )
 
 
 def _entry_shaped(text):
@@ -609,8 +732,20 @@ class _VoiceChecks:
     split: int | None
     exit: tuple[bool, str | None] = (False, "voice_unavailable")
     exit_origin: str | None = None
+    defer_verification: bool = False
     binding: tuple | None = None
     entry: bool = False
+
+
+@dataclass
+class _DeferredPrivateExit:
+    checks: _VoiceChecks
+    privacy_span: list[int | None]
+    status: bool
+    join: str | None
+    name: _VoiceChecks | None
+    emission_clock: Callable[[], int] | None
+    playback_excluded: bool = False
 
 
 @dataclass
@@ -779,9 +914,12 @@ class SpeechEvents:
         self.capture_epoch = object()
         self._voiceprint_masks = []  # Exact stream byte ranges, including capture backlog.
         # The stream time the enrolled owner's lone name fragment ended, heard while privacy
-        # was on (a split exit), or None; a time only, never the words. Cleared by every
+        # was on (a split exit), its verification generation and join punctuation. Cleared by every
         # other turn, private or not, and whenever the mode changes.
         self._private_name_end = None
+        self._private_name_checks = None
+        self._private_name_join = ""
+        self._deferred_private_exit: _DeferredPrivateExit | None = None
         # Utterance ids of private turns already matched (see MAX_PRIVATE_SEEN).
         self._private_seen = deque(maxlen=MAX_PRIVATE_SEEN)
         # Whether `transcript` events may carry `role_source` this session: a live session
@@ -956,6 +1094,7 @@ class SpeechEvents:
         self._cue_voices.clear()
         self._others_turns.clear()
         self._playbacks.clear()
+        self._deferred_private_exit = None
         self._playback_scopes.clear()
         self._spoken_replies = None
         self._asked_at = None
@@ -1047,7 +1186,7 @@ class SpeechEvents:
             self._duck_spans = [[0, None]] if self._duck else []
             self.capture_epoch = None if self._duck else object()
             self._voiceprint_masks.clear()
-            self._private_name_end = None
+            self._clear_private_name()
             self._voice_generation += 1
             self._private_seen.clear()
             self._role_sources = duck and priority is not None
@@ -1307,6 +1446,33 @@ class SpeechEvents:
             self._owner_voice_state = state
             self._emit("owner_voice", state=state)
 
+    def _clear_private_name(self):
+        self._private_name_end = None
+        self._private_name_checks = None
+        self._private_name_join = ""
+
+    def _armed_name_end(self):
+        name = self._private_name_checks
+        if (
+            self._private_name_end is not None
+            and name is not None
+            and name.generation == self._voice_generation
+            and self._name_evidence_current(name)
+        ):
+            return self._private_name_end
+        return None
+
+    def _name_evidence_current(self, name):
+        turn = name.turn
+        epoch = getattr(getattr(self._priority, "source", None), "epoch", None)
+        return (
+            name is self._private_name_checks
+            and name.speaker_epoch == epoch
+            and self._exit_precheck(turn, name.inferred) is None
+            and self._binding_unchanged(name, turn, require_revision=turn.speaker_id is not None)
+            and (name.exit_origin != "binding" or self._binding_exit_check(turn, False)[0])
+        )
+
     def prepare_transcript(self, turn, *, inferred=False):
         """Snapshot candidate checks, then score without any caller's controller lock.
 
@@ -1329,7 +1495,7 @@ class SpeechEvents:
                 inferred,
                 self._voice_generation,
                 getattr(getattr(self._priority, "source", None), "epoch", None),
-                self._private_name_end,
+                self._armed_name_end(),
                 binding=self._binding_snapshot(turn),
             )
             binding = None
@@ -1341,16 +1507,37 @@ class SpeechEvents:
                     and turn.utterance_id not in self._private_seen
                 ):
                     with contextlib.suppress(Exception):
-                        kinds = privacy_phrase(turn.text, self._addressing)
-                        if (
-                            "name" in kinds
-                            or "exit" in kinds
-                            or (
-                                "rest" in kinds
-                                and ticket.split is not None
-                                and 0 <= turn.start_ms - ticket.split <= PRIVACY_SPLIT_NAME_MS
+                        matches = (
+                            _exit_matches(
+                                turn.text,
+                                self._addressing,
+                                open_name=True,
+                                split_join=self._private_name_join,
                             )
-                        ):
+                            if turn.recognition_complete
+                            else {}
+                        )
+                        match = matches.get("exit")
+                        if match is None and _completes_split(turn, ticket.split):
+                            match = matches.get("rest")
+                        if match is None:
+                            match = matches.get("name")
+                        if match is not None and turn.acoustic_span_ms is not None:
+                            # Keep each matched part isolated through confirmation.
+                            reason = self._exit_precheck(turn, inferred)
+                            if reason:
+                                self._clear_exit_audio(turn)
+                                return replace(ticket, exit=(False, reason))
+                            select = getattr(self._priority, "select_exit_audio", None)
+                            if (
+                                turn.defer_exit is not None
+                                and callable(select)
+                                and select(turn, match)
+                            ):
+                                return replace(ticket, defer_verification=True)
+                            self._clear_exit_audio(turn)
+                            return ticket
+                        if match is not None:
                             binding = self._binding_exit_check(turn, inferred)
                 if binding is None:
                     # No owner check will consume this turn. Silence may follow it
@@ -1373,7 +1560,7 @@ class SpeechEvents:
                     ):
                         entry = getattr(self._priority, "entry_voice", None)
         if binding is not None:
-            outcome, origin = self._exit_approval(turn, inferred, binding=binding)
+            outcome, origin = self._exit_approval(turn, inferred, binding=binding, match=match)
             ticket = replace(ticket, exit=outcome, exit_origin=origin)
         if callable(entry):
             with contextlib.suppress(Exception):
@@ -1429,6 +1616,7 @@ class SpeechEvents:
         diarized_head=None,
         voice_checks=None,
         self_turn=False,
+        emission_clock=None,
     ):
         """Emit one final turn; `inferred` marks a speaker label partly inferred (#137).
 
@@ -1439,6 +1627,8 @@ class SpeechEvents:
         attention and precedence, but never exercises owner or trusted authority:
         no override, no owner stop phrase, and a playback-only dismissal that withdraws
         nothing and leaves the speaker's engagement in place.
+
+        The live controller supplies its stream clock for a deferred private status.
         """
         if voice_checks is None and not self_turn:
             voice_checks = self.prepare_transcript(turn, inferred=inferred)
@@ -1456,7 +1646,7 @@ class SpeechEvents:
             self.expire(max(now_ms, turn.end_ms))
             if self.heard_ducked(turn):
                 if self_turn:
-                    self._private_name_end = None
+                    self._clear_private_name()
                     self._voice_generation += 1
                     self._clear_exit_audio()
                     return
@@ -1479,10 +1669,12 @@ class SpeechEvents:
                 ):
                     # Kept only while privacy is on; cleared at its end (#735 S-1).
                     self._private_seen.append(uid)
-                    self._private(turn, inferred, voice_checks if checks_current else None)
+                    self._private(
+                        turn, inferred, voice_checks if checks_current else None, emission_clock
+                    )
                 return
             # Any turn heard outside privacy ends a split exit.
-            self._private_name_end = None
+            self._clear_private_name()
             self._voice_generation += 1
             if self_turn and self.self_voice.config.transcripts == "suppress":
                 # The host matches privacy entry on the public transcript stream.
@@ -1982,7 +2174,7 @@ class SpeechEvents:
             at = now_ms
             self._clear_exit_audio()
             # A change of mode always ends a split exit.
-            self._private_name_end = None
+            self._clear_private_name()
             self._voice_generation += 1
             if on and not self._duck:
                 self.capture_epoch = None
@@ -2019,7 +2211,7 @@ class SpeechEvents:
             if on and ack and self._active and self._duck_acks:
                 self._emit("privacy", action="on", at_ms=at)
 
-    def _private(self, turn, inferred, checks):
+    def _private(self, turn, inferred, checks, emission_clock):
         """Match a turn heard in privacy against the local phrases, then drop it.
 
         Called with the lock held. Emits at most one content-free `privacy` event: "exit"
@@ -2030,18 +2222,172 @@ class SpeechEvents:
         """
         self._private_counts["discarded"] += 1
         try:
-            kinds = privacy_phrase(turn.text, self._addressing)
+            kinds = privacy_phrase(
+                turn.text,
+                self._addressing,
+                recognition_complete=turn.recognition_complete,
+                open_name=True,
+                split_join=self._private_name_join,
+            )
         except Exception:  # noqa: BLE001 - the words must never reach an error or a log
             kinds = frozenset()
             self._private_counts["failed"] += 1
             self._clear_exit_audio()
-        split, self._private_name_end = self._private_name_end, None
-        self._voice_generation += 1
+        split, self._private_name_end = self._armed_name_end(), None
         outcome = (
-            checks.exit
+            self._revalidate_exit(checks, turn, inferred)
             if checks is not None and checks.split == split
             else (False, "voice_unavailable")
         )
+        self._voice_generation += 1
+        # Only a turn heard entirely since the mode last went on, while it is still on, is
+        # matched at all (#242 round 23, see `transcript`): one heard in an earlier private
+        # period and released late can never end this one, answer its status or be counted.
+        remainder = "exit" not in kinds and "rest" in kinds and _completes_split(turn, split)
+        named = "exit" in kinds or remainder
+        join = None
+        if not named and "name" in kinds:
+            ending = turn.text.rstrip(" \t")
+            if ending.endswith(("...", "…")):
+                join = "..."
+            elif ending[-1].isalnum() or ending.endswith(("'", "’")):
+                join = ""
+            else:
+                join = ","
+        name = self._private_name_checks if remainder else None
+        if name is None:
+            self._clear_private_name()
+        if (
+            (named or join is not None)
+            and checks
+            and checks.split == split
+            and checks.defer_verification
+        ):
+            ticket = replace(
+                checks,
+                turn=replace(turn, text="", exit_timings=(), defer_exit=None),
+                generation=self._voice_generation,
+            )
+            candidate = _DeferredPrivateExit(
+                ticket, self._duck_spans[-1], "status" in kinds, join, name, emission_clock
+            )
+            self._deferred_private_exit = candidate
+            turn.defer_exit(lambda at_ms: self._resolve_private_exit(candidate, at_ms))
+            return
+        if named:
+            self._clear_exit_audio(turn)
+            allowed, reason = outcome
+            if name is not None and not self._name_evidence_current(name):
+                allowed, reason = False, "voice_unavailable"
+            self._clear_private_name()
+            if allowed and turn.acoustic_span_ms is None:
+                self._emit_private_exit()
+                return
+            self._count_exit_refused(reason or "voice_unavailable")
+        elif join is not None:
+            allowed, reason = outcome
+            if allowed and turn.acoustic_span_ms is None:
+                self._arm_name(checks, join)
+            else:
+                self._private_counts["exit_name_refused"] += 1
+                self._count_exit_refused(reason or "voice_unavailable")
+        elif "rest" in kinds:
+            self._private_counts["exit_unnamed"] += 1
+        self._clear_exit_audio(turn)
+        if "status" in kinds:
+            self._emit_private_status()
+
+    def _arm_name(self, checks, join):
+        turn = checks.turn
+        self._private_name_end = turn.acoustic_span_ms[1] if turn.acoustic_span_ms else turn.end_ms
+        self._private_name_join = join
+        self._private_name_checks = replace(
+            checks,
+            generation=self._voice_generation,
+            turn=replace(turn, text="", exit_timings=(), exit_available=None, defer_exit=None),
+        )
+
+    def _emit_private_status(self):
+        self._private_counts["status"] += 1
+        self._emit("privacy", action="status")
+
+    def _emit_private_exit(self):
+        self._private_counts["exit"] += 1
+        self._emit("privacy", action="exit")
+
+    @staticmethod
+    def _exit_available(turn):
+        try:
+            return turn.exit_available is not None and turn.exit_available() is True
+        except Exception:  # Private guard failures never expose content.
+            return False
+
+    def _settle_private_exit(self, candidate, at_ms, *, exited=False):
+        if self._deferred_private_exit is candidate:
+            self._deferred_private_exit = None
+        if (
+            candidate.status
+            and not exited
+            and self._active
+            and self._duck
+            and candidate.privacy_span is self._duck_spans[-1]
+        ):
+            if candidate.emission_clock is not None:
+                self._now = max(self._now, candidate.emission_clock())
+            elif at_ms is not None:
+                self._now = max(self._now, at_ms)
+            self._emit_private_status()
+
+    def _resolve_private_exit(self, candidate, at_ms):
+        checks, join, name = candidate.checks, candidate.join, candidate.name
+        turn = checks.turn
+        with self._lock:
+            if (
+                not self._active
+                or not self._in_current_privacy(turn)
+                or not self._voice_checks_current(checks, turn, checks.inferred)
+            ):
+                self._clear_exit_audio(turn)
+                self._settle_private_exit(candidate, at_ms)
+                return
+            if (
+                at_ms is None
+                or not self._exit_available(turn)
+                or (name is not None and not self._name_evidence_current(name))
+            ):
+                self._clear_private_name()
+                self._clear_exit_audio(turn)
+                self._count_exit_refused("voice_unavailable")
+                if join is not None:
+                    self._private_counts["exit_name_refused"] += 1
+                self._settle_private_exit(candidate, at_ms)
+                return
+            binding = self._binding_exit_check(turn, checks.inferred)
+        outcome, origin = self._exit_approval(turn, checks.inferred, binding=binding)
+        checks = replace(checks, exit=outcome, exit_origin=origin)
+        with self._lock:
+            if not self._active or not self._voice_checks_current(checks, turn, checks.inferred):
+                self._settle_private_exit(candidate, at_ms)
+                return
+            allowed, reason = self._revalidate_exit(checks, turn, checks.inferred)
+            if name is not None and not self._name_evidence_current(name):
+                allowed, reason = False, "voice_unavailable"
+            self._clear_private_name()
+            if allowed:
+                if join is None:
+                    self._now = max(self._now, at_ms)
+                    self._settle_private_exit(candidate, at_ms, exited=True)
+                    self._emit_private_exit()
+                    return
+                self._arm_name(checks, join)
+            else:
+                if join is not None:
+                    self._private_counts["exit_name_refused"] += 1
+                self._count_exit_refused(reason)
+            self._settle_private_exit(candidate, at_ms)
+
+    def _revalidate_exit(self, checks, turn, inferred):
+        outcome = checks.exit
         if outcome[0]:
             allowed, reason = self._binding_exit_check(turn, inferred)
             if checks.exit_origin == "binding":
@@ -2052,36 +2398,14 @@ class SpeechEvents:
                     outcome = False, reason
             else:
                 outcome = False, "voice_unavailable"
-        # Only a turn heard entirely since the mode last went on, while it is still on, is
-        # matched at all (#242 round 23, see `transcript`): one heard in an earlier private
-        # period and released late can never end this one, answer its status or be counted.
-        if "name" in kinds:
-            # Authenticate both split fragments independently. Private processor turns
-            # are unlabelled: only their own isolated voice can authenticate them.
-            allowed, reason = outcome
-            if allowed:
-                self._private_name_end = turn.end_ms
-            else:
-                self._private_counts["exit_name_refused"] += 1
-                self._count_exit_refused(reason)
-            return
-        named = "exit" in kinds or (
-            "rest" in kinds
-            and split is not None
-            and 0 <= turn.start_ms - split <= PRIVACY_SPLIT_NAME_MS
-        )
-        if named:
-            allowed, reason = outcome
-            if allowed:
-                self._private_counts["exit"] += 1
-                self._emit("privacy", action="exit")
-                return
-            self._count_exit_refused(reason)
-        elif "rest" in kinds:
-            self._private_counts["exit_unnamed"] += 1
-        if "status" in kinds:
-            self._private_counts["status"] += 1
-            self._emit("privacy", action="status")
+        if outcome[0] and turn.acoustic_span_ms is not None:
+            # The worker can die while the isolated owner check runs outside
+            # the lock. Both the full exit and a split name need a live judge.
+            if not self._exit_available(turn):
+                outcome = False, "voice_unavailable"
+        if outcome[0] and not self._voice_checks_current(checks, turn, inferred):
+            outcome = False, "voice_unavailable"
+        return outcome
 
     def _in_current_privacy(self, turn):
         """Whether `turn` was heard entirely since privacy last went on, and it is still on
@@ -2111,7 +2435,7 @@ class SpeechEvents:
     def _exit_check(self, turn, inferred, *, binding=None):
         return self._exit_approval(turn, inferred, binding=binding)[0]
 
-    def _exit_approval(self, turn, inferred, *, binding=None):
+    def _exit_approval(self, turn, inferred, *, binding=None, match=None):
         """Check binding OR this turn's voice, retaining the conservative prechecks.
 
         Always erase candidate audio, even if a binding passes or a precheck refuses.
@@ -2121,39 +2445,52 @@ class SpeechEvents:
                 with self._lock:
                     binding = self._binding_exit_check(turn, inferred)
             allowed, reason = binding
-            if allowed or reason in {"inferred", "playback", "no_owner_check"}:
-                return (allowed, reason), "binding" if allowed else None
+            if reason in {"inferred", "playback", "no_owner_check"}:
+                return (False, reason), None
+            if allowed and turn.acoustic_span_ms is None:
+                return (True, None), "binding"
             voice = getattr(self._priority, "exit_voice", None)
             if callable(voice):
-                outcome = voice(turn)
+                outcome = voice(turn, match)
                 if outcome == "pass":
                     return (True, None), "voice"
                 if outcome in {"voice_below_threshold", "voice_unavailable"}:
                     return (False, outcome), None
-            return (False, reason), None
+            return (False, reason or "voice_unavailable"), None
         except Exception:  # noqa: BLE001 - private exceptions may contain words
             return (False, "voice_unavailable"), None
         finally:
-            self._clear_exit_audio()
+            self._clear_exit_audio(turn)
+
+    def _exit_precheck(self, turn, inferred):
+        if inferred:
+            return "inferred"
+        if not self._per_turn or not callable(getattr(self._priority, "enrolled_owner", None)):
+            return "no_owner_check"
+        candidate = self._deferred_private_exit
+        if (
+            candidate is not None and candidate.checks.turn is turn and candidate.playback_excluded
+        ) or any(self._playback_excludes(turn, span) for span in self._playbacks):
+            return "playback"
+        return None
+
+    @staticmethod
+    def _playback_excludes(turn, span):
+        start, end = span
+        return start - PLAYBACK_MARGIN_MS <= turn.end_ms and (
+            end is None or turn.start_ms <= end + PLAYBACK_MARGIN_MS
+        )
 
     def _binding_exit_check(self, turn, inferred):
         """The existing binding decision, with a fixed, content-free refusal token.
 
         Diagnostic lookups happen only after refusal and cannot grant an exit.
         """
-        check = getattr(self._priority, "enrolled_owner", None)
-        if inferred:
-            return False, "inferred"
-        if not self._per_turn or not callable(check):
-            return False, "no_owner_check"
-        if any(
-            start - PLAYBACK_MARGIN_MS <= turn.end_ms
-            and (end is None or turn.start_ms <= end + PLAYBACK_MARGIN_MS)
-            for start, end in self._playbacks
-        ):
-            return False, "playback"
+        reason = self._exit_precheck(turn, inferred)
+        if reason:
+            return False, reason
         try:
-            result = check(turn)
+            result = self._priority.enrolled_owner(turn)
             if result is True:
                 return True, None
             explain = getattr(self._priority, "enrolled_owner_refusal_reason", None)
@@ -2208,6 +2545,8 @@ class SpeechEvents:
         integer(now_ms, "now_ms")
         with self._lock:
             self._voice_generation += 1
+            self._clear_private_name()
+            self._clear_exit_audio()
             for ticket in self._pending_voiceprints.values():
                 ticket.cancel("no_turn_embedding")
             ended = (
@@ -2610,6 +2949,17 @@ class SpeechEvents:
                     if len(self._playback_scopes) >= MAX_PLAYBACKS:
                         del self._playback_scopes[next(iter(self._playback_scopes))]
                     span = [now_ms, None]
+                    if len(self._playbacks) == MAX_PLAYBACKS:
+                        # A confirming candidate keeps its veto through deque eviction.
+                        evicted = self._playbacks[0]
+                        candidate = self._deferred_private_exit
+                        if candidate is not None and self._playback_excludes(
+                            candidate.checks.turn, evicted
+                        ):
+                            candidate.playback_excluded = True
+                        name = self._private_name_checks
+                        if name is not None and self._playback_excludes(name.turn, evicted):
+                            self._clear_private_name()
                     self._playbacks.append(span)
                     self._playback_scopes[scope] = span
                 else:
@@ -4135,7 +4485,8 @@ class SpeechEvents:
             self._delivered.clear()
             self._withdrawn.clear()
             self._private_seen.clear()
-            self._private_name_end = None
+            self._clear_private_name()
+            self._deferred_private_exit = None
             self._voice_generation += 1
             self._clear_exit_audio()
             self._request_outcomes.clear()
