@@ -317,7 +317,7 @@ class AdversarialReplay(Replay):
         endpoint_pause=None,
     ):
         vad = self.worker(speech)
-        calls, labels = [], []
+        calls, labels, owner_check_times = [], [], []
         hold_observations = []
         classify = vad.is_speech
 
@@ -340,6 +340,7 @@ class AdversarialReplay(Replay):
         worker_at_approval = []
 
         def score(*_):
+            owner_check_times.append(len(labels) * CHUNK_MS)
             if worker_action == "close":
                 vad.close()
                 worker_at_approval.append(not vad.available)
@@ -395,10 +396,15 @@ class AdversarialReplay(Replay):
         self.assertTrue(all(event["type"] == "privacy" for event in events))
         self.assertFalse(e._memory.retained_ids, "private transcript retained")
         self.assertEqual(([event["action"] for event in events], s.exit_score.call_count), expected)
+        if owner_check_times:
+            # ASR finalization and the acoustic-end window must both be complete.
+            ready = math.ceil(max(command[1] + 1440, calls[0][1]) / CHUNK_MS) * CHUNK_MS
+            self.assertEqual(owner_check_times, [ready])
         for event in events:
             if event["action"] == "exit":
-                self.assertGreaterEqual(event["emitted_at_ms"], calls[0][1] + 704)
-                self.assertLess(event["emitted_at_ms"], calls[0][1] + 704 + CHUNK_MS)
+                # Publication can already be on the 20 ms input frame carrying the last block.
+                self.assertGreaterEqual(event["emitted_at_ms"], owner_check_times[0])
+                self.assertLess(event["emitted_at_ms"], owner_check_times[0] + 20)
         self.assertFalse(c._private_sentence.pcm)
         return labels, calls
 
@@ -414,32 +420,37 @@ class AdversarialReplay(Replay):
             **options,
         )
 
-    def speechlike_tail(self, level, duration, first_positive, expected):
+    def speechlike_tail(self, level, duration, lag, expected):
         fan = tones((50, 1000))
         room = array("h", fan * (duration // 100))
         wave = speechlike_wave(duration)
         tail = array("h", (round(bg + level * v) for bg, v in zip(room, wave, strict=True)))
-        labels, windows = self.key_exit(
-            tail.tobytes() + fan * 16,
-            later_speech=[(first_positive, first_positive + CHUNK_MS)],
-            expected=expected,
-        )
-        close = windows[0][1]
-        self.assertEqual(close, 2120)
-        first = next(i * CHUNK_MS for i, v in enumerate(labels) if v and i * CHUNK_MS >= 1400)
-        self.assertEqual(first, first_positive)
-        return first - 1400  # Acoustic end of the last authored word.
+        pcm = tail.tobytes() + fan * 16
+        first_positive = 1400 + lag
+        for pause, close in ((None, 2120), (20, 700), (720, 1400)):
+            with self.subTest(endpoint_pause=pause):
+                labels, windows = self.key_exit(
+                    pcm,
+                    later_speech=[(first_positive, first_positive + CHUNK_MS)],
+                    expected=expected if close >= 1400 else ([], 0),
+                    endpoint_pause=pause,
+                )
+                self.assertEqual(windows[0][1], close)
+                first = next(
+                    i * CHUNK_MS for i, v in enumerate(labels) if v and i * CHUNK_MS >= 1400
+                )
+                self.assertEqual(first - 1400, lag)
 
     def test_speechlike_continuation_cancels_at_both_measured_levels(self):
-        # #350 round 16, key8 P2-2: continuing speech must cancel before owner scoring.
-        for rms, first, lag in ((400, 2336, 936), (180, 2752, 1352)):
+        for rms, lag in ((400, 936), (180, 1352)):
             with self.subTest(rms=rms):
-                self.assertEqual(self.speechlike_tail(rms, 2000, first, ([], 0)), lag)
+                self.speechlike_tail(rms, 2000, lag, ([], 0))
 
     def test_accepting_endpointer_close_relative_to_acoustic_end(self):
         # Same clean command, ending at 1400 ms. An early close can truncate it.
         for pause, close, expected in (
             (20, 700, ([], 0)),
+            (700, 1380, ([], 0)),
             (720, 1400, (["exit"], 1)),
             (800, 1480, (["exit"], 1)),
         ):
@@ -451,18 +462,25 @@ class AdversarialReplay(Replay):
 
     def test_clean_exit_requires_the_last_observed_block(self):
         fan = tones((50, 1000)) * 24
-        # ASR closes at 2120 ms. The block [2816, 2848) covers the final 8 ms.
-        self.key_exit(fan[: (2848 - 1400) * 32 - 2], expected=([], 0))
-        self.key_exit(fan[: (2848 - 1400) * 32], expected=(["exit"], 1))
+        # The last word ends at 1400 ms. The block [2816, 2848) covers the 2840 ms deadline.
+        last = (2848 - 1400) * BYTES_PER_MS
+        for pause in (None, 720):
+            with self.subTest(endpoint_pause=pause):
+                self.key_exit(fan[: last - 2], endpoint_pause=pause, expected=([], 0))
+                self.key_exit(fan[:last], endpoint_pause=pause, expected=(["exit"], 1))
 
     def test_speech_on_the_last_block_cancels_the_exit(self):
         fan = tones((50, 1000))
         resumed = tones((50, 1000), (200, 3000), (400, 1000))
         tail = (fan * 15)[: (2816 - 1400) * 32] + resumed * 4 + fan * 24
-        labels, windows = self.key_exit(tail, later_speech=[(2816, 2848)], expected=([], 0))
-        self.assertEqual(windows[0][1], 2120)
-        self.assertFalse(any(labels[math.ceil(2120 / CHUNK_MS) : 2816 // CHUNK_MS]))
-        self.assertTrue(labels[2816 // CHUNK_MS])
+        for pause, close in ((None, 2120), (720, 1400)):
+            with self.subTest(endpoint_pause=pause):
+                labels, windows = self.key_exit(
+                    tail, later_speech=[(2816, 2848)], endpoint_pause=pause, expected=([], 0)
+                )
+                self.assertEqual(windows[0][1], close)
+                self.assertFalse(any(labels[math.ceil(1400 / CHUNK_MS) : 2816 // CHUNK_MS]))
+                self.assertTrue(labels[2816 // CHUNK_MS])
 
     def test_worker_failure_during_hold_or_after_last_score_cancels_exit(self):
         def stop_worker(c, e, vad):
@@ -677,7 +695,9 @@ class FakeWorkerDecisions(AdversarialReplay, unittest.TestCase):
 
     def test_incomplete_last_vad_block_cannot_supply_an_ending_pause(self):
         command = doc(segment("Jarvis,", 20, 180), segment(" privacy off.", 180, 340))
-        for pause_ms, expected in ((20, ([], 0)), (32, ([], 0)), (736, (["exit"], 1))):
+        for pause_ms, expected in (
+            (20, ([], 0)), (32, ([], 0)), (736, ([], 0)), (1440, (["exit"], 1)),
+        ):
             with self.subTest(pause_ms=pause_ms):
                 self.assertEqual(
                     self.replay_private_windows(
@@ -757,13 +777,12 @@ class RealModelDecisions(RealSilero, AdversarialReplay, unittest.TestCase):
         return self.real_worker()
 
     def test_boundary_tail_quieter_than_180_rms(self):
-        """#350 round 15 operator ruling (2026-11-27), key7 P1-1, residual tail limit.
+        """#350 round 17 operator ruling (2026-11-27), P1-1 residual tail limit.
 
         The same moving formants continue at 160 counts RMS. Silero first detects
-        them after the approved window, so the stand-in owner's exit has already fired.
+        them 5416 ms after the last word, beyond the 1440 ms acoustic-end window.
         """
-        lag = self.speechlike_tail(160, 6000, 6816, (["exit"], 1))
-        self.assertEqual(lag, 5416)
+        self.speechlike_tail(160, 6000, 5416, (["exit"], 1))
 
     def test_boundary_quiet_speechlike_onset_at_stream_start(self):
         """#350 round 15 operator ruling (2026-11-27), key7 P1-1, residual onset limit.

@@ -23,7 +23,7 @@ from rightyo.memory import TranscriptMemory
 from rightyo.tool import _stderr
 from rightyo.tool_events import SpeechEvents
 
-# 20 ms replay frames covering the 1440 ms hangover and the 704 ms exit hold.
+# 20 ms replay frames covering both ASR hangover and confirmation from the last word.
 EXIT_PAUSE = SILENCE * 108
 
 
@@ -802,12 +802,16 @@ class PrivacyMinimumTests(unittest.TestCase):
             (["exit"], 1),
         )
         # The same coverage rule applies when end-of-turn accepts a shorter pause.
-        for length, expected in ((50, (["exit"], 1)), (51, ([], 0))):
+        for length, silence, expected in (
+            (50, SILENCE * 46, ([], 0)),
+            (50, EXIT_PAUSE, (["exit"], 1)),
+            (51, EXIT_PAUSE, ([], 0)),
+        ):
             endpoint = Mock(return_value=1.0)
             self.assertEqual(
                 self.replay_private_windows(
                     command,
-                    audio=[SILENCE * 10 + VOICE * length + SILENCE * 46],
+                    audio=[SILENCE * 10 + VOICE * length + silence],
                     end_of_turn=endpoint,
                 ),
                 expected,
@@ -953,7 +957,7 @@ class PrivacyMinimumTests(unittest.TestCase):
         second = doc(addressed_segment("Jarvis, privacy off.", 20, 1020))
         for gap in (15, 72):
             with self.subTest(gap=gap):
-                audio = [VOICE * 50 + SILENCE * gap + VOICE * 50 + SILENCE * 46]
+                audio = [VOICE * 50 + SILENCE * gap + VOICE * 50 + EXIT_PAUSE]
                 self.assertEqual(
                     self.replay_private_windows(second, audio=audio, end_of_turn=lambda _: 1),
                     (["exit"], 1),
@@ -996,7 +1000,7 @@ class PrivacyMinimumTests(unittest.TestCase):
         )
         for gap in (15, 72):
             with self.subTest(gap_ms=20 * gap):
-                audio = [lead + SILENCE * gap + VOICE * 50 + SILENCE * 46]
+                audio = [lead + SILENCE * gap + VOICE * 50 + EXIT_PAUSE]
                 self.assertEqual(
                     self.replay_private_windows(
                         cut,
@@ -1366,7 +1370,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                 self.replay_private_windows(
                     doc(segment("Other speech.", 20, 4000)),
                     doc(addressed_segment("Jarvis, privacy off.", 20, 1020)),
-                    audio=[SILENCE * 10 + VOICE * 199 + SILENCE * gap + VOICE * 50 + SILENCE * 46],
+                    audio=[SILENCE * 10 + VOICE * 199 + SILENCE * gap + VOICE * 50 + EXIT_PAUSE],
                     end_of_turn=lambda _: 1.0,
                     max_utterance_ms=4000,
                 ),
@@ -1381,7 +1385,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                         doc(segment("Other speech.", 20, 20 + frames * 20)),
                         doc(addressed_segment("Jarvis, privacy off.", 20, 1020)),
                         audio=[
-                            SILENCE * 10 + VOICE * frames + SILENCE * 15 + VOICE * 50 + SILENCE * 46
+                            SILENCE * 10 + VOICE * frames + SILENCE * 15 + VOICE * 50 + EXIT_PAUSE
                         ],
                         end_of_turn=lambda _: 1.0,
                         max_utterance_ms=4000,

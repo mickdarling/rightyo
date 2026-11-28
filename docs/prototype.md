@@ -235,14 +235,21 @@ reason. Host privacy controls remain available. Private status questions remain 
 and after a runtime worker failure. Once a worker is judging private speech,
 only its observed blocks can open a private recognition window.
 
-Every voice exit waits for **704 ms** (22 native blocks) of Silero-verified
-speech absence after ASR closes. In round 15, the pinned worker first detected
-a continuing synthetic speech-like tail 216 ms after close at 400 counts RMS
-and 632 ms after close at 180 counts RMS. The operator fixed the window on
-2026-11-27 by adding two blocks of margin to the longer lag and rounding up
-to a whole block. This adds about 0.7 s to every voice exit and errs toward
-staying private. Speech in the window cancels the exit before the owner check. All exit preconditions,
+Every voice exit takes about **1,440 ms** from the acoustic end of the command.
+The window starts at the end of the last word supported by Silero speech evidence.
+ASR closure timing cannot shorten it. The processor waits for the entire block
+covering the deadline before the owner check. Resumed speech on any of those
+blocks cancels the exit. This errs toward staying private. All exit preconditions,
 including a fresh worker liveness round-trip, must still pass at commit.
+
+In the round 17 generated replay, the last word ended at 1,400 ms. The pinned
+worker's first speech-positive continuation block began 936 ms later at 400
+counts RMS, 1,352 ms later at 180 counts RMS and 5,416 ms later at 160 counts
+RMS. The 2026-11-27 operator ruling adds two 32 ms blocks to the 180 RMS lag
+and rounds up to 45 whole blocks. Normal ASR close was 2,120 ms. The fast
+“complete” endpointer closed as early as 700 ms, truncating the command. Its
+earliest close retaining every word was 1,400 ms. Both qualifying endpointers
+reached the owner check at 2,848 ms on the clean replay.
 
 The pinned VAD missed a very quiet speech-like onset from stream start and
 detected a quieter, 160 counts RMS continuation only after the hold expired.

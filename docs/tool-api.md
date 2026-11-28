@@ -1865,15 +1865,21 @@ consecutive 512-sample (32 ms) blocks at 16 kHz. A speech probability of at leas
 0.5 marks the whole block as speech. Only observed blocks count toward either
 pause. A quiet period qualifies only the onset immediately following it.
 
-After ASR closes an exit candidate, the processor requires another **704 ms**
-(22 native blocks) of Silero-verified speech absence. A speech block overlapping
-any part of that window cancels the exit before owner verification, including
-speech on its last block. An incomplete
-block at end of input cannot finish the window. In the round 15 synthetic replay,
-Silero first detected the continuing speech-like tail 216 ms after ASR closed at
-400 counts RMS and 632 ms after close at 180 counts RMS. The 2026-11-27 operator
-ruling added two blocks of margin to 632 ms and rounded up to 704 ms. This adds
-about 0.7 s to every voice exit and errs toward staying private. At commit the
+Every voice exit takes about **1,440 ms** from the acoustic end of the command
+(the end of the last word whose timing is supported by Silero speech evidence).
+The processor counts observed audio from that word end, independent of ASR close.
+It waits for the complete native block covering the deadline before checking the
+owner. Resumed speech cancels the exit even on that last block. A partial block at
+end of input cannot complete the window. This errs toward staying private.
+
+In the round 17 synthetic replay, the last word ended at 1,400 ms. Measured from
+that end to the start of the first continuation block the pinned worker labelled
+speech, the lags were 936 ms at 400 counts RMS, 1,352 ms at 180 counts RMS and
+5,416 ms at 160 counts RMS. The 2026-11-27 ruling adds two 32 ms blocks to
+1,352 ms and rounds up to a whole block, giving 45 blocks. Normal ASR close was
+2,120 ms. The earliest fast “complete” close was 700 ms and truncated the command.
+The earliest close retaining every word was 1,400 ms. With either qualifying
+endpointer, a clean replay reached the owner check at 2,848 ms. At commit the
 publisher rechecks the current privacy session, owner approval, speaker and
 playback evidence, and requires a fresh round-trip to the VAD worker.
 

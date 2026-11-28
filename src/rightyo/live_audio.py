@@ -53,7 +53,7 @@ ASR_END_PADDING_MS = 1000
 # Two 10 ms whisper timestamp ticks (one PCM frame): tolerate rounding jitter only.
 ASR_TIMING_JITTER_MS = 20
 PRIVATE_ONSET_QUIET_MS = 200
-PRIVATE_EXIT_TAIL_MS = 704  # #350 operator ruling: 22 native Silero blocks after ASR close
+PRIVATE_EXIT_TAIL_MS = 1440  # 1352 ms from the last word + two 32 ms blocks, rounded up
 # Recovery alone is asynchronous and bounded. The first decode retains its configured
 # timeout, including the base's pre-existing synchronous input-path blocking.
 ASR_REDECODE_SECONDS = 5.0
@@ -1686,7 +1686,7 @@ class _OffsetDiarizer:
 @dataclass
 class _PendingExit:
     window_number: int
-    close_ms: int
+    word_end_ms: int
     resolve: Callable[[int | None], None] | None
 
 
@@ -1733,7 +1733,7 @@ class LiveProcessor:
         self._vad_quiet_ms = 0
         self._vad_observed_absence = False
         self._vad_scored_ms = 0
-        self._vad_last_positive_end = 0
+        self._vad_last_positive_start = -1
         self._pending_exit: _PendingExit | None = None
         self._utterance_vad: bytearray | None = None
         self._frame_private = False
@@ -1899,11 +1899,13 @@ class LiveProcessor:
             return (
                 pending is not None
                 and pending.window_number == window_number
-                and self._vad_last_positive_end <= pending.close_ms
-                and self._vad_scored_ms >= pending.close_ms + PRIVATE_EXIT_TAIL_MS
+                and self._vad_last_positive_start < pending.word_end_ms
+                and self._vad_scored_ms >= pending.word_end_ms + PRIVATE_EXIT_TAIL_MS
             )
 
-    def _defer_private_exit(self, number: int, resolve: Callable[[int | None], None]) -> None:
+    def _defer_private_exit(
+        self, number: int, word_end_ms: int, resolve: Callable[[int | None], None]
+    ) -> None:
         with self._recovery_lock:
             packet = self._publishing
             if (
@@ -1912,7 +1914,7 @@ class LiveProcessor:
                 and packet.number == number
                 and not packet.discarded
             ):
-                self._pending_exit = _PendingExit(number, packet.through_ms, resolve)
+                self._pending_exit = _PendingExit(number, word_end_ms, resolve)
                 return
         resolve(None)
 
@@ -1927,9 +1929,11 @@ class LiveProcessor:
             pending = self._pending_exit
             if pending is None or pending.resolve is None:
                 return
-            if self._vad_last_positive_end > pending.close_ms:
+            # A positive block straddling the last word's end was already checked
+            # by _covered_exit_intervals. Any later positive block is new speech.
+            if self._vad_last_positive_start >= pending.word_end_ms:
                 at_ms = None
-            elif self._vad_scored_ms >= pending.close_ms + PRIVATE_EXIT_TAIL_MS:
+            elif self._vad_scored_ms >= pending.word_end_ms + PRIVATE_EXIT_TAIL_MS:
                 at_ms = self._vad_scored_ms
             else:
                 return
@@ -1968,9 +1972,9 @@ class LiveProcessor:
                 if self.closed:  # Stop may have released the input while the worker scored it.
                     return
                 self._vad_pending.extend(bytes([voice]) * block)
-                self._vad_scored_ms += block
                 if voice:
-                    self._vad_last_positive_end = self._vad_scored_ms
+                    self._vad_last_positive_start = self._vad_scored_ms
+                self._vad_scored_ms += block
                 if self._pending_exit is not None:
                     self._advance_private_exit()
             if self.closed or len(self._partial) < FRAME_BYTES:
@@ -3049,9 +3053,10 @@ class LiveProcessor:
                     # A consumer retaining the turn cannot retain PCM through this
                     # guard or redeem the approval against a different window.
                     processor = weakref.proxy(self)
+                    word_end_ms = group["end_ms"]
                     group["exit_available"] = lambda: processor._private_exit_available(number)
                     group["defer_exit"] = lambda commit: processor._defer_private_exit(
-                        number, commit
+                        number, word_end_ms, commit
                     )
                 start = (group["start_ms"] - offset) * BYTES_PER_MS
                 end = (group["end_ms"] - offset) * BYTES_PER_MS
