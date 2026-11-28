@@ -19,6 +19,7 @@ import test_privacy_minimum as privacy
 from test_live_audio import SILENCE, VOICE
 from test_whisper_window_recovery import doc, segment
 
+from rightyo.live_audio import BYTES_PER_MS
 from rightyo.live_speaker_id import EntryScore, LabelState
 from rightyo.silero_vad import CHUNK_BYTES, CHUNK_MS, VERSION, SileroVad, VadConfig, VadError
 
@@ -514,6 +515,51 @@ class RealSilero:
 class RealModelDecisions(RealSilero, AdversarialReplay, unittest.TestCase):
     def worker(self, speech):
         return self.real_worker()
+
+    def test_boundary_nonspeech_100_hz_tone_with_rising_harmonics_allows_exit(self):
+        """#350 operator ruling (2026-11-27), P1-1.
+
+        Pinned Silero labels the tone after the phrase as non-speech. One owner check
+        and one exit are expected while the fundamental continues.
+        """
+        base = ((50, 100), (100, 1000))
+        tone = tones(*base, (200, 80), (400, 50)) * 34
+        louder = tones(*base, (200, 3000), (400, 1000)) * 14
+        # Change only the harmonic amplitudes. Keep the phase continuous at both edges.
+        start, end = 384, 1384
+        left, right = start * BYTES_PER_MS, end * BYTES_PER_MS
+        labels, windows = self.exercise(
+            tone[:left] + louder[left:right] + tone[right:],
+            None,
+            (start, end),
+            words=[(start, 484, "Jarvis,"), (484, 564, " privacy"), (564, end, " off.")],
+            expected=(["exit"], 1),
+        )
+        self.assertFalse(any(labels[: start // CHUNK_MS]))
+        self.assertFalse(any(labels[end // CHUNK_MS :]))
+        ((_, close_ms),) = windows
+        self.assertLess(close_ms, 3400, "ASR waited for the tone to end")
+
+    def test_boundary_nonspeech_tail_at_1_465_times_fan_rms_after_400_ms_lead_allows_exit(self):
+        """#350 operator ruling (2026-11-27), P1-2.
+
+        Pinned Silero labels the synthetic voiced tail as non-speech. One owner check
+        and one exit are expected while the tail continues.
+        """
+        fan = (50, 1000)
+        command = tones(fan, (200, 3000), (400, 1000))
+        amp = 1000 * math.sqrt((1.465**2 - 1) / (1 + 0.2**2 + 0.1**2))
+        tail = tones(fan, (80, amp), (160, 0.2 * amp), (240, 0.1 * amp))
+        labels, windows = self.exercise(
+            tones(fan) * 4 + command * 10 + tail * 20 + tones(fan) * 16,
+            None,
+            (400, 1400),
+            words=[(400, 500, "Jarvis,"), (500, 580, " privacy"), (580, 1400, " off.")],
+            expected=(["exit"], 1),
+        )
+        self.assertFalse(any(labels[1400 // CHUNK_MS :]))
+        ((_, close_ms),) = windows
+        self.assertLess(close_ms, 3400, "ASR waited for the synthetic tail to end")
 
     def test_persistent_fundamental_with_louder_third_harmonic(self):
         self.persistent_fundamental()

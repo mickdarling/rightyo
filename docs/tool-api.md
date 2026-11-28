@@ -1865,6 +1865,12 @@ consecutive 512-sample (32 ms) blocks at 16 kHz. A speech probability of at leas
 0.5 marks the whole block as speech. Only observed blocks count toward either
 pause. A quiet period qualifies only the onset immediately following it.
 
+R4 and R4b cover continuing speech as judged by the pinned VAD. Continuing
+non-speech sound such as a tone, hum or music does not block an exit after a
+genuine exit phrase. Before any install, the owner-clip speech-continues negative
+must prove that real speech continuing beyond the recognized phrase keeps privacy
+on, with zero owner checks and zero exits. [Owner-clip replay](prototype.md#owner-clip-replay-for-350)
+
 Each word's supplied timing must contain a complete speech block. A shared
 interval for several words supplies their common timing evidence. The first speech
 block may straddle the reported onset. A whole speech block before the first word

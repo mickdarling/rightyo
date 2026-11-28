@@ -235,6 +235,10 @@ reason. Host privacy controls remain available. Sessions started without a VAD
 can still recognize the status question. Once a worker is judging private speech,
 only its observed blocks can open a private recognition window.
 
+R4 and R4b cover continuing speech as judged by the pinned VAD. Continuing
+non-speech sound such as a tone, hum or music does not block an exit after a
+genuine exit phrase.
+
 ### Reproduce the Silero test worker on Apple Silicon
 
 The #350 round-8 replay used an existing CPython 3.11.14 on macOS 15.8.3 arm64,
@@ -272,10 +276,14 @@ HOME="$PWD/../.cache/test-home" TMPDIR="$PWD/../.cache/tmp" \
 ```
 
 The cases skip when the model or runtime is absent. With the pinned worker, the
-100 and 200 Hz machinery replays, the omitted low-pitched tail and the persistent
-fundamental must all keep privacy on, make zero owner checks and emit no transcript
-or exit. The separate 50 Hz control with 400 ms of lead-in still expects one
-stand-in check and one exit. The fake worker supplies known speech intervals and
+100 and 200 Hz machinery replays, the omitted low-pitched tail with a 200 ms
+lead-in and the persistent fundamental with a louder third harmonic must all
+keep privacy on, make zero owner checks and emit no transcript or exit.
+Two boundary replays use a persistent 100 Hz tone with raised second and fourth
+harmonics and a synthetic tail at 1.465× fan RMS after a 400 ms lead-in.
+Silero labels the continuing tone in each as non-speech. Both expect one
+stand-in owner check and one exit, as does the 50 Hz clean control with a
+400 ms lead-in. The fake worker supplies known speech intervals and
 exercises the positive machinery, onset, omitted-tail and early-close decisions in CI.
 
 ### Owner-clip replay for #350
@@ -321,8 +329,10 @@ Silero before (see below). This same background check is part of owner qualifica
 
 The full podcast sentence and its final words alone must stay private. A second
 pass drops Whisper's words and timings after “listening” while Silero hears the
-whole recording. It checks for speech in the omitted tail and requires the ASR
-window to remain open through the clip. Whisper's timing for “to” also locates
+whole recording. Before any install, this owner-clip speech-continues negative
+(`test_omitted_continuing_speech_stays_private`) must prove that Silero detects
+real continuing speech, the ASR window stays open through the clip, and the
+processor makes zero owner checks and emits zero exits. Whisper's timing for “to” also locates
 the excerpt used for the side-talk replay.
 
 With a 2 s gap, the name must authenticate silently and the remainder must
