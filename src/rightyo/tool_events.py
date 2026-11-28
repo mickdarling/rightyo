@@ -393,7 +393,7 @@ def _phrase_in(words, phrases):
     )
 
 
-def _exit_kinds(text, addressing):
+def _exit_matches(text, addressing, *, open_name):
     """Parse the exit and both split fragments without discarding unknown words."""
     # Keep original offsets for sentence breaks and the vocative's question exemption.
     # Only whitespace and punctuation separate words. Marks, format characters and
@@ -447,13 +447,19 @@ def _exit_kinds(text, addressing):
                     if not question_shaped(
                         text[sentence:sentence_end], address_end=tokens[stop - 1].end() - sentence
                     ):
-                        return True
+                        return tokens[at].start(), tokens[stop - 1].end()
             head = head and words[at] in PRIVACY_EXIT_FILLER
-        return False
+        return None
 
-    kinds = set()
-    if addressed(len(words), len(text)):
-        kinds.add("name")
+    matches = {}
+    boundaries = ".!?;" + LINE_BREAKS
+    name = addressed(len(words), len(text), sentences[-1]) if words else None
+    if name is not None:
+        # A terminal period can classify a standalone name for other callers.
+        # Arming a split requires the sentence to remain open at the join.
+        after = source[name[1] : len(source) if open_name else tokens[-1].end()]
+        if not any(ch in boundaries for ch in after):
+            matches["name"] = name
     end = len(words)
     while end and words[end - 1] in PRIVACY_EXIT_TRAILING:
         end -= 1
@@ -467,26 +473,29 @@ def _exit_kinds(text, addressing):
             # The existing vocative grammar allows a three-dot hesitation before
             # the phrase. Internal name/phrase breaks above retain their meaning.
             phrase_sentence = sentences[start - 1]
-        if addressed(start, sentence_end, phrase_sentence):
-            kinds.add("exit")
+        address = addressed(start, sentence_end, phrase_sentence)
+        if address is not None:
+            matches["exit"] = (address[0], sentence_end)
         elif (
-            sentences[0] == sentences[start]
+            not any(ch in boundaries for ch in source[: tokens[start].start()])
             and all(w in PRIVACY_EXIT_FILLER for w in words[:start])
             and not question_shaped(text[:sentence_end])
         ):
-            kinds.add("rest")
+            matches["rest"] = (tokens[0].start(), sentence_end)
         break
-    return kinds
+    return matches
 
 
-def privacy_phrase(text, addressing, *, recognition_complete=True):
+def privacy_phrase(text, addressing, *, recognition_complete=True, open_name=False):
     """Classify local privacy phrases. Exit evidence requires complete recognition,
     a statement and a sentence-initial address (or two whole split fragments).
     Status and standalone entry retain their own grammars.
     """
     unfiltered = _privacy_words(text, ())
     words = _matched_words(unfiltered, addressing)
-    kinds = _exit_kinds(text, addressing) if recognition_complete else set()
+    kinds = (
+        set(_exit_matches(text, addressing, open_name=open_name)) if recognition_complete else set()
+    )
     if _phrase_in(words, PRIVACY_STATUS):
         kinds.add("status")
     if not text.rstrip().endswith("?") and _standalone_entry(unfiltered, addressing):
@@ -1423,16 +1432,17 @@ class SpeechEvents:
                     and turn.utterance_id not in self._private_seen
                 ):
                     with contextlib.suppress(Exception):
-                        kinds = privacy_phrase(
-                            turn.text,
-                            self._addressing,
-                            recognition_complete=turn.recognition_complete,
+                        matches = (
+                            _exit_matches(turn.text, self._addressing, open_name=True)
+                            if turn.recognition_complete
+                            else {}
                         )
-                        if (
-                            "name" in kinds
-                            or "exit" in kinds
-                            or ("rest" in kinds and _completes_split(turn, ticket.split))
-                        ):
+                        match = matches.get("exit")
+                        if match is None and _completes_split(turn, ticket.split):
+                            match = matches.get("rest")
+                        if match is None:
+                            match = matches.get("name")
+                        if match is not None:
                             binding = self._binding_exit_check(turn, inferred)
                 if binding is None:
                     # No owner check will consume this turn. Silence may follow it
@@ -1455,7 +1465,7 @@ class SpeechEvents:
                     ):
                         entry = getattr(self._priority, "entry_voice", None)
         if binding is not None:
-            outcome, origin = self._exit_approval(turn, inferred, binding=binding)
+            outcome, origin = self._exit_approval(turn, inferred, binding=binding, match=match)
             ticket = replace(ticket, exit=outcome, exit_origin=origin)
         if callable(entry):
             with contextlib.suppress(Exception):
@@ -2113,7 +2123,10 @@ class SpeechEvents:
         self._private_counts["discarded"] += 1
         try:
             kinds = privacy_phrase(
-                turn.text, self._addressing, recognition_complete=turn.recognition_complete
+                turn.text,
+                self._addressing,
+                recognition_complete=turn.recognition_complete,
+                open_name=True,
             )
         except Exception:  # noqa: BLE001 - the words must never reach an error or a log
             kinds = frozenset()
@@ -2202,7 +2215,7 @@ class SpeechEvents:
     def _exit_check(self, turn, inferred, *, binding=None):
         return self._exit_approval(turn, inferred, binding=binding)[0]
 
-    def _exit_approval(self, turn, inferred, *, binding=None):
+    def _exit_approval(self, turn, inferred, *, binding=None, match=None):
         """Check binding OR this turn's voice, retaining the conservative prechecks.
 
         Always erase candidate audio, even if a binding passes or a precheck refuses.
@@ -2216,7 +2229,7 @@ class SpeechEvents:
                 return (allowed, reason), "binding" if allowed else None
             voice = getattr(self._priority, "exit_voice", None)
             if callable(voice):
-                outcome = voice(turn)
+                outcome = voice(turn, match)
                 if outcome == "pass":
                     return (True, None), "voice"
                 if outcome in {"voice_below_threshold", "voice_unavailable"}:

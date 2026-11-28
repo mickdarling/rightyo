@@ -1872,11 +1872,12 @@ must prove that real speech continuing beyond the recognized phrase keeps privac
 on, with zero owner checks and zero exits. [Owner-clip replay](prototype.md#owner-clip-replay-for-350)
 
 Each word's supplied timing must contain a complete speech block. A shared
-interval for several words supplies their common timing evidence. The first speech
-block may straddle the reported onset. A whole speech block before the first word
-keeps Privacy on. So does voice in a gap between original spoken tokens or beyond the final word,
-even when the gap intersects only part of a speech block. A missing or failed VAD
-disables voice exits. See [local setup and model pin](prototype.md#silero-vad-for-leaving-privacy-by-voice).
+interval for several words supplies their common timing evidence. A native block may
+straddle the first word's start or the final word's end. A whole speech block outside
+those bounds keeps privacy on. Any detected speech in a gap between original spoken
+tokens also keeps privacy on. Initial positive blocks alone cannot open private ASR.
+The worker must answer a fresh, bounded probe after owner verification to authorize
+publication. A missing or unresponsive VAD disables voice exits. See [local setup and model pin](prototype.md#silero-vad-for-leaving-privacy-by-voice).
 Punctuation supplies no speech timing. A speaker boundary
 that divides the text, a forced ASR cut or its continuation, and an end-of-input
 flush also disqualify the fragment. So do lost text, a recognizer retry, textless timed
@@ -1892,8 +1893,11 @@ follow it. For example, "May," followed by "I'm back." qualifies when "May"
 is configured. A recognition loss between the fragments breaks the pair.
 Both turns must authenticate. Each may pass its own binding check or an isolated voice check on
 its own buffered audio alone. Private processor turns are unlabelled, so both fragments
-must pass their own isolated voice checks. A guest or a TV supplying the name never
-counts. Any other turn between them, private or not, and any change of
+must pass their own isolated voice checks. For the name fragment, the verifier
+receives only the configured name's timed audio, excluding earlier sentences and
+surrounding fillers. Shared timestamps that cannot isolate the name refuse the check.
+A sentence boundary after the name or at the start of the remainder breaks the pair.
+A guest or a TV supplying the name never counts. Any other turn between them, private or not, and any change of
 the mode, ends it, and a name piece released after the off (heard across it) never
 starts one. Private finalized pieces bypass continuation holds and wake joining: each
 piece replaces the retained sentence, and each half of a split exit authenticates its

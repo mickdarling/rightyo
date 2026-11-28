@@ -128,6 +128,36 @@ class PrivateTurnAudio:
     def for_turn(self, turn):
         return self.pcm if self.key == self._key(turn) else None
 
+    def for_match(self, turn, match):
+        pcm = self.for_turn(turn)
+        if not pcm or match is None:
+            return None
+        left, right = match
+        if not any(ch.isalnum() for ch in turn.text[:left] + turn.text[right:]):
+            return pcm
+        # Never apportion a shared timestamp between the address and other words.
+        # Verify the selected PCM in isolation, before the verifier trims silence.
+        selected = []
+        cursor = left
+        for first, last, start, end in turn.exit_timings:
+            if first < right and left < last:
+                if (
+                    first < cursor
+                    or last > right
+                    or any(ch.isalnum() for ch in turn.text[cursor:first])
+                ):
+                    return None
+                selected.append((start, end))
+                cursor = last
+        if not selected or any(ch.isalnum() for ch in turn.text[cursor:right]):
+            return None
+        start, end = selected[0][0], selected[-1][1]
+        if not turn.start_ms <= start < end <= turn.end_ms:
+            return None
+        first_byte = (start - turn.start_ms) * BYTES_PER_MS
+        past_byte = (end - turn.start_ms) * BYTES_PER_MS
+        return memoryview(pcm)[first_byte:past_byte]
+
     def clear(self) -> None:
         wipe(self.pcm)
         self.pcm = bytearray()
@@ -1267,7 +1297,7 @@ class ShadowSpeakerId:
         except Exception:  # noqa: BLE001 - a check that fails refuses, never raises
             return EntryScore(None, None, 0, "unavailable")
 
-    def exit_score(self, pcm: bytearray, owners) -> EntryScore:
+    def exit_score(self, pcm: bytearray | memoryview, owners) -> EntryScore:
         """Score only an exit candidate, without binding, accumulation or immutable PCM.
 
         Always wipes the borrowed buffer, including unavailable/busy/timeout/error.
@@ -1506,7 +1536,7 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         ):
             self.exit_audio.clear()
 
-    def exit_voice(self, turn) -> str | None:
+    def exit_voice(self, turn, match) -> str | None:
         """Fixed outcome for this turn's isolated exit check; None for legacy callers.
 
         Uses entry_threshold and entry_min_seconds, never a label or accumulated voice.
@@ -1515,7 +1545,7 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         if self.exit_audio is None:
             return None
         try:
-            pcm = self.exit_audio.for_turn(turn)
+            pcm = self.exit_audio.for_match(turn, match)
             source = self.source
             check = getattr(source, "exit_score", None)
             if not callable(check) or not pcm or turn.overlap:

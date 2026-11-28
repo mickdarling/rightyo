@@ -11,6 +11,7 @@ import tempfile
 import threading
 import unittest
 from argparse import Namespace
+from array import array
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
@@ -29,6 +30,7 @@ from test_live_speaker_id import (
     wait_for,
 )
 from test_privacy_minimum import FixtureVad
+from test_silero_vad import fake_worker
 
 from rightyo import speaker_id
 from rightyo.contracts import Addressing, SpeakerPriority
@@ -904,6 +906,58 @@ class PrivateExitTests(unittest.TestCase):
                 self.assertEqual(
                     events._private_counts["exit_name_refused"], int(identity == "guest")
                 )
+
+    def test_really_question_owner_cannot_authenticate_guest_unit(self):
+        owner_question = tone(2, OWNER_F0)
+        for name_hz, gain, allowed in (
+            (GUEST_F0, 1, False),
+            (GUEST_F0, 0.01, False),
+            (GUEST_F0, 0, False),
+            (OWNER_F0, 1, True),
+        ):
+            with self.subTest(name_hz=name_hz, gain=gain):
+                name = array("h", (round(x * gain) for x in array("h", tone(0.8, name_hz))))
+                harness = self.harness()
+                c, events, _ = self.controller(harness)
+                asr = Units()
+                asr.transcribe = Mock(
+                    side_effect=[
+                        Units(("Really?", 20, 2020), (" Unit,", 2020, 2820)).units,
+                        Units(("Privacy off.", 20, 980)).units,
+                    ]
+                )
+                speech = [(320, 3120 if gain else 2320), (4800, 5760)]
+                processor = LiveProcessor(
+                    LiveConfig(
+                        "shadow-test",
+                        transcriber=asr,
+                        diarizer=Timeline(),
+                        pre_roll_ms=20,
+                        private=c._heard_private_span,
+                        silero_vad=fake_worker(self, speech),
+                        on_private_turn_audio=lambda t, pcm: c._private_turn_audio(
+                            c._generation, t, pcm
+                        ),
+                    ),
+                    lambda t: c._turn(c._generation, work, memory, harness.shadow, t),
+                )
+                self.addCleanup(processor.close)
+                work, memory = queue.Queue(), TranscriptMemory()
+
+                def feed(pcm):
+                    for at in range(0, len(pcm), 6400):
+                        c._feed(
+                            c._generation, processor, pcm[at : at + 6400], "demo", harness.shadow
+                        )
+
+                feed(bytes(320 * 32) + owner_question + name.tobytes() + bytes(1680 * 32))
+                self.assertEqual(events._private_name_end is not None, allowed)
+                self.assertEqual(harness.embedder.frames["owner"], 40 if allowed else 0)
+                feed(tone(0.96, OWNER_F0) + bytes(1600 * 32))
+                processor.finish()
+                self.assertEqual(asr.transcribe.call_count, 2)
+                self.assertEqual([e["action"] for e in events.drain()], ["exit"] if allowed else [])
+                self.assertFalse(c._private_sentence.pcm)
 
     def test_unbound_owner_split_exit_checks_each_fragments_audio(self):
         harness = self.harness()

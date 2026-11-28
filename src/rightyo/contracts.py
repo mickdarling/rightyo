@@ -768,7 +768,13 @@ class WordAttribution:
 
 
 _INTERNAL_TURN_FIELDS = frozenset(
-    {"word_attribution", "recognition_loss_end_ms", "acoustic_span_ms", "exit_available"}
+    {
+        "word_attribution",
+        "recognition_loss_end_ms",
+        "acoustic_span_ms",
+        "exit_available",
+        "exit_timings",
+    }
 )
 
 
@@ -791,6 +797,11 @@ class Turn:
     recognition_loss_end_ms: int = field(default=0, kw_only=True, compare=False)
     # Stream-relative observed speech edges for the private split clock.
     acoustic_span_ms: tuple[int, int] | None = field(default=None, kw_only=True, compare=False)
+    # (first character, past last character, stream start ms, stream end ms)
+    # for each spoken token of a qualified private recognition.
+    exit_timings: tuple[tuple[int, int, int, int], ...] = field(
+        default=(), kw_only=True, compare=False, repr=False
+    )
     # Revalidate the originating private window at publication. Never exported or imported.
     exit_available: Callable[[], bool] | None = field(
         default=None, kw_only=True, compare=False, repr=False

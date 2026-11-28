@@ -49,7 +49,11 @@ def fake_worker(test, speech, failure_ms=None):
         "out = sys.stdout.buffer\n"
         "out.write(b'R'); out.flush()\n"
         "ms = 0\n"
-        f"while len(sys.stdin.buffer.read({CHUNK_BYTES})) == {CHUNK_BYTES}:\n"
+        "while opcode := sys.stdin.buffer.read(1):\n"
+        "    if opcode == b'P':\n"
+        "        out.write(b'P'); out.flush(); continue\n"
+        "    assert opcode == b'S'\n"
+        f"    assert len(sys.stdin.buffer.read({CHUNK_BYTES})) == {CHUNK_BYTES}\n"
         f"    if ms == {failure_ms!r}: sys.exit(1)\n"
         f"    voiced = any(start <= ms and ms + {CHUNK_MS} <= end for start, end in {speech!r})\n"
         "    out.write(b'1' if voiced else b'0'); out.flush()\n"
@@ -246,7 +250,7 @@ class FailureTests(Replay, unittest.TestCase):
 class AdversarialReplay(Replay):
     """The identical waveforms and recognition/owner gates run with either worker."""
 
-    def exercise(self, pcm, speech, command, *, expected, words=None, close_during_check=False):
+    def exercise(self, pcm, speech, command, *, expected, words=None, worker_action=None):
         vad = self.worker(speech)
         calls, labels = [], []
         classify = vad.is_speech
@@ -262,9 +266,13 @@ class AdversarialReplay(Replay):
         worker_at_approval = []
 
         def score(*_):
-            if close_during_check:
+            if worker_action == "close":
                 vad.close()
-                worker_at_approval.append(vad.available)
+                worker_at_approval.append(not vad.available)
+            elif worker_action == "stop":
+                vad.process.send_signal(signal.SIGSTOP)
+                pid, status = os.waitpid(vad.process.pid, os.WUNTRACED)
+                worker_at_approval.append(pid == vad.process.pid and os.WIFSTOPPED(status))
             return EntryScore(0.9, None, 0, "scored")
 
         s.exit_score = Mock(side_effect=score)
@@ -293,8 +301,9 @@ class AdversarialReplay(Replay):
         units.transcribe = decode
         self.feed(c, p, pcm, s)
         p.finish()
-        if close_during_check:
-            self.assertEqual(worker_at_approval, [False])
+        if worker_action:
+            self.assertIsNone(p._vad)
+            self.assertEqual(worker_at_approval, [True])
         else:
             self.assertIs(p._vad, vad, "worker failure is not an adversarial result")
             self.assertEqual(len(labels), len(pcm) // CHUNK_BYTES)
@@ -306,7 +315,7 @@ class AdversarialReplay(Replay):
         self.assertFalse(c._private_sentence.pcm)
         return labels, calls
 
-    def clean_timed_control(self, shift, *, expected, close_during_check=False, late=0):
+    def clean_timed_control(self, shift, *, expected, worker_action=None, late=0):
         machine = tones((50, 1000))
         voice = tones((50, 1000), (200, 3000), (400, 1000))
         start, end = 400 + shift, 1400 + shift
@@ -319,12 +328,36 @@ class AdversarialReplay(Replay):
                 (start + 100, start + 180, " privacy"),
                 (start + 180, end, " off."),
             ],
-            close_during_check=close_during_check,
+            worker_action=worker_action,
             expected=expected,
         )
 
     def test_worker_dies_inside_owner_verification(self):
-        self.clean_timed_control(0, close_during_check=True, expected=([], 1))
+        self.clean_timed_control(0, worker_action="close", expected=([], 1))
+
+    def test_stopped_child_inside_owner_verification_cannot_publish(self):
+        self.clean_timed_control(0, worker_action="stop", expected=([], 1))
+
+    def test_last_word_ends_one_ms_inside_native_speech_block(self):
+        voice = tones((200, 5000)) + tones((200, 5000), (400, 5000))
+        for end in (1407, 1408):
+            with self.subTest(end=end):
+                labels, _ = self.exercise(
+                    bytes(400 * 32) + (voice * 6)[: (end - 400) * 32] + bytes(1600 * 32),
+                    [(480, 1408)],
+                    (400, end),
+                    words=[(400, 600, "Jarvis,"), (600, 800, " privacy"), (800, end, " off.")],
+                    expected=(["exit"], 1),
+                )
+                self.assertEqual((len(labels) - labels[::-1].index(True)) * CHUNK_MS, 1408)
+
+    def test_steady_200_hz_from_crest_never_opens_private_asr(self):
+        # A quarter period shifts the same 1,000-count wave from zero to its crest.
+        wave = tones((200, 1000))
+        shifted = wave[40:] + wave[:40]
+        labels, windows = self.exercise(shifted * 240, [(0, 64)], (0, 24000), expected=([], 0))
+        self.assertEqual(labels[:2], [True, True])
+        self.assertEqual(windows, [])
 
     def test_18_ms_shifted_word_onset_in_first_native_speech_block(self):
         labels, _ = self.clean_timed_control(18, expected=(["exit"], 1))

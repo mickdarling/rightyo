@@ -8,6 +8,7 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,7 @@ CHUNK_MS = 32
 CHUNK_BYTES = 512 * 2  # 16 kHz mono signed little-endian PCM
 THRESHOLD = 0.5
 READY_TIMEOUT = 30
+PROBE_TIMEOUT = 0.3
 
 # Fixed startup protocol. Never relay paths, native errors, or worker output.
 _ERRORS = {
@@ -41,7 +43,9 @@ class SpeechVad(Protocol):
     chunk_ms: int
 
     @property
-    def available(self) -> bool: ...
+    def available(self) -> bool:
+        """Fresh, bounded evidence the current judge is responsive."""
+        ...
 
     def is_speech(self, pcm: bytes) -> bool: ...
 
@@ -95,7 +99,12 @@ def _worker(path: str) -> int:
             pcm = bytearray(CHUNK_BYTES)
             reply.write(b"R")
             try:
-                while (count := sys.stdin.buffer.readinto(pcm)) == CHUNK_BYTES:
+                while opcode := sys.stdin.buffer.read(1):
+                    if opcode == b"P":
+                        reply.write(b"P")
+                        continue
+                    if opcode != b"S" or sys.stdin.buffer.readinto(pcm) != CHUNK_BYTES:
+                        return 1
                     samples[0, 64:] = np.frombuffer(pcm, dtype="<i2")
                     samples[0, 64:] /= 32768.0
                     score, next_state = session.run(
@@ -111,7 +120,7 @@ def _worker(path: str) -> int:
                     samples[0, 64:].fill(0)
                     pcm[:] = bytes(CHUNK_BYTES)
                     reply.write(b"1" if probability >= THRESHOLD else b"0")
-                return int(count != 0)
+                return 0
             finally:
                 pcm[:] = bytes(CHUNK_BYTES)
                 samples.fill(0)
@@ -128,6 +137,7 @@ class SileroVad:
 
     def __init__(self, settings: VadConfig, *, cancelled=lambda: False):
         self.cancelled = cancelled
+        self._exchange = threading.Lock()
         try:
             self.channel, worker = socket.socketpair()
         except OSError:
@@ -152,7 +162,7 @@ class SileroVad:
             self.close()
             raise
 
-    def _receive(self, seconds: int) -> bytes:
+    def _receive(self, seconds: float) -> bytes:
         deadline = time.monotonic() + seconds
         self.channel.settimeout(0.1)
         while not self.cancelled() and time.monotonic() < deadline:
@@ -168,8 +178,10 @@ class SileroVad:
         if len(pcm) != CHUNK_BYTES:
             raise VadError("invalid VAD block")
         try:
-            self.channel.sendall(pcm)
-            response = self._receive(5)
+            with self._exchange:
+                self.channel.sendall(b"S")
+                self.channel.sendall(pcm)
+                response = self._receive(5)
             if response not in (b"0", b"1"):
                 raise VadError(_ERRORS[b"W"])
             return response == b"1"
@@ -179,7 +191,22 @@ class SileroVad:
 
     @property
     def available(self) -> bool:
-        return self.channel.fileno() >= 0 and self.process.poll() is None
+        # Only the worker loop can acknowledge this ordered probe. It consumes
+        # no samples and leaves both the native block clock and model state intact.
+        if not self._exchange.acquire(timeout=PROBE_TIMEOUT):
+            return False
+        try:
+            try:
+                self.channel.settimeout(PROBE_TIMEOUT)
+                self.channel.sendall(b"P")
+                if self._receive(PROBE_TIMEOUT) == b"P" and self.process.poll() is None:
+                    return True
+            except (OSError, VadError):
+                pass
+            self.channel.close()
+            return False
+        finally:
+            self._exchange.release()
 
     def close(self):
         self.channel.close()

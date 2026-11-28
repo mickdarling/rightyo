@@ -278,6 +278,9 @@ class NamedPrivacyExitTests(unittest.TestCase):
         self.assertNotIn("acoustic_span_ms", turn.to_dict())
         with self.assertRaises(ContractError):
             Turn.from_dict({**turn.to_dict(), "acoustic_span_ms": (200, 1200)})
+        self.assertNotIn("exit_timings", turn.to_dict())
+        with self.assertRaises(ContractError):
+            Turn.from_dict({**turn.to_dict(), "exit_timings": [[0, 6, 100, 200]]})
         self.assertNotIn("exit_available", turn.to_dict())
         with self.assertRaises(ContractError):
             Turn.from_dict({**turn.to_dict(), "exit_available": True})
