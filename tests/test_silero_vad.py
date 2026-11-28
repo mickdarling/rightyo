@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from array import array
 from dataclasses import replace
@@ -150,6 +151,24 @@ class FailureTests(Replay, unittest.TestCase):
                                 child.kill()
                             child.wait()
 
+    def test_hung_probe_escalates_to_kill_and_reaps_before_teardown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "unresponsive"
+            script.write_text(
+                f"#!{sys.executable}\nimport os, signal\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "os.write(1, b'R')\nsignal.pause()\n"
+            )
+            script.chmod(0o700)
+            worker = SileroVad(VadConfig(script, script))
+            self.addCleanup(worker.close)
+            start = time.monotonic()
+            self.assertFalse(worker.available)
+            self.assertLess(time.monotonic() - start, 2)
+            self.assertEqual(worker.process.returncode, -signal.SIGKILL)
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(worker.process.pid, os.WNOHANG)
+
     def test_unconfigured_vad_diagnostic_at_session_start(self):
         for roles in (False, True):
             with self.subTest(roles=roles):
@@ -224,23 +243,32 @@ class FailureTests(Replay, unittest.TestCase):
 
     def test_failure_after_qualified_onset_revokes_candidate_and_following_exits(self):
         worker = fake_worker(self, [(320, 640)], failure_ms=640)
-        command = doc(segment("Jarvis, privacy off.", 20, 340))
+        command = doc(segment("Jarvis,", 20, 180), segment(" privacy off.", 180, 340))
         stream = SILENCE * 16 + VOICE * 16 + SILENCE * 80
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             # The already-open window finishes without exit evidence. The second
-            # replay must not open another window through the energy gate.
+            # energy-gated window may recognize status but cannot exit.
             self.assertEqual(
-                self.replay_private_windows(command, audio=[stream, stream], vad=worker),
+                self.replay_private_windows(command, command, audio=[stream, stream], vad=worker),
                 ([], 0),
             )
         self.assertEqual(
             stderr.getvalue(), "rightyo: Silero VAD worker failed; voice privacy exit disabled\n"
         )
 
+    def test_private_status_survives_a_runtime_worker_failure(self):
+        status = doc(segment("Are you recording?", 0, 100))
+        command = doc(privacy.addressed_segment("Jarvis, privacy off.", 0, 100))
+        for vad in (None, fake_worker(self, [], failure_ms=32)):
+            with self.subTest(configured=vad is not None):
+                self.assertEqual(
+                    self.replay_private_windows(status, command, vad=vad), (["status"], 0)
+                )
+
     def test_worker_lost_after_scoring_cannot_release_an_exit(self):
         worker = fake_worker(self, [(320, 640)])
-        command = doc(segment("Jarvis, privacy off.", 20, 340))
+        command = doc(segment("Jarvis,", 20, 180), segment(" privacy off.", 180, 340))
 
         def end_turn(_pcm):
             worker.close()
@@ -277,7 +305,16 @@ class AdversarialReplay(Replay):
     """The identical waveforms and recognition/owner gates run with either worker."""
 
     def exercise(
-        self, pcm, speech, command, *, expected, words=None, worker_action=None, during_hold=None
+        self,
+        pcm,
+        speech,
+        command,
+        *,
+        expected,
+        words=None,
+        worker_action=None,
+        during_hold=None,
+        endpoint_pause=None,
     ):
         vad = self.worker(speech)
         calls, labels = [], []
@@ -288,13 +325,17 @@ class AdversarialReplay(Replay):
             label = classify(block)
             labels.append(label)
             if during_hold and len(labels) * CHUNK_MS == during_hold[0]:
-                before_change = s.exit_score.call_count, e.drain(), bool(c._private_sentence.pcm)
+                before_change = s.exit_score.call_count, e.drain(), len(c._private_sentence.pcm)
                 during_hold[1](c, e, vad)
                 hold_observations.append(before_change)
             return label
 
         vad.is_speech = observe
-        c, e, s, p, _, units = self.arrange(vad=vad, pre_roll_ms=400)
+        c, e, s, p, _, units = self.arrange(
+            vad=vad, pre_roll_ms=400, end_of_turn=(lambda _: 1.0) if endpoint_pause else None
+        )
+        if endpoint_pause:
+            p.config = replace(p.config, end_of_turn_silence_ms=endpoint_pause)
         c._enrolled_roles.exit_audio = c._private_sentence
         worker_at_approval = []
 
@@ -327,7 +368,11 @@ class AdversarialReplay(Replay):
                         "end_ms": right - start,
                         "text": text,
                     }
-                    for left, right, text in words or [(*command, "Jarvis, privacy off.")]
+                    for left, right, text in words
+                    or [
+                        (command[0], command[0] + 100, "Jarvis,"),
+                        (command[0] + 100, command[1], " privacy off."),
+                    ]
                 ]
             return []
 
@@ -335,7 +380,8 @@ class AdversarialReplay(Replay):
         self.feed(c, p, pcm, s)
         p.finish()
         if during_hold:
-            self.assertEqual(hold_observations, [(1, [], False)])
+            name_ms = words[0][1] - words[0][0]
+            self.assertEqual(hold_observations, [(0, [], name_ms * BYTES_PER_MS)])
         if worker_action == "during_hold":
             self.assertIsNone(p._vad)
         elif worker_action:
@@ -382,24 +428,38 @@ class AdversarialReplay(Replay):
         self.assertEqual(close, 2120)
         first = next(i * CHUNK_MS for i, v in enumerate(labels) if v and i * CHUNK_MS >= 1400)
         self.assertEqual(first, first_positive)
-        return first - close
+        return first - 1400  # Acoustic end of the last authored word.
 
     def test_speechlike_continuation_cancels_at_both_measured_levels(self):
-        for rms, first, lag in ((400, 2336, 216), (180, 2752, 632)):
+        # #350 round 16, key8 P2-2: continuing speech must cancel before owner scoring.
+        for rms, first, lag in ((400, 2336, 936), (180, 2752, 1352)):
             with self.subTest(rms=rms):
-                self.assertEqual(self.speechlike_tail(rms, 2000, first, ([], 1)), lag)
+                self.assertEqual(self.speechlike_tail(rms, 2000, first, ([], 0)), lag)
+
+    def test_accepting_endpointer_close_relative_to_acoustic_end(self):
+        # Same clean command, ending at 1400 ms. An early close can truncate it.
+        for pause, close, expected in (
+            (20, 700, ([], 0)),
+            (720, 1400, (["exit"], 1)),
+            (800, 1480, (["exit"], 1)),
+        ):
+            with self.subTest(pause=pause):
+                _, windows = self.key_exit(
+                    tones((50, 1000)) * 24, endpoint_pause=pause, expected=expected
+                )
+                self.assertEqual(windows, [(0, close)])
 
     def test_clean_exit_requires_the_last_observed_block(self):
         fan = tones((50, 1000)) * 24
         # ASR closes at 2120 ms. The block [2816, 2848) covers the final 8 ms.
-        self.key_exit(fan[: (2848 - 1400) * 32 - 2], expected=([], 1))
+        self.key_exit(fan[: (2848 - 1400) * 32 - 2], expected=([], 0))
         self.key_exit(fan[: (2848 - 1400) * 32], expected=(["exit"], 1))
 
     def test_speech_on_the_last_block_cancels_the_exit(self):
         fan = tones((50, 1000))
         resumed = tones((50, 1000), (200, 3000), (400, 1000))
         tail = (fan * 15)[: (2816 - 1400) * 32] + resumed * 4 + fan * 24
-        labels, windows = self.key_exit(tail, later_speech=[(2816, 2848)], expected=([], 1))
+        labels, windows = self.key_exit(tail, later_speech=[(2816, 2848)], expected=([], 0))
         self.assertEqual(windows[0][1], 2120)
         self.assertFalse(any(labels[math.ceil(2120 / CHUNK_MS) : 2816 // CHUNK_MS]))
         self.assertTrue(labels[2816 // CHUNK_MS])
@@ -419,7 +479,7 @@ class AdversarialReplay(Replay):
                     tones((50, 1000)) * 24,
                     during_hold=(at_ms, fail),
                     worker_action="during_hold",
-                    expected=([], 1),
+                    expected=([], 0),
                 )
 
     def clean_timed_control(self, shift, *, expected, worker_action=None, late=0):
@@ -444,6 +504,37 @@ class AdversarialReplay(Replay):
 
     def test_stopped_child_inside_owner_verification_cannot_publish(self):
         self.clean_timed_control(0, worker_action="stop", expected=([], 1))
+
+    def test_failed_probe_reaps_stopped_worker_before_teardown(self):
+        worker = self.worker([])
+        worker.process.send_signal(signal.SIGSTOP)
+        _, status = os.waitpid(worker.process.pid, os.WUNTRACED)
+        self.assertTrue(os.WIFSTOPPED(status))
+        start = time.monotonic()
+        self.assertFalse(worker.available)
+        self.assertLess(time.monotonic() - start, 2)
+        self.assertIn(worker.process.returncode, (-signal.SIGTERM, -signal.SIGKILL))
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(worker.process.pid, os.WNOHANG)
+
+    def test_timed_period_uses_the_final_words_native_block_tolerance(self):
+        voice = tones((200, 5000)) + tones((200, 5000), (400, 5000))
+        pcm = bytes(400 * 32) + (voice * 6)[: 1007 * 32] + bytes(2400 * 32)
+        for period_start in (1407, 1408):
+            with self.subTest(period_start=period_start):
+                labels, _ = self.exercise(
+                    pcm,
+                    [(480, 1408)],
+                    (400, 1407),
+                    words=[
+                        (400, 600, "Jarvis,"),
+                        (600, 800, " privacy"),
+                        (800, 1407, " off"),
+                        (period_start, period_start + 10, "."),
+                    ],
+                    expected=(["exit"], 1),
+                )
+                self.assertEqual((len(labels) - labels[::-1].index(True)) * CHUNK_MS, 1408)
 
     def test_last_word_ends_one_ms_inside_native_speech_block(self):
         voice = tones((200, 5000)) + tones((200, 5000), (400, 5000))
@@ -545,9 +636,7 @@ class FakeWorkerDecisions(AdversarialReplay, unittest.TestCase):
             ("privacy epoch", lambda c, e, vad: e.duck(True, now_ms=2496)),
         ):
             with self.subTest(name=name):
-                self.key_exit(
-                    tones((50, 1000)) * 24, during_hold=(2496, revoke), expected=([], 1)
-                )
+                self.key_exit(tones((50, 1000)) * 24, during_hold=(2496, revoke), expected=([], 0))
 
     def test_off_silences_a_whole_private_frame_waiting_for_vad_alignment(self):
         c, _, s, p, notes, _ = self.arrange(vad=self.worker([]))
@@ -587,8 +676,8 @@ class FakeWorkerDecisions(AdversarialReplay, unittest.TestCase):
         self.assertFalse(any(end <= 24000 for _, end in calls), "steady machinery opened ASR")
 
     def test_incomplete_last_vad_block_cannot_supply_an_ending_pause(self):
-        command = doc(segment("Jarvis, privacy off.", 20, 340))
-        for pause_ms, expected in ((20, ([], 0)), (32, ([], 1)), (736, (["exit"], 1))):
+        command = doc(segment("Jarvis,", 20, 180), segment(" privacy off.", 180, 340))
+        for pause_ms, expected in ((20, ([], 0)), (32, ([], 0)), (736, (["exit"], 1))):
             with self.subTest(pause_ms=pause_ms):
                 self.assertEqual(
                     self.replay_private_windows(
@@ -674,7 +763,7 @@ class RealModelDecisions(RealSilero, AdversarialReplay, unittest.TestCase):
         them after the approved window, so the stand-in owner's exit has already fired.
         """
         lag = self.speechlike_tail(160, 6000, 6816, (["exit"], 1))
-        self.assertGreater(lag, 704)
+        self.assertEqual(lag, 5416)
 
     def test_boundary_quiet_speechlike_onset_at_stream_start(self):
         """#350 round 15 operator ruling (2026-11-27), key7 P1-1, residual onset limit.

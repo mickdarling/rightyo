@@ -64,6 +64,15 @@ class NamedPrivacyExitTests(unittest.TestCase):
                 (event,) = self.hear(f"start listening{tail}", at + 1000)
                 self.assertEqual((event["type"], event["action"]), ("privacy", "exit"))
 
+    def test_forget_between_name_and_remainder_revokes_the_name_approval(self):
+        self.assertEqual(self.hear("Jarvis,", 0), [])
+        self.assertEqual(self.events._private_name_end, 900)
+        self.events.forget_speakers(now_ms=950)
+        with patch.object(self.events, "_exit_approval", wraps=self.events._exit_approval) as owner:
+            self.assertEqual(self.hear("privacy off.", 1000), [])
+            owner.assert_not_called()
+        self.assertTrue(self.events.ducked)
+
     def test_questions_cannot_start_or_complete_an_exit(self):
         self.assertEqual(self.hear("Did you hear Jarvis start listening?  ", 0), [])
         self.assertEqual(self.hear("Jarvis?", 1000), [])

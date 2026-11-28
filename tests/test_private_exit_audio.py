@@ -53,6 +53,14 @@ OWNERS = SpeakerPriority(owners=("owner",))
 EXIT = "Unit, privacy off"
 
 
+def authored_turn(current, text):
+    timings = ()
+    if text == EXIT:
+        boundary = current.start_ms + (current.end_ms - current.start_ms) * 3 // 4
+        timings = ((0, 4, current.start_ms, boundary), (6, len(EXIT), boundary, current.end_ms))
+    return replace(current, text=text, exit_timings=timings)
+
+
 class PrivateExitTests(unittest.TestCase):
     def harness(self, embedder=None, **options):
         harness = Harness(embedder or ToneEmbedder(), config=settings(**options))
@@ -79,7 +87,7 @@ class PrivateExitTests(unittest.TestCase):
         return controller, events, roles
 
     def hear(self, controller, text=EXIT, *, start=0, seconds=1, f0=OWNER_F0, inferred=False):
-        current = replace(turn(start, start + round(seconds * 1000)), text=text)
+        current = authored_turn(turn(start, start + round(seconds * 1000)), text)
         controller._received_bytes = current.end_ms * 32
         controller._received_ms = current.end_ms
         controller._private_turn_audio(
@@ -193,7 +201,9 @@ class PrivateExitTests(unittest.TestCase):
                     h = self.harness()
                     c, e, _ = self.controller(h)
                     h.shadow._labels["Speaker A"] = LabelState(state="bound", identity="guest")
-                    candidate = replace(turn(0, 1000, "Speaker A" if labelled else None), text=EXIT)
+                    candidate = authored_turn(
+                        turn(0, 1000, "Speaker A" if labelled else None), EXIT
+                    )
                     c._received_ms = 1000
                     c._received_bytes = 32000
                     c._private_turn_audio(c._generation, candidate, memoryview(tone(1)))
@@ -332,8 +342,8 @@ class PrivateExitTests(unittest.TestCase):
                                 if entry:
                                     self.hear(c, text, start=start, inferred=True)
                                 else:
-                                    candidate = replace(
-                                        turn(start, start + 1000, speaker), text=text
+                                    candidate = authored_turn(
+                                        turn(start, start + 1000, speaker), text
                                     )
                                     c._received_ms = candidate.end_ms
                                     c._received_bytes = candidate.end_ms * 32
@@ -678,7 +688,7 @@ class PrivateExitTests(unittest.TestCase):
     def test_classifying_another_turn_does_not_wipe_the_candidate_being_verified(self):
         harness = self.harness()
         controller, events, _roles = self.controller(harness)
-        candidate = replace(turn(1000, 2000), text=EXIT)
+        candidate = authored_turn(turn(1000, 2000), EXIT)
         controller._private_turn_audio(
             controller._generation, candidate, memoryview(tone(1, OWNER_F0))
         )
@@ -739,7 +749,7 @@ class PrivateExitTests(unittest.TestCase):
                 harness = self.harness()
                 controller, events, _roles = self.controller(harness)
                 old = self.hear(controller, "synthetic token")
-                current = replace(turn(1000, 2000), text=EXIT)
+                current = authored_turn(turn(1000, 2000), EXIT)
                 controller._private_turn_audio(
                     controller._generation, current, memoryview(tone(1, OWNER_F0))
                 )
@@ -782,6 +792,24 @@ class PrivateExitTests(unittest.TestCase):
                 )
                 if outcome != "bound":
                     self.assertEqual(events._private_counts[f"exit_refused_{outcome}"], 1)
+
+    def test_preexisting_playback_refuses_before_retaining_audio_for_confirmation(self):
+        c, e, _ = self.controller(self.harness())
+        schedule = Mock()
+        current = replace(
+            authored_turn(turn(0, 1000), EXIT),
+            acoustic_span_ms=(0, 1000),
+            exit_available=lambda: True,
+            defer_exit=schedule,
+        )
+        c._private_turn_audio(c._generation, current, memoryview(tone(1, OWNER_F0)))
+        e.reply("started", now_ms=500)
+        with patch.object(c._shadow, "exit_score") as score:
+            e.transcript(current, now_ms=1000)
+            schedule.assert_not_called()
+            score.assert_not_called()
+        self.assertFalse(c._private_sentence.pcm)
+        self.assertEqual(e._private_counts["exit_refused_playback"], 1)
 
     def test_wipes_on_privacy_off_stop_session_end_and_forget(self):
         for action in ("off", "stop", "end", "forget", "renew"):
@@ -959,6 +987,98 @@ class PrivateExitTests(unittest.TestCase):
                 self.assertEqual([e["action"] for e in events.drain()], ["exit"] if allowed else [])
                 self.assertFalse(c._private_sentence.pcm)
 
+    def test_single_recognition_guest_name_and_owner_phrase(self):
+        for hz, gain, timed, allowed in (
+            (OWNER_F0, 1, True, True),
+            (GUEST_F0, 1, True, False),
+            (GUEST_F0, 0.01, True, False),
+            (GUEST_F0, 0, True, False),
+            (OWNER_F0, 1, False, False),
+        ):
+            with self.subTest(hz=hz, gain=gain, name_timed=timed):
+                h = self.harness()
+                c, e, _ = self.controller(h)
+                name = array("h", (round(x * gain) for x in array("h", tone(0.8, hz)))).tobytes()
+                pcm = bytes(320 * 32) + name + tone(1.6, OWNER_F0) + bytes(2400 * 32)
+                # Even a positive VAD classification cannot give a silent name
+                # the owner's phrase. A shared timestamp cannot locate the name.
+                units = (
+                    Units(("Unit,", 20, 820), (" privacy off", 820, 2420))
+                    if timed
+                    else Units((EXIT, 20, 2420))
+                )
+                work, memory = queue.Queue(), TranscriptMemory()
+                p = LiveProcessor(
+                    LiveConfig(
+                        "shadow-test",
+                        transcriber=units,
+                        diarizer=Timeline(),
+                        pre_roll_ms=20,
+                        private=c._heard_private_span,
+                        silero_vad=fake_worker(self, [(320, 2720)]),
+                        on_private_turn_audio=lambda t, data: c._private_turn_audio(
+                            c._generation, t, data
+                        ),
+                    ),
+                    lambda t: c._turn(c._generation, work, memory, h.shadow, t),
+                )
+                self.addCleanup(p.close)
+                score = h.shadow.exit_score
+
+                isolated = []
+
+                def verify(data, owners):
+                    isolated.append(bytes(data) == name)
+                    return score(data, owners)
+
+                with patch.object(h.shadow, "exit_score", side_effect=verify) as check:
+                    for at in range(0, len(pcm), 6400):
+                        c._feed(c._generation, p, pcm[at : at + 6400], "demo", h.shadow)
+                    p.finish()
+                self.assertEqual(p._utterances, 1)
+                self.assertEqual(check.call_count, int(timed))
+                self.assertEqual(isolated, [True] if timed else [])
+                self.assertEqual(
+                    [event["action"] for event in e.drain()], ["exit"] if allowed else []
+                )
+                self.assertEqual(memory.snapshot(6000)["turns"], [])
+                self.assertTrue(work.empty())
+                self.assertFalse(c._private_sentence.pcm)
+
+    def test_multiword_name_keeps_only_its_timed_tokens(self):
+        c, e, _ = self.controller(self.harness(), addressing=Addressing(("Alpha Unit",)))
+        current = replace(
+            turn(0, 2000),
+            text="Alpha Unit, privacy off",
+            exit_timings=((0, 5, 0, 400), (6, 10, 800, 1200), (12, 23, 1200, 2000)),
+        )
+        name = tone(0.4, GUEST_F0)
+        pcm = name + tone(0.4, OWNER_F0) + name + tone(0.8, OWNER_F0)
+        c._private_turn_audio(c._generation, current, memoryview(pcm))
+        received = []
+
+        def score(data, owners):
+            received.append(bytes(data) == name * 2)
+            return EntryScore(0.1, None, 0, "scored")
+
+        with patch.object(c._shadow, "exit_score", side_effect=score):
+            e.transcript(current, now_ms=2000)
+        self.assertEqual(received, [True])
+        self.assertEqual(e.drain(), [])
+        self.assertFalse(c._private_sentence.pcm)
+
+    def test_speaker_epoch_change_between_split_fragments(self):
+        h = self.harness()
+        c, e, _ = self.controller(h)
+        self.hear(c, "Unit", seconds=0.9)
+        self.assertEqual(e._private_name_end, 900)
+        h.shadow.forget()
+        with patch.object(h.shadow, "exit_score", wraps=h.shadow.exit_score) as score:
+            self.hear(c, "privacy off", start=1000)
+            score.assert_not_called()
+        self.assertEqual(e.drain(), [])
+        self.assertTrue(e.ducked)
+
     def test_unbound_owner_split_exit_checks_each_fragments_audio(self):
         harness = self.harness()
         controller, events, _roles = self.controller(harness)
@@ -1095,7 +1215,7 @@ class PrivateExitTests(unittest.TestCase):
         recognizer.transcribe = Mock(
             side_effect=[
                 Units(("synthetic token", 200, 600)).units,
-                Units((EXIT, 0, 1000)).units,
+                Units(("Unit,", 0, 750), (" privacy off", 750, 1000)).units,
             ]
         )
         processor = LiveProcessor(
@@ -1176,7 +1296,7 @@ class PrivateListenTests(unittest.TestCase):
                     return LiveProcessor(
                         replace(
                             loaded,
-                            transcriber=Units((EXIT, 200, 1200)),
+                            transcriber=Units(("Unit,", 200, 950), (" privacy off", 950, 1200)),
                             diarizer=Timeline((200, 1200, 1)),
                             on_private_turn_audio=audio,
                         ),

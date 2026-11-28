@@ -109,59 +109,71 @@ class PrivateTurnAudio:
     def __init__(self):
         self.pcm = bytearray()
         self.key = None
+        self._selected = False
+        self._lock = threading.RLock()
 
     @staticmethod
     def _key(turn):
         return (turn.session_id, turn.utterance_id, turn.start_ms, turn.end_ms)
 
     def replace(self, turn, pcm) -> None:
-        self.clear()
-        self.key = self._key(turn)
-        expected = (turn.end_ms - turn.start_ms) * BYTES_PER_MS
-        if (
-            turn.recognition_complete
-            and len(pcm) == expected
-            and 0 < expected <= PRIVATE_TURN_MAX_BYTES
-        ):
-            self.pcm.extend(memoryview(pcm))
+        with self._lock:
+            self.clear()
+            self.key = self._key(turn)
+            expected = (turn.end_ms - turn.start_ms) * BYTES_PER_MS
+            if (
+                turn.recognition_complete
+                and len(pcm) == expected
+                and 0 < expected <= PRIVATE_TURN_MAX_BYTES
+            ):
+                self.pcm.extend(memoryview(pcm))
 
-    def for_turn(self, turn):
-        return self.pcm if self.key == self._key(turn) else None
+    def for_turn(self, turn, *, selected=False):
+        with self._lock:
+            if self.key == self._key(turn) and (not selected or self._selected):
+                return self.pcm
+            return None
 
-    def for_match(self, turn, match):
-        pcm = self.for_turn(turn)
-        if not pcm or match is None:
-            return None
-        left, right = match
-        if not any(ch.isalnum() for ch in turn.text[:left] + turn.text[right:]):
-            return pcm
-        # Never apportion a shared timestamp between the address and other words.
-        # Verify the selected PCM in isolation, before the verifier trims silence.
-        selected = []
-        cursor = left
-        for first, last, start, end in turn.exit_timings:
-            if first < right and left < last:
-                if (
-                    first < cursor
-                    or last > right
-                    or any(ch.isalnum() for ch in turn.text[cursor:first])
-                ):
-                    return None
-                selected.append((start, end))
-                cursor = last
-        if not selected or any(ch.isalnum() for ch in turn.text[cursor:right]):
-            return None
-        start, end = selected[0][0], selected[-1][1]
-        if not turn.start_ms <= start < end <= turn.end_ms:
-            return None
-        first_byte = (start - turn.start_ms) * BYTES_PER_MS
-        past_byte = (end - turn.start_ms) * BYTES_PER_MS
-        return memoryview(pcm)[first_byte:past_byte]
+    def select(self, turn, match) -> bool:
+        """Keep only the matched tokens, serialized with replacement and revocation."""
+        with self._lock:
+            pcm = self.for_turn(turn)
+            if not pcm or match is None or self._selected:
+                return False
+            left, right = match
+            if not any(ch.isalnum() for ch in turn.text[:left] + turn.text[right:]):
+                # A whole split fragment already has its own isolated sentence.
+                self._selected = True
+                return True
+            cursor = left
+            previous_end = turn.start_ms
+            pieces = []
+            for first, last, start, end in turn.exit_timings:
+                if first < right and left < last:
+                    if (
+                        not cursor <= first < last <= right
+                        or not previous_end <= start < end <= turn.end_ms
+                        or any(ch.isalnum() for ch in turn.text[cursor:first])
+                    ):
+                        return False
+                    first_byte = (start - turn.start_ms) * BYTES_PER_MS
+                    past_byte = (end - turn.start_ms) * BYTES_PER_MS
+                    pieces.append(memoryview(pcm)[first_byte:past_byte])
+                    cursor, previous_end = last, end
+            if not pieces or any(ch.isalnum() for ch in turn.text[cursor:right]):
+                return False
+            self.pcm = bytearray().join(pieces)
+            wipe(pcm)
+            self._selected = True
+            return True
 
-    def clear(self) -> None:
-        wipe(self.pcm)
-        self.pcm = bytearray()
-        self.key = None
+    def clear(self, turn=None) -> None:
+        with self._lock:
+            if turn is None or self.key == self._key(turn):
+                wipe(self.pcm)
+                self.pcm = bytearray()
+                self.key = None
+                self._selected = False
 
 
 class _ExitCheck:
@@ -1531,10 +1543,11 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         self.exit_audio: PrivateTurnAudio | None = None
 
     def clear_exit_audio(self, turn=None) -> None:
-        if self.exit_audio is not None and (
-            turn is None or self.exit_audio.for_turn(turn) is not None
-        ):
-            self.exit_audio.clear()
+        if self.exit_audio is not None:
+            self.exit_audio.clear(turn)
+
+    def select_exit_audio(self, turn, match):
+        return self.exit_audio is not None and self.exit_audio.select(turn, match)
 
     def exit_voice(self, turn, match) -> str | None:
         """Fixed outcome for this turn's isolated exit check; None for legacy callers.
@@ -1545,7 +1558,9 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         if self.exit_audio is None:
             return None
         try:
-            pcm = self.exit_audio.for_match(turn, match)
+            if match is not None and not self.select_exit_audio(turn, match):
+                return "voice_unavailable"
+            pcm = self.exit_audio.for_turn(turn, selected=True)
             source = self.source
             check = getattr(source, "exit_score", None)
             if not callable(check) or not pcm or turn.overlap:
@@ -1560,7 +1575,7 @@ class EnrolledRoles(ConfiguredPriorityProvider):
         except Exception:  # noqa: BLE001 - private failures never reach logs
             return "voice_unavailable"
         finally:
-            self.clear_exit_audio()
+            self.clear_exit_audio(turn)
 
     def role_for(self, turn) -> str:
         self._resolved = None

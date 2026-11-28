@@ -231,8 +231,8 @@ An absent configuration, missing or unreadable model, checksum mismatch, or work
 failure disables voice exits for the session. Sessions with enrolled roles report
 a missing configuration on stderr. An explicitly configured worker reports startup
 or runtime failures regardless of roles. These diagnostics include only a fixed
-reason. Host privacy controls remain available. Sessions started without a VAD
-can still recognize the status question. Once a worker is judging private speech,
+reason. Host privacy controls remain available. Private status questions remain available both without a configured VAD
+and after a runtime worker failure. Once a worker is judging private speech,
 only its observed blocks can open a private recognition window.
 
 Every voice exit waits for **704 ms** (22 native blocks) of Silero-verified
@@ -241,7 +241,7 @@ a continuing synthetic speech-like tail 216 ms after close at 400 counts RMS
 and 632 ms after close at 180 counts RMS. The operator fixed the window on
 2026-11-27 by adding two blocks of margin to the longer lag and rounding up
 to a whole block. This adds about 0.7 s to every voice exit and errs toward
-staying private. Speech in the window cancels the exit. All exit preconditions,
+staying private. Speech in the window cancels the exit before the owner check. All exit preconditions,
 including a fresh worker liveness round-trip, must still pass at commit.
 
 The pinned VAD missed a very quiet speech-like onset from stream start and

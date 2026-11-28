@@ -1867,7 +1867,8 @@ pause. A quiet period qualifies only the onset immediately following it.
 
 After ASR closes an exit candidate, the processor requires another **704 ms**
 (22 native blocks) of Silero-verified speech absence. A speech block overlapping
-any part of that window cancels the exit, including its last block. An incomplete
+any part of that window cancels the exit before owner verification, including
+speech on its last block. An incomplete
 block at end of input cannot finish the window. In the round 15 synthetic replay,
 Silero first detected the continuing speech-like tail 216 ms after ASR closed at
 400 counts RMS and 632 ms after close at 180 counts RMS. The 2026-11-27 operator
@@ -1913,10 +1914,13 @@ follow it. For example, "May," followed by "I'm back." qualifies when "May"
 is configured. A recognition loss between the fragments breaks the pair.
 Both turns must authenticate. Each may pass its own binding check or an isolated voice check on
 its own buffered audio alone. Private processor turns are unlabelled, so both fragments
-must pass their own isolated voice checks. For the name fragment, the verifier
+must pass their own isolated voice checks. For a single recognition or a split
+name fragment, the verifier
 receives only the configured name's timed audio, excluding earlier sentences and
 surrounding fillers. Shared timestamps that cannot isolate the name refuse the check.
-A sentence boundary after the name or at the start of the remainder breaks the pair.
+The three-dot vocative pause may fall on either side of the split. Other sentence
+boundaries at the join break the pair. Forgetting speakers or changing the verification
+generation also revokes the name.
 A guest or a TV supplying the name never counts. Any other turn between them, private or not, and any change of
 the mode, ends it, and a name piece released after the off (heard across it) never
 starts one. Private finalized pieces bypass continuation holds and wake joining: each
@@ -1952,6 +1956,8 @@ Only a complete named exit phrase or a name-only fragment matched by the existin
 matcher (`exit`, `name`, or `rest` completing an accepted split-name fragment) can invoke
 the scorer. When the matcher rules out an exit, it immediately wipes and releases
 the sentence, including for an unnamed remainder or a status question alone.
+While the final confirmation window runs, the buffer retains only the matched
+name PCM or the completing fragment's PCM. Cancellation and end of input wipe it.
 Every exit check, including a name fragment's check,
 wipes and releases the sentence immediately after the check, whether a binding already
 passed, the voice passed, a precheck refused, or

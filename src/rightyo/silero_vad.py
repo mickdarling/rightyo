@@ -194,6 +194,7 @@ class SileroVad:
         # Only the worker loop can acknowledge this ordered probe. It consumes
         # no samples and leaves both the native block clock and model state intact.
         if not self._exchange.acquire(timeout=PROBE_TIMEOUT):
+            self.close()
             return False
         try:
             try:
@@ -203,22 +204,23 @@ class SileroVad:
                     return True
             except (OSError, VadError):
                 pass
-            self.channel.close()
-            return False
         finally:
             self._exchange.release()
+        self.close()
+        return False
 
     def close(self):
         self.channel.close()
         try:
-            self.process.wait(timeout=1)
+            # EOF lets a responsive worker wipe its model state and exit normally.
+            self.process.wait(timeout=PROBE_TIMEOUT)
         except subprocess.TimeoutExpired:
             self.process.terminate()
             try:
-                self.process.wait(timeout=2)
+                self.process.wait(timeout=PROBE_TIMEOUT)
             except subprocess.TimeoutExpired:
                 self.process.kill()
-                self.process.wait()
+                self.process.wait(timeout=1)
 
 
 if __name__ == "__main__":

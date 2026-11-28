@@ -1172,6 +1172,7 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
 
     reasons = [0] * 6
     source_length = 0
+    previous_char = ""
     for segment in segments:
         if not isinstance(segment, dict):
             raise LiveAudioError("Invalid local recognizer result")
@@ -1181,6 +1182,9 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
         start, end = offsets.get("from"), offsets.get("to")
         segment_offset = source_length
         source_length += len(text)
+        segment_prefix = previous_char
+        if text:
+            previous_char = text[-1]
         if not text.strip():
             # Even a zero-time space can be the only boundary between words.
             if not (type(start) is int and type(end) is int and 0 <= start == end <= duration_ms):
@@ -1246,9 +1250,10 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
                 continue
             # Tokens can split a word, or start another immediately after a
             # comma. Preserve this distinction independently of published units.
-            continues_word = (
-                reconstructed[-1:].isalnum() or reconstructed.endswith(("'", "’"))
-            ) and (value[:1].isalnum() or value.startswith(("'", "’")))
+            preceding = reconstructed[-1:] or segment_prefix
+            continues_word = (preceding.isalnum() or preceding in ("'", "’")) and (
+                value[:1].isalnum() or value.startswith(("'", "’"))
+            )
             token_offset = segment_offset + len(reconstructed)
             reconstructed += value
             interval = token.get("offsets", {})
@@ -1584,11 +1589,9 @@ def _covered_exit_intervals(
         if _punctuation(value) and (
             start == end
             or packet.window is not None
-            or (
-                packet.vad_mask is not None
-                and end <= len(packet.vad_mask)
-                and packet.vad_mask.find(b"\x01", start, end) < 0
-            )
+            # The spoken intervals below check gaps and both rounded outer
+            # edges. Punctuation neither covers speech nor changes those edges.
+            or packet.vad_mask is not None
         ):
             continue
         if not any(c.isalnum() for c in value) or start >= end:
@@ -1680,10 +1683,11 @@ class _OffsetDiarizer:
         self._inner.close()
 
 
-class _PendingExit(NamedTuple):
+@dataclass
+class _PendingExit:
     window_number: int
     close_ms: int
-    resolve: Callable[[int | None], None]
+    resolve: Callable[[int | None], None] | None
 
 
 class LiveProcessor:
@@ -1863,7 +1867,7 @@ class LiveProcessor:
 
     def _disable_vad(self) -> None:
         self._vad = None
-        self._pending_exit = None
+        self._cancel_private_exit()
         self._vad_pending.clear()
         self._utterance_vad = None
         print(
@@ -1902,28 +1906,42 @@ class LiveProcessor:
     def _defer_private_exit(self, number: int, resolve: Callable[[int | None], None]) -> None:
         with self._recovery_lock:
             packet = self._publishing
-            if self.closed or packet is None or packet.number != number or packet.discarded:
+            if (
+                not self.closed
+                and packet is not None
+                and packet.number == number
+                and not packet.discarded
+            ):
+                self._pending_exit = _PendingExit(number, packet.through_ms, resolve)
                 return
-            self._pending_exit = _PendingExit(number, packet.through_ms, resolve)
-        # An ordered ASR result can arrive after the audio clock has advanced.
-        self._advance_private_exit()
+        resolve(None)
 
     def _cancel_private_exit(self) -> None:
-        pending, self._pending_exit = self._pending_exit, None
-        if pending is not None:
+        with self._recovery_lock:
+            pending, self._pending_exit = self._pending_exit, None
+        if pending is not None and pending.resolve is not None:
             pending.resolve(None)
 
     def _advance_private_exit(self) -> None:
-        pending = self._pending_exit
-        if pending is None:
-            return
-        if self._vad_last_positive_end > pending.close_ms:
-            self._cancel_private_exit()
-        elif self._vad_scored_ms >= pending.close_ms + PRIVATE_EXIT_TAIL_MS:
-            try:
-                pending.resolve(self._vad_scored_ms)
-            finally:
-                self._pending_exit = None
+        with self._recovery_lock:
+            pending = self._pending_exit
+            if pending is None or pending.resolve is None:
+                return
+            if self._vad_last_positive_end > pending.close_ms:
+                at_ms = None
+            elif self._vad_scored_ms >= pending.close_ms + PRIVATE_EXIT_TAIL_MS:
+                at_ms = self._vad_scored_ms
+            else:
+                return
+            # Consume once. Keep the window number revocable while the owner
+            # verifier runs outside both the processor and publisher locks.
+            resolve, pending.resolve = pending.resolve, None
+        try:
+            resolve(at_ms)
+        finally:
+            with self._recovery_lock:
+                if self._pending_exit is pending:
+                    self._pending_exit = None
 
     def _drain_frames(self, *, final: bool = False) -> None:
         # Attribute each native VAD block to its own audio. A 20 ms ASR frame can
@@ -1945,7 +1963,6 @@ class LiveProcessor:
                     if type(voice) is not bool:
                         raise ValueError
                 except Exception:  # never expose worker output or private content
-                    self._cancel_private_exit()
                     self._disable_vad()
                     break
                 if self.closed:  # Stop may have released the input while the worker scored it.
@@ -2007,7 +2024,7 @@ class LiveProcessor:
         active = None
         uncertain = False
         with self._recovery_lock:
-            self._pending_exit = None
+            pending, self._pending_exit = self._pending_exit, None
             spans = self._recovery_privacy_spans
             if end is not None and spans and spans[-1] == [start, None]:
                 if start < end:
@@ -2050,6 +2067,8 @@ class LiveProcessor:
                 for p in self._recoveries
                 if not p.discarded or (self._recovery and p is self._recovery.packet)
             )
+        if pending is not None and pending.resolve is not None:
+            pending.resolve(None)
         if active is not None:
             # cancel() sees the flag set above; explicitly take this owned child.
             with self._recovery_lock:
@@ -2297,7 +2316,6 @@ class LiveProcessor:
         self._push_diarizer(frame, private, uncertain)
         frame_start = self._received_ms
         self._received_ms += 20
-        judge = self.config.silero_vad
         if mask is not None and not self._vad_observed_absence:
             # Ignore the entire stream-initial positive run. Only a subsequent
             # onset can open private ASR, even if startup spans several blocks.
@@ -2306,25 +2324,28 @@ class LiveProcessor:
             onset_mask = mask[first_absent + 1 :] if self._vad_observed_absence else b""
         else:
             onset_mask = mask
-        if private and judge is not None:
+        if private and self._vad is not None:
             voiced = onset_mask is not None and any(onset_mask)
         else:
-            # Public ASR, or status recognition in a session started without VAD.
+            # Public ASR, or private status recognition without an active VAD.
             voiced = _frame_rms(frame) >= self.config.energy_threshold
         if voiced and not self._utterance:
-            pre_roll_ms = len(self._pre_roll) * 20
+            pre_roll_ms = 20 * len(self._pre_roll)
+            self._voice_start = frame_start
+            self._utterance_start = frame_start - pre_roll_ms
+            self._utterance.extend(b"".join(self._pre_roll))
+            self._pre_roll.clear()
             if (
                 private
                 and mask is not None
                 and not uncertain
-                and prior_quiet >= pre_roll_ms
                 and prior_quiet + mask.index(1) >= PRIVATE_ONSET_QUIET_MS
             ):
+                # Keep the ASR clock aligned, but do not replay an earlier voice
+                # from before the verified absence as part of this command.
                 self._utterance_vad = bytearray(pre_roll_ms)
-            self._voice_start = frame_start
-            self._utterance_start = frame_start - len(self._pre_roll) * 20
-            self._utterance.extend(b"".join(self._pre_roll))
-            self._pre_roll.clear()
+                stale_bytes = max(0, pre_roll_ms - prior_quiet) * BYTES_PER_MS
+                self._utterance[:stale_bytes] = bytes(stale_bytes)
             if self._merger.holding and not self._waiting:
                 # Followed by detected speech, whether or not it yields text (#96).
                 self._merger.heard(frame_start)
@@ -2454,10 +2475,12 @@ class LiveProcessor:
             # At a voiced private cut the next frame may already be silent.
             # A continuation starts clipped, but a new VAD-qualified onset
             # after the cut can stand on its own without a continuation window.
-            quiet = self.config.hangover_ms
-            if self._frame_private and self._last_voice_ms == self._received_ms:
-                quiet = PRIVATE_ONSET_QUIET_MS
-            self._continuation_until_ms = self._last_voice_ms + quiet
+            if self._frame_private and self._vad is not None:
+                self._continuation_until_ms = (
+                    self._received_ms - self._vad_quiet_ms + PRIVATE_ONSET_QUIET_MS
+                )
+            else:
+                self._continuation_until_ms = self._last_voice_ms + self.config.hangover_ms
             return None
         self._continuation_until_ms = 0
         if self._frame_private:
@@ -2716,6 +2739,9 @@ class LiveProcessor:
         finally:
             with self._recovery_lock:
                 self._publishing = None
+        # Delayed ASR may already have enough audio. Resolve only after the
+        # publication callback has released the controller and publisher locks.
+        self._advance_private_exit()
 
     def _publish_window(self, packet: _FinalizedWindow) -> None:
         # Privacy-off/Stop release the packet under this same lock. Never iterate or
@@ -3138,7 +3164,7 @@ class LiveProcessor:
         with self._recovery_lock:
             first = not self.closed
             self.closed = True
-            self._pending_exit = None
+            pending, self._pending_exit = self._pending_exit, None
             self._recovery_shutdown.set()
             recovery = self._recovery
             process = self._asr_process if first else None
@@ -3155,6 +3181,8 @@ class LiveProcessor:
                 packet.release()
             self._waiting.clear()
             self._recoveries.clear()
+        if pending is not None and pending.resolve is not None:
+            pending.resolve(None)
         # Startup/publication cannot race this snapshot. Native cleanup and worker
         # joins must stay outside the lock needed by registration and the finalizer.
         try:
