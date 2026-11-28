@@ -269,9 +269,70 @@ HOME="$PWD/../.cache/test-home" TMPDIR="$PWD/../.cache/tmp" \
   taskpolicy -b python3 -m unittest -v test_silero_vad.RealModelDecisions
 ```
 
-The cases skip when the model or runtime is absent. A failed inference or an
-unexpected adversarial decision fails the test. The fake worker covers the same
-decision path in CI. Its results provide no measure of Silero's accuracy.
+The cases skip when the model or runtime is absent. With the pinned worker, the
+100 and 200 Hz machinery replays, the omitted low-pitched tail and the persistent
+fundamental must all keep privacy on, make zero owner checks and emit no transcript
+or exit. The separate 50 Hz control with 400 ms of lead-in still expects one
+stand-in check and one exit. The fake worker supplies known speech intervals and
+exercises the positive machinery, onset, omitted-tail and early-close decisions in CI.
+
+### Owner-clip replay for #350
+
+The optional file tests read six consented owner recordings from
+`~/.local/share/rightyo-fixtures/350/` or the directory named by
+`RIGHTYO_350_FIXTURES`. Use uncompressed mono 16 kHz signed 16-bit PCM WAV.
+Trim leading and trailing quiet to the spoken boundaries. The replay supplies
+the lead-in, background, exact inter-clip gaps and trailing quiet in memory.
+Keep the clips and the separate existing enrollment outside Git.
+
+| Filename | Spoken words | Approximate spoken duration |
+| --- | --- | --- |
+| `privacy-off.wav` | Jarvis, privacy off. | 1.2–1.6 s |
+| `podcast.wav` | Jarvis, start listening to the podcast. | 2.5–3.5 s, one uninterrupted sentence |
+| `jarvis.wav` | Jarvis. | 0.7–1.0 s |
+| `start-listening.wav` | Start listening. | 0.8–1.2 s |
+| `stop-recording.wav` | Jarvis, stop recording. | 1.2–1.8 s |
+| `go-private.wav` | Go private. | 0.8–1.2 s |
+
+Each split fragment needs at least 0.5 s of speech after the verifier's silence
+trim. Set these variables to existing local files before running the tests.
+
+| Variable | File |
+| --- | --- |
+| `RIGHTYO_SILERO_PYTHON` | Worker interpreter for Silero and WeSpeaker, with NumPy and ONNX Runtime |
+| `RIGHTYO_SILERO_MODEL` | Optional override for the pinned Silero model in the checkout cache |
+| `RIGHTYO_350_WHISPER_CLI` | Local whisper.cpp CLI with the stdin WAV and stdout full-JSON support used by the prototype |
+| `RIGHTYO_350_WHISPER_MODEL` | Whisper model for that CLI |
+| `RIGHTYO_350_SPEAKER_MODEL` | Pinned WeSpeaker ResNet34-LM ONNX model used for the enrollment |
+| `RIGHTYO_350_OWNER_PRINT` | Existing RightyO `<id>.json` enrollment from independent owner speech, read individually |
+
+With those variables exported, run the suite from the checkout root.
+
+```sh
+PYTHONPATH=src:tests python3 -m unittest -v test_privacy_owner_clips
+```
+
+The single exit must authenticate once and emit one content-free exit clean and
+over 50, 100 and 200 Hz tones. At 100 and 200 Hz, 24 seconds of machinery alone
+must open zero recognition windows. The synthetic 200 Hz onset has triggered
+Silero before (see below). This same background check is part of owner qualification.
+
+The full podcast sentence and its final words alone must stay private. A second
+pass drops Whisper's words and timings after “listening” while Silero hears the
+whole recording. It checks for speech in the omitted tail and requires the ASR
+window to remain open through the clip. Whisper's timing for “to” also locates
+the excerpt used for the side-talk replay.
+
+With a 2 s gap, the name must authenticate silently and the remainder must
+authenticate independently and emit one exit. With a 4.2 s gap, only the name
+is checked. The remainder alone stays private. Each public entry must publish
+its own transcript before the merge hold expires. Replayed in privacy, it must
+produce zero checks or events.
+
+These replays use a single-speaker diarization stand-in. Silero, local ASR and
+isolated owner scoring use their production adapters. A missing clip, model,
+interpreter or enrollment skips the affected tests with a reason. A supplied
+fixture that misses an expected result fails qualification.
 
 ### Round-8 synthetic replay results (2026-11-27)
 

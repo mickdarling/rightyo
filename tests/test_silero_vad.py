@@ -191,7 +191,7 @@ class FailureTests(Replay, unittest.TestCase):
 class AdversarialReplay(Replay):
     """The identical waveforms and recognition/owner gates run with either worker."""
 
-    def exercise(self, pcm, speech, command, *, expected, machinery_ms=0):
+    def exercise(self, pcm, speech, command, *, expected):
         vad = self.worker(speech)
         calls, labels = [], []
         classify = vad.is_speech
@@ -231,22 +231,59 @@ class AdversarialReplay(Replay):
         p.finish()
         self.assertIs(p._vad, vad, "worker failure is not an adversarial result")
         self.assertEqual(len(labels), len(pcm) // CHUNK_BYTES)
-        self.assertEqual(
-            ([event["action"] for event in e.drain()], s.exit_score.call_count), expected
-        )
+        events = e.drain()
+        self.assertTrue(e.ducked)
+        self.assertTrue(all(event["type"] == "privacy" for event in events))
+        self.assertFalse(e._memory.retained_ids, "private transcript retained")
+        self.assertEqual(([event["action"] for event in events], s.exit_score.call_count), expected)
         self.assertFalse(c._private_sentence.pcm)
-        self.assertFalse(
-            any(end <= machinery_ms for _, end in calls), "steady machinery opened an ASR window"
-        )
         return labels, calls
 
-    def test_persistent_fundamental_with_louder_third_harmonic(self):
+    def persistent_fundamental(self):
         # The 100 Hz voice stays 20 dB above the 50 Hz background throughout.
         base = ((50, 100), (100, 1000), (200, 80))
         voice, louder = tones(*base, (300, 50)), tones(*base, (300, 3000))
-        labels, _ = self.exercise(
+        return self.exercise(
             voice * 4 + louder * 10 + voice * 18, [(0, 3200)], (400, 1400), expected=([], 0)
         )
+
+    def test_clean_command_over_50_hz_fan_with_400_ms_lead(self):
+        # With a 200 ms lead-in, the native onset block can leave only 192 ms of absence.
+        fan = (50, 1000)
+        command = tones(fan, (200, 3000), (400, 1000))
+        self.exercise(
+            tones(fan) * 4 + command * 10 + tones(fan) * 16,
+            [(400, 1400)],
+            (400, 1400),
+            expected=(["exit"], 1),
+        )
+
+    def omitted_tail(self):
+        fan = (50, 1000)
+        command = tones(fan, (200, 3000), (400, 1000))
+        amp = 1000 * math.sqrt((1.465**2 - 1) / (1 + 0.2**2 + 0.1**2))
+        tail = tones(fan, (80, amp), (160, 0.2 * amp), (240, 0.1 * amp))
+        audio = tones(fan) * 2 + command * 10 + tail * 20 + tones(fan) * 16
+        return self.exercise(audio, [(200, 3200)], (200, 1200), expected=([], 0))
+
+    def machinery(self, hz, *, expected):
+        machine = tones((hz, 1000))
+        # Both acoustic boundaries coincide with native VAD and ASR frame edges.
+        command = tones((hz, 1000), (100, 3000), (300, 1200))
+        return self.exercise(
+            machine * 240 + command * 16 + machine * 16,
+            [(24000, 25600)],
+            (24000, 25600),
+            expected=expected,
+        )
+
+
+class FakeWorkerDecisions(AdversarialReplay, unittest.TestCase):
+    def worker(self, speech):
+        return fake_worker(self, speech)
+
+    def test_persistent_fundamental_with_louder_third_harmonic(self):
+        labels, _ = self.persistent_fundamental()
         self.assertNotIn(
             b"\0" * 7,
             bytes(labels[: 400 // CHUNK_MS]),
@@ -254,48 +291,19 @@ class AdversarialReplay(Replay):
         )
 
     def test_omitted_low_pitched_tail_at_1_47_times_fan_rms(self):
-        fan = (50, 1000)
-        command = tones(fan, (200, 3000), (400, 1000))
-        amp = 1000 * math.sqrt((1.465**2 - 1) / (1 + 0.2**2 + 0.1**2))
-        tail = tones(fan, (80, amp), (160, 0.2 * amp), (240, 0.1 * amp))
-        with self.subTest(case="clean command over the same fan"):
-            # Silero labels whole 32 ms blocks. A 200 ms lead-in can count as only
-            # 192 ms of absence when the block straddling onset is labelled speech.
-            self.exercise(
-                tones(fan) * 4 + command * 10 + tones(fan) * 16,
-                [(400, 1400)],
-                (400, 1400),
-                expected=(["exit"], 1),
-            )
-        audio = tones(fan) * 2 + command * 10 + tail * 20 + tones(fan) * 16
-        labels, calls = self.exercise(audio, [(200, 3200)], (200, 1200), expected=([], 0))
+        labels, calls = self.omitted_tail()
         self.assertTrue(
             any(labels[1200 // CHUNK_MS : 3200 // CHUNK_MS]), "VAD missed the voiced tail"
         )
         self.assertFalse(any(end < 3200 for _, end in calls), "ASR ended while speech continued")
 
-    def machinery(self, hz):
-        machine = tones((hz, 1000))
-        # Both acoustic boundaries coincide with native VAD and ASR frame edges.
-        command = tones((hz, 1000), (100, 3000), (300, 1200))
-        self.exercise(
-            machine * 240 + command * 16 + machine * 16,
-            [(24000, 25600)],
-            (24000, 25600),
-            machinery_ms=24000,
-            expected=(["exit"], 1),
-        )
-
     def test_clean_command_over_200_hz_steady_machinery(self):
-        self.machinery(200)
+        _, calls = self.machinery(200, expected=(["exit"], 1))
+        self.assertFalse(any(end <= 24000 for _, end in calls), "steady machinery opened ASR")
 
     def test_clean_command_sharing_a_fundamental_with_the_fan(self):
-        self.machinery(100)
-
-
-class FakeWorkerDecisions(AdversarialReplay, unittest.TestCase):
-    def worker(self, speech):
-        return fake_worker(self, speech)
+        _, calls = self.machinery(100, expected=(["exit"], 1))
+        self.assertFalse(any(end <= 24000 for _, end in calls), "steady machinery opened ASR")
 
     def test_incomplete_last_vad_block_cannot_supply_an_ending_pause(self):
         command = doc(segment("Jarvis, privacy off.", 20, 340))
@@ -344,7 +352,7 @@ class FakeWorkerDecisions(AdversarialReplay, unittest.TestCase):
                 )
 
 
-class RealModelDecisions(AdversarialReplay, unittest.TestCase):
+class RealSilero:
     def setUp(self):
         python = Path(os.environ.get("RIGHTYO_SILERO_PYTHON", sys.executable))
         model = Path(os.environ.get("RIGHTYO_SILERO_MODEL", MODEL))
@@ -368,7 +376,27 @@ class RealModelDecisions(AdversarialReplay, unittest.TestCase):
             self.skipTest(f"Silero worker missing {missing}; set RIGHTYO_SILERO_PYTHON")
         self.settings = VadConfig(python, model)
 
-    def worker(self, speech):
+    def real_worker(self):
         worker = SileroVad(self.settings)
         self.addCleanup(worker.close)
         return worker
+
+
+class RealModelDecisions(RealSilero, AdversarialReplay, unittest.TestCase):
+    def worker(self, speech):
+        return self.real_worker()
+
+    def test_persistent_fundamental_with_louder_third_harmonic(self):
+        self.persistent_fundamental()
+
+    def test_omitted_low_pitched_tail_at_1_47_times_fan_rms(self):
+        self.omitted_tail()
+
+    def test_clean_command_over_200_hz_steady_machinery(self):
+        _, calls = self.machinery(200, expected=([], 0))
+        # Silero can trigger on the initial step into this 200 Hz tone.
+        self.assertFalse(any(0 < start and end <= 24000 for start, end in calls))
+
+    def test_clean_command_sharing_a_fundamental_with_the_fan(self):
+        _, calls = self.machinery(100, expected=([], 0))
+        self.assertFalse(any(end <= 24000 for _, end in calls))
