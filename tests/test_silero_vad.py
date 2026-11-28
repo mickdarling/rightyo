@@ -381,8 +381,8 @@ class AdversarialReplay(Replay):
         self.feed(c, p, pcm, s)
         p.finish()
         if during_hold:
-            name_ms = words[0][1] - words[0][0]
-            self.assertEqual(hold_observations, [(0, [], name_ms * BYTES_PER_MS)])
+            selected_ms = sum(end - start for start, end, word in words if "?" not in word)
+            self.assertEqual(hold_observations, [(0, [], selected_ms * BYTES_PER_MS)])
         if worker_action == "during_hold":
             self.assertIsNone(p._vad)
         elif worker_action:
@@ -399,7 +399,7 @@ class AdversarialReplay(Replay):
         if owner_check_times:
             # ASR finalization and the acoustic-end window must both be complete.
             ready = math.ceil(max(command[1] + 1440, calls[0][1]) / CHUNK_MS) * CHUNK_MS
-            self.assertEqual(owner_check_times, [ready])
+            self.assertEqual(owner_check_times, [ready] * expected[1])
         for event in events:
             if event["action"] == "exit":
                 # Publication can already be on the 20 ms input frame carrying the last block.
@@ -446,13 +446,59 @@ class AdversarialReplay(Replay):
             with self.subTest(rms=rms):
                 self.speechlike_tail(rms, 2000, lag, ([], 0))
 
+    def test_name_waits_for_confirmation_before_owner_check(self):
+        fan = tones((50, 1000))
+        voice = tones((50, 1000), (200, 3000), (400, 1000))
+        wave = speechlike_wave(2000)
+        tail = array("h", (round(b + 400 * v) for b, v in zip(array("h", fan * 20), wave)))
+        for continuation, later, checks in (
+            (tail.tobytes(), [(2336, 2368)], 0),
+            (fan * 20, [], 1),
+        ):
+            with self.subTest(checks=checks):
+                self.exercise(
+                    fan * 4 + voice * 10 + continuation + fan * 16,
+                    [(416, 672), *later], (400, 1400), words=[(400, 1400, "Jarvis,")],
+                    endpoint_pause=720, expected=([], checks),
+                )
+
+    def test_contiguous_final_subwords_cover_the_same_native_block_as_one_word(self):
+        voice = tones((200, 5000)) + tones((200, 5000), (400, 5000))
+        pcm = bytes(400 * 32) + (voice * 6)[:1008 * 32] + bytes(2400 * 32)
+        for ending in ([segment(" off.", 1280, 1328)],
+                       [segment(" o", 1280, 1310), segment("ff.", 1310, 1328)]):
+            with self.subTest(split=len(ending) == 2):
+                parts = [segment("Jarvis,", 320, 520), segment(" privacy", 520, 1280), *ending]
+                phrase = doc({**segment("Jarvis, privacy off.", 320, 1328), "tokens": parts})
+                self.assertEqual(
+                    self.replay_private_windows(
+                        phrase, pre_roll_ms=400, audio=[pcm], vad=self.worker([(480, 1408)])
+                    ),
+                    (["exit"], 2),
+                )
+
+    def test_status_question_survives_cancelled_exit_in_same_recognition(self):
+        fan = tones((50, 1000))
+        voice = tones((50, 1000), (200, 3000), (400, 1000))
+        words = [(400, 480, "Are you recording?"), (480, 560, " Jarvis,"),
+                 (560, 610, " privacy"), (610, 1400, " off.")]
+        for failure in (True, False):
+            with self.subTest(failure=failure):
+                tail = fan * 24 if failure else (fan * 15)[:1416 * 32] + voice * 4 + fan * 16
+                self.exercise(
+                    fan * 4 + voice * 10 + tail,
+                    [(416, 672), (2816, 2848)], (400, 1400), words=words,
+                    during_hold=(2496, lambda c, e, vad: vad.close()) if failure else None,
+                    worker_action="during_hold" if failure else None, expected=(["status"], 0),
+                )
+
     def test_accepting_endpointer_close_relative_to_acoustic_end(self):
         # Same clean command, ending at 1400 ms. An early close can truncate it.
         for pause, close, expected in (
             (20, 700, ([], 0)),
             (700, 1380, ([], 0)),
-            (720, 1400, (["exit"], 1)),
-            (800, 1480, (["exit"], 1)),
+            (720, 1400, (["exit"], 2)),
+            (800, 1480, (["exit"], 2)),
         ):
             with self.subTest(pause=pause):
                 _, windows = self.key_exit(
@@ -467,7 +513,7 @@ class AdversarialReplay(Replay):
         for pause in (None, 720):
             with self.subTest(endpoint_pause=pause):
                 self.key_exit(fan[: last - 2], endpoint_pause=pause, expected=([], 0))
-                self.key_exit(fan[:last], endpoint_pause=pause, expected=(["exit"], 1))
+                self.key_exit(fan[:last], endpoint_pause=pause, expected=(["exit"], 2))
 
     def test_speech_on_the_last_block_cancels_the_exit(self):
         fan = tones((50, 1000))
@@ -550,7 +596,7 @@ class AdversarialReplay(Replay):
                         (800, 1407, " off"),
                         (period_start, period_start + 10, "."),
                     ],
-                    expected=(["exit"], 1),
+                    expected=(["exit"], 2),
                 )
                 self.assertEqual((len(labels) - labels[::-1].index(True)) * CHUNK_MS, 1408)
 
@@ -563,7 +609,7 @@ class AdversarialReplay(Replay):
                     [(480, 1408)],
                     (400, end),
                     words=[(400, 600, "Jarvis,"), (600, 800, " privacy"), (800, end, " off.")],
-                    expected=(["exit"], 1),
+                    expected=(["exit"], 2),
                 )
                 self.assertEqual((len(labels) - labels[::-1].index(True)) * CHUNK_MS, 1408)
 
@@ -576,7 +622,7 @@ class AdversarialReplay(Replay):
         self.assertEqual(windows, [])
 
     def test_18_ms_shifted_word_onset_in_first_native_speech_block(self):
-        labels, _ = self.clean_timed_control(18, expected=(["exit"], 1))
+        labels, _ = self.clean_timed_control(18, expected=(["exit"], 2))
         self.assertEqual(labels.index(True) * CHUNK_MS, 416)
         # Omitting the entire 416-448 ms speech block still refuses.
         self.clean_timed_control(18, late=30, expected=([], 0))
@@ -620,7 +666,7 @@ class AdversarialReplay(Replay):
             tones(fan) * 4 + command * 10 + tones(fan) * 24,
             [(400, 1400)],
             (400, 1400),
-            expected=(["exit"], 1),
+            expected=(["exit"], 2),
         )
 
     def omitted_tail(self):
@@ -646,6 +692,33 @@ class AdversarialReplay(Replay):
 class FakeWorkerDecisions(AdversarialReplay, unittest.TestCase):
     def worker(self, speech):
         return fake_worker(self, speech)
+
+    def test_split_filler_ellipsis_and_playback_during_remainder_confirmation(self):
+        fragment = bytes(320 * 32) + VOICE * 16 + bytes(2400 * 32)
+        name = doc(segment("Jarvis,", 20, 340))
+        rest = doc(segment("please...", 20, 116), segment(" privacy off.", 116, 340))
+        for late_playback in (False, True):
+            with self.subTest(late_playback=late_playback):
+                vad = self.worker([(320, 640), (3360, 3680)])
+                replay = self.arrange(vad=vad, pre_roll_ms=20)
+                _, events, shadow, _, _, _ = replay
+                classify = vad.is_speech
+                clock = 0
+
+                def observe(block):
+                    nonlocal clock
+                    clock += CHUNK_MS
+                    if late_playback and clock == 4992:
+                        # The remainder has finalized. Only the name overlaps playback.
+                        self.assertEqual(shadow.exit_score.call_count, 1)
+                        events.reply("started", now_ms=690)
+                        events.reply("ended", now_ms=740)
+                    return classify(block)
+
+                vad.is_speech = observe
+                with patch.object(self, "arrange", return_value=replay):
+                    result = self.replay_private_windows(name, rest, vad=vad, audio=[fragment] * 2)
+                self.assertEqual(result, ([], 1) if late_playback else (["exit"], 2))
 
     def test_owner_forget_or_late_playback_report_during_hold_revokes_exit(self):
         for name, revoke in (
@@ -686,17 +759,17 @@ class FakeWorkerDecisions(AdversarialReplay, unittest.TestCase):
         self.assertFalse(any(end < 3200 for _, end in calls), "ASR ended while speech continued")
 
     def test_clean_command_over_200_hz_steady_machinery(self):
-        _, calls = self.machinery(200, expected=(["exit"], 1))
+        _, calls = self.machinery(200, expected=(["exit"], 2))
         self.assertFalse(any(end <= 24000 for _, end in calls), "steady machinery opened ASR")
 
     def test_clean_command_sharing_a_fundamental_with_the_fan(self):
-        _, calls = self.machinery(100, expected=(["exit"], 1))
+        _, calls = self.machinery(100, expected=(["exit"], 2))
         self.assertFalse(any(end <= 24000 for _, end in calls), "steady machinery opened ASR")
 
     def test_incomplete_last_vad_block_cannot_supply_an_ending_pause(self):
         command = doc(segment("Jarvis,", 20, 180), segment(" privacy off.", 180, 340))
         for pause_ms, expected in (
-            (20, ([], 0)), (32, ([], 0)), (736, ([], 0)), (1440, (["exit"], 1)),
+            (20, ([], 0)), (32, ([], 0)), (736, ([], 0)), (1440, (["exit"], 2)),
         ):
             with self.subTest(pause_ms=pause_ms):
                 self.assertEqual(
@@ -726,7 +799,7 @@ class FakeWorkerDecisions(AdversarialReplay, unittest.TestCase):
         )
 
     def test_partial_native_block_cannot_authenticate_a_word(self):
-        for name_end, expected in ((52, (["exit"], 1)), (21, ([], 0))):
+        for name_end, expected in ((52, (["exit"], 2)), (21, ([], 0))):
             with self.subTest(name_end=name_end):
                 worker = self.worker([(320, 640)])
                 words = doc(
@@ -782,7 +855,7 @@ class RealModelDecisions(RealSilero, AdversarialReplay, unittest.TestCase):
         The same moving formants continue at 160 counts RMS. Silero first detects
         them 5416 ms after the last word, beyond the 1440 ms acoustic-end window.
         """
-        self.speechlike_tail(160, 6000, 5416, (["exit"], 1))
+        self.speechlike_tail(160, 6000, 5416, (["exit"], 2))
 
     def test_boundary_quiet_speechlike_onset_at_stream_start(self):
         """#350 round 15 operator ruling (2026-11-27), key7 P1-1, residual onset limit.
@@ -796,14 +869,14 @@ class RealModelDecisions(RealSilero, AdversarialReplay, unittest.TestCase):
             pcm.tobytes() + bytes(2400 * 32),
             None,
             (400, 1400),
-            expected=(["exit"], 1),
+            expected=(["exit"], 2),
         )
         self.assertEqual(labels.index(True) * CHUNK_MS, 416)
 
     def test_boundary_nonspeech_100_hz_tone_with_rising_harmonics_allows_exit(self):
         """#350 operator ruling (2026-11-27), P1-1.
 
-        Pinned Silero labels the tone after the phrase as non-speech. One owner check
+        Pinned Silero labels the tone after the phrase as non-speech. Two owner checks
         and one exit are expected while the fundamental continues.
         """
         base = ((50, 100), (100, 1000))
@@ -817,7 +890,7 @@ class RealModelDecisions(RealSilero, AdversarialReplay, unittest.TestCase):
             None,
             (start, end),
             words=[(start, 484, "Jarvis,"), (484, 564, " privacy"), (564, end, " off.")],
-            expected=(["exit"], 1),
+            expected=(["exit"], 2),
         )
         self.assertFalse(any(labels[: start // CHUNK_MS]))
         self.assertFalse(any(labels[end // CHUNK_MS :]))
@@ -827,7 +900,7 @@ class RealModelDecisions(RealSilero, AdversarialReplay, unittest.TestCase):
     def test_boundary_nonspeech_tail_at_1_465_times_fan_rms_after_400_ms_lead_allows_exit(self):
         """#350 operator ruling (2026-11-27), P1-2.
 
-        Pinned Silero labels the synthetic voiced tail as non-speech. One owner check
+        Pinned Silero labels the synthetic voiced tail as non-speech. Two owner checks
         and one exit are expected while the tail continues.
         """
         fan = (50, 1000)
@@ -839,7 +912,7 @@ class RealModelDecisions(RealSilero, AdversarialReplay, unittest.TestCase):
             None,
             (400, 1400),
             words=[(400, 500, "Jarvis,"), (500, 580, " privacy"), (580, 1400, " off.")],
-            expected=(["exit"], 1),
+            expected=(["exit"], 2),
         )
         self.assertFalse(any(labels[1400 // CHUNK_MS :]))
         ((_, close_ms),) = windows

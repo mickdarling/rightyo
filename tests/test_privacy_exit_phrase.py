@@ -73,6 +73,28 @@ class NamedPrivacyExitTests(unittest.TestCase):
             owner.assert_not_called()
         self.assertTrue(self.events.ducked)
 
+    def test_late_playback_within_name_margin_revokes_split(self):
+        for start, allowed in ((950, False), (1200, False), (1201, True)):
+            with self.subTest(playback=start):
+                self.start(duck.OURS)
+                self.assertEqual(self.hear("Jarvis,", 0), [])
+                self.events.reply("started", now_ms=start)
+                self.events.reply("ended", now_ms=start + 50)
+                self.assertEqual(
+                    [e["action"] for e in self.hear("privacy off.", 2500)],
+                    ["exit"] if allowed else [],
+                )
+
+    def test_split_vocative_filler_before_ellipsis(self):
+        for i, prefix in enumerate(("please...", "um, well...", "please; well...", "really...")):
+            with self.subTest(prefix=prefix):
+                at = 5000 * i
+                rest = f"{prefix} privacy off."
+                expected = ["exit"] if i < 2 else []
+                self.assertEqual([e["action"] for e in self.hear("Jarvis, " + rest, at)], expected)
+                self.assertEqual(self.hear("Jarvis,", at + 1000), [])
+                self.assertEqual([e["action"] for e in self.hear(rest, at + 2500)], expected)
+
     def test_questions_cannot_start_or_complete_an_exit(self):
         self.assertEqual(self.hear("Did you hear Jarvis start listening?  ", 0), [])
         self.assertEqual(self.hear("Jarvis?", 1000), [])

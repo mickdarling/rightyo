@@ -214,7 +214,7 @@ class OwnerClipTests(RealSilero, unittest.TestCase):
             with self.subTest(phase="machinery alone"):
                 self.assertEqual(background_windows, 0, "background alone opened ASR")
         with self.subTest(phase="single spoken exit"):
-            self.finish_private(1, 1)
+            self.finish_private(2, 1)
 
     def test_single_exit_clean(self):
         self.single_exit()

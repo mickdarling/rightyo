@@ -784,7 +784,7 @@ class PrivacyMinimumTests(unittest.TestCase):
             with self.subTest(tail_start=start):
                 window = doc(command, segment(" to the podcast", start, 200))
                 self.assertEqual(self.replay_private_windows(window), ([], 0))
-        self.assertEqual(self.replay_private_windows(doc(command)), (["exit"], 1))
+        self.assertEqual(self.replay_private_windows(doc(command)), (["exit"], 2))
 
     def test_omitted_voiced_tail_and_stream_start(self):
         # Identical synthetic voice before/after the recognised command. Only the
@@ -799,12 +799,12 @@ class PrivacyMinimumTests(unittest.TestCase):
             )
         self.assertEqual(
             self.replay_private_windows(command, audio=[SILENCE * 10 + VOICE * 50 + pause]),
-            (["exit"], 1),
+            (["exit"], 2),
         )
         # The same coverage rule applies when end-of-turn accepts a shorter pause.
         for length, silence, expected in (
             (50, SILENCE * 46, ([], 0)),
-            (50, EXIT_PAUSE, (["exit"], 1)),
+            (50, EXIT_PAUSE, (["exit"], 2)),
             (51, EXIT_PAUSE, ([], 0)),
         ):
             endpoint = Mock(return_value=1.0)
@@ -839,7 +839,7 @@ class PrivacyMinimumTests(unittest.TestCase):
         phrase = doc(
             addressed_segment("Jarvis, privacy off", 20, 1020), segment(" please", 1620, 1820)
         )
-        for gap, expected in ((SILENCE, (["exit"], 1)), (VOICE, ([], 0))):
+        for gap, expected in ((SILENCE, (["exit"], 2)), (VOICE, ([], 0))):
             with self.subTest(expected=expected):
                 audio = [SILENCE * 10 + VOICE * 50 + gap * 30 + VOICE * 10 + EXIT_PAUSE]
                 self.assertEqual(self.replay_private_windows(phrase, audio=audio), expected)
@@ -873,7 +873,7 @@ class PrivacyMinimumTests(unittest.TestCase):
         # A partly padded word still overlaps voice. An additional word timed
         # only by the padded token does not.
         for first, last, expected in (
-            (" privacy o", "ff.", (["exit"], 1)),
+            (" privacy o", "ff.", (["exit"], 2)),
             (" pri", "vacy off.", ([], 0)),
         ):
             with self.subTest(last=last):
@@ -895,7 +895,7 @@ class PrivacyMinimumTests(unittest.TestCase):
             segment(" privacy", 420, 620),
             segment(" o", 620, 1020),
         ]
-        for suffix, expected in (("ff.", (["exit"], 1)), (" ff.", ([], 0))):
+        for suffix, expected in (("ff.", (["exit"], 2)), (" ff.", ([], 0))):
             last = segment(suffix, 1120, 1420)
             single = segment(first["text"] + suffix, 20, 1420)
             for layout in (
@@ -960,7 +960,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                 audio = [VOICE * 50 + SILENCE * gap + VOICE * 50 + EXIT_PAUSE]
                 self.assertEqual(
                     self.replay_private_windows(second, audio=audio, end_of_turn=lambda _: 1),
-                    (["exit"], 1),
+                    (["exit"], 2),
                 )
 
     def test_verified_absence_before_onset_can_be_shorter_than_retained_pre_roll(self):
@@ -970,11 +970,11 @@ class PrivacyMinimumTests(unittest.TestCase):
                 command = doc(addressed_segment("Jarvis, privacy off.", pre_roll, pre_roll + 1000))
                 self.assertEqual(
                     self.replay_private_windows(command, audio=audio, pre_roll_ms=pre_roll),
-                    (["exit"], 1) if gap >= 200 else ([], 0),
+                    (["exit"], 2) if gap >= 200 else ([], 0),
                 )
 
     def test_full_ending_pause_exactly_at_the_cap_is_a_natural_end(self):
-        for length, expected in ((126, (["exit"], 1)), (127, (["exit"], 1)), (128, ([], 0))):
+        for length, expected in ((126, (["exit"], 2)), (127, (["exit"], 2)), (128, ([], 0))):
             with self.subTest(voice_frames=length):
                 phrase = doc(addressed_segment("Jarvis, privacy off.", 20, 20 + 20 * length))
                 audio = [SILENCE * 10 + VOICE * length + EXIT_PAUSE]
@@ -1010,7 +1010,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                         end_of_turn=lambda _: 1.0,
                         max_utterance_ms=4000,
                     ),
-                    (["exit"], 1),
+                    (["exit"], 2),
                 )
 
     def test_cap_honours_completion_waiting_for_private_diarizer(self):
@@ -1025,7 +1025,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                         timeline=[],
                         max_utterance_ms=cap,
                     ),
-                    (["exit"], 1),
+                    (["exit"], 2),
                 )
                 endpoint.assert_called_once()
 
@@ -1051,7 +1051,7 @@ class PrivacyMinimumTests(unittest.TestCase):
         for gain in (100, 1000):
             quiet, voiced = self.fan_frame(gain), self.fan_frame(gain, math.sqrt(10))
             phrase = doc(addressed_segment("Jarvis, privacy off.", 200, 1200))
-            for extra, expected in ((0, (["exit"], 1)), (100, ([], 0))):
+            for extra, expected in ((0, (["exit"], 2)), (100, ([], 0))):
                 with self.subTest(gain=gain, extra=extra):
                     audio = [quiet * 10 + voiced * (50 + extra) + quiet * 108]
                     self.assertEqual(
@@ -1079,7 +1079,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                 audio = [lead + voice * 50 + fan * 108]
                 self.assertEqual(
                     self.replay_private_windows(phrase, vad=FixtureVad(fan), audio=audio),
-                    (["exit"], 1),
+                    (["exit"], 2),
                 )
 
     def test_subframe_edges_over_50_and_100_hz_background_peaks(self):
@@ -1111,7 +1111,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                     self.replay_private_windows(
                         phrase, vad=FixtureVad(fan), audio=audio, pre_roll_ms=240
                     ),
-                    (["exit"], 1),
+                    (["exit"], 2),
                 )
                 if shift:
                     early = doc(
@@ -1137,7 +1137,7 @@ class PrivacyMinimumTests(unittest.TestCase):
             ):
                 with self.subTest(window=window):
                     self.assertEqual(
-                        self.replay_private_windows(window, audio=audio), (["exit"], 1)
+                        self.replay_private_windows(window, audio=audio), (["exit"], 2)
                     )
                     # The punctuation cannot account for even one omitted voiced frame.
                     tail = [SILENCE * 10 + VOICE * 50 + SILENCE * 5 + VOICE + EXIT_PAUSE]
@@ -1187,7 +1187,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                     self.replay_private_windows(
                         phrase, vad=FixtureVad(fan), audio=audio, pre_roll_ms=240
                     ),
-                    (["exit"], 1),
+                    (["exit"], 2),
                 )
 
     def test_zero_duration_punctuation_cannot_cover_an_omitted_voiced_tail(self):
@@ -1200,7 +1200,7 @@ class PrivacyMinimumTests(unittest.TestCase):
         audio = [SILENCE * 10 + VOICE * 150 + EXIT_PAUSE]
         self.assertEqual(self.replay_private_windows(doc(command), audio=audio), ([], 0))
         command["tokens"][1]["offsets"]["to"] = 3020
-        self.assertEqual(self.replay_private_windows(doc(command), audio=audio), (["exit"], 1))
+        self.assertEqual(self.replay_private_windows(doc(command), audio=audio), (["exit"], 2))
 
     def test_gaps_between_original_subwords_must_be_speech_absent(self):
         command = segment("Jarvis, privacy off.", 20, 1220)
@@ -1210,7 +1210,7 @@ class PrivacyMinimumTests(unittest.TestCase):
             segment("vacy", 820, 1020),
             segment(" off.", 1020, 1220),
         ]
-        for gap, expected in ((VOICE, ([], 0)), (SILENCE, (["exit"], 1))):
+        for gap, expected in ((VOICE, ([], 0)), (SILENCE, (["exit"], 2))):
             with self.subTest(expected=expected):
                 audio = [SILENCE * 10 + VOICE * 20 + gap * 20 + VOICE * 20 + EXIT_PAUSE]
                 self.assertEqual(self.replay_private_windows(doc(command), audio=audio), expected)
@@ -1243,7 +1243,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                 start, stop = 20 + shift, 1020 + shift
                 command = doc(addressed_segment("Jarvis, privacy off.", start, stop))
                 audio = [lead + VOICE * 50 + tail]
-                self.assertEqual(self.replay_private_windows(command, audio=audio), (["exit"], 1))
+                self.assertEqual(self.replay_private_windows(command, audio=audio), (["exit"], 2))
                 # Even a short voiced overhang inside the same frame is outside the word.
                 audio = [lead + VOICE * 50 + VOICE[:32] + tail]
                 self.assertEqual(self.replay_private_windows(command, audio=audio), ([], 0))
@@ -1252,7 +1252,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                     segment(" privacy off.", start + 600, stop),
                 )
                 audio = [lead + VOICE * 20 + SILENCE * 10 + VOICE * 20 + tail]
-                self.assertEqual(self.replay_private_windows(command, audio=audio), (["exit"], 1))
+                self.assertEqual(self.replay_private_windows(command, audio=audio), (["exit"], 2))
 
     def test_subframe_word_edges_over_nonzero_background(self):
         fan, voice = self.fan_frame(1000), self.fan_frame(1000, math.sqrt(10))
@@ -1262,7 +1262,7 @@ class PrivacyMinimumTests(unittest.TestCase):
         doc_with_gap = doc(segment("Jarvis,", 30, 430), segment(" privacy off.", 630, 1030))
         self.assertEqual(
             self.replay_private_windows(doc_with_gap, vad=FixtureVad(fan), audio=audio),
-            (["exit"], 1),
+            (["exit"], 2),
         )
 
     def test_partial_speaker_coverage_cannot_separate_an_exit_from_its_window(self):
@@ -1276,7 +1276,7 @@ class PrivacyMinimumTests(unittest.TestCase):
         ):
             with self.subTest(window=window):
                 self.assertEqual(self.replay_private_windows(window, timeline=timeline), ([], 0))
-        self.assertEqual(self.replay_private_windows(doc(phrase), timeline=timeline), (["exit"], 1))
+        self.assertEqual(self.replay_private_windows(doc(phrase), timeline=timeline), (["exit"], 2))
 
     def test_only_a_naturally_ended_whole_utterance_can_exit(self):
         phrase = doc(addressed_segment("Jarvis start listening", 0, 200))
@@ -1308,7 +1308,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                 audio=[SILENCE * 10 + VOICE * 590, SILENCE * 72 + VOICE * 10 + pause],
                 pre_roll_ms=240,
             ),
-            (["exit"], 1),
+            (["exit"], 2),
         )
 
     def test_blank_segment_cannot_hide_tokens_or_timed_silence(self):
@@ -1342,7 +1342,7 @@ class PrivacyMinimumTests(unittest.TestCase):
         name = {"text": "Jarvis", "start_ms": 20, "end_ms": 60}
         comma = {"text": ",", "start_ms": 60, "end_ms": 70}
         rest = {"text": " privacy off.", "start_ms": 70, "end_ms": 120}
-        for gap, expected in ((bytes(320), (["exit"], 1)), (VOICE[:320], ([], 0))):
+        for gap, expected in ((bytes(320), (["exit"], 2)), (VOICE[:320], ([], 0))):
             pcm = SILENCE * 10 + VOICE * 2 + gap + (VOICE * 3)[:1600] + EXIT_PAUSE
             self.assertEqual(
                 self.replay_private_windows([name, comma, rest], audio=[pcm]), expected
@@ -1360,7 +1360,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                         end_of_turn_silence_ms=200,
                         max_utterance_ms=cap,
                     ),
-                    (["exit"], 1),
+                    (["exit"], 2),
                 )
                 endpoint.assert_called_once()
 
@@ -1374,7 +1374,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                     end_of_turn=lambda _: 1.0,
                     max_utterance_ms=4000,
                 ),
-                (["exit"], 1),
+                (["exit"], 2),
             )
 
     def test_speech_ending_one_frame_before_forced_cut_permits_a_fresh_command(self):
@@ -1390,7 +1390,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                         end_of_turn=lambda _: 1.0,
                         max_utterance_ms=4000,
                     ),
-                    (["exit"], 1),
+                    (["exit"], 2),
                 )
 
     def test_split_fragments_must_continue_the_address_sentence(self):
@@ -1449,7 +1449,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                     addressed_segment("Jarvis, privacy off.", 60, 100),
                 )
                 self.assertFalse(_recognizer_window(separated, 100).timing_incomplete)
-                self.assertEqual(self.replay_private_windows(separated), (["exit"], 1))
+                self.assertEqual(self.replay_private_windows(separated), (["exit"], 2))
 
     def test_token_timing_is_checked_before_joining_words(self):
         for start, end in ((40, 60), (90, 150), (110, 160)):
@@ -1487,7 +1487,7 @@ class PrivacyMinimumTests(unittest.TestCase):
             with self.subTest(units=units):
                 self.assertEqual(self.replay_private_windows(units), ([], 0))
         command = [piece("Jarvis,", 0, 50), piece(" start listening", 50, 100)]
-        self.assertEqual(self.replay_private_windows(command), (["exit"], 1))
+        self.assertEqual(self.replay_private_windows(command), (["exit"], 2))
         for invisible in ("\u200b", "\ufeff", "\u2060"):
             with self.subTest(invisible=invisible):
                 self.assertEqual(
@@ -1495,11 +1495,11 @@ class PrivacyMinimumTests(unittest.TestCase):
                 )
         # #350 round 12 P2-2 corrects this PR's earlier standalone-period refusal.
         self.assertEqual(
-            self.replay_private_windows([*command, piece(".", 100, 200)]), (["exit"], 1)
+            self.replay_private_windows([*command, piece(".", 100, 200)]), (["exit"], 2)
         )
         spoken = [piece("Jarvis,", 20, 520), piece(" privacy off", 520, 1020)]
         period = piece(".", 1120, 1140)
-        for tail, expected in ((SILENCE, (["exit"], 1)), (VOICE, ([], 0))):
+        for tail, expected in ((SILENCE, (["exit"], 2)), (VOICE, ([], 0))):
             audio = [SILENCE * 10 + VOICE * 50 + SILENCE * 5 + tail + EXIT_PAUSE]
             self.assertEqual(self.replay_private_windows([*spoken, period], audio=audio), expected)
         # Here each standalone fragment has timings for its own complete window.
@@ -1533,7 +1533,7 @@ class PrivacyMinimumTests(unittest.TestCase):
         phrase["tokens"][1] = segment(" start", 50, 100)
         # The shorter replay ends before "listening" begins.
         self.assertEqual(self.replay_private_windows(doc(phrase)), ([], 0))
-        self.assertEqual(self.replay_private_windows(doc(phrase), audio=full_audio), (["exit"], 1))
+        self.assertEqual(self.replay_private_windows(doc(phrase), audio=full_audio), (["exit"], 2))
 
     def test_split_exit_refuses_loss_on_either_fragment_or_between_them(self):
         name = segment("Jarvis", 0, 100)
@@ -1894,7 +1894,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                 self.feed(c, p, SILENCE * 10 + VOICE * 9 + EXIT_PAUSE, s)
                 actions = [event.get("action") for event in e.drain()]
                 self.assertEqual("exit" in actions, allowed)
-                s.exit_score.assert_called_once()
+                self.assertEqual(s.exit_score.call_count, 2 if allowed else 1)
                 self.assertEqual(s.offered, 0)
                 self.assertFalse(c._private_sentence.pcm)
 

@@ -1869,7 +1869,9 @@ Every voice exit takes about **1,440 ms** from the acoustic end of the command
 (the end of the last word whose timing is supported by Silero speech evidence).
 The processor counts observed audio from that word end, independent of ASR close.
 It waits for the complete native block covering the deadline before checking the
-owner. Resumed speech cancels the exit even on that last block. A partial block at
+owner for a complete exit or either split fragment. Resumed speech cancels the
+candidate even on that last block. An independently matched status question in
+the same private turn still emits its status event. A partial block at
 end of input cannot complete the window. This errs toward staying private.
 
 In the round 17 synthetic replay, the last word ended at 1,400 ms. Measured from
@@ -1898,7 +1900,8 @@ genuine exit phrase. Before any install, the owner-clip speech-continues negativ
 must prove that real speech continuing beyond the recognized phrase keeps privacy
 on, with zero owner checks and zero exits. [Owner-clip replay](prototype.md#owner-clip-replay-for-350)
 
-Each word's supplied timing must contain a complete speech block. A shared
+Each word's supplied timing must contain a complete speech block. Consecutive
+subword timings of the same word can cover that block together when they touch. A shared
 interval for several words supplies their common timing evidence. A native block may
 straddle the first word's start or the final word's end. A whole speech block outside
 those bounds keeps privacy on. Any detected speech in a gap between original spoken
@@ -1920,13 +1923,17 @@ follow it. For example, "May," followed by "I'm back." qualifies when "May"
 is configured. A recognition loss between the fragments breaks the pair.
 Both turns must authenticate. Each may pass its own binding check or an isolated voice check on
 its own buffered audio alone. Private processor turns are unlabelled, so both fragments
-must pass their own isolated voice checks. For a single recognition or a split
-name fragment, the verifier
-receives only the configured name's timed audio, excluding earlier sentences and
-surrounding fillers. Shared timestamps that cannot isolate the name refuse the check.
+must pass their own isolated voice checks. In a single recognition the verifier
+checks the configured name's timed audio and the exit phrase's timed audio
+separately. A split fragment supplies only its own matched tokens. Earlier
+sentences, fillers and intervening audio are excluded. Missing or shared times
+that prevent isolation, or insufficient speech after trimming either part, keep
+privacy on.
 The three-dot vocative pause may fall on either side of the split. Other sentence
 boundaries at the join break the pair. Forgetting speakers or changing the verification
-generation also revokes the name.
+generation also revokes the name. The remainder rechecks the original speaker's
+binding revision and playback exclusion over the name's span, including the
+300 ms margin, before it can emit an exit.
 A guest or a TV supplying the name never counts. Any other turn between them, private or not, and any change of
 the mode, ends it, and a name piece released after the off (heard across it) never
 starts one. Private finalized pieces bypass continuation holds and wake joining: each
@@ -1962,8 +1969,8 @@ Only a complete named exit phrase or a name-only fragment matched by the existin
 matcher (`exit`, `name`, or `rest` completing an accepted split-name fragment) can invoke
 the scorer. When the matcher rules out an exit, it immediately wipes and releases
 the sentence, including for an unnamed remainder or a status question alone.
-While the final confirmation window runs, the buffer retains only the matched
-name PCM or the completing fragment's PCM. Cancellation and end of input wipe it.
+During confirmation the buffer retains only the matched token audio, with a
+separate range for each part that requires verification. Cancellation and end of input wipe it.
 Every exit check, including a name fragment's check,
 wipes and releases the sentence immediately after the check, whether a binding already
 passed, the voice passed, a precheck refused, or

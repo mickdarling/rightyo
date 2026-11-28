@@ -343,8 +343,8 @@ With those variables exported, run the suite from the checkout root.
 PYTHONPATH=src:tests python3 -m unittest -v test_privacy_owner_clips
 ```
 
-The single exit must authenticate once and emit one content-free exit clean and
-over 50, 100 and 200 Hz tones. At 100 and 200 Hz, 24 seconds of machinery alone
+The clean single exit and its 50, 100 and 200 Hz tone variants must each pass
+separate name and phrase checks and emit one content-free exit. At 100 and 200 Hz, 24 seconds of machinery alone
 must open zero recognition windows. The synthetic 200 Hz onset has triggered
 Silero before (see below). This same background check is part of owner qualification.
 

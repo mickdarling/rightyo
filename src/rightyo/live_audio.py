@@ -1087,6 +1087,16 @@ def _spoken_chars(text: str, offset: int) -> tuple[int, int]:
     return offset + first, offset + len(text) - trailing
 
 
+def _continues_word(previous: str, value: str) -> bool:
+    return (previous.isalnum() or previous in ("'", "’")) and (
+        value[:1].isalnum() or value.startswith(("'", "’"))
+    )
+
+
+def _word_count(value: str) -> int:
+    return len(re.findall(r"[^\W_]+(?:['’]+[^\W_]+)*", value))
+
+
 @dataclass
 class _RecognizerWindow:
     """Internal validation evidence only; never serialized into host events."""
@@ -1150,8 +1160,8 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
         right: int,
         value: str,
         char_offset: int,
-        word_count: int = 1,
-        continues_word: bool = False,
+        word_count: int,
+        continues_word: bool,
     ) -> None:
         intervals = window.spoken_intervals
         if intervals is None or left >= right or window.unreliable_token_timing:
@@ -1230,7 +1240,10 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
         ):
             result.append(fallback)
             if any(c.isalnum() for c in text):
-                record_spoken(start, end, text, segment_offset)
+                record_spoken(
+                    start, end, text, segment_offset, _word_count(text),
+                    _continues_word(segment_prefix, text),
+                )
             continue
         if not isinstance(tokens, list) or len(tokens) > 4000:
             window.unreliable_token_timing = True
@@ -1251,9 +1264,7 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
             # Tokens can split a word, or start another immediately after a
             # comma. Preserve this distinction independently of published units.
             preceding = reconstructed[-1:] or segment_prefix
-            continues_word = (preceding.isalnum() or preceding in ("'", "’")) and (
-                value[:1].isalnum() or value.startswith(("'", "’"))
-            )
+            continues_word = _continues_word(preceding, value)
             token_offset = segment_offset + len(reconstructed)
             reconstructed += value
             interval = token.get("offsets", {})
@@ -1279,8 +1290,7 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
                 window.unreliable_token_timing = True
             left, right = min(left, end), min(right, end)
             if spoken:
-                word_count = len(re.findall(r"[^\W_]+(?:['’]+[^\W_]+)*", value))
-                record_spoken(left, right, value, token_offset, word_count, continues_word)
+                record_spoken(left, right, value, token_offset, _word_count(value), continues_word)
             if not words or (value[:1].isspace() and value.strip()):
                 words.append({"text": value, "start_ms": left, "end_ms": right})
             else:
@@ -1575,7 +1585,11 @@ def _covered_exit_intervals(
     intervals = []
     previous_end = 0
     source_length = 0
+    previous_char = ""
     for unit in units:
+        prefix = previous_char
+        if unit["text"]:
+            previous_char = unit["text"][-1]
         unit_offset = source_length
         source_length += len(unit["text"])
         start, end = unit["start_ms"], unit["end_ms"]
@@ -1596,10 +1610,12 @@ def _covered_exit_intervals(
             continue
         if not any(c.isalnum() for c in value) or start >= end:
             return None
-        word = len(intervals)
-        intervals.append(
-            _SpokenInterval(start, end, word, word, *_spoken_chars(unit["text"], unit_offset))
-        )
+        left, right = _spoken_chars(unit["text"], unit_offset)
+        word = 0
+        if intervals:
+            word = intervals[-1].last_word + int(not _continues_word(prefix, unit["text"]))
+        last_word = word + _word_count(value) - 1
+        intervals.append(_SpokenInterval(start, end, word, last_word, left, right))
     if packet.window and packet.window.spoken_intervals is not None:
         intervals = packet.window.spoken_intervals
     if not intervals:
@@ -1619,6 +1635,7 @@ def _covered_exit_intervals(
 
     previous = first
     covered_word = -1
+    word_start = 0
     for index, interval in enumerate(intervals):
         start, end, first_word, last_word = interval[:4]
         # The first speech block can straddle the recognized onset. A complete
@@ -1626,10 +1643,18 @@ def _covered_exit_intervals(
         gap_end = start if index else start - (packet.offset + start) % packet.vad_block_ms
         if first_word > covered_word + 1 or has_voice(previous, min(gap_end, last)):
             return None
-        if last_word > covered_word and has_voice(
-            max(first, start), min(last, end), whole_block=True
+        # A native block can cross a subword boundary within the same word.
+        # A timing gap breaks that run even if the spelling continues.
+        if not index or start != previous or first_word != intervals[index - 1].last_word:
+            word_start = start
+        if first_word > covered_word and has_voice(
+            max(first, word_start), min(last, end), whole_block=True
         ):
-            covered_word = last_word
+            covered_word = first_word
+        if last_word != first_word:
+            word_start = start
+            if has_voice(max(first, start), min(last, end), whole_block=True):
+                covered_word = last_word
         previous = max(previous, end)
     # As at onset, a native block straddling the final word edge cannot
     # establish omitted speech. Every subsequent positive block still vetoes.
