@@ -1590,7 +1590,8 @@ class EnrolledRoles(ConfiguredPriorityProvider):
                 ):
                     return "voice_unavailable"
                 source._report(f"speaker_id exit_check score={score:.3f}")
-                if score < source.settings.entry_threshold:
+                passed = score >= source.settings.entry_threshold
+                if not passed:
                     return "voice_below_threshold"
             return "pass"
         except Exception:  # noqa: BLE001 - private failures never reach logs

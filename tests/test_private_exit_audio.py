@@ -1186,6 +1186,16 @@ class PrivateExitTests(unittest.TestCase):
                 )
                 self.assertEqual(harness.embedder.calls, 1)
 
+    def test_unordered_threshold_cannot_approve_a_guest(self):
+        h = self.harness(entry_threshold=float("nan"))
+        c, e, _ = self.controller(h)
+        with patch.object(h.shadow, "exit_score", wraps=h.shadow.exit_score) as check:
+            self.hear(c, f0=GUEST_F0)
+        self.assertEqual(e.drain(), [])
+        self.assertEqual(check.call_count, 1)
+        self.assertTrue(e.ducked)
+        self.assertFalse(c._private_sentence.pcm)
+
     def test_threshold_and_minimum_match_entry_configuration(self):
         harness = self.harness(ScriptedEmbedder(vectors=([0.6, 0.8, 0],)), entry_threshold=0.7)
         controller, events, _roles = self.controller(harness)
