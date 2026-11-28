@@ -1585,7 +1585,8 @@ class EnrolledRoles(ConfiguredPriorityProvider):
                 result = check(pcm, self.priority.owners)
                 score = result.labelled
                 if (
-                    result.outcome != "scored" or type(score) is not float
+                    result.outcome != "scored"
+                    or type(score) is not float
                     or not math.isfinite(score)
                 ):
                     return "voice_unavailable"

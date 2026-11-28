@@ -70,13 +70,14 @@ def speechlike_wave(duration_ms, *, reference_ms=None):
         for h in range(1, 47):
             hz = h * pitch
             amplitude = (
-                0.09 / h + math.exp(-0.5 * ((hz - f1) / 100) ** 2)
+                0.09 / h
+                + math.exp(-0.5 * ((hz - f1) / 100) ** 2)
                 + 0.6 * math.exp(-0.5 * ((hz - f2) / 150) ** 2)
                 + 0.32 * math.exp(-0.5 * ((hz - f3) / 180) ** 2)
             )
             sample += amplitude / math.sqrt(h) * math.sin(h * phase)
         wave.append(sample * (0.28 + 0.72 * (0.5 + 0.5 * math.sin(3.15 * t)) ** 1.4))
-    reference = wave if reference_ms is None else wave[:reference_ms * 16]
+    reference = wave if reference_ms is None else wave[: reference_ms * 16]
     rms = math.sqrt(sum(s * s for s in reference) / len(reference))
     return tuple(s / rms for s in wave)
 
@@ -451,7 +452,7 @@ class AdversarialReplay(Replay):
         command = tones((50, 1000), (200, 3000), (400, 1000))
         onset = math.ceil((lead + 16) / CHUNK_MS) * CHUNK_MS
         return self.exercise(
-            (fan * 10)[:lead * BYTES_PER_MS] + command * 10 + tail,
+            (fan * 10)[: lead * BYTES_PER_MS] + command * 10 + tail,
             [(onset, onset + 8 * CHUNK_MS), *later_speech],
             (lead, lead + 1000),
             words=[
@@ -497,7 +498,7 @@ class AdversarialReplay(Replay):
         wave = speechlike_wave(duration, reference_ms=2000)
         if residual:
             short = speechlike_wave(2000)
-            self.assertEqual(wave[:len(short)], short)
+            self.assertEqual(wave[: len(short)], short)
         fan = tones((50, 1000))
         room = array("h", fan * (duration // 100))
         tail = array("h", (bg + round(rms * v) for bg, v in zip(room, wave, strict=True)))
@@ -522,11 +523,11 @@ class AdversarialReplay(Replay):
                 if residual:
                     two_seconds = math.ceil((end + 2000) / CHUNK_MS)
                     self.assertFalse(any(labels[after:two_seconds]))
-                    self.assertTrue(any(labels[two_seconds:(end + duration) // CHUNK_MS]))
+                    self.assertTrue(any(labels[two_seconds : (end + duration) // CHUNK_MS]))
                     if not can_exit:
                         self.assertEqual(labels.index(True) * CHUNK_MS, 192)
                 else:
-                    self.assertTrue(any(labels[after:math.ceil((end + 1728) / CHUNK_MS)]))
+                    self.assertTrue(any(labels[after : math.ceil((end + 1728) / CHUNK_MS)]))
             self.doCleanups()
 
     def test_grid_continuations_detected_within_window_cancel(self):
@@ -538,11 +539,14 @@ class AdversarialReplay(Replay):
     def test_early_final_word_timestamp_cannot_shorten_acoustic_confirmation(self):
         fan = tones((50, 1000))
         command = tones((50, 1000), (200, 3000), (400, 1000)) * 10
-        tail = array("h", (
-            bg + round(200 * value)
-            for bg, value in zip(array("h", fan * 20), speechlike_wave(2000), strict=True)
-        ))
-        prefix = (fan * 5)[:420 * BYTES_PER_MS] + command
+        tail = array(
+            "h",
+            (
+                bg + round(200 * value)
+                for bg, value in zip(array("h", fan * 20), speechlike_wave(2000), strict=True)
+            ),
+        )
+        prefix = (fan * 5)[: 420 * BYTES_PER_MS] + command
         pcm = prefix + tail.tobytes() + fan * 16
         for reported_end in (1300, 1420):
             with self.subTest(reported_end=reported_end):
@@ -550,8 +554,11 @@ class AdversarialReplay(Replay):
                     pcm,
                     [(416, 1184), (3072, 3104)],
                     (420, reported_end),
-                    words=[(420, 520, "Jarvis,"), (520, 600, " privacy"),
-                           (600, reported_end, " off.")],
+                    words=[
+                        (420, 520, "Jarvis,"),
+                        (520, 600, " privacy"),
+                        (600, reported_end, " off."),
+                    ],
                     expected=([], 0),
                 )
                 self.assertGreaterEqual(windows[0][1], 1420)
@@ -571,8 +578,11 @@ class AdversarialReplay(Replay):
     def report_playback(self, replay, vad, spans, *, use_received_clock):
         c, events, _, processor, _, _ = replay
         classify = vad.is_speech
-        reports = [(edge, phase) for start, end in spans
-                   for edge, phase in ((start, "started"), (end, "ended"))]
+        reports = [
+            (edge, phase)
+            for start, end in spans
+            for edge, phase in ((start, "started"), (end, "ended"))
+        ]
         reports = iter(reports)
         next_report = next(reports, None)
         block_end = 0
@@ -609,19 +619,26 @@ class AdversarialReplay(Replay):
             fan * 4 + command * 10 + fan * 24,
             [(416, 672)],
             (400, 1400),
-            words=[(400, 480, "Are you recording?"), (480, 560, " Jarvis,"),
-                   (560, 610, " privacy"), (610, 1400, " off.")],
+            words=[
+                (400, 480, "Are you recording?"),
+                (480, 560, " Jarvis,"),
+                (560, 610, " privacy"),
+                (610, 1400, " off."),
+            ],
             during_hold=(2496, lambda c, e, vad: e.forget_speakers(now_ms=2496)),
             expected=(["status"], 0),
         )
 
     def test_stream_start_status_does_not_require_preceding_absence(self):
-        wave = speechlike_wave(2000)[:16 * 800]
+        wave = speechlike_wave(2000)[: 16 * 800]
         pcm = array("h", (round(3000 * value) for value in wave)).tobytes()
         labels, windows = self.exercise(
             pcm + bytes(2400 * BYTES_PER_MS),
-            [(0, 800)], (0, 600), words=[(0, 600, "Are you recording?")],
-            expected=(["status"], 0), pre_roll_ms=240,
+            [(0, 800)],
+            (0, 600),
+            words=[(0, 600, "Are you recording?")],
+            expected=(["status"], 0),
+            pre_roll_ms=240,
         )
         self.assertEqual(labels[:26], [True] * 25 + [False])
         self.assertEqual(windows, [(0, 2240)])
@@ -663,15 +680,20 @@ class AdversarialReplay(Replay):
             with self.subTest(checks=checks):
                 self.exercise(
                     fan * 4 + voice * 10 + continuation + fan * 16,
-                    [(416, 672), *later], (400, 1400), words=[(400, 1400, "Jarvis,")],
-                    endpoint_pause=720, expected=([], checks),
+                    [(416, 672), *later],
+                    (400, 1400),
+                    words=[(400, 1400, "Jarvis,")],
+                    endpoint_pause=720,
+                    expected=([], checks),
                 )
 
     def test_contiguous_final_subwords_cover_the_same_native_block_as_one_word(self):
         voice = tones((200, 5000)) + tones((200, 5000), (400, 5000))
-        pcm = bytes(400 * 32) + (voice * 6)[:1008 * 32] + bytes(2400 * 32)
-        for ending in ([segment(" off.", 1280, 1328)],
-                       [segment(" o", 1280, 1310), segment("ff.", 1310, 1328)]):
+        pcm = bytes(400 * 32) + (voice * 6)[: 1008 * 32] + bytes(2400 * 32)
+        for ending in (
+            [segment(" off.", 1280, 1328)],
+            [segment(" o", 1280, 1310), segment("ff.", 1310, 1328)],
+        ):
             with self.subTest(split=len(ending) == 2):
                 parts = [segment("Jarvis,", 320, 520), segment(" privacy", 520, 1280), *ending]
                 phrase = doc({**segment("Jarvis, privacy off.", 320, 1328), "tokens": parts})
@@ -685,16 +707,23 @@ class AdversarialReplay(Replay):
     def test_status_question_survives_cancelled_exit_in_same_recognition(self):
         fan = tones((50, 1000))
         voice = tones((50, 1000), (200, 3000), (400, 1000))
-        words = [(400, 480, "Are you recording?"), (480, 560, " Jarvis,"),
-                 (560, 610, " privacy"), (610, 1400, " off.")]
+        words = [
+            (400, 480, "Are you recording?"),
+            (480, 560, " Jarvis,"),
+            (560, 610, " privacy"),
+            (610, 1400, " off."),
+        ]
         for failure in (True, False):
             with self.subTest(failure=failure):
-                tail = fan * 24 if failure else (fan * 15)[:1416 * 32] + voice * 4 + fan * 16
+                tail = fan * 24 if failure else (fan * 15)[: 1416 * 32] + voice * 4 + fan * 16
                 self.exercise(
                     fan * 4 + voice * 10 + tail,
-                    [(416, 672), (2816, 2848)], (400, 1400), words=words,
+                    [(416, 672), (2816, 2848)],
+                    (400, 1400),
+                    words=words,
                     during_hold=(2496, lambda c, e, vad: vad.close()) if failure else None,
-                    worker_action="during_hold" if failure else None, expected=(["status"], 0),
+                    worker_action="during_hold" if failure else None,
+                    expected=(["status"], 0),
                     expected_status_at=2540 if failure else None,
                 )
 
@@ -835,7 +864,9 @@ class AdversarialReplay(Replay):
 
     def test_initial_machine_block_and_incomplete_final_block(self):
         for hz, ms, speech, windows in (
-            (200, 24000, [(0, 32)], [(0, 1480)]), (50, 1600, [], []), (50, 1620, [], [])
+            (200, 24000, [(0, 32)], [(0, 1480)]),
+            (50, 1600, [], []),
+            (50, 1620, [], []),
         ):
             with self.subTest(hz=hz, ms=ms):
                 pcm = (tones((hz, 1000)) * (ms // 100 + 1))[: 32 * ms]
@@ -911,8 +942,11 @@ class FakeWorkerDecisions(AdversarialReplay, unittest.TestCase):
         self.report_playback(replay, vad, spans, use_received_clock=False)
         with patch.object(self, "arrange", return_value=replay):
             result = self.replay_private_windows(
-                doc(segment("Jarvis,", 20, 340)), doc(segment("Privacy off.", 20, 340)),
-                audio=[fragment, fragment], vad=vad, end_of_turn_silence_ms=160,
+                doc(segment("Jarvis,", 20, 340)),
+                doc(segment("Privacy off.", 20, 340)),
+                audio=[fragment, fragment],
+                vad=vad,
+                end_of_turn_silence_ms=160,
             )
         self.assertEqual(result, ([], 0))
 
@@ -992,7 +1026,11 @@ class FakeWorkerDecisions(AdversarialReplay, unittest.TestCase):
     def test_incomplete_last_vad_block_cannot_supply_an_ending_pause(self):
         command = doc(segment("Jarvis,", 20, 180), segment(" privacy off.", 180, 340))
         for pause_ms, expected in (
-            (20, ([], 0)), (32, ([], 0)), (736, ([], 0)), (1440, ([], 0)), (1728, (["exit"], 2)),
+            (20, ([], 0)),
+            (32, ([], 0)),
+            (736, ([], 0)),
+            (1440, ([], 0)),
+            (1728, (["exit"], 2)),
         ):
             with self.subTest(pause_ms=pause_ms):
                 self.assertEqual(
@@ -1088,8 +1126,11 @@ class RealModelDecisions(RealSilero, AdversarialReplay, unittest.TestCase):
                     self.report_playback(replay, vad, spans, use_received_clock=True)
                 with patch.object(self, "arrange", return_value=replay):
                     result = self.replay_private_windows(
-                        doc(segment("Jarvis,", 400, 1400)), doc(segment("Privacy off.", 400, 1400)),
-                        audio=[pcm], vad=vad, end_of_turn_silence_ms=720,
+                        doc(segment("Jarvis,", 400, 1400)),
+                        doc(segment("Privacy off.", 400, 1400)),
+                        audio=[pcm],
+                        vad=vad,
+                        end_of_turn_silence_ms=720,
                     )
                 self.assertEqual(result, ([], 0) if with_playback else (["exit"], 2))
 

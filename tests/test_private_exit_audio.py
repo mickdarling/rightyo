@@ -87,7 +87,14 @@ class PrivateExitTests(unittest.TestCase):
         return controller, events, roles
 
     def hear(
-        self, controller, text=EXIT, *, start=0, seconds=1, f0=OWNER_F0, inferred=False,
+        self,
+        controller,
+        text=EXIT,
+        *,
+        start=0,
+        seconds=1,
+        f0=OWNER_F0,
+        inferred=False,
         speaker="Speaker A",
     ):
         current = authored_turn(turn(start, start + round(seconds * 1000), speaker), text)
@@ -1007,10 +1014,12 @@ class PrivateExitTests(unittest.TestCase):
             (OWNER_F0, GUEST_F0, 1, 0, True),
             (OWNER_F0, OWNER_F0, 1, 1, False),
         ):
-            with self.subTest(name=name_hz, phrase=phrase_hz, gains=(name_gain, phrase_gain),
-                              timed=timed):
+            with self.subTest(
+                name=name_hz, phrase=phrase_hz, gains=(name_gain, phrase_gain), timed=timed
+            ):
                 h = self.harness()
                 c, e, _ = self.controller(h)
+
                 def voiced(seconds, hz, gain):
                     return array("h", (round(x * gain) for x in array("h", tone(seconds, hz))))
 

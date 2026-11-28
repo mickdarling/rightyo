@@ -1241,7 +1241,11 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
             result.append(fallback)
             if any(c.isalnum() for c in text):
                 record_spoken(
-                    start, end, text, segment_offset, _word_count(text),
+                    start,
+                    end,
+                    text,
+                    segment_offset,
+                    _word_count(text),
                     _continues_word(segment_prefix, text),
                 )
             continue

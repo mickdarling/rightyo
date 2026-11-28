@@ -971,9 +971,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                 audio = [VOICE * 50 + SILENCE * (gap // 20) + VOICE * 50 + EXIT_PAUSE]
                 command = doc(addressed_segment("Jarvis, privacy off.", pre_roll, pre_roll + 1000))
                 self.assertEqual(
-                    self.replay_private_windows(
-                        [], command, audio=audio, pre_roll_ms=pre_roll
-                    ),
+                    self.replay_private_windows([], command, audio=audio, pre_roll_ms=pre_roll),
                     (["exit"], 2) if gap >= 200 else ([], 0),
                 )
 

@@ -1454,7 +1454,8 @@ class SpeechEvents:
     def _armed_name_end(self):
         name = self._private_name_checks
         if (
-            self._private_name_end is not None and name is not None
+            self._private_name_end is not None
+            and name is not None
             and name.generation == self._voice_generation
             and self._name_evidence_current(name)
         ):
@@ -2257,7 +2258,9 @@ class SpeechEvents:
         if name is None:
             self._clear_private_name()
         if (
-            (named or join is not None) and checks and checks.split == split
+            (named or join is not None)
+            and checks
+            and checks.split == split
             and checks.defer_verification
         ):
             ticket = replace(
@@ -2299,7 +2302,8 @@ class SpeechEvents:
         self._private_name_end = turn.acoustic_span_ms[1] if turn.acoustic_span_ms else turn.end_ms
         self._private_name_join = join
         self._private_name_checks = replace(
-            checks, generation=self._voice_generation,
+            checks,
+            generation=self._voice_generation,
             turn=replace(turn, text="", exit_timings=(), exit_available=None, defer_exit=None),
         )
 
@@ -2322,7 +2326,10 @@ class SpeechEvents:
         if self._deferred_private_exit is candidate:
             self._deferred_private_exit = None
         if (
-            candidate.status and not exited and self._active and self._duck
+            candidate.status
+            and not exited
+            and self._active
+            and self._duck
             and candidate.privacy_span is self._duck_spans[-1]
         ):
             if candidate.emission_clock is not None:
@@ -2344,7 +2351,8 @@ class SpeechEvents:
                 self._settle_private_exit(candidate, at_ms)
                 return
             if (
-                at_ms is None or not self._exit_available(turn)
+                at_ms is None
+                or not self._exit_available(turn)
                 or (name is not None and not self._name_evidence_current(name))
             ):
                 self._clear_private_name()
