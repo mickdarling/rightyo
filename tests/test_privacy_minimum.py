@@ -908,6 +908,52 @@ class PrivacyMinimumTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_natural_end_of_forced_continuation_clears_barrier_for_next_onset(self):
+        cut = doc(segment("Forced cut.", 20, 4000))
+        continuation = doc(segment("Jarvis, privacy off.", 0, 200))
+        fresh = doc(segment("Jarvis, privacy off.", 20, 1020))
+        lead = SILENCE * 10 + VOICE * 209
+        self.assertEqual(
+            self.replay_private_windows(
+                cut,
+                continuation,
+                audio=[lead + SILENCE * 15],
+                end_of_turn=lambda _: 1.0,
+                max_utterance_ms=4000,
+            ),
+            ([], 0),
+        )
+        for gap in (15, 72):
+            with self.subTest(gap_ms=20 * gap):
+                audio = [lead + SILENCE * gap + VOICE * 50 + SILENCE * 10]
+                self.assertEqual(
+                    self.replay_private_windows(
+                        cut,
+                        continuation,
+                        fresh,
+                        audio=audio,
+                        end_of_turn=lambda _: 1.0,
+                        max_utterance_ms=4000,
+                    ),
+                    (["exit"], 1),
+                )
+
+    def test_cap_honours_completion_waiting_for_private_diarizer(self):
+        for cap in (4000, 6000):
+            with self.subTest(cap=cap):
+                endpoint = Mock(return_value=1.0)
+                self.assertEqual(
+                    self.replay_private_windows(
+                        doc(segment("Jarvis, privacy off.", 20, 3620)),
+                        audio=[SILENCE * 10 + VOICE * 180 + SILENCE * 72],
+                        end_of_turn=endpoint,
+                        timeline=[],
+                        max_utterance_ms=cap,
+                    ),
+                    (["exit"], 1),
+                )
+                endpoint.assert_called_once()
+
     @staticmethod
     def fan_frame(gain, voice_ratio=0, voice_hz=250):
         return array(
@@ -1184,6 +1230,37 @@ class PrivacyMinimumTests(unittest.TestCase):
             with self.subTest(blank=blank):
                 self.assertEqual(self.replay_private_windows(doc(command, blank)), ([], 0))
 
+    def test_whisper_keeps_line_boundaries_in_segments_and_token_reconstruction(self):
+        start = segment("Jarvis, start", 20, 60)
+        for br in ("\n", "\u2028", "\u2029", "\x85"):
+            for reported, token in ((br, br), (br, " "), (" ", br)):
+                last = segment(reported + "listening.", 60, 100)
+                last["tokens"] = [segment(token + "listening.", 60, 100)]
+                with self.subTest(reported=reported, token=token):
+                    window = _recognizer_window(doc(start, last), 100)
+                    self.assertEqual(window.timing_incomplete, reported != token)
+                    self.assertEqual(
+                        "".join(u["text"] for u in window.units),
+                        "Jarvis, start" + reported + "listening.",
+                    )
+                    self.assertEqual(self.replay_private_windows(doc(start, last)), ([], 0))
+            point = segment(br, 60, 60)
+            document = doc(start, point, segment(" listening.", 60, 100))
+            with self.subTest(point=br):
+                self.assertIn(
+                    br, "".join(u["text"] for u in _recognizer_window(document, 100).units)
+                )
+                self.assertEqual(self.replay_private_windows(document), ([], 0))
+                # A matching newline token can also separate a finished sentence
+                # from a complete addressed command in the same Whisper window.
+                separated = doc(
+                    segment("Done.", 20, 60),
+                    {**point, "tokens": [point]},
+                    segment("Jarvis, privacy off.", 60, 100),
+                )
+                self.assertFalse(_recognizer_window(separated, 100).timing_incomplete)
+                self.assertEqual(self.replay_private_windows(separated), (["exit"], 1))
+
     def test_token_timing_is_checked_before_joining_words(self):
         for start, end in ((40, 60), (90, 150), (110, 160)):
             with self.subTest(start=start, end=end):
@@ -1221,11 +1298,20 @@ class PrivacyMinimumTests(unittest.TestCase):
                 self.assertEqual(self.replay_private_windows(units), ([], 0))
         command = piece("Jarvis, start listening", 0, 100)
         self.assertEqual(self.replay_private_windows([command]), (["exit"], 1))
-        for invisible in ("\u200b", "\ufeff", "\u2060", "."):
+        for invisible in ("\u200b", "\ufeff", "\u2060"):
             with self.subTest(invisible=invisible):
                 self.assertEqual(
                     self.replay_private_windows([command, piece(invisible, 100, 200)]), ([], 0)
                 )
+        # #350 round 12 P2-2 corrects this PR's earlier standalone-period refusal.
+        self.assertEqual(
+            self.replay_private_windows([command, piece(".", 100, 200)]), (["exit"], 1)
+        )
+        spoken = piece("Jarvis, privacy off", 20, 1020)
+        period = piece(".", 1120, 1140)
+        for tail, expected in ((SILENCE, (["exit"], 1)), (VOICE, ([], 0))):
+            audio = [SILENCE * 10 + VOICE * 50 + SILENCE * 5 + tail + SILENCE * 72]
+            self.assertEqual(self.replay_private_windows([spoken, period], audio=audio), expected)
         # Here each standalone fragment has timings for its own complete window.
         name, rest = piece("Jarvis", 0, 100), piece("start listening", 0, 100)
         self.assertEqual(self.replay_private_windows([name], [blank], [rest]), ([], 1))

@@ -6,7 +6,7 @@ import json
 import math
 import re
 from dataclasses import dataclass, field, fields
-from typing import Any
+from typing import Any, Callable
 
 LABELS = frozenset({"attend", "ignore", "uncertain"})
 # The dismissal judgement (#98): `stop` and `disengage` dismiss the assistant; `none` is
@@ -768,7 +768,7 @@ class WordAttribution:
 
 
 _INTERNAL_TURN_FIELDS = frozenset(
-    {"word_attribution", "recognition_loss_end_ms", "acoustic_span_ms"}
+    {"word_attribution", "recognition_loss_end_ms", "acoustic_span_ms", "exit_available"}
 )
 
 
@@ -791,6 +791,10 @@ class Turn:
     recognition_loss_end_ms: int = field(default=0, kw_only=True, compare=False)
     # Stream-relative observed speech edges for the private split clock.
     acoustic_span_ms: tuple[int, int] | None = field(default=None, kw_only=True, compare=False)
+    # Revalidate the originating private window at publication. Never exported or imported.
+    exit_available: Callable[[], bool] | None = field(
+        default=None, kw_only=True, compare=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         for name in ("session_id", "utterance_id", "recognizer_id", "speaker_provenance"):

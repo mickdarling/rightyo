@@ -4,6 +4,7 @@ import contextlib
 import io
 import math
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -12,13 +13,13 @@ import unittest
 from array import array
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import test_privacy_minimum as privacy
 from test_live_audio import SILENCE, VOICE
 from test_whisper_window_recovery import doc, segment
 
-from rightyo.live_speaker_id import EntryScore
+from rightyo.live_speaker_id import EntryScore, LabelState
 from rightyo.silero_vad import CHUNK_BYTES, CHUNK_MS, VERSION, SileroVad, VadConfig, VadError
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +68,57 @@ class Replay:
 
 
 class FailureTests(Replay, unittest.TestCase):
+    def test_tool_api_discloses_inter_block_audio_retention(self):
+        contract = " ".join((ROOT / "docs/tool-api.md").read_text().split())
+        self.assertIn("last 64 samples", contract)
+        self.assertIn("until its next block or shutdown", contract)
+
+    def test_invalid_or_timed_out_readiness_kills_and_reaps_own_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "stalled-worker"
+            controller = self.controller(silero_vad={"python": str(script), "model": str(script)})
+            spawn = subprocess.Popen
+            for invalid in (True, False):
+                with self.subTest(invalid=invalid):
+                    script.write_text(
+                        f"#!{sys.executable}\nimport os, signal\n"
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                        + ("os.write(1, b'?')\n" if invalid else "")
+                        + "signal.pause()\n"
+                    )
+                    script.chmod(0o700)
+                    children = []
+
+                    def start(*args, **kwargs):
+                        child = spawn(*args, **kwargs)
+                        children.append(child)
+                        return child
+
+                    diagnostic = io.StringIO()
+                    try:
+                        with (
+                            patch("rightyo.silero_vad.subprocess.Popen", side_effect=start),
+                            patch("rightyo.silero_vad.READY_TIMEOUT", 1),
+                            contextlib.redirect_stderr(diagnostic),
+                        ):
+                            vad = controller._silero_vad(threading.Event())
+                        self.assertIsNone(vad)
+                        self.assertEqual(
+                            diagnostic.getvalue(),
+                            "rightyo: Silero VAD worker unavailable; voice privacy exit disabled\n",
+                        )
+                        (child,) = children
+                        self.assertEqual(child.returncode, -signal.SIGKILL)
+                        with self.assertRaises(ChildProcessError):
+                            os.waitpid(child.pid, os.WNOHANG)
+                        command = doc(segment("Jarvis, privacy off.", 0, 100))
+                        self.assertEqual(self.replay_private_windows(command, vad=vad), ([], 0))
+                    finally:
+                        for child in children:
+                            if child.poll() is None:
+                                child.kill()
+                            child.wait()
+
     def test_unconfigured_vad_diagnostic_at_session_start(self):
         for roles in (False, True):
             with self.subTest(roles=roles):
@@ -145,8 +197,10 @@ class FailureTests(Replay, unittest.TestCase):
         stream = SILENCE * 16 + VOICE * 16 + SILENCE * 80
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
+            # The already-open window finishes without exit evidence. The second
+            # replay must not open another window through the energy gate.
             self.assertEqual(
-                self.replay_private_windows(command, command, audio=[stream, stream], vad=worker),
+                self.replay_private_windows(command, audio=[stream, stream], vad=worker),
                 ([], 0),
             )
         self.assertEqual(
@@ -191,7 +245,7 @@ class FailureTests(Replay, unittest.TestCase):
 class AdversarialReplay(Replay):
     """The identical waveforms and recognition/owner gates run with either worker."""
 
-    def exercise(self, pcm, speech, command, *, expected):
+    def exercise(self, pcm, speech, command, *, expected, words=None, close_during_check=False):
         vad = self.worker(speech)
         calls, labels = [], []
         classify = vad.is_speech
@@ -204,7 +258,15 @@ class AdversarialReplay(Replay):
         vad.is_speech = observe
         c, e, s, p, _, units = self.arrange(vad=vad, pre_roll_ms=400)
         c._enrolled_roles.exit_audio = c._private_sentence
-        s.exit_score = Mock(return_value=EntryScore(0.9, None, 0, "scored"))
+        worker_at_approval = []
+
+        def score(*_):
+            if close_during_check:
+                vad.close()
+                worker_at_approval.append(vad.available)
+            return EntryScore(0.9, None, 0, "scored")
+
+        s.exit_score = Mock(side_effect=score)
         p.config = replace(
             p.config,
             on_private_turn_audio=lambda t, pcm: c._private_turn_audio(c._generation, t, pcm),
@@ -219,18 +281,22 @@ class AdversarialReplay(Replay):
             if start <= command[0] and end >= command[1]:
                 return [
                     {
-                        "start_ms": command[0] - start,
-                        "end_ms": command[1] - start,
-                        "text": "Jarvis, privacy off.",
+                        "start_ms": left - start,
+                        "end_ms": right - start,
+                        "text": text,
                     }
+                    for left, right, text in words or [(*command, "Jarvis, privacy off.")]
                 ]
             return []
 
         units.transcribe = decode
         self.feed(c, p, pcm, s)
         p.finish()
-        self.assertIs(p._vad, vad, "worker failure is not an adversarial result")
-        self.assertEqual(len(labels), len(pcm) // CHUNK_BYTES)
+        if close_during_check:
+            self.assertEqual(worker_at_approval, [False])
+        else:
+            self.assertIs(p._vad, vad, "worker failure is not an adversarial result")
+            self.assertEqual(len(labels), len(pcm) // CHUNK_BYTES)
         events = e.drain()
         self.assertTrue(e.ducked)
         self.assertTrue(all(event["type"] == "privacy" for event in events))
@@ -238,6 +304,55 @@ class AdversarialReplay(Replay):
         self.assertEqual(([event["action"] for event in events], s.exit_score.call_count), expected)
         self.assertFalse(c._private_sentence.pcm)
         return labels, calls
+
+    def clean_timed_control(self, shift, *, expected, close_during_check=False, late=0):
+        machine = tones((50, 1000))
+        voice = tones((50, 1000), (200, 3000), (400, 1000))
+        start, end = 400 + shift, 1400 + shift
+        return self.exercise(
+            machine * 4 + machine[: shift * 32] + voice * 10 + machine * 16,
+            [(416, 672)],
+            (start + late, end),
+            words=[
+                (start + late, start + 100, "Jarvis,"),
+                (start + 100, start + 180, " privacy"),
+                (start + 180, end, " off."),
+            ],
+            close_during_check=close_during_check,
+            expected=expected,
+        )
+
+    def test_worker_dies_inside_owner_verification(self):
+        self.clean_timed_control(0, close_during_check=True, expected=([], 1))
+
+    def test_18_ms_shifted_word_onset_in_first_native_speech_block(self):
+        labels, _ = self.clean_timed_control(18, expected=(["exit"], 1))
+        self.assertEqual(labels.index(True) * CHUNK_MS, 416)
+        # Omitting the entire 416-448 ms speech block still refuses.
+        self.clean_timed_control(18, late=30, expected=([], 0))
+
+    def test_first_machine_block_and_incomplete_final_block_never_open_private_asr(self):
+        for hz, ms, speech in ((200, 24000, [(0, 32)]), (50, 1600, []), (50, 1620, [])):
+            with self.subTest(hz=hz, ms=ms):
+                pcm = (tones((hz, 1000)) * (ms // 100 + 1))[: 32 * ms]
+                _, calls = self.exercise(pcm, speech, (0, ms), expected=([], 0))
+                self.assertEqual(calls, [])
+
+    def test_privacy_off_after_silence_with_native_alignment_remainder(self):
+        for ms in (160, 1000):
+            with self.subTest(ms=ms):
+                vad = self.worker([])
+                c, _, shadow, p, notes, _ = self.arrange(vad=vad)
+                shadow._labels["Speaker A"] = LabelState(state="bound", identity="owner")
+                c.duck(True)
+                epoch = shadow.epoch
+                self.feed(c, p, bytes(ms * 32), shadow)
+                self.assertEqual(len(p._partial), (20 if ms == 1000 else 0) * 32)
+                c.duck(False)
+                self.assertIn("diarizer_private_frames=0 forget=skipped", notes[-1])
+                self.assertEqual(shadow.epoch, epoch)
+                self.assertEqual(shadow.binding("Speaker A"), ("bound", "owner"))
+                self.assertFalse(p._speaker_reset)
 
     def persistent_fundamental(self):
         # The 100 Hz voice stays 20 dB above the 50 Hz background throughout.
@@ -281,6 +396,20 @@ class AdversarialReplay(Replay):
 class FakeWorkerDecisions(AdversarialReplay, unittest.TestCase):
     def worker(self, speech):
         return fake_worker(self, speech)
+
+    def test_off_silences_a_whole_private_frame_waiting_for_vad_alignment(self):
+        c, _, s, p, notes, _ = self.arrange(vad=self.worker([]))
+        c.duck(True)
+        self.feed(c, p, SILENCE * 49 + VOICE, s)
+        self.assertEqual(p._partial, VOICE)
+        c.duck(False)
+        self.assertIn("forget=skipped", notes[-1])
+        # Observe the cutoff itself before the diarizer's second substitution.
+        substitute = Mock(wraps=p._diarizer_frame)
+        with patch.object(p, "_diarizer_frame", substitute):
+            self.feed(c, p, VOICE * 3, s)
+        self.assertEqual(substitute.call_args_list[0].args[0], SILENCE)
+        self.assertEqual(substitute.call_args_list[1].args[0], VOICE)
 
     def test_persistent_fundamental_with_louder_third_harmonic(self):
         labels, _ = self.persistent_fundamental()
@@ -394,8 +523,7 @@ class RealModelDecisions(RealSilero, AdversarialReplay, unittest.TestCase):
 
     def test_clean_command_over_200_hz_steady_machinery(self):
         _, calls = self.machinery(200, expected=([], 0))
-        # Silero can trigger on the initial step into this 200 Hz tone.
-        self.assertFalse(any(0 < start and end <= 24000 for start, end in calls))
+        self.assertFalse(any(end <= 24000 for _, end in calls))
 
     def test_clean_command_sharing_a_fundamental_with_the_fan(self):
         _, calls = self.machinery(100, expected=([], 0))

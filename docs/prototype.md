@@ -231,7 +231,9 @@ An absent configuration, missing or unreadable model, checksum mismatch, or work
 failure disables voice exits for the session. Sessions with enrolled roles report
 a missing configuration on stderr. An explicitly configured worker reports startup
 or runtime failures regardless of roles. These diagnostics include only a fixed
-reason. Host privacy controls and the status question remain available.
+reason. Host privacy controls remain available. Sessions started without a VAD
+can still recognize the status question. Once a worker is judging private speech,
+only its observed blocks can open a private recognition window.
 
 ### Reproduce the Silero test worker on Apple Silicon
 

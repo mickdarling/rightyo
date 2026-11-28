@@ -30,12 +30,13 @@ import threading
 import time
 import unicodedata
 import wave
+import weakref
 from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from .addressedness import reply_wait
+from .addressedness import LINE_BREAKS, reply_wait
 from .contracts import PROVENANCE, Turn, WordAttribution, identifier, utterance_scoped_speaker
 from .providers import Diarizer, Transcriber
 from .silero_vad import SpeechVad
@@ -1106,6 +1107,10 @@ def _punctuation(text: str) -> bool:
     return bool(value) and all(unicodedata.category(c).startswith("P") for c in value)
 
 
+def _line_separator(text: str) -> bool:
+    return text.isspace() and any(c in LINE_BREAKS for c in text)
+
+
 def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _RecognizerWindow:
     """Keep every usable segment in source order, without moving its valid times.
 
@@ -1146,14 +1151,16 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
         if not isinstance(text, str) or len(text) > 4000 or not isinstance(offsets, dict):
             raise LiveAudioError("Invalid local recognizer result")
         start, end = offsets.get("from"), offsets.get("to")
+        line_break = _line_separator(text)
         if not text.strip():
-            # An empty, instantaneous placeholder carries no speech. Tokens or a
-            # nonempty/unknown interval could hide words that never reach the matcher.
-            if segment.get("tokens") not in (None, []) or not (
+            # Keep a line boundary and validate any tokens that report it. Other
+            # blank placeholders must be instantaneous and cannot hide tokens.
+            if (not line_break and segment.get("tokens") not in (None, [])) or not (
                 type(start) is int and type(end) is int and 0 <= start == end <= duration_ms
             ):
                 window.unreliable_token_timing = True
-            continue
+            if not line_break:
+                continue
         previous_start = fallbacks[-1]["start_ms"] if fallbacks else 0
         previous_end = fallbacks[-1]["end_ms"] if fallbacks else 0
         reason = 0
@@ -1175,7 +1182,9 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
             window.gaps.add(len(result))
             segment_gaps.add(len(fallbacks))
             continue
-        repaired = (start, end) != original or (start == end and not _punctuation(text))
+        repaired = (start, end) != original or (
+            start == end and not (_punctuation(text) or line_break)
+        )
         window.repaired += int(repaired)
         fallback = {"text": text, "start_ms": start, "end_ms": end}
         fallbacks.append(fallback)
@@ -1185,7 +1194,7 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
             or end > original[1]
             or (repaired and start == end)
             or tokens is None
-            or (tokens == [] and _punctuation(text))
+            or (tokens == [] and (_punctuation(text) or line_break))
         ):
             result.append(fallback)
             if any(c.isalnum() for c in text):
@@ -1244,7 +1253,9 @@ def _recognizer_window(document: dict[str, Any], duration_ms: int) -> _Recognize
                 words[-1]["text"] += value
                 words[-1]["start_ms"] = min(words[-1]["start_ms"], left)
                 words[-1]["end_ms"] = max(words[-1]["end_ms"], right)
-        usable &= reconstructed.strip() == text.strip()
+        # Whisper can vary horizontal padding. A line break, even at either
+        # edge of a segment, belongs to the reported sentence structure.
+        usable &= reconstructed.strip(" \t") == text.strip(" \t")
         usable &= bool(words) and all(w["start_ms"] <= w["end_ms"] for w in words)
         # Word intervals must also be in order; otherwise the common unit check would
         # suppress the whole utterance, so keep the segment's text as one unit (#78).
@@ -1536,7 +1547,17 @@ def _complete_exit_span(
             if start < previous_end:
                 return None
             previous_end = end
-        if _punctuation(value) and (start == end or packet.window is not None):
+        if start == end and _line_separator(unit["text"]):
+            continue
+        if _punctuation(value) and (
+            start == end
+            or packet.window is not None
+            or (
+                packet.vad_mask is not None
+                and packet.exit_voice_span[1] <= start
+                and end <= len(packet.vad_mask)
+            )
+        ):
             continue
         if not any(c.isalnum() for c in value) or start >= end:
             return None
@@ -1554,15 +1575,18 @@ def _complete_exit_span(
     def has_voice(start: int, end: int, *, whole_block: bool = False) -> bool:
         if whole_block:
             # A speech block straddling a word edge cannot establish speech on
-            # that word's side. For gaps, even part of a speech block vetoes exit.
+            # that word's side.
             start += -(packet.offset + start) % packet.vad_block_ms
             end -= (packet.offset + end) % packet.vad_block_ms
-        return packet.vad_mask.find(b"\x01", start, end) >= 0
+        return start < end and packet.vad_mask.find(b"\x01", start, end) >= 0
 
     previous = first
     covered_word = -1
-    for start, end, first_word, last_word in intervals:
-        if first_word > covered_word + 1 or has_voice(previous, min(start, last)):
+    for index, (start, end, first_word, last_word) in enumerate(intervals):
+        # The first speech block can straddle the recognized onset. A complete
+        # uncovered block before it, and any speech in later gaps, still veto.
+        gap_end = start if index else start - (packet.offset + start) % packet.vad_block_ms
+        if first_word > covered_word + 1 or has_voice(previous, min(gap_end, last)):
             return None
         if last_word > covered_word and has_voice(
             max(first, start), min(last, end), whole_block=True
@@ -1663,6 +1687,7 @@ class LiveProcessor:
         self._privacy_uncertain = False
         self._diarizer_pending = 0
         self._diarizer_audited_bytes = 0
+        self._buffered_input_bytes = 0
         # Where the last privacy end was reached (audio thread only), bounding a deferred renewal;
         # and, after a forced one, the renewal's offset: a turn starting before it is unlabelled.
         self._end_reached_ms: int | None = None
@@ -1777,6 +1802,10 @@ class LiveProcessor:
                 raise LiveAudioError("Audio session exceeded duration limit")
             self._partial.extend(pcm)
             self._drain_frames()
+            with self._private_lock:
+                # Input still owned after the push, including any tail waiting for
+                # VAD alignment. The privacy cutoff covers it before its native push.
+                self._buffered_input_bytes = len(self._partial)
         except Exception:
             self.failed = True
             self.close()
@@ -1792,9 +1821,34 @@ class LiveProcessor:
             flush=True,
         )
 
+    def _private_exit_available(self, window_number: int) -> bool:
+        """Recheck the current window and its judge before committing a private exit."""
+        vad = self._vad
+        if vad is None:
+            return False
+        available = False
+        with contextlib.suppress(Exception):
+            available = vad.available is True
+        if not available:
+            self._disable_vad()
+            return False
+        with self._recovery_lock:
+            packet = self._publishing
+            return (
+                not self.closed
+                and not self.failed
+                and self._vad is vad
+                and packet is not None
+                and packet.number == window_number
+                and not packet.discarded
+                and packet.vad_mask is not None
+            )
+
     def _drain_frames(self, *, final: bool = False) -> None:
         # Attribute each native VAD block to its own audio. A 20 ms ASR frame can
         # straddle two 32 ms blocks. Wait for both before interpreting silence.
+        with self._private_lock:
+            self._buffered_input_bytes = 0
         while len(self._partial) >= FRAME_BYTES:
             mask = None
             while self._vad is not None and len(self._vad_pending) < 20:
@@ -1949,9 +2003,9 @@ class LiveProcessor:
         with self._private_lock:
             count = self._diarizer_private_frames
             # The controller accepts a chunk before the audio thread processes it.
-            # A sub-frame tail is safe: finish's cutoff silences it before any push.
-            # Complete accepted frames still awaiting their verdict are not certified.
-            audited_bytes = self._diarizer_audited_bytes + min(len(self._partial), FRAME_BYTES - 2)
+            # Count only finished diarizer pushes and the processor's accounted
+            # alignment tail. An accepted chunk still in flight remains uncertified.
+            audited_bytes = self._diarizer_audited_bytes + self._buffered_input_bytes
             reason = (
                 "private_frames"
                 if count
@@ -1984,8 +2038,12 @@ class LiveProcessor:
         start = self._received_ms * BYTES_PER_MS
         with self._private_lock:
             until = self._private_until
-            if until is None or (until >= start + len(pcm) and not final):
+            if until is None:
                 return pcm
+            if until >= start + len(pcm) and not final:
+                # Alignment may leave a whole private frame buffered at the off
+                # edge. Silence it now and retain the cutoff for subsequent frames.
+                return self._silence_ranges(pcm, start, self._private_ranges)
             self._private_until = None
             ranges, self._private_ranges = self._private_ranges, []
         if self._speaker_reset and self._end_reached_ms is None:
@@ -2151,13 +2209,16 @@ class LiveProcessor:
         self._push_diarizer(frame, private, uncertain)
         frame_start = self._received_ms
         self._received_ms += 20
-        # Ordinary ASR can still recognize status when VAD is unavailable. Only
-        # a VAD-qualified private window ever receives private exit evidence.
-        voiced = (
-            any(mask)
-            if private and mask is not None
-            else (_frame_rms(frame) >= self.config.energy_threshold)
-        )
+        judge = self.config.silero_vad
+        if private and judge is not None:
+            # The first native block starts with synthetic zero context. Its
+            # decision alone cannot open private ASR. Keep its actual label in
+            # the quiet history; a positive bootstrap block never proves absence.
+            after_bootstrap = max(0, judge.chunk_ms - frame_start)
+            voiced = mask is not None and any(mask[after_bootstrap:])
+        else:
+            # Public ASR, or status recognition in a session started without VAD.
+            voiced = _frame_rms(frame) >= self.config.energy_threshold
         if voiced and not self._utterance:
             pre_roll_ms = len(self._pre_roll) * 20
             if (
@@ -2188,7 +2249,9 @@ class LiveProcessor:
             ending_pause = self._received_ms - self._last_voice_ms >= self.config.hangover_ms
             if at_cap or ending_pause:
                 self._finalize(
-                    self._diarizer.segments(), complete=self._complete, natural_end=ending_pause
+                    self._diarizer.segments(),
+                    complete=self._complete,
+                    natural_end=ending_pause or self._complete,
                 )
             elif self._complete or self._ask_end_of_turn():
                 self._finalize_when_attributed()
@@ -2296,6 +2359,7 @@ class LiveProcessor:
         if not natural_end:
             self._continuation_until_ms = self._last_voice_ms + self.config.hangover_ms
             return None
+        self._continuation_until_ms = 0
         if self._frame_private:
             mask = self._utterance_vad
             if mask is None:
@@ -2303,7 +2367,6 @@ class LiveProcessor:
             span = (mask.index(1), mask.rindex(1) + 1)
         else:
             span = (self._voice_start - offset, self._last_voice_ms - offset)
-        self._continuation_until_ms = 0
         if offset + span[0] == 0 or offset + span[0] < continuation:
             return None
         return span
@@ -2452,6 +2515,9 @@ class LiveProcessor:
                 packet.pcm[:] = bytes(len(packet.pcm))
             packet.pcm = bytearray()
             packet.timeline = []
+            packet.window.spoken_intervals = None
+            packet.vad_mask = None
+            packet.exit_voice_span = None
 
     def _append_overflow(self, packet: _FinalizedWindow) -> None:
         self._lose_window(packet, reason=5, compact=True)
@@ -2734,15 +2800,19 @@ class LiveProcessor:
                 attributed, evidence, self.config.edge_attribution_ms, blockers=edges
             )
         if spoken_span is not None and packet.vad_mask is not None:
-            # A punctuation point can lack a timeline label. Keep its text and
+            # A punctuation or line-separator point can lack a timeline label. Keep its text and
             # original privacy bounds with the private speech it punctuates.
             # An actual speaker division still disqualifies the entire window.
-            marks = [entry for entry in attributed if _punctuation(entry[0]["text"])]
+            marks = [
+                entry
+                for entry in attributed
+                if _punctuation(entry[0]["text"]) or _line_separator(entry[0]["text"])
+            ]
             if marks and self._heard_private(offset + spoken_span[0], offset + spoken_span[1]):
                 voices = {
                     (speaker, overlap)
                     for unit, _, _, speaker, overlap in attributed
-                    if not _punctuation(unit["text"])
+                    if not (_punctuation(unit["text"]) or _line_separator(unit["text"]))
                 }
                 if len(voices) == 1:
                     voice = voices.pop()
@@ -2830,14 +2900,16 @@ class LiveProcessor:
                 # publishing it, while keeping only this private sentence's PCM for exit.
                 self._merger.discard()
                 # ASR can outlive the worker that scored this window.
-                if self._vad is not None and not self._vad.available:
-                    self._disable_vad()
-                if self._vad is None or packet.vad_mask is None:
+                if not self._private_exit_available(number):
                     self._recognition_loss_end_ms = offset + packet.duration_ms
                     spoken_span = None
                 if len(kept) == 1 and spoken_span is not None:
                     group["start_ms"], group["end_ms"] = (offset + ms for ms in spoken_span)
                     group["acoustic_span_ms"] = tuple(offset + ms for ms in acoustic_span)
+                    # A consumer retaining the turn cannot retain PCM through this
+                    # guard or redeem the approval against a different window.
+                    processor = weakref.proxy(self)
+                    group["exit_available"] = lambda: processor._private_exit_available(number)
                 start = (group["start_ms"] - offset) * BYTES_PER_MS
                 end = (group["end_ms"] - offset) * BYTES_PER_MS
                 self._emit(group, memoryview(pcm)[start:end])
@@ -2893,6 +2965,7 @@ class LiveProcessor:
             word_attribution=attribution,
             recognition_loss_end_ms=self._recognition_loss_end_ms,
             acoustic_span_ms=group.get("acoustic_span_ms"),
+            exit_available=group.get("exit_available"),
         )
         if gap is not None and self.config.on_post_turn_gap is not None:
             self.config.on_post_turn_gap(turn.utterance_id, gap)

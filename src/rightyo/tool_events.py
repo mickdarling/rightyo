@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from threading import RLock
 
 from rightyo.addressedness import (
+    LINE_BREAKS,
     answer_shaped,
     follow_up_cued,
     guest_address_tail,
@@ -397,28 +398,37 @@ def _exit_kinds(text, addressing):
     # Keep original offsets for sentence breaks and the vocative's question exemption.
     # Only whitespace and punctuation separate words. Marks, format characters and
     # unfamiliar symbols survive as literal input that must match the grammar.
-    cleaned = "".join(
-        " " if c != "'" and unicodedata.category(c).startswith("P") else c
-        for c in text.replace("’", "'")
-    )
-    tokens = list(re.finditer(r"\S+", cleaned))
-    words = [token.group().lower() for token in tokens]
-    name_keys = {
-        name_key(spelling)
+    spellings = {
+        spelling
         for name in (addressing.names if addressing else ())
         for spelling in (name, *addressing.spellings(name))
     }
+    source = text.replace("’", "'")
+    dotted = sorted((s for s in spellings if "." in s), key=len, reverse=True)
+    if dotted:
+        # Keep literal intra-name periods inside the address token. An apostrophe
+        # preserves its source offset and is already ignored in the name key.
+        pattern = "|".join(map(re.escape, dotted))
+        source = re.sub(
+            rf"(?<!\w)(?:{pattern})(?!\w)", lambda m: m[0].replace(".", "'"), source, flags=re.I
+        )
+    cleaned = "".join(
+        " " if c != "'" and unicodedata.category(c).startswith("P") else c for c in source
+    )
+    tokens = list(re.finditer(r"\S+", cleaned))
+    words = [token.group().lower() for token in tokens]
+    name_keys = {name_key(spelling) for spelling in spellings}
     # Retain the source sentence of each word through phrase and name matching.
     sentences = []
     sentence = 0
     for at, token in enumerate(tokens):
         if at:
             for i in range(tokens[at - 1].end(), token.start()):
-                if text[i] in ".!?;\r\n":
+                if source[i] in ".!?;" + LINE_BREAKS:
                     sentence = i + 1
         sentences.append(sentence)
 
-    def addressed(end, sentence_end):
+    def addressed(end, sentence_end, phrase_sentence=None):
         # A name of at most three words must consume the last non-filler before
         # the phrase. Try filler words as names too (including configured variants).
         last = max((i for i in range(end) if words[i] not in PRIVACY_EXIT_FILLER), default=-1)
@@ -427,7 +437,7 @@ def _exit_kinds(text, addressing):
             sentence = sentences[at]
             if at and sentence != sentences[at - 1]:
                 head = True
-            if head and at + 3 > last:
+            if head and at + 3 > last and (phrase_sentence is None or sentence == phrase_sentence):
                 for stop in range(max(at + 1, last + 1), min(end, at + 3) + 1):
                     key = "".join(words[at:stop]).casefold().replace("'", "")
                     if key not in name_keys or sentences[stop - 1] != sentence:
@@ -452,7 +462,12 @@ def _exit_kinds(text, addressing):
         if start < 0 or tuple(words[start:end]) != phrase or sentences[start] != sentences[end - 1]:
             continue
         sentence_end = next((s for s in sentences[end:] if s != sentences[end - 1]), len(text))
-        if addressed(start, sentence_end):
+        phrase_sentence = sentences[start]
+        if start and text[tokens[start - 1].end() : tokens[start].start()].strip(" \t") == "...":
+            # The existing vocative grammar allows a three-dot hesitation before
+            # the phrase. Internal name/phrase breaks above retain their meaning.
+            phrase_sentence = sentences[start - 1]
+        if addressed(start, sentence_end, phrase_sentence):
             kinds.add("exit")
         elif (
             sentences[0] == sentences[start]
@@ -2105,7 +2120,6 @@ class SpeechEvents:
             self._private_counts["failed"] += 1
             self._clear_exit_audio()
         split, self._private_name_end = self._private_name_end, None
-        self._voice_generation += 1
         outcome = (
             checks.exit
             if checks is not None and checks.split == split
@@ -2121,6 +2135,17 @@ class SpeechEvents:
                     outcome = False, reason
             else:
                 outcome = False, "voice_unavailable"
+        if outcome[0] and turn.acoustic_span_ms is not None:
+            # The worker can die while the isolated owner check runs outside
+            # the lock. Both the full exit and a split name need a live judge.
+            available = False
+            with contextlib.suppress(Exception):
+                available = turn.exit_available is not None and turn.exit_available() is True
+            if not available:
+                outcome = False, "voice_unavailable"
+        if outcome[0] and not self._voice_checks_current(checks, turn, inferred):
+            outcome = False, "voice_unavailable"
+        self._voice_generation += 1
         # Only a turn heard entirely since the mode last went on, while it is still on, is
         # matched at all (#242 round 23, see `transcript`): one heard in an earlier private
         # period and released late can never end this one, answer its status or be counted.

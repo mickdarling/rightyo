@@ -158,6 +158,8 @@ def _utterance_scope(speaker: str) -> str:
 
 
 _WORDS = re.compile(r"[a-z']+")
+# Unicode line boundaries recognized by str.splitlines().
+LINE_BREAKS = "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
 _FILLERS = frozenset(
     "hey ok okay so and um uh oh well now then also actually alright right yeah yes".split()
 )

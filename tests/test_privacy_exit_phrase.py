@@ -2,6 +2,7 @@
 
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 import test_duck_mode as duck
 
@@ -113,13 +114,38 @@ class NamedPrivacyExitTests(unittest.TestCase):
                 )
 
     def test_sentence_break_between_phrase_words_refuses_single_and_split_exit(self):
-        for i, boundary in enumerate((".", "!", "?", ";", "\n")):
+        for i, boundary in enumerate(".!?;\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"):
             with self.subTest(boundary=boundary):
-                at = 3000 * i
+                at = 4000 * i
                 phrase = f"start{boundary} listening."
                 self.assertEqual(self.hear("Jarvis, " + phrase, at), [])
                 self.assertEqual(self.hear("Jarvis,", at + 1000), [])
                 self.assertEqual(self.hear(phrase, at + 2000), [])
+                self.assertEqual(self.hear(f"Jarvis{boundary} privacy off.", at + 3000), [])
+
+    def test_period_inside_exact_configured_name(self):
+        self.start(Addressing(("A.B",)))
+        self.assertEqual([e["action"] for e in self.hear("A.B, privacy off.", 0)], ["exit"])
+        for index, text in enumerate(("A. B, privacy off.", "A.B; privacy off.", "A.B?")):
+            self.assertEqual(self.hear(text, (index + 1) * 1000), [])
+
+    def test_only_a_vocative_ellipsis_can_join_address_and_phrase(self):
+        with patch.object(self.events, "_exit_approval", wraps=self.events._exit_approval) as owner:
+            for i, text in enumerate(
+                (
+                    "Jarvis; privacy off.",
+                    "Jarvis. Privacy off.",
+                    "Jarvis...\nprivacy off.",
+                    "Jarvis; ... privacy off.",
+                    "Jarvis, privacy...off.",
+                )
+            ):
+                self.assertEqual(self.hear(text, i * 1000), [])
+            owner.assert_not_called()
+            self.assertEqual(
+                [e["action"] for e in self.hear("Jarvis... privacy off.", 5000)], ["exit"]
+            )
+            owner.assert_called_once()
 
     def test_earlier_negated_question_or_refused_address_does_not_veto_exit(self):
         for name, text in (
@@ -252,3 +278,6 @@ class NamedPrivacyExitTests(unittest.TestCase):
         self.assertNotIn("acoustic_span_ms", turn.to_dict())
         with self.assertRaises(ContractError):
             Turn.from_dict({**turn.to_dict(), "acoustic_span_ms": (200, 1200)})
+        self.assertNotIn("exit_available", turn.to_dict())
+        with self.assertRaises(ContractError):
+            Turn.from_dict({**turn.to_dict(), "exit_available": True})

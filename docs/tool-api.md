@@ -1846,9 +1846,11 @@ the name and the phrase. "Um, ok Jarvis, so, I'm back" qualifies. "I heard
 Jarvis start listening" stays private. A nearby negation before the name also
 blocks the exit.
 
-The words of the exit phrase must belong to one sentence. "Jarvis, start;
-listening." keeps privacy on. Only "now", "please" and "again" may follow
-the phrase, in any combination.
+In a single-turn exit, the configured name and all words of the exit phrase
+must belong to one sentence. Both "Jarvis; privacy off." and "Jarvis, start;
+listening." keep privacy on. Unicode line breaks also end a sentence. A three-dot
+pause before the phrase is allowed in "Jarvis... privacy off." Only "now",
+"please" and "again" may follow the phrase, in any combination.
 "Jarvis, I'm back, please" qualifies. "Jarvis, I'm back, okay" and "Jarvis,
 start listening to the podcast" stay private. Words in any script count.
 Question punctuation in the exit sentence or a question opener after the
@@ -1864,8 +1866,9 @@ consecutive 512-sample (32 ms) blocks at 16 kHz. A speech probability of at leas
 pause. A quiet period qualifies only the onset immediately following it.
 
 Each word's supplied timing must contain a complete speech block. A shared
-interval for several words supplies their common timing evidence. Voice in a gap
-between original spoken tokens or beyond the final spoken token keeps Privacy on,
+interval for several words supplies their common timing evidence. The first speech
+block may straddle the reported onset. A whole speech block before the first word
+keeps Privacy on. So does voice in a gap between original spoken tokens or beyond the final word,
 even when the gap intersects only part of a speech block. A missing or failed VAD
 disables voice exits. See [local setup and model pin](prototype.md#silero-vad-for-leaving-privacy-by-voice).
 Punctuation supplies no speech timing. A speaker boundary
@@ -1911,8 +1914,9 @@ retains no audio and cannot pass the new voice check: scoring a clipped fragment
 omit another voice's words. The previous sentence is overwritten with zeros in place
 before replacement and release, so references to the old object see zeros. The new
 buffer contains no public prefix if privacy began mid-turn; that crossing turn refuses.
-Between finalized turns, only the existing bounded local ASR assembly holds current
-utterance/pre-roll audio; there is no additional streaming private ring or archive.
+Between finalized turns, the bounded local ASR assembly holds the current utterance
+and pre-roll. The Silero worker keeps the last 64 samples of audio context until
+its next block or shutdown, along with the recurrent state required by the model.
 
 Only a complete named exit phrase or a name-only fragment matched by the existing local
 matcher (`exit`, `name`, or `rest` completing an accepted split-name fragment) can invoke

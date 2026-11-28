@@ -23,6 +23,7 @@ MODEL_BYTES = 2327524
 CHUNK_MS = 32
 CHUNK_BYTES = 512 * 2  # 16 kHz mono signed little-endian PCM
 THRESHOLD = 0.5
+READY_TIMEOUT = 30
 
 # Fixed startup protocol. Never relay paths, native errors, or worker output.
 _ERRORS = {
@@ -144,7 +145,7 @@ class SileroVad:
             self.channel.close()
             raise VadError(_ERRORS[b"W"]) from None
         try:
-            ready = self._receive(30)
+            ready = self._receive(READY_TIMEOUT)
             if ready != b"R":
                 raise VadError(_ERRORS.get(ready, _ERRORS[b"W"]))
         except BaseException:
@@ -186,7 +187,11 @@ class SileroVad:
             self.process.wait(timeout=1)
         except subprocess.TimeoutExpired:
             self.process.terminate()
-            self.process.wait(timeout=2)
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
 
 
 if __name__ == "__main__":
