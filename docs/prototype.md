@@ -231,13 +231,15 @@ An absent configuration, missing or unreadable model, checksum mismatch, or work
 failure disables voice exits for the session. Sessions with enrolled roles report
 a missing configuration on stderr. An explicitly configured worker reports startup
 or runtime failures regardless of roles. These diagnostics include only a fixed
-reason. Host privacy controls remain available. Private status questions remain available both without a configured VAD
-and after a runtime worker failure. Once a worker is judging private speech,
-only its observed blocks can open a private recognition window.
+reason. Host privacy controls remain available. Private status questions remain available
+without a configured VAD and after a runtime worker failure. With an active worker,
+its observed speech can open a recognition window at stream start for status.
+The preceding absence rule still applies to every exit candidate.
 
 The post-end confirmation window is fixed at **1,728 ms (54 native blocks)**.
-It starts at the acoustic end of the command, the end of the last word supported
-by Silero speech evidence. ASR closure timing cannot shorten it. The processor
+It starts at the latest observed evidence of the command's acoustic end, using
+the recognized final-word end, its last associated positive Silero block, and
+acoustically continuous final-word audio in the recognition window. The processor
 waits for the entire block covering the deadline before checking the owner.
 Resumed speech on any of those blocks cancels the exit. All exit preconditions,
 including a fresh worker liveness round-trip, must still pass at publication.

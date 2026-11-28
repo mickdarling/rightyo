@@ -1712,6 +1712,7 @@ class _OffsetDiarizer:
 class _PendingExit:
     window_number: int
     word_end_ms: int
+    acoustic_end_ms: int
     resolve: Callable[[int | None], None] | None
 
 
@@ -1761,6 +1762,7 @@ class LiveProcessor:
         self._vad_last_positive_start = -1
         self._pending_exit: _PendingExit | None = None
         self._utterance_vad: bytearray | None = None
+        self._startup_status = False
         self._frame_private = False
         self._diarizer_private_frames = 0
         self._privacy_uncertain = False
@@ -1925,12 +1927,17 @@ class LiveProcessor:
                 pending is not None
                 and pending.window_number == window_number
                 and self._vad_last_positive_start < pending.word_end_ms
-                and self._vad_scored_ms >= pending.word_end_ms + PRIVATE_EXIT_TAIL_MS
+                and self._vad_scored_ms >= pending.acoustic_end_ms + PRIVATE_EXIT_TAIL_MS
             )
 
     def _defer_private_exit(
-        self, number: int, word_end_ms: int, resolve: Callable[[int | None], None]
+        self,
+        number: int,
+        word_end_ms: int,
+        acoustic_end_ms: int,
+        resolve: Callable[[int | None], None],
     ) -> None:
+        cancel = resolve
         with self._recovery_lock:
             packet = self._publishing
             if (
@@ -1939,9 +1946,11 @@ class LiveProcessor:
                 and packet.number == number
                 and not packet.discarded
             ):
-                self._pending_exit = _PendingExit(number, word_end_ms, resolve)
-                return
-        resolve(None)
+                previous = self._pending_exit
+                cancel = previous.resolve if previous is not None else None
+                self._pending_exit = _PendingExit(number, word_end_ms, acoustic_end_ms, resolve)
+        if cancel is not None:
+            cancel(None)
 
     def _cancel_private_exit(self) -> None:
         with self._recovery_lock:
@@ -1954,11 +1963,10 @@ class LiveProcessor:
             pending = self._pending_exit
             if pending is None or pending.resolve is None:
                 return
-            # A positive block straddling the last word's end was already checked
-            # by _covered_exit_intervals. Any later positive block is new speech.
+            # The last command block was already checked by _covered_exit_intervals.
             if self._vad_last_positive_start >= pending.word_end_ms:
                 at_ms = None
-            elif self._vad_scored_ms >= pending.word_end_ms + PRIVATE_EXIT_TAIL_MS:
+            elif self._vad_scored_ms >= pending.acoustic_end_ms + PRIVATE_EXIT_TAIL_MS:
                 at_ms = self._vad_scored_ms
             else:
                 return
@@ -2342,23 +2350,30 @@ class LiveProcessor:
             and self._take_renewal()
         ):
             self._renew_diarizer()
-        self._push_diarizer(frame, private, uncertain)
         frame_start = self._received_ms
-        self._received_ms += 20
+        startup = False
         if mask is not None and not self._vad_observed_absence:
-            # Ignore the entire stream-initial positive run. Only a subsequent
-            # onset can open private ASR, even if startup spans several blocks.
             first_absent = mask.find(0)
             self._vad_observed_absence = first_absent >= 0
             onset_mask = mask[first_absent + 1 :] if self._vad_observed_absence else b""
+            startup = bool(mask[0]) and not any(onset_mask)
         else:
             onset_mask = mask
         if private and self._vad is not None:
             voiced = onset_mask is not None and any(onset_mask)
+            if voiced and self._startup_status:
+                # A new onset starts the same window it would have without startup ASR.
+                self._finalize(self._diarizer.segments(), natural_end=True)
+                if self.closed:
+                    return
+            voiced |= startup
         else:
             # Public ASR, or private status recognition without an active VAD.
             voiced = _frame_rms(frame) >= self.config.energy_threshold
+        self._push_diarizer(frame, private, uncertain)
+        self._received_ms += 20
         if voiced and not self._utterance:
+            self._startup_status = private and self._vad is not None and startup
             pre_roll_ms = 20 * len(self._pre_roll)
             self._voice_start = frame_start
             self._utterance_start = frame_start - pre_roll_ms
@@ -2368,6 +2383,7 @@ class LiveProcessor:
                 private
                 and mask is not None
                 and not uncertain
+                and not self._startup_status
                 and prior_quiet + mask.index(1) >= PRIVATE_ONSET_QUIET_MS
             ):
                 # Keep the ASR clock aligned, but do not replay an earlier voice
@@ -2498,6 +2514,8 @@ class LiveProcessor:
 
     def _exit_voice_span(self, natural_end: bool) -> tuple[int, int] | None:
         """Record the next continuation barrier and qualify this window's acoustic edges."""
+        if self._startup_status:
+            return None
         offset = self._utterance_start
         continuation = self._continuation_until_ms
         if not natural_end:
@@ -2589,9 +2607,18 @@ class LiveProcessor:
                 raise LiveAudioError("Audio session was stopped")
         finally:
             self._asr_process = None
+        if self._startup_status:
+            # Preserve the ordinary onset pre-roll for the next run.
+            start = max(0, len(self._utterance) - self._pre_roll.maxlen * FRAME_BYTES)
+            self._pre_roll.extend(
+                bytes(self._utterance[i : i + FRAME_BYTES])
+                for i in range(start, len(self._utterance), FRAME_BYTES)
+            )
+        else:
+            self._pre_roll.clear()
+        self._startup_status = False
         self._utterance.clear()
         self._utterance_vad = None
-        self._pre_roll.clear()
         self._drain_results()
         try:
             self._queue_window(packet)
@@ -2771,6 +2798,37 @@ class LiveProcessor:
         # Delayed ASR may already have enough audio. Resolve only after the
         # publication callback has released the controller and publisher locks.
         self._advance_private_exit()
+
+    def _exit_anchor_ms(
+        self,
+        packet: _FinalizedWindow,
+        pcm: bytearray,
+        word_end: int,
+        acoustic_span: tuple[int, int],
+    ) -> int:
+        """Use the latest supported end, including the final word's audible tail."""
+        first, last = acoustic_span
+        block_end = last + (-(packet.offset + last) % packet.vad_block_ms)
+        anchor = max(word_end, block_end)
+        frame_ms = FRAME_BYTES // BYTES_PER_MS
+        if first < frame_ms or word_end < frame_ms:
+            return anchor
+        # Silero can label a sustained part of a word absent. Follow its level
+        # across the time stamp until it changes by the ordinary ASR energy gate.
+        # The lead-in distinguishes a word's level from unchanged room sound.
+        quiet_end = first * BYTES_PER_MS
+        end = word_end * BYTES_PER_MS
+        background = _frame_rms(pcm[quiet_end - FRAME_BYTES : quiet_end])
+        level = _frame_rms(pcm[end - FRAME_BYTES : end])
+        tolerance = self.config.energy_threshold
+        if level < background + tolerance:
+            return anchor
+        while end + FRAME_BYTES <= len(pcm):
+            following = _frame_rms(pcm[end : end + FRAME_BYTES])
+            if abs(following - level) >= tolerance:
+                break
+            end += FRAME_BYTES
+        return max(anchor, end // BYTES_PER_MS)
 
     def _publish_window(self, packet: _FinalizedWindow) -> None:
         # Privacy-off/Stop release the packet under this same lock. Never iterate or
@@ -3079,9 +3137,12 @@ class LiveProcessor:
                     # guard or redeem the approval against a different window.
                     processor = weakref.proxy(self)
                     word_end_ms = group["end_ms"]
+                    acoustic_end_ms = offset + self._exit_anchor_ms(
+                        packet, pcm, spoken_span[1], acoustic_span
+                    )
                     group["exit_available"] = lambda: processor._private_exit_available(number)
                     group["defer_exit"] = lambda commit: processor._defer_private_exit(
-                        number, word_end_ms, commit
+                        number, word_end_ms, acoustic_end_ms, commit
                     )
                 start = (group["start_ms"] - offset) * BYTES_PER_MS
                 end = (group["end_ms"] - offset) * BYTES_PER_MS

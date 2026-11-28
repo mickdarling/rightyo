@@ -727,7 +727,6 @@ class PrivacyMinimumTests(unittest.TestCase):
         self,
         *windows,
         retry=None,
-        expect_no_asr=False,
         timeline=None,
         audio=None,
         end_of_turn=None,
@@ -773,7 +772,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                 self.feed(c, p, pcm, s)
                 p._drain_results(wait=True)
             p.finish()
-        self.assertEqual(list(pending), list(windows) if expect_no_asr else [])
+        self.assertEqual(list(pending), [])
         self.assertEqual(redecode.call_count, int(retry is not None))
         self.assertFalse(c._private_sentence.pcm)
         return [event["action"] for event in e.drain()], s.exit_score.call_count
@@ -831,7 +830,7 @@ class PrivacyMinimumTests(unittest.TestCase):
         )
         clipped = doc(addressed_segment("Jarvis start listening", 0, 1000))
         self.assertEqual(
-            self.replay_private_windows(clipped, audio=[VOICE * 50 + pause], expect_no_asr=True),
+            self.replay_private_windows(clipped, audio=[VOICE * 50 + pause]),
             ([], 0),
         )
 
@@ -953,14 +952,17 @@ class PrivacyMinimumTests(unittest.TestCase):
             ([], 0),
         )
 
-    def test_suppressed_stream_start_does_not_bar_a_fresh_onset(self):
+    def test_status_at_stream_start_does_not_bar_a_fresh_onset(self):
+        first = doc(segment("Are you recording?", 0, 800))
         second = doc(addressed_segment("Jarvis, privacy off.", 20, 1020))
         for gap in (15, 72):
             with self.subTest(gap=gap):
                 audio = [VOICE * 50 + SILENCE * gap + VOICE * 50 + EXIT_PAUSE]
                 self.assertEqual(
-                    self.replay_private_windows(second, audio=audio, end_of_turn=lambda _: 1),
-                    (["exit"], 2),
+                    self.replay_private_windows(
+                        first, second, audio=audio, end_of_turn=lambda _: 1
+                    ),
+                    (["status", "exit"], 2),
                 )
 
     def test_verified_absence_before_onset_can_be_shorter_than_retained_pre_roll(self):
@@ -969,7 +971,9 @@ class PrivacyMinimumTests(unittest.TestCase):
                 audio = [VOICE * 50 + SILENCE * (gap // 20) + VOICE * 50 + EXIT_PAUSE]
                 command = doc(addressed_segment("Jarvis, privacy off.", pre_roll, pre_roll + 1000))
                 self.assertEqual(
-                    self.replay_private_windows(command, audio=audio, pre_roll_ms=pre_roll),
+                    self.replay_private_windows(
+                        [], command, audio=audio, pre_roll_ms=pre_roll
+                    ),
                     (["exit"], 2) if gap >= 200 else ([], 0),
                 )
 
@@ -1066,7 +1070,6 @@ class PrivacyMinimumTests(unittest.TestCase):
                     clipped,
                     vad=FixtureVad(quiet),
                     audio=[voiced * 50 + quiet * 108],
-                    expect_no_asr=True,
                 ),
                 ([], 0),
             )
@@ -1152,9 +1155,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                 command = doc(segment("Jarvis, privacy off.", 400, 1400))
                 audio = [voice * 20 + louder * 50 + voice * 100]
                 self.assertEqual(
-                    self.replay_private_windows(
-                        command, audio=audio, pre_roll_ms=400, expect_no_asr=True
-                    ),
+                    self.replay_private_windows(command, audio=audio, pre_roll_ms=400),
                     ([], 0),
                 )
 
@@ -1168,9 +1169,7 @@ class PrivacyMinimumTests(unittest.TestCase):
                 phrase = doc(segment("Jarvis, privacy off.", 400, 1400))
                 audio = [voice * 20 + louder * 50 + voice * 100]
                 self.assertEqual(
-                    self.replay_private_windows(
-                        phrase, audio=audio, pre_roll_ms=400, expect_no_asr=True
-                    ),
+                    self.replay_private_windows(phrase, audio=audio, pre_roll_ms=400),
                     ([], 0),
                 )
 

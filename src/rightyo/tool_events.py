@@ -9,6 +9,7 @@ import json
 import re
 import unicodedata
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from threading import RLock
 
@@ -722,6 +723,17 @@ class _VoiceChecks:
 
 
 @dataclass
+class _DeferredPrivateExit:
+    checks: _VoiceChecks
+    privacy_span: list[int | None]
+    status: bool
+    join: str | None
+    name: _VoiceChecks | None
+    emission_clock: Callable[[], int] | None
+    playback_excluded: bool = False
+
+
+@dataclass
 class _LegacyRequest:
     end_ms: int
     guest: bool
@@ -892,6 +904,7 @@ class SpeechEvents:
         self._private_name_end = None
         self._private_name_checks = None
         self._private_name_join = ""
+        self._deferred_private_exit: _DeferredPrivateExit | None = None
         # Utterance ids of private turns already matched (see MAX_PRIVATE_SEEN).
         self._private_seen = deque(maxlen=MAX_PRIVATE_SEEN)
         # Whether `transcript` events may carry `role_source` this session: a live session
@@ -1066,6 +1079,7 @@ class SpeechEvents:
         self._cue_voices.clear()
         self._others_turns.clear()
         self._playbacks.clear()
+        self._deferred_private_exit = None
         self._playback_scopes.clear()
         self._spoken_replies = None
         self._asked_at = None
@@ -1586,6 +1600,7 @@ class SpeechEvents:
         diarized_head=None,
         voice_checks=None,
         self_turn=False,
+        emission_clock=None,
     ):
         """Emit one final turn; `inferred` marks a speaker label partly inferred (#137).
 
@@ -1596,6 +1611,8 @@ class SpeechEvents:
         attention and precedence, but never exercises owner or trusted authority:
         no override, no owner stop phrase, and a playback-only dismissal that withdraws
         nothing and leaves the speaker's engagement in place.
+
+        The live controller supplies its stream clock for a deferred private status.
         """
         if voice_checks is None and not self_turn:
             voice_checks = self.prepare_transcript(turn, inferred=inferred)
@@ -1636,7 +1653,9 @@ class SpeechEvents:
                 ):
                     # Kept only while privacy is on; cleared at its end (#735 S-1).
                     self._private_seen.append(uid)
-                    self._private(turn, inferred, voice_checks if checks_current else None)
+                    self._private(
+                        turn, inferred, voice_checks if checks_current else None, emission_clock
+                    )
                 return
             # Any turn heard outside privacy ends a split exit.
             self._clear_private_name()
@@ -2176,7 +2195,7 @@ class SpeechEvents:
             if on and ack and self._active and self._duck_acks:
                 self._emit("privacy", action="on", at_ms=at)
 
-    def _private(self, turn, inferred, checks):
+    def _private(self, turn, inferred, checks, emission_clock):
         """Match a turn heard in privacy against the local phrases, then drop it.
 
         Called with the lock held. Emits at most one content-free `privacy` event: "exit"
@@ -2231,10 +2250,11 @@ class SpeechEvents:
                 turn=replace(turn, text="", exit_timings=(), defer_exit=None),
                 generation=self._voice_generation,
             )
-            status = "status" in kinds
-            turn.defer_exit(
-                lambda at_ms: self._resolve_private_exit(ticket, at_ms, status, join, name)
+            candidate = _DeferredPrivateExit(
+                ticket, self._duck_spans[-1], "status" in kinds, join, name, emission_clock
             )
+            self._deferred_private_exit = candidate
+            turn.defer_exit(lambda at_ms: self._resolve_private_exit(candidate, at_ms))
             return
         if named:
             self._clear_exit_audio(turn)
@@ -2283,7 +2303,21 @@ class SpeechEvents:
         except Exception:  # Private guard failures never expose content.
             return False
 
-    def _resolve_private_exit(self, checks, at_ms, status, join, name):
+    def _settle_private_exit(self, candidate, at_ms, *, exited=False):
+        if self._deferred_private_exit is candidate:
+            self._deferred_private_exit = None
+        if (
+            candidate.status and not exited and self._active and self._duck
+            and candidate.privacy_span is self._duck_spans[-1]
+        ):
+            if candidate.emission_clock is not None:
+                self._now = max(self._now, candidate.emission_clock())
+            elif at_ms is not None:
+                self._now = max(self._now, at_ms)
+            self._emit_private_status()
+
+    def _resolve_private_exit(self, candidate, at_ms):
+        checks, join, name = candidate.checks, candidate.join, candidate.name
         turn = checks.turn
         with self._lock:
             if (
@@ -2292,6 +2326,7 @@ class SpeechEvents:
                 or not self._voice_checks_current(checks, turn, checks.inferred)
             ):
                 self._clear_exit_audio(turn)
+                self._settle_private_exit(candidate, at_ms)
                 return
             if (
                 at_ms is None or not self._exit_available(turn)
@@ -2302,14 +2337,14 @@ class SpeechEvents:
                 self._count_exit_refused("voice_unavailable")
                 if join is not None:
                     self._private_counts["exit_name_refused"] += 1
-                if status:
-                    self._emit_private_status()
+                self._settle_private_exit(candidate, at_ms)
                 return
             binding = self._binding_exit_check(turn, checks.inferred)
         outcome, origin = self._exit_approval(turn, checks.inferred, binding=binding)
         checks = replace(checks, exit=outcome, exit_origin=origin)
         with self._lock:
             if not self._active or not self._voice_checks_current(checks, turn, checks.inferred):
+                self._settle_private_exit(candidate, at_ms)
                 return
             allowed, reason = self._revalidate_exit(checks, turn, checks.inferred)
             if name is not None and not self._name_evidence_current(name):
@@ -2318,6 +2353,7 @@ class SpeechEvents:
             if allowed:
                 if join is None:
                     self._now = max(self._now, at_ms)
+                    self._settle_private_exit(candidate, at_ms, exited=True)
                     self._emit_private_exit()
                     return
                 self._arm_name(checks, join)
@@ -2325,8 +2361,7 @@ class SpeechEvents:
                 if join is not None:
                     self._private_counts["exit_name_refused"] += 1
                 self._count_exit_refused(reason)
-            if status:
-                self._emit_private_status()
+            self._settle_private_exit(candidate, at_ms)
 
     def _revalidate_exit(self, checks, turn, inferred):
         outcome = checks.exit
@@ -2409,7 +2444,10 @@ class SpeechEvents:
             return "inferred"
         if not self._per_turn or not callable(getattr(self._priority, "enrolled_owner", None)):
             return "no_owner_check"
-        if any(self._playback_excludes(turn, span) for span in self._playbacks):
+        candidate = self._deferred_private_exit
+        if (
+            candidate is not None and candidate.checks.turn is turn and candidate.playback_excluded
+        ) or any(self._playback_excludes(turn, span) for span in self._playbacks):
             return "playback"
         return None
 
@@ -2888,14 +2926,17 @@ class SpeechEvents:
                     if len(self._playback_scopes) >= MAX_PLAYBACKS:
                         del self._playback_scopes[next(iter(self._playback_scopes))]
                     span = [now_ms, None]
-                    # Keep an armed name revoked if its playback evidence ages out
-                    # before the remainder arrives or completes confirmation.
-                    name = self._private_name_checks
-                    if (
-                        name is not None and len(self._playbacks) == MAX_PLAYBACKS
-                        and self._playback_excludes(name.turn, self._playbacks[0])
-                    ):
-                        self._clear_private_name()
+                    if len(self._playbacks) == MAX_PLAYBACKS:
+                        # A confirming candidate keeps its veto through deque eviction.
+                        evicted = self._playbacks[0]
+                        candidate = self._deferred_private_exit
+                        if candidate is not None and self._playback_excludes(
+                            candidate.checks.turn, evicted
+                        ):
+                            candidate.playback_excluded = True
+                        name = self._private_name_checks
+                        if name is not None and self._playback_excludes(name.turn, evicted):
+                            self._clear_private_name()
                     self._playbacks.append(span)
                     self._playback_scopes[scope] = span
                 else:
@@ -4422,6 +4463,7 @@ class SpeechEvents:
             self._withdrawn.clear()
             self._private_seen.clear()
             self._clear_private_name()
+            self._deferred_private_exit = None
             self._voice_generation += 1
             self._clear_exit_audio()
             self._request_outcomes.clear()

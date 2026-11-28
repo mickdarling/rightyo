@@ -1865,14 +1865,16 @@ consecutive 512-sample (32 ms) blocks at 16 kHz. A speech probability of at leas
 0.5 marks the whole block as speech. Only observed blocks count toward either
 pause. A quiet period qualifies only the onset immediately following it.
 
-The fixed **1,728 ms (54 native blocks)** confirmation window starts at the acoustic
-end of the command (the end of the last word whose timing is supported by Silero speech evidence).
-The processor counts observed audio from that word end, independent of ASR close.
+The fixed **1,728 ms (54 native blocks)** confirmation window starts at the latest
+of the recognized final-word end, the end of its last associated Silero speech block,
+and any acoustically continuous final-word audio observed in the recognition window.
+The processor counts observed audio from that end, independent of ASR close.
 It waits for the complete native block covering the deadline before checking the
 owner for a complete exit or either split fragment. Resumed speech cancels the
 candidate even on that last block. An independently matched status question in
-the same private turn still emits its status event. A partial block at
-end of input cannot complete the window. This errs toward staying private.
+the same private turn still emits its status event after a cancellation, including
+after speakers are forgotten. Its timestamp follows the session clock at
+publication. A partial block at end of input cannot complete the window.
 
 The 2026-11-27 operator ruling uses the maximum lag among grid cells that Silero
 detects within 2 s, plus 2 blocks. The round-18 synthetic replay maximum in that
@@ -1903,7 +1905,8 @@ subword timings of the same word can cover that block together when they touch. 
 interval for several words supplies their common timing evidence. A native block may
 straddle the first word's start or the final word's end. A whole speech block outside
 those bounds keeps privacy on. Any detected speech in a gap between original spoken
-tokens also keeps privacy on. Initial positive blocks alone cannot open private ASR.
+tokens also keeps privacy on. Initial positive blocks can supply local recognition
+for a status question. Exit eligibility still requires the preceding observed absence.
 The worker must answer a fresh, bounded probe after owner verification to authorize
 publication. A missing or unresponsive VAD disables voice exits. See [local setup and model pin](prototype.md#silero-vad-for-leaving-privacy-by-voice).
 Punctuation supplies no speech timing. A speaker boundary
@@ -1931,7 +1934,8 @@ The three-dot vocative pause may fall on either side of the split. Other sentenc
 boundaries at the join break the pair. Forgetting speakers or changing the verification
 generation also revokes the name. The remainder rechecks the original speaker's
 binding revision and playback exclusion over the name's span, including the
-300 ms margin, before it can emit an exit.
+300 ms margin, before it can emit an exit. A confirming candidate retains an
+applicable playback veto even after that report leaves the recent playback history.
 A guest or a TV supplying the name never counts. Any other turn between them, private or not, and any change of
 the mode, ends it, and a name piece released after the off (heard across it) never
 starts one. Private finalized pieces bypass continuation holds and wake joining: each

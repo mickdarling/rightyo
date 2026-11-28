@@ -1142,6 +1142,11 @@ class PrototypeController:
                     **({"inferred": True} if inferred else {}),
                     **({"diarized_head": head} if head is not None else {}),
                     **({"voice_checks": checks} if callable(prepare) else {}),
+                    **(
+                        {"emission_clock": self._now_ms}
+                        if isinstance(events, SpeechEvents) and turn.defer_exit is not None
+                        else {}
+                    ),
                 )
             if self._decision_status == "off" or self._decision_cancel.is_set() or ducked:
                 return ducked
