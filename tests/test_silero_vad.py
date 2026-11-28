@@ -14,6 +14,7 @@ import unittest
 from array import array
 from dataclasses import replace
 from functools import lru_cache
+from itertools import product
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -918,9 +919,9 @@ class FakeWorkerDecisions(AdversarialReplay, unittest.TestCase):
     def test_split_filler_ellipsis_and_playback_during_remainder_confirmation(self):
         fragment = bytes(320 * 32) + VOICE * 16 + bytes(2400 * 32)
         name = doc(segment("Jarvis,", 20, 340))
-        rest = doc(segment("please...", 20, 116), segment(" privacy off.", 116, 340))
-        for late_playback in (False, True):
-            with self.subTest(late_playback=late_playback):
+        for dots, late_playback in product(("...", "…"), (False, True)):
+            with self.subTest(dots=dots, late_playback=late_playback):
+                rest = doc(segment(f"please{dots}", 20, 116), segment(" privacy off.", 116, 340))
                 vad = self.worker([(320, 640), (3360, 3680)])
                 replay = self.arrange(vad=vad, pre_roll_ms=20)
                 _, events, shadow, _, _, _ = replay

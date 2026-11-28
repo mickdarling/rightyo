@@ -396,7 +396,17 @@ def _phrase_in(words, phrases):
 
 def _exit_matches(text, addressing, *, open_name, split_join=""):
     """Parse the exit and both split fragments without discarding unknown words."""
-    # Keep original offsets for sentence breaks and the vocative's question exemption.
+    # Apply the same grammar to both ellipsis spellings, then map the matched spans
+    # back to the transcript offsets used for audio selection.
+    offsets = None
+    if "…" in text:
+        offsets = []
+        for index, char in enumerate(text):
+            offsets.extend([index] * (3 if char == "…" else 1))
+        offsets.append(len(text))
+        text = text.replace("…", "...")
+
+    # Keep character offsets for sentence breaks and the vocative's question exemption.
     # Only whitespace and punctuation separate words. Marks, format characters and
     # unfamiliar symbols survive as literal input that must match the grammar.
     spellings = {
@@ -420,12 +430,13 @@ def _exit_matches(text, addressing, *, open_name, split_join=""):
     words = [token.group().lower() for token in tokens]
     name_keys = {name_key(spelling) for spelling in spellings}
     # Retain the source sentence of each word through phrase and name matching.
+    boundaries = ".!?;" + LINE_BREAKS
     sentences = []
     sentence = 0
     for at, token in enumerate(tokens):
         if at:
             for i in range(tokens[at - 1].end(), token.start()):
-                if source[i] in ".!?;" + LINE_BREAKS:
+                if source[i] in boundaries:
                     sentence = i + 1
         sentences.append(sentence)
 
@@ -453,7 +464,6 @@ def _exit_matches(text, addressing, *, open_name, split_join=""):
         return None
 
     matches = {}
-    boundaries = ".!?;" + LINE_BREAKS
     name = addressed(len(words), len(text), sentences[-1]) if words else None
     if name is not None:
         # A terminal period can classify a standalone name for other callers.
@@ -479,7 +489,7 @@ def _exit_matches(text, addressing, *, open_name, split_join=""):
             phrase_sentence = sentences[start - 1]
         address = addressed(start, sentence_end, phrase_sentence)
         prefix = source[: tokens[start].start()]
-        if split_join == "...":
+        if split_join in ("...", "…"):
             joins = not prefix.strip(" \t")
         else:
             filler_end = tokens[start - 1].end() if start else 0
@@ -498,6 +508,11 @@ def _exit_matches(text, addressing, *, open_name, split_join=""):
         ):
             matches["rest"] = (phrase_span,)
         break
+    if offsets is not None:
+        return {
+            kind: tuple((offsets[left], offsets[right]) for left, right in spans)
+            for kind, spans in matches.items()
+        }
     return matches
 
 
@@ -2232,7 +2247,7 @@ class SpeechEvents:
         join = None
         if not named and "name" in kinds:
             ending = turn.text.rstrip(" \t")
-            if ending.endswith("..."):
+            if ending.endswith(("...", "…")):
                 join = "..."
             elif ending[-1].isalnum() or ending.endswith(("'", "’")):
                 join = ""

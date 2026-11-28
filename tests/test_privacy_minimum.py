@@ -1392,6 +1392,16 @@ class PrivacyMinimumTests(unittest.TestCase):
                     (["exit"], 2),
                 )
 
+    def test_single_exit_ellipsis_preserves_word_timing_offsets(self):
+        for dots in ("...", "…"):
+            with self.subTest(dots=dots):
+                window = doc(
+                    segment(f"I heard{dots}", 20, 40),
+                    segment(f" Jarvis{dots}", 40, 60),
+                    segment(f" start listening{dots}", 60, 100),
+                )
+                self.assertEqual(self.replay_private_windows(window), (["exit"], 2))
+
     def test_split_fragments_must_continue_the_address_sentence(self):
         for name, rest, checks in (
             ("Jarvis. Well", "privacy off.", 0),
@@ -1409,15 +1419,18 @@ class PrivacyMinimumTests(unittest.TestCase):
             ("Jarvis...", "well privacy off.", 1),
             ("Jarvis...", "\nprivacy off.", 1),
         ):
-            with self.subTest(name=name, rest=rest):
-                # Give the name and same-sentence filler distinct timings.
-                parts = [segment(name, 20, 100)]
-                if name == "Jarvis, well":
-                    parts = [segment("Jarvis,", 20, 60), segment(" well", 60, 100)]
-                self.assertEqual(
-                    self.replay_private_windows(doc(*parts), doc(segment(rest, 20, 100))),
-                    (["exit"] if checks == 2 else [], checks),
-                )
+            encodings = ("...", "…") if "..." in name or "..." in rest else ("...",)
+            for dots in encodings:
+                address, phrase = name.replace("...", dots), rest.replace("...", dots)
+                with self.subTest(name=address, rest=phrase):
+                    # Give the name and same-sentence filler distinct timings.
+                    parts = [segment(address, 20, 100)]
+                    if address == "Jarvis, well":
+                        parts = [segment("Jarvis,", 20, 60), segment(" well", 60, 100)]
+                    self.assertEqual(
+                        self.replay_private_windows(doc(*parts), doc(segment(phrase, 20, 100))),
+                        (["exit"] if checks == 2 else [], checks),
+                    )
 
     def test_whisper_keeps_line_boundaries_in_segments_and_token_reconstruction(self):
         start = segment("Jarvis, start", 20, 60)

@@ -86,14 +86,18 @@ class NamedPrivacyExitTests(unittest.TestCase):
                 )
 
     def test_split_vocative_filler_before_ellipsis(self):
-        for i, prefix in enumerate(("please...", "um, well...", "please; well...", "really...")):
-            with self.subTest(prefix=prefix):
-                at = 5000 * i
-                rest = f"{prefix} privacy off."
-                expected = ["exit"] if i < 2 else []
-                self.assertEqual([e["action"] for e in self.hear("Jarvis, " + rest, at)], expected)
-                self.assertEqual(self.hear("Jarvis,", at + 1000), [])
-                self.assertEqual([e["action"] for e in self.hear(rest, at + 2500)], expected)
+        cases = (("please", True), ("um, well", True), ("please; well", False), ("really", False))
+        for dots in ("...", "…"):
+            self.start(duck.OURS)
+            for i, (prefix, allowed) in enumerate(cases):
+                with self.subTest(prefix=prefix, dots=dots):
+                    at = 5000 * i
+                    rest = f"{prefix}{dots} privacy off."
+                    expected = ["exit"] if allowed else []
+                    single = self.hear("Jarvis, " + rest, at)
+                    self.assertEqual([e["action"] for e in single], expected)
+                    self.assertEqual(self.hear("Jarvis,", at + 1000), [])
+                    self.assertEqual([e["action"] for e in self.hear(rest, at + 2500)], expected)
 
     def test_questions_cannot_start_or_complete_an_exit(self):
         self.assertEqual(self.hear("Did you hear Jarvis start listening?  ", 0), [])
@@ -160,23 +164,42 @@ class NamedPrivacyExitTests(unittest.TestCase):
         for index, text in enumerate(("A. B, privacy off.", "A.B; privacy off.", "A.B?")):
             self.assertEqual(self.hear(text, (index + 1) * 1000), [])
 
+    def test_ellipsis_inside_exact_configured_name(self):
+        for dots in ("...", "…"):
+            with self.subTest(dots=dots):
+                self.start(Addressing(("A...B",)))
+                self.assertEqual(
+                    [e["action"] for e in self.hear(f"A{dots}B, privacy off.", 0)], ["exit"]
+                )
+                self.assertEqual(self.hear(f"A{dots}B,", 1000), [])
+                self.assertEqual([e["action"] for e in self.hear("privacy off.", 2000)], ["exit"])
+
     def test_only_a_vocative_ellipsis_can_join_address_and_phrase(self):
-        with patch.object(self.events, "_exit_approval", wraps=self.events._exit_approval) as owner:
-            for i, text in enumerate(
-                (
+        for dots in ("...", "…"):
+            with self.subTest(dots=dots):
+                self.start(duck.OURS)
+                rejected = (
                     "Jarvis; privacy off.",
                     "Jarvis. Privacy off.",
-                    "Jarvis...\nprivacy off.",
-                    "Jarvis; ... privacy off.",
-                    "Jarvis, privacy...off.",
+                    f"Jarvis{dots}\nprivacy off.",
+                    f"Jarvis; {dots} privacy off.",
+                    f"Jarvis, privacy{dots}off.",
                 )
-            ):
-                self.assertEqual(self.hear(text, i * 1000), [])
-            owner.assert_not_called()
-            self.assertEqual(
-                [e["action"] for e in self.hear("Jarvis... privacy off.", 5000)], ["exit"]
-            )
-            owner.assert_called_once()
+                accepted = (
+                    f"Jarvis{dots} privacy off.",
+                    f"JARVIS{dots} PRIVACY OFF!!",
+                    f"Jarvis, privacy off{dots}",
+                )
+                with patch.object(
+                    self.events, "_exit_approval", wraps=self.events._exit_approval
+                ) as owner:
+                    for i, text in enumerate(rejected):
+                        self.assertEqual(self.hear(text, i * 1000), [])
+                    owner.assert_not_called()
+                    for i, text in enumerate(accepted, start=len(rejected)):
+                        owner.reset_mock()
+                        self.assertEqual([e["action"] for e in self.hear(text, i * 1000)], ["exit"])
+                        owner.assert_called_once()
 
     def test_earlier_negated_question_or_refused_address_does_not_veto_exit(self):
         for name, text in (
@@ -207,6 +230,10 @@ class NamedPrivacyExitTests(unittest.TestCase):
             (
                 ("We’re done. ", True),
                 ("Really? ", True),
+                ("I heard... ", True),
+                ("I heard… ", True),
+                ("Don't... ", True),
+                ("Don't… ", True),
                 ("Did Alice hear ", False),
                 ("We're done, ", False),
                 ("We're done. ¿", False),
@@ -221,7 +248,7 @@ class NamedPrivacyExitTests(unittest.TestCase):
                 self.assertEqual([e["action"] for e in events], ["exit"] if allowed else [])
 
     def test_address_starts_a_sentence(self):
-        for index, sep in enumerate((".", "!", ";", "\n")):
+        for index, sep in enumerate((".", "!", ";", "\n", "...", "…")):
             with self.subTest(sep=sep):
                 (event,) = self.hear(
                     f"That's enough of that{sep} Well, Jarvis, I'm back", index * 1000
