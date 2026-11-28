@@ -26,7 +26,7 @@ from rightyo.speaker_id import SpeakerIdConfig
 from rightyo.tool_events import SpeechEvents, privacy_phrase
 
 LEAD_MS = 400
-TRAIL_MS = 1600
+TRAIL_MS = 1600 + 704  # keep observing after the private ASR window closes
 PODCAST = "jarvis start listening to the podcast"
 
 

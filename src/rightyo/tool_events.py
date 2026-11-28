@@ -2134,10 +2134,73 @@ class SpeechEvents:
             self._clear_exit_audio()
         split, self._private_name_end = self._private_name_end, None
         outcome = (
-            checks.exit
+            self._revalidate_exit(checks, turn, inferred)
             if checks is not None and checks.split == split
             else (False, "voice_unavailable")
         )
+        self._voice_generation += 1
+        # Only a turn heard entirely since the mode last went on, while it is still on, is
+        # matched at all (#242 round 23, see `transcript`): one heard in an earlier private
+        # period and released late can never end this one, answer its status or be counted.
+        named = "exit" in kinds or ("rest" in kinds and _completes_split(turn, split))
+        if named:
+            allowed, reason = outcome
+            if allowed:
+                if turn.acoustic_span_ms is None:
+                    self._emit_private_exit()
+                elif turn.defer_exit is not None:
+                    # Keep only the authenticated timing/identity and its revocable
+                    # guard. The processor can release the sentence and PCM now.
+                    ticket = replace(
+                        checks,
+                        turn=replace(turn, text="", exit_timings=(), defer_exit=None),
+                        generation=self._voice_generation,
+                    )
+                    turn.defer_exit(lambda at_ms: self._resolve_private_exit(ticket, at_ms))
+                else:
+                    self._count_exit_refused("voice_unavailable")
+                return
+            self._count_exit_refused(reason)
+        elif "name" in kinds:
+            # Authenticate both split fragments independently. Private processor turns
+            # are unlabelled: only their own isolated voice can authenticate them.
+            allowed, reason = outcome
+            if allowed:
+                self._private_name_end = (
+                    turn.acoustic_span_ms[1] if turn.acoustic_span_ms else turn.end_ms
+                )
+            else:
+                self._private_counts["exit_name_refused"] += 1
+                self._count_exit_refused(reason)
+        elif "rest" in kinds:
+            self._private_counts["exit_unnamed"] += 1
+        if "status" in kinds:
+            self._private_counts["status"] += 1
+            self._emit("privacy", action="status")
+
+    def _emit_private_exit(self):
+        self._private_counts["exit"] += 1
+        self._emit("privacy", action="exit")
+
+    def _resolve_private_exit(self, checks, at_ms):
+        with self._lock:
+            turn = checks.turn
+            if not self._active or not self._in_current_privacy(turn):
+                return
+            if not self._voice_checks_current(checks, turn, checks.inferred):
+                return
+            if at_ms is None:
+                self._count_exit_refused("voice_unavailable")
+                return
+            allowed, reason = self._revalidate_exit(checks, turn, checks.inferred)
+            if allowed:
+                self._now = max(self._now, at_ms)
+                self._emit_private_exit()
+            else:
+                self._count_exit_refused(reason)
+
+    def _revalidate_exit(self, checks, turn, inferred):
+        outcome = checks.exit
         if outcome[0]:
             allowed, reason = self._binding_exit_check(turn, inferred)
             if checks.exit_origin == "binding":
@@ -2158,34 +2221,7 @@ class SpeechEvents:
                 outcome = False, "voice_unavailable"
         if outcome[0] and not self._voice_checks_current(checks, turn, inferred):
             outcome = False, "voice_unavailable"
-        self._voice_generation += 1
-        # Only a turn heard entirely since the mode last went on, while it is still on, is
-        # matched at all (#242 round 23, see `transcript`): one heard in an earlier private
-        # period and released late can never end this one, answer its status or be counted.
-        named = "exit" in kinds or ("rest" in kinds and _completes_split(turn, split))
-        if named:
-            allowed, reason = outcome
-            if allowed:
-                self._private_counts["exit"] += 1
-                self._emit("privacy", action="exit")
-                return
-            self._count_exit_refused(reason)
-        elif "name" in kinds:
-            # Authenticate both split fragments independently. Private processor turns
-            # are unlabelled: only their own isolated voice can authenticate them.
-            allowed, reason = outcome
-            if allowed:
-                self._private_name_end = (
-                    turn.acoustic_span_ms[1] if turn.acoustic_span_ms else turn.end_ms
-                )
-            else:
-                self._private_counts["exit_name_refused"] += 1
-                self._count_exit_refused(reason)
-        elif "rest" in kinds:
-            self._private_counts["exit_unnamed"] += 1
-        if "status" in kinds:
-            self._private_counts["status"] += 1
-            self._emit("privacy", action="status")
+        return outcome
 
     def _in_current_privacy(self, turn):
         """Whether `turn` was heard entirely since privacy last went on, and it is still on

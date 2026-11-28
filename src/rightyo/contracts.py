@@ -773,6 +773,7 @@ _INTERNAL_TURN_FIELDS = frozenset(
         "recognition_loss_end_ms",
         "acoustic_span_ms",
         "exit_available",
+        "defer_exit",
         "exit_timings",
     }
 )
@@ -804,6 +805,10 @@ class Turn:
     )
     # Revalidate the originating private window at publication. Never exported or imported.
     exit_available: Callable[[], bool] | None = field(
+        default=None, kw_only=True, compare=False, repr=False
+    )
+    # Schedule a content-free approval on the originating processor's audio clock.
+    defer_exit: Callable[[Callable[[int | None], None]], None] | None = field(
         default=None, kw_only=True, compare=False, repr=False
     )
 

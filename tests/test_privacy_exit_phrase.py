@@ -284,3 +284,6 @@ class NamedPrivacyExitTests(unittest.TestCase):
         self.assertNotIn("exit_available", turn.to_dict())
         with self.assertRaises(ContractError):
             Turn.from_dict({**turn.to_dict(), "exit_available": True})
+        self.assertNotIn("defer_exit", turn.to_dict())
+        with self.assertRaises(ContractError):
+            Turn.from_dict({**turn.to_dict(), "defer_exit": True})

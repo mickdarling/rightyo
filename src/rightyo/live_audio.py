@@ -53,6 +53,7 @@ ASR_END_PADDING_MS = 1000
 # Two 10 ms whisper timestamp ticks (one PCM frame): tolerate rounding jitter only.
 ASR_TIMING_JITTER_MS = 20
 PRIVATE_ONSET_QUIET_MS = 200
+PRIVATE_EXIT_TAIL_MS = 704  # #350 operator ruling: 22 native Silero blocks after ASR close
 # Recovery alone is asynchronous and bounded. The first decode retains its configured
 # timeout, including the base's pre-existing synchronous input-path blocking.
 ASR_REDECODE_SECONDS = 5.0
@@ -1679,6 +1680,12 @@ class _OffsetDiarizer:
         self._inner.close()
 
 
+class _PendingExit(NamedTuple):
+    window_number: int
+    close_ms: int
+    resolve: Callable[[int | None], None]
+
+
 class LiveProcessor:
     """Single-owner processor with one bounded recovery worker.
 
@@ -1721,6 +1728,9 @@ class LiveProcessor:
         self._vad_pending = bytearray()  # scored milliseconds at the head of _partial
         self._vad_quiet_ms = 0
         self._vad_observed_absence = False
+        self._vad_scored_ms = 0
+        self._vad_last_positive_end = 0
+        self._pending_exit: _PendingExit | None = None
         self._utterance_vad: bytearray | None = None
         self._frame_private = False
         self._diarizer_private_frames = 0
@@ -1853,6 +1863,7 @@ class LiveProcessor:
 
     def _disable_vad(self) -> None:
         self._vad = None
+        self._pending_exit = None
         self._vad_pending.clear()
         self._utterance_vad = None
         print(
@@ -1872,24 +1883,54 @@ class LiveProcessor:
         if not available:
             self._disable_vad()
             return False
+        if self.config.cancelled and self.config.cancelled():
+            return False
+        with self._recovery_lock:
+            if self.closed or self.failed or self._vad is not vad:
+                return False
+            packet = self._publishing
+            if packet is not None and packet.number == window_number:
+                return not packet.discarded and packet.vad_mask is not None
+            pending = self._pending_exit
+            return (
+                pending is not None
+                and pending.window_number == window_number
+                and self._vad_last_positive_end <= pending.close_ms
+                and self._vad_scored_ms >= pending.close_ms + PRIVATE_EXIT_TAIL_MS
+            )
+
+    def _defer_private_exit(self, number: int, resolve: Callable[[int | None], None]) -> None:
         with self._recovery_lock:
             packet = self._publishing
-            return (
-                not self.closed
-                and not self.failed
-                and self._vad is vad
-                and packet is not None
-                and packet.number == window_number
-                and not packet.discarded
-                and packet.vad_mask is not None
-            )
+            if self.closed or packet is None or packet.number != number or packet.discarded:
+                return
+            self._pending_exit = _PendingExit(number, packet.through_ms, resolve)
+        # An ordered ASR result can arrive after the audio clock has advanced.
+        self._advance_private_exit()
+
+    def _cancel_private_exit(self) -> None:
+        pending, self._pending_exit = self._pending_exit, None
+        if pending is not None:
+            pending.resolve(None)
+
+    def _advance_private_exit(self) -> None:
+        pending = self._pending_exit
+        if pending is None:
+            return
+        if self._vad_last_positive_end > pending.close_ms:
+            self._cancel_private_exit()
+        elif self._vad_scored_ms >= pending.close_ms + PRIVATE_EXIT_TAIL_MS:
+            try:
+                pending.resolve(self._vad_scored_ms)
+            finally:
+                self._pending_exit = None
 
     def _drain_frames(self, *, final: bool = False) -> None:
         # Attribute each native VAD block to its own audio. A 20 ms ASR frame can
         # straddle two 32 ms blocks. Wait for both before interpreting silence.
         with self._private_lock:
             self._buffered_input_bytes = 0
-        while len(self._partial) >= FRAME_BYTES:
+        while self._partial:
             mask = None
             while self._vad is not None and len(self._vad_pending) < 20:
                 block = self._vad.chunk_ms
@@ -1904,12 +1945,18 @@ class LiveProcessor:
                     if type(voice) is not bool:
                         raise ValueError
                 except Exception:  # never expose worker output or private content
+                    self._cancel_private_exit()
                     self._disable_vad()
                     break
                 if self.closed:  # Stop may have released the input while the worker scored it.
                     return
                 self._vad_pending.extend(bytes([voice]) * block)
-            if self.closed:
+                self._vad_scored_ms += block
+                if voice:
+                    self._vad_last_positive_end = self._vad_scored_ms
+                if self._pending_exit is not None:
+                    self._advance_private_exit()
+            if self.closed or len(self._partial) < FRAME_BYTES:
                 return
             if len(self._vad_pending) >= 20:
                 mask = bytes(self._vad_pending[:20])
@@ -1960,6 +2007,7 @@ class LiveProcessor:
         active = None
         uncertain = False
         with self._recovery_lock:
+            self._pending_exit = None
             spans = self._recovery_privacy_spans
             if end is not None and spans and spans[-1] == [start, None]:
                 if start < end:
@@ -2976,6 +3024,9 @@ class LiveProcessor:
                     # guard or redeem the approval against a different window.
                     processor = weakref.proxy(self)
                     group["exit_available"] = lambda: processor._private_exit_available(number)
+                    group["defer_exit"] = lambda commit: processor._defer_private_exit(
+                        number, commit
+                    )
                 start = (group["start_ms"] - offset) * BYTES_PER_MS
                 end = (group["end_ms"] - offset) * BYTES_PER_MS
                 self._emit(group, memoryview(pcm)[start:end])
@@ -3032,6 +3083,7 @@ class LiveProcessor:
             recognition_loss_end_ms=self._recognition_loss_end_ms,
             acoustic_span_ms=group.get("acoustic_span_ms"),
             exit_available=group.get("exit_available"),
+            defer_exit=group.get("defer_exit"),
             exit_timings=group.get("exit_timings", ()),
         )
         if gap is not None and self.config.on_post_turn_gap is not None:
@@ -3065,6 +3117,7 @@ class LiveProcessor:
             if self._utterance:
                 self._finalize(self._diarizer.finish())
             self._drain_results(wait=True)
+            self._cancel_private_exit()  # EOF supplies no further absence evidence.
             self._merger.flush()
         except Exception:
             self.failed = True
@@ -3085,6 +3138,7 @@ class LiveProcessor:
         with self._recovery_lock:
             first = not self.closed
             self.closed = True
+            self._pending_exit = None
             self._recovery_shutdown.set()
             recovery = self._recovery
             process = self._asr_process if first else None

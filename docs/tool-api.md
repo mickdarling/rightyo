@@ -1865,6 +1865,26 @@ consecutive 512-sample (32 ms) blocks at 16 kHz. A speech probability of at leas
 0.5 marks the whole block as speech. Only observed blocks count toward either
 pause. A quiet period qualifies only the onset immediately following it.
 
+After ASR closes an exit candidate, the processor requires another **704 ms**
+(22 native blocks) of Silero-verified speech absence. A speech block overlapping
+any part of that window cancels the exit, including its last block. An incomplete
+block at end of input cannot finish the window. In the round 15 synthetic replay,
+Silero first detected the continuing speech-like tail 216 ms after ASR closed at
+400 counts RMS and 632 ms after close at 180 counts RMS. The 2026-11-27 operator
+ruling added two blocks of margin to 632 ms and rounded up to 704 ms. This adds
+about 0.7 s to every voice exit and errs toward staying private. At commit the
+publisher rechecks the current privacy session, owner approval, speaker and
+playback evidence, and requires a fresh round-trip to the VAD worker.
+
+The pinned VAD can judge a very quiet speech-like onset at stream start as
+absent. An exit in that case also requires ASR to omit the opening words.
+If ASR retains them ahead of the configured name in the same sentence, the
+sentence-initial name rule (R1) refuses the exit. A quieter continuation can
+also escape the hold. In the 160 counts RMS replay, Silero first detected the
+tail after the exit had committed. Both limits were observed with generated
+signals and authored recognition. The owner-clip install gate below supplies
+the required real-speech evidence.
+
 R4 and R4b cover continuing speech as judged by the pinned VAD. Continuing
 non-speech sound such as a tone, hum or music does not block an exit after a
 genuine exit phrase. Before any install, the owner-clip speech-continues negative

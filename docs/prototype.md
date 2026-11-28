@@ -235,6 +235,20 @@ reason. Host privacy controls remain available. Sessions started without a VAD
 can still recognize the status question. Once a worker is judging private speech,
 only its observed blocks can open a private recognition window.
 
+Every voice exit waits for **704 ms** (22 native blocks) of Silero-verified
+speech absence after ASR closes. In round 15, the pinned worker first detected
+a continuing synthetic speech-like tail 216 ms after close at 400 counts RMS
+and 632 ms after close at 180 counts RMS. The operator fixed the window on
+2026-11-27 by adding two blocks of margin to the longer lag and rounding up
+to a whole block. This adds about 0.7 s to every voice exit and errs toward
+staying private. Speech in the window cancels the exit. All exit preconditions,
+including a fresh worker liveness round-trip, must still pass at commit.
+
+The pinned VAD missed a very quiet speech-like onset from stream start and
+detected a quieter, 160 counts RMS continuation only after the hold expired.
+The onset replay also required the recognizer to omit the quiet words. The
+owner-clip replay below remains the real-speech install gate.
+
 R4 and R4b cover continuing speech as judged by the pinned VAD. Continuing
 non-speech sound such as a tone, hum or music does not block an exit after a
 genuine exit phrase.

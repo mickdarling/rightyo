@@ -953,7 +953,7 @@ class PrivateExitTests(unittest.TestCase):
                 feed(bytes(320 * 32) + owner_question + name.tobytes() + bytes(1680 * 32))
                 self.assertEqual(events._private_name_end is not None, allowed)
                 self.assertEqual(harness.embedder.frames["owner"], 40 if allowed else 0)
-                feed(tone(0.96, OWNER_F0) + bytes(1600 * 32))
+                feed(tone(0.96, OWNER_F0) + bytes(2400 * 32))
                 processor.finish()
                 self.assertEqual(asr.transcribe.call_count, 2)
                 self.assertEqual([e["action"] for e in events.drain()], ["exit"] if allowed else [])
@@ -1113,7 +1113,7 @@ class PrivateExitTests(unittest.TestCase):
         )
         self.addCleanup(processor.close)
         pause = bytes(1440 * 32)
-        pcm = bytes(200 * 32) + tone(0.4, OWNER_F0) + pause + tone(1, OWNER_F0) + pause
+        pcm = bytes(200 * 32) + tone(0.4, OWNER_F0) + pause + tone(1, OWNER_F0) + bytes(2144 * 32)
         for at in range(0, len(pcm), 6400):
             controller._feed(generation, processor, pcm[at : at + 6400], "stdin", harness.shadow)
         processor.finish()
@@ -1215,7 +1215,7 @@ class PrivateListenTests(unittest.TestCase):
                         args,
                         output=output,
                         controller_factory=factory,
-                        audio_input=io.BytesIO(bytes(200 * 32) + tone(1, f0) + bytes(32000 * 2)),
+                        audio_input=io.BytesIO(bytes(200 * 32) + tone(1, f0) + bytes(2400 * 32)),
                     )
                 self.assertEqual(result, 0)
                 start_vad.assert_called_once()
