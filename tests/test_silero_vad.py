@@ -13,6 +13,7 @@ import time
 import unittest
 from array import array
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -27,6 +28,18 @@ from rightyo.silero_vad import CHUNK_BYTES, CHUNK_MS, VERSION, SileroVad, VadCon
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = ROOT / ".cache" / f"silero_vad-{VERSION}.onnx"
 
+# Round 18. Lag in ms from the command end to the start of a positive block.
+# Values beyond 2,000 ms came from a 6 s continuation with the same 2 s prefix.
+GRID_LEADS_MS = (200, 420, 1000)
+GRID_LAGS_MS = {
+    160: (3568, 3220, 1360),
+    180: (1360, 3188, 1328),
+    200: (1328, 1652, 976),
+    250: (944, 1332, 944),
+    300: (944, 1012, 944),
+    400: (720, 980, 720),
+}
+
 
 def tones(*components):
     """100 ms of orthogonal integer-cycle sinusoids, at 16 kHz."""
@@ -39,8 +52,9 @@ def tones(*components):
     ).tobytes()
 
 
-def speechlike_wave(duration_ms):
-    """Key7's synthetic voiced signal with varying pitch and three moving formants, at unit RMS."""
+@lru_cache(maxsize=2)
+def speechlike_wave(duration_ms, *, reference_ms=None):
+    """Key7's moving formants, scaled to unit RMS over the reference interval."""
     wave = []
     pitch_sum = 0.0
     for i in range(duration_ms * 16):
@@ -61,8 +75,9 @@ def speechlike_wave(duration_ms):
             )
             sample += amplitude / math.sqrt(h) * math.sin(h * phase)
         wave.append(sample * (0.28 + 0.72 * (0.5 + 0.5 * math.sin(3.15 * t)) ** 1.4))
-    rms = math.sqrt(sum(s * s for s in wave) / len(wave))
-    return [s / rms for s in wave]
+    reference = wave if reference_ms is None else wave[:reference_ms * 16]
+    rms = math.sqrt(sum(s * s for s in reference) / len(reference))
+    return tuple(s / rms for s in wave)
 
 
 def fake_worker(test, speech, failure_ms=None):
@@ -398,7 +413,7 @@ class AdversarialReplay(Replay):
         self.assertEqual(([event["action"] for event in events], s.exit_score.call_count), expected)
         if owner_check_times:
             # ASR finalization and the acoustic-end window must both be complete.
-            ready = math.ceil(max(command[1] + 1440, calls[0][1]) / CHUNK_MS) * CHUNK_MS
+            ready = math.ceil(max(command[1] + 1728, calls[0][1]) / CHUNK_MS) * CHUNK_MS
             self.assertEqual(owner_check_times, [ready] * expected[1])
         for event in events:
             if event["action"] == "exit":
@@ -408,14 +423,19 @@ class AdversarialReplay(Replay):
         self.assertFalse(c._private_sentence.pcm)
         return labels, calls
 
-    def key_exit(self, tail, *, later_speech=(), expected, **options):
+    def key_exit(self, tail, *, lead=400, later_speech=(), expected, **options):
         fan = tones((50, 1000))
         command = tones((50, 1000), (200, 3000), (400, 1000))
+        onset = math.ceil((lead + 16) / CHUNK_MS) * CHUNK_MS
         return self.exercise(
-            fan * 4 + command * 10 + tail,
-            [(416, 672), *later_speech],
-            (400, 1400),
-            words=[(400, 500, "Jarvis,"), (500, 580, " privacy"), (580, 1400, " off.")],
+            (fan * 10)[:lead * BYTES_PER_MS] + command * 10 + tail,
+            [(onset, onset + 8 * CHUNK_MS), *later_speech],
+            (lead, lead + 1000),
+            words=[
+                (lead, lead + 100, "Jarvis,"),
+                (lead + 100, lead + 180, " privacy"),
+                (lead + 180, lead + 1000, " off."),
+            ],
             expected=expected,
             **options,
         )
@@ -445,6 +465,77 @@ class AdversarialReplay(Replay):
         for rms, lag in ((400, 936), (180, 1352)):
             with self.subTest(rms=rms):
                 self.speechlike_tail(rms, 2000, lag, ([], 0))
+
+    def replay_grid_cell(self, rms, lead, *, residual=False):
+        lag = GRID_LAGS_MS[rms][GRID_LEADS_MS.index(lead)]
+        end = lead + 1000
+        duration = 6000 if residual else 2000
+        # Keep the first two seconds identical when extending a starred cell.
+        wave = speechlike_wave(duration, reference_ms=2000)
+        if residual:
+            short = speechlike_wave(2000)
+            self.assertEqual(wave[:len(short)], short)
+        fan = tones((50, 1000))
+        room = array("h", fan * (duration // 100))
+        tail = array("h", (bg + round(rms * v) for bg, v in zip(room, wave, strict=True)))
+        for pause in (None, 720):
+            with self.subTest(rms=rms, lead=lead, endpoint_pause=pause):
+                # The fake worker gives every command a qualified onset so the
+                # tail gate is exercised even for the shortest lead-in.
+                can_exit = residual and (lead != 200 or self.qualified_200_ms_onset)
+                labels, windows = self.key_exit(
+                    tail.tobytes() + fan * 16,
+                    lead=lead,
+                    later_speech=[(end + lag, end + lag + CHUNK_MS)],
+                    endpoint_pause=pause,
+                    expected=(["exit"], 2) if can_exit else ([], 0),
+                )
+                start, close = windows[0]
+                self.assertLessEqual(start, lead)
+                self.assertGreaterEqual(close, end, "ASR truncated the candidate")
+                if pause:
+                    self.assertLess(close, end + lag, "fast ASR must close before detection")
+                after = math.ceil(end / CHUNK_MS)
+                if residual:
+                    two_seconds = math.ceil((end + 2000) / CHUNK_MS)
+                    self.assertFalse(any(labels[after:two_seconds]))
+                    self.assertTrue(any(labels[two_seconds:(end + duration) // CHUNK_MS]))
+                    if not can_exit:
+                        self.assertEqual(labels.index(True) * CHUNK_MS, 192)
+                else:
+                    self.assertTrue(any(labels[after:math.ceil((end + 1728) / CHUNK_MS)]))
+            self.doCleanups()
+
+    def test_grid_continuations_detected_within_window_cancel(self):
+        for rms, lags in GRID_LAGS_MS.items():
+            for lead, lag in zip(GRID_LEADS_MS, lags, strict=True):
+                if lag <= 1728:
+                    self.replay_grid_cell(rms, lead)
+
+    def test_clean_grid_commands_under_both_endpointers(self):
+        for lead in GRID_LEADS_MS:
+            for pause in (None, 720):
+                with self.subTest(lead=lead, endpoint_pause=pause):
+                    qualified = lead != 200 or self.qualified_200_ms_onset
+                    self.key_exit(
+                        tones((50, 1000)) * 24,
+                        lead=lead,
+                        endpoint_pause=pause,
+                        expected=(["exit"], 2) if qualified else ([], 0),
+                    )
+                self.doCleanups()
+
+    def test_boundary_lag_3568_ms_after_command_end(self):
+        """Residual limit at 160 RMS / 200 ms. The real onset also lacks 200 ms of absence."""
+        self.replay_grid_cell(160, 200, residual=True)
+
+    def test_boundary_lag_3220_ms_after_command_end(self):
+        """Residual limit at 160 RMS / 420 ms. Detection follows the confirmed exit."""
+        self.replay_grid_cell(160, 420, residual=True)
+
+    def test_boundary_lag_3188_ms_after_command_end(self):
+        """Residual limit at 180 RMS / 420 ms. Detection follows the confirmed exit."""
+        self.replay_grid_cell(180, 420, residual=True)
 
     def test_name_waits_for_confirmation_before_owner_check(self):
         fan = tones((50, 1000))
@@ -508,8 +599,8 @@ class AdversarialReplay(Replay):
 
     def test_clean_exit_requires_the_last_observed_block(self):
         fan = tones((50, 1000)) * 24
-        # The last word ends at 1400 ms. The block [2816, 2848) covers the 2840 ms deadline.
-        last = (2848 - 1400) * BYTES_PER_MS
+        # The last word ends at 1400 ms. The block [3104, 3136) covers the 3128 ms deadline.
+        last = (3136 - 1400) * BYTES_PER_MS
         for pause in (None, 720):
             with self.subTest(endpoint_pause=pause):
                 self.key_exit(fan[: last - 2], endpoint_pause=pause, expected=([], 0))
@@ -518,15 +609,15 @@ class AdversarialReplay(Replay):
     def test_speech_on_the_last_block_cancels_the_exit(self):
         fan = tones((50, 1000))
         resumed = tones((50, 1000), (200, 3000), (400, 1000))
-        tail = (fan * 15)[: (2816 - 1400) * 32] + resumed * 4 + fan * 24
+        tail = (fan * 18)[: (3104 - 1400) * 32] + resumed * 4 + fan * 24
         for pause, close in ((None, 2120), (720, 1400)):
             with self.subTest(endpoint_pause=pause):
                 labels, windows = self.key_exit(
-                    tail, later_speech=[(2816, 2848)], endpoint_pause=pause, expected=([], 0)
+                    tail, later_speech=[(3104, 3136)], endpoint_pause=pause, expected=([], 0)
                 )
                 self.assertEqual(windows[0][1], close)
-                self.assertFalse(any(labels[math.ceil(1400 / CHUNK_MS) : 2816 // CHUNK_MS]))
-                self.assertTrue(labels[2816 // CHUNK_MS])
+                self.assertFalse(any(labels[math.ceil(1400 / CHUNK_MS) : 3104 // CHUNK_MS]))
+                self.assertTrue(labels[3104 // CHUNK_MS])
 
     def test_worker_failure_during_hold_or_after_last_score_cancels_exit(self):
         def stop_worker(c, e, vad):
@@ -537,7 +628,7 @@ class AdversarialReplay(Replay):
         def close_worker(c, e, vad):
             vad.close()
 
-        for at_ms, fail in ((2496, close_worker), (2848, close_worker), (2848, stop_worker)):
+        for at_ms, fail in ((2496, close_worker), (3136, close_worker), (3136, stop_worker)):
             with self.subTest(at_ms=at_ms, failure=fail.__name__):
                 self.key_exit(
                     tones((50, 1000)) * 24,
@@ -690,6 +781,8 @@ class AdversarialReplay(Replay):
 
 
 class FakeWorkerDecisions(AdversarialReplay, unittest.TestCase):
+    qualified_200_ms_onset = True
+
     def worker(self, speech):
         return fake_worker(self, speech)
 
@@ -769,7 +862,7 @@ class FakeWorkerDecisions(AdversarialReplay, unittest.TestCase):
     def test_incomplete_last_vad_block_cannot_supply_an_ending_pause(self):
         command = doc(segment("Jarvis,", 20, 180), segment(" privacy off.", 180, 340))
         for pause_ms, expected in (
-            (20, ([], 0)), (32, ([], 0)), (736, ([], 0)), (1440, (["exit"], 2)),
+            (20, ([], 0)), (32, ([], 0)), (736, ([], 0)), (1440, ([], 0)), (1728, (["exit"], 2)),
         ):
             with self.subTest(pause_ms=pause_ms):
                 self.assertEqual(
@@ -846,16 +939,10 @@ class RealSilero:
 
 
 class RealModelDecisions(RealSilero, AdversarialReplay, unittest.TestCase):
+    qualified_200_ms_onset = False
+
     def worker(self, speech):
         return self.real_worker()
-
-    def test_boundary_tail_quieter_than_180_rms(self):
-        """#350 round 17 operator ruling (2026-11-27), P1-1 residual tail limit.
-
-        The same moving formants continue at 160 counts RMS. Silero first detects
-        them 5416 ms after the last word, beyond the 1440 ms acoustic-end window.
-        """
-        self.speechlike_tail(160, 6000, 5416, (["exit"], 2))
 
     def test_boundary_quiet_speechlike_onset_at_stream_start(self):
         """#350 round 15 operator ruling (2026-11-27), key7 P1-1, residual onset limit.

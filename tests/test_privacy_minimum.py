@@ -1594,6 +1594,9 @@ class PrivacyMinimumTests(unittest.TestCase):
                 c.duck(True)
                 e.drain()
                 self.feed(c, p, SILENCE * 10 + VOICE * 9 + SILENCE * 72, s)
+                self.assertIsNone(e._private_name_end)
+                s.exit_score.assert_not_called()
+                self.feed(c, p, SILENCE * 15, s)  # 1740 ms of observed quiet after the name.
                 self.assertEqual(e._private_name_end is not None, scores[0] > 0.5)
                 if forget:
                     e.forget_speakers(now_ms=c._received_ms)

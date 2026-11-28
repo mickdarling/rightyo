@@ -53,7 +53,7 @@ ASR_END_PADDING_MS = 1000
 # Two 10 ms whisper timestamp ticks (one PCM frame): tolerate rounding jitter only.
 ASR_TIMING_JITTER_MS = 20
 PRIVATE_ONSET_QUIET_MS = 200
-PRIVATE_EXIT_TAIL_MS = 1440  # 1352 ms from the last word + two 32 ms blocks, rounded up
+PRIVATE_EXIT_TAIL_MS = 1728  # Fixed at 54 native blocks by the #350 round-19 ruling.
 # Recovery alone is asynchronous and bounded. The first decode retains its configured
 # timeout, including the base's pre-existing synchronous input-path blocking.
 ASR_REDECODE_SECONDS = 5.0

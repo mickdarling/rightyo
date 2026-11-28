@@ -957,7 +957,7 @@ class PrivateExitTests(unittest.TestCase):
                         Units(("Privacy off.", 20, 980)).units,
                     ]
                 )
-                speech = [(320, 3120 if gain else 2320), (4800, 5760)]
+                speech = [(320, 3120 if gain else 2320), (4864, 5824)]
                 processor = LiveProcessor(
                     LiveConfig(
                         "shadow-test",
@@ -982,6 +982,9 @@ class PrivateExitTests(unittest.TestCase):
                         )
 
                 feed(bytes(320 * 32) + owner_question + name.tobytes() + bytes(1680 * 32))
+                self.assertIsNone(events._private_name_end)
+                self.assertEqual(harness.embedder.calls, 0)
+                feed(bytes(64 * 32))  # Complete the native block covering the 4848 ms deadline.
                 self.assertEqual(events._private_name_end is not None, allowed)
                 self.assertEqual(harness.embedder.frames["owner"], 40 if allowed else 0)
                 feed(tone(0.96, OWNER_F0) + bytes(2400 * 32))

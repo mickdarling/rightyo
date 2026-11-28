@@ -235,26 +235,55 @@ reason. Host privacy controls remain available. Private status questions remain 
 and after a runtime worker failure. Once a worker is judging private speech,
 only its observed blocks can open a private recognition window.
 
-Every voice exit takes about **1,440 ms** from the acoustic end of the command.
-The window starts at the end of the last word supported by Silero speech evidence.
-ASR closure timing cannot shorten it. The processor waits for the entire block
-covering the deadline before the owner check. Resumed speech on any of those
-blocks cancels the exit. This errs toward staying private. All exit preconditions,
-including a fresh worker liveness round-trip, must still pass at commit.
+The post-end confirmation window is fixed at **1,728 ms (54 native blocks)**.
+It starts at the acoustic end of the command, the end of the last word supported
+by Silero speech evidence. ASR closure timing cannot shorten it. The processor
+waits for the entire block covering the deadline before checking the owner.
+Resumed speech on any of those blocks cancels the exit. All exit preconditions,
+including a fresh worker liveness round-trip, must still pass at publication.
 
-In the round 17 generated replay, the last word ended at 1,400 ms. The pinned
-worker's first speech-positive continuation block began 936 ms later at 400
-counts RMS, 1,352 ms later at 180 counts RMS and 5,416 ms later at 160 counts
-RMS. The 2026-11-27 operator ruling adds two 32 ms blocks to the 180 RMS lag
-and rounds up to 45 whole blocks. Normal ASR close was 2,120 ms. The fast
-“complete” endpointer closed as early as 700 ms, truncating the command. Its
-earliest close retaining every word was 1,400 ms. Both qualifying endpointers
-reached the owner check at 2,848 ms on the clean replay.
+### Post-end confirmation window basis
 
-The pinned VAD missed a very quiet speech-like onset from stream start and
-detected a quieter, 160 counts RMS continuation only after the hold expired.
-The onset replay also required the recognizer to omit the quiet words. The
-owner-clip replay below remains the real-speech install gate.
+The operator fixed the window on 2026-11-27 using the maximum lag among grid
+cells that Silero detects within 2 s, plus 2 blocks. In the round-18 generated
+replay, that maximum was **1,652 ms** at 200 counts RMS with a 420 ms lead-in.
+Adding 64 ms gives 1,716 ms, which rounds up to 54 whole 32 ms blocks.
+
+The table gives the lag in milliseconds from the acoustic end of the one-second
+command to the **start** of the first continuation block labelled speech by
+pinned Silero v5.1.2. Each row sets the RMS of the generated speech-like
+continuation mixed with the 50 Hz background. Each column sets the duration
+of the background before the command.
+
+| Continuation RMS (counts) | 200 ms lead-in | 420 ms lead-in | 1,000 ms lead-in |
+|---:|---:|---:|---:|
+| 160 | 3,568\* | 3,220\* | 1,360 |
+| 180 | 1,360 | 3,188\* | 1,328 |
+| 200 | 1,328 | 1,652 | 976 |
+| 250 | 944 | 1,332 | 944 |
+| 300 | 944 | 1,012 | 944 |
+| 400 | 720 | 980 | 720 |
+
+\* No detection occurred within the two-second continuation. The marked lags
+come from six-second continuations whose first two seconds were byte-identical
+to the original replays.
+
+The residual limit is a speech-like continuation that the pinned VAD first
+detects later than the window after the command's acoustic end. The three
+starred cells illustrate this limit. When all other gates pass, the exit can
+commit before detection. In the 200 ms lead-in replay the first speech-positive
+command block starts at 192 ms, so the separate 200 ms onset gate refuses it.
+
+In the clean 400 ms lead-in control, the command ends at 1,400 ms and the
+window ends at 3,128 ms. Normal ASR closes at 2,120 ms. The fast “complete”
+endpointer can close at 700 ms and truncate the command. Its earliest close
+retaining every word is 1,400 ms. Both qualifying endpointers reach the owner
+checks at 3,136 ms, when the last native block is complete.
+
+The pinned VAD can also miss a very quiet speech-like onset at stream start.
+The onset replay requires the recognizer to omit those quiet words. These
+measurements use generated audio and authored recognition. The owner-clip
+replay below remains the real-speech install gate.
 
 R4 and R4b cover continuing speech as judged by the pinned VAD. Continuing
 non-speech sound such as a tone, hum or music does not block an exit after a
@@ -302,8 +331,8 @@ lead-in and the persistent fundamental with a louder third harmonic must all
 keep privacy on, make zero owner checks and emit no transcript or exit.
 Two boundary replays use a persistent 100 Hz tone with raised second and fourth
 harmonics and a synthetic tail at 1.465× fan RMS after a 400 ms lead-in.
-Silero labels the continuing tone in each as non-speech. Both expect one
-stand-in owner check and one exit, as does the 50 Hz clean control with a
+Silero labels the continuing tone in each as non-speech. Both expect two
+stand-in owner checks and one exit, as does the 50 Hz clean control with a
 400 ms lead-in. The fake worker supplies known speech intervals and
 exercises the positive machinery, onset, omitted-tail and early-close decisions in CI.
 

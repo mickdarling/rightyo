@@ -1865,8 +1865,8 @@ consecutive 512-sample (32 ms) blocks at 16 kHz. A speech probability of at leas
 0.5 marks the whole block as speech. Only observed blocks count toward either
 pause. A quiet period qualifies only the onset immediately following it.
 
-Every voice exit takes about **1,440 ms** from the acoustic end of the command
-(the end of the last word whose timing is supported by Silero speech evidence).
+The fixed **1,728 ms (54 native blocks)** confirmation window starts at the acoustic
+end of the command (the end of the last word whose timing is supported by Silero speech evidence).
 The processor counts observed audio from that word end, independent of ASR close.
 It waits for the complete native block covering the deadline before checking the
 owner for a complete exit or either split fragment. Resumed speech cancels the
@@ -1874,25 +1874,23 @@ candidate even on that last block. An independently matched status question in
 the same private turn still emits its status event. A partial block at
 end of input cannot complete the window. This errs toward staying private.
 
-In the round 17 synthetic replay, the last word ended at 1,400 ms. Measured from
-that end to the start of the first continuation block the pinned worker labelled
-speech, the lags were 936 ms at 400 counts RMS, 1,352 ms at 180 counts RMS and
-5,416 ms at 160 counts RMS. The 2026-11-27 ruling adds two 32 ms blocks to
-1,352 ms and rounds up to a whole block, giving 45 blocks. Normal ASR close was
-2,120 ms. The earliest fast “complete” close was 700 ms and truncated the command.
-The earliest close retaining every word was 1,400 ms. With either qualifying
-endpointer, a clean replay reached the owner check at 2,848 ms. At commit the
-publisher rechecks the current privacy session, owner approval, speaker and
-playback evidence, and requires a fresh round-trip to the VAD worker.
+The 2026-11-27 operator ruling uses the maximum lag among grid cells that Silero
+detects within 2 s, plus 2 blocks. The round-18 synthetic replay maximum in that
+interval was 1,652 ms at 200 counts RMS with a 420 ms lead-in. Adding 64 ms
+and rounding up to a whole block gives 1,728 ms. At publication the processor
+rechecks the current privacy session, owner approval, speaker and playback
+evidence, and requires a fresh round-trip to the VAD worker.
+[Full detection-lag grid and clean control](prototype.md#post-end-confirmation-window-basis)
 
 The pinned VAD can judge a very quiet speech-like onset at stream start as
 absent. An exit in that case also requires ASR to omit the opening words.
 If ASR retains them ahead of the configured name in the same sentence, the
-sentence-initial name rule (R1) refuses the exit. A quieter continuation can
-also escape the hold. In the 160 counts RMS replay, Silero first detected the
-tail after the exit had committed. Both limits were observed with generated
-signals and authored recognition. The owner-clip install gate below supplies
-the required real-speech evidence.
+sentence-initial name rule (R1) refuses the exit. The residual tail limit is a
+speech-like continuation that the pinned VAD first detects later than the window
+after the command's acoustic end. If the other gates pass, the exit can commit
+before detection. The three starred grid cells illustrate this limit with
+generated signals and authored recognition. The owner-clip install gate below
+supplies the required real-speech evidence.
 
 R4 and R4b cover continuing speech as judged by the pinned VAD. Continuing
 non-speech sound such as a tone, hum or music does not block an exit after a
